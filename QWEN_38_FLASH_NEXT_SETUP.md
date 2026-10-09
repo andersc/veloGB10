@@ -398,6 +398,7 @@ Caveat: the model still SEES the tools and is merely told not to call them — a
 `<tool_call>` comes back as visible text instead of being executed. `--exit-on-fatal` pairs
 well with a supervisor for unattended runs (see `docs/OPERATIONS.md`).
 
+<!-- CUT: see the matching marker in CHANGELOG.md (the two-quoted-calls clause below) -->
 **Tool-call values that quote tool-call syntax.** A parameter value may itself contain the
 text `</parameter>` (an agent writing a file that documents the tool-call format). The parser
 ends a value only at the *structural* `</parameter>` — the one followed by the next

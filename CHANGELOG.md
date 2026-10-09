@@ -313,6 +313,7 @@ The NVFP4 server does not read this flag (it has its own `--prefill-sched`).
   unless told not to; this endpoint sends it only when asked.)
 - **Benchmark and probe rounds** (`--bench-mtp` and two diagnostics) stop at the 2,051-token
   switch like the server, so a losslessness run across the switch measures what is served.
+<!-- CUT: if the parser is changed before the cut so that two quoted calls with no closing function tag between them are no longer read as two calls, drop that clause here and in the Flash-Next guide section 8; otherwise keep it -->
 - **Flash-Next guide: tool-call values that quote tool-call syntax.** The guide listed two
   cases that the tool-call format cannot disambiguate; there are three. The one that was
   missing: a value that quotes a call with two or more parameters is cut at the first quoted
