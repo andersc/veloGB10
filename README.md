@@ -113,6 +113,32 @@ on decode and **×2.0–2.2** on prefill.
 Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
 
+### New in v0.7.4
+
+- **Speculation re-arms inside a request.** The per-request control that turns speculative
+  decoding off when it stops paying used a 2 % margin against one stale measurement and was
+  final for the request; in a user's log 63 % of a long request ran at plain speed because of
+  it. It now needs a 10 % margin confirmed by a fresh measurement, and tries speculation again
+  after a doubling wait (`--mtp-reprobe auto`, the default; `off` = the old behaviour).
+- **A request's greedy text no longer depends on what else is served.** Dense or sparse
+  attention is chosen per row (`--qsa-row-regime`, default on). This changes the greedy bytes
+  of requests that cross about 2,051 tokens of context and of short requests that shared a
+  step with a longer one, compared with v0.7.3, where those bytes depended on timing.
+- **Images survive a GPU vision-tower error** (issue #20, pull request #16): the request is
+  answered by the CPU tower and the next one uses the GPU tower again.
+- **Community pull requests ported:** RoCE GID auto-detection and `--gid-idx` (#15), TP image
+  payload order and `--ple-headroom-per-lane-gb` (#17), the served-window memory fix and the
+  `--max-seq-len` clamp on the EXL3 server (#21), `--prefill-interleave` (#23, opt-in).
+- **Smaller changes:** `--mtp off` is honoured on the EXL3 server; `--help` corrected
+  (`--max-tokens`, penalties, sampler defaults); the TP launcher derives `--tp` from the
+  `--node` count; the `[gen]` log line carries `stop_kind` / `stop_p` / `stop_rank`; streaming
+  `/v1/completions` can send a usage chunk.
+- **New on `/metrics`:** `velogb10_spec_mtp_off_events_total`,
+  `velogb10_spec_mtp_reprobes_total`, `velogb10_spec_mtp_reprobe_ok_total`,
+  `velogb10_graph_cache_mixed_step_entries`.
+
+Numbers, credits, the behaviour change in full and the known limits: [CHANGELOG](CHANGELOG.md).
+
 ### New in v0.7.3
 
 The fixes from reported issues: the TP=2 pre-verify race (issue #10) and exllamav3 1.5.x
@@ -515,7 +541,8 @@ detection; and TP=2 speed features that are on by default with an `off` value ea
 
 **Limits on this path:**
 
-- **262,144 tokens maximum.** YaRN is not implemented, so there is no 1M context.
+- **262,144 tokens maximum.** YaRN is not implemented, so there is no 1M context. Since v0.7.4 a
+  larger `--max-seq-len` is clamped to this with a warning line.
 - **Images yes, video not yet.** Image parts are served at every topology (TP=1/2/4); **video and
   audio parts return `400`** until video support lands.
 - **Two or three concurrent requests do not scale yet.** `--max-batch N` serves N requests; from about
@@ -716,7 +743,7 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 
 | Mode | What it does |
 |---|---|
-| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`, `GET /metrics`) |. v0.7.3: `/v1/models` reports `max_model_len`; chat/legacy non-streaming responses report `usage.prompt_tokens_details.cached_tokens`; the streaming usage chunk carries it too |
+| `--server` | OpenAI-compatible HTTP server — the normal way to run (endpoints: `POST /v1/chat/completions`, `POST /v1/tokenize`, `POST /v1/detokenize`, `GET /v1/models[/:id]`, `GET /health`, `GET /metrics`; the legacy `POST /v1/completions` is served too). v0.7.3: `/v1/models` reports `max_model_len`; chat/legacy non-streaming responses report `usage.prompt_tokens_details.cached_tokens`; the streaming usage chunk carries it too. v0.7.4: streaming `/v1/completions` sends a usage chunk when the request sets `stream_options.include_usage: true` |
 | *(no mode)* | Interactive CLI: load model, generate from `--prompt` |
 | `--help`, `-h` | Print help |
 
@@ -752,22 +779,27 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--lane-order <rr\|fcfs>` | rr | Order of serial speculative rounds with several busy requests: `rr` = a round per lane per step (all finish late); `fcfs` = run one lane to completion at a time (measured: −23%/−30% mean completion at 2/3 equal-length concurrent; two 512-token turns at quantum 1024: −20–24%; worse TTFT for later lanes; aggregate unchanged; `rr` wins the mean on mixed lengths; greedy output identical) |
 | `--lane-quantum <N>` | 256 | The `--lane-order=fcfs` turn cap in generated tokens (bounds a pathologically long turn) |
 | `--ple-ram <auto\|ram\|ssd>` | auto | EXL3 n-gram table location: RAM, or read from SSD (frees 30–39 GB, decode ~1–4% slower); `auto` decides after the boot and refuses impossible configurations before the load |
-| `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
-| `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
-| `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch |
+| `--ple-headroom-per-lane-gb <F>` | 0 | Opt-in: extra headroom for the `--ple-ram auto` decision, this many GiB per additional lane on top of the fixed 16 GiB (2 with `--max-batch 10` → 16 + 2 × 9 = 34 GiB). 0 = the decision as before v0.7.4 |
+| `--max-tokens <N>` | EXL3: unlimited; NVFP4: 8192 | Output length for a **chat** request that omits `max_tokens`. A default, not a cap: a request may ask for more, up to the room left in the context. `/v1/completions` requests that omit it get 16 and ignore this flag |
+| `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family); since v0.7.4 the EXL3 server clamps too and prints the limit (before, a larger value booted and could corrupt device memory). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
+| `--prefill-interleave <N>` | 0 | EXL3, one machine: after each prefill chunk (except the last) of a prompt that joins while other requests are generating, run up to N decode steps for those requests. Measured with a 20K-token joining prompt: longest stall 14.1 s → 5.4 s at the default `--prefill-chunk 4095`, 15.1 s → 2.7 s at 2048, 16.6–17.0 s → 1.35–1.47 s at 1024, for +3 % to +9 % time to first token of the joining request. The joining request's output is unchanged. Ignored under TP (a boot line says so) |
+| `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch. Since v0.7.4 a GPU-tower error falls back to the CPU tower for that one request by itself |
 | `--reasoning-effort <e>` | template default | Reasoning level in the chat template (`no_think`/`low`/`medium`/`high`/`xhigh`); per-request `reasoning_effort` overrides |
 | `--output-prompts [n]` | off | Log each chat request human-readable (params, messages, rendered prompt); optional render cap `n` |
-| `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
+| `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` = speculation with the profitability control (NVFP4: calibrated at boot and re-picked live; EXL3: the per-request auto-off and re-probe); greedy verify is bitwise-lossless, temp>0 distribution-exact. `off` = plain decoding only, on every server (the EXL3 server honours it since v0.7.4; it ignored the flag before). `on` forces it on NVFP4 (benchmarking) and equals `auto` on EXL3 |
+| `--mtp-reprobe <auto\|off>` | auto | EXL3: what happens after the per-request speculation auto-off. `auto` = the draft head stays in step and speculation is tried again for a short probe after 256 plain steps, the wait doubling to 4,096 per failed probe and resetting on success; `off` = the off decision is final for the request (the behaviour before v0.7.4) |
+| `--mtp-lanes <on\|off>` | off | NVFP4 server, EXPERIMENTAL: batched MTP verify across lanes (the draft chains of several concurrent greedy requests packed into one verify). Not read by the EXL3 server |
+| `--qsa-row-regime <on\|off>` | on | EXL3: choose dense or sparse attention per row from the row's own position, and stop a speculative round at the 2,051-token switch, so a request's greedy text does not depend on what else is served. `off` (`0`) = the rule before v0.7.4 (one choice per step, from its longest request), for comparison |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
 | `--spec-source <mode>` | auto | Speculative source: `mtp` / `dflash` (DFlash v1 lane) / `dflash2` / `dflash2-rq` / `dflash2-auto` / `dflash2-tree` (tree verification) / `dflash2-synth` / `dspark` (DSpark drafter) / `none` |
 | `--draft-dir <DIR>` | — | Drafter artifact directory (used with `--spec-source dflash*`/`dspark`) |
 | `--df2-block <8\|16>` | 8 | DFlash2 draft block size (16 is opt-in; measured +23% pooled at TP=4 on the mission set) |
-| `--prefill-sched <inline\|cursor>` | inline | Prefill scheduling: `cursor` runs the window loop in the step loop (two-lane prefill) |
+| `--prefill-sched <cursor\|inline>` | cursor | NVFP4 server: how a joining prompt's prefill is scheduled. `cursor` = one prefill window per scheduler step, so running streams keep moving; `inline` = the whole prompt prefills inside admission and running streams wait. Schedule only: output unchanged. Not read by the EXL3 server (see `--prefill-interleave`) |
 | `--tripwire` | off | Release-live pool/OOB tripwire (with `--pool-census`, `--tripwire-selftest`) |
 | `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |
 | `--prefix-cache <on\|off>` | off | Reuse a conversation's cached prefix (~3× faster follow-up turns). Not bit-exact across reuse; greedy MTP stays lossless |
 | `--default-repetition-penalty <F>` | 1.0 | Repetition penalty (1.0 = off) |
-| `--default-presence-penalty <F>` | 1.5 (2.0 on 2B) | Presence penalty |
+| `--default-presence-penalty <F>` | EXL3: 0.0; NVFP4: 1.5 (2.0 on 2B) | Presence penalty (chat endpoint; `/v1/completions` ignores the `--default-*-penalty` flags) |
 | `--default-frequency-penalty <F>` | 0.0 | Frequency penalty |
 | `--otel-endpoint <URL>` | off | Enable the OpenTelemetry emitter: OTLP receiver base URL (POSTs `/v1/logs`). Off = zero session work |
 | `--otel-batch-size <N>` | 512 | Max LogRecords per POST `/v1/logs` |
@@ -780,8 +812,11 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--keep-tools-when-tool-choice-none` | off | vLLM-compatible `tool_choice:"none"`: keep the tools in the prompt (prefix cache survives compaction turns), append a do-not-call instruction, return plain content |
 | `--exit-on-fatal <on\|off>` | on | EXL3: on a fatal CUDA error / scheduler panic, finish the in-flight request with an error and exit 70 for a supervisor (see docs/OPERATIONS.md) instead of serving 503s from a DEAD engine; `off` keeps the DEAD/503 behaviour (default flipped ON in v0.7.3) |
 
-`temperature` / `top_p` / `top_k` / `seed` are **per-request** only (defaults 0.7 / 0.8 / 20) —
-every request may override in its JSON body. There are no MTP env vars; speculation is auto-tuned
+`temperature` / `top_p` / `top_k` / `seed` are **per-request** only; every request may override
+them in its JSON body. Defaults when a request omits them: 0.7 / 0.8 / 20, except a chat request
+on the EXL3 server whose prompt opens a thinking block, which gets 1.0 / 0.95 / 20.
+`/v1/completions` uses 0.7 / 0.8 / 20 on both servers, with penalties 1.0 / 0.0 / 0.0. Greedy
+decoding needs an explicit `temperature: 0`. There are no MTP env vars; speculation is auto-tuned
 per request.
 
 ### TP=2/TP=4 flags (head) and node mode
@@ -793,6 +828,7 @@ per request.
 | `--nodes <ip[:port],...>` | — | Explicit node address(es); skips UDP discovery |
 | `--discover-wait <S>` | 3 | Discovery broadcast window (instead of `--nodes`) |
 | `--rdma-dev <d1[,d2]>` | platform defaults | RoCE devices |
+| `--gid-idx <N>` | auto | RoCE GID index of the TP data plane. Auto-detect (v0.7.4) takes the first IPv4-mapped RoCE v2 GID from sysfs and prints it at bring-up with the evidence; if none is found, the fixed index 3 used before. An explicit N applies to every rail; a wrong N fails at bind. Per machine |
 | `--head --model-dir <DIR>` | — | One-shot bench/generate head (use `--server --tp` for serving) |
 
 **The engine reads no environment variables.** Every option is a command-line flag: leaving a
@@ -828,6 +864,14 @@ invariance), `--probe-state` (GDN state divergence), `--probe-reject` (rollback)
 `--probe-gemm` (cuBLAS audit), `--probe-bandwidth` / `--probe-bandwidth-sustained` (roofline;
 idle GB10 ≈ 238 GB/s), `--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc
 transport audit), `--sweep-gemm`.
+
+New in v0.7.4, all listed by `--help-diag`: `--probe-exl3-regime` (bit-level comparison of a
+row alone and inside a mixed dense/sparse decode step; options `--regime-runner`,
+`--regime-joiner`, `--regime-steps`, `--regime-order`, `--regime-csv`, `--regime-time`), and
+two test drills that are never for serving: `--mtp-reprobe-drill` (forces the speculation
+off / re-arm cycle on a short schedule) and `--vision-fail-gemm` (fails the first GPU-tower
+matrix multiply once, to exercise the CPU fallback; on the EXL3 server it is armed only when
+another flag follows it on the command line).
 
 ## Requirements
 

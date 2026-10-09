@@ -59,6 +59,9 @@ explicitly for readability; with the v0.7.3 default it can be omitted.
 
 The release tarball's `run_tp_server.sh` / `run_tp_node.sh` wrap the same flags (`--help` on
 both; `--dry-run` prints the exact engine command line) if you prefer scripts over units.
+Since v0.7.4 `run_tp_server.sh` derives `--tp` from the number of `--node` flags (one `--node`
+= TP=2, three = TP=4), refuses an explicit `--tp` that disagrees with that count, and refuses
+two `--node` flags (the engine serves a world of 2 or 4).
 
 ## 3. Log handling
 
@@ -87,6 +90,10 @@ diagnostics, so:
 | `velogb10_scheduler_busy` | 1 = scheduler work in progress; 0 = idle-waiting | alert **only together with the age gauge** |
 | `velogb10_scheduler_last_step_age_seconds` | seconds since the last COMPLETED round or prefill chunk | alert on `scheduler_busy == 1 AND age > 120` **only**. With `busy == 0` the server is idle-waiting and a high age is EXPECTED — not a wedge, not an admission stall |
 | `velogb10_graph_cache_entries` | CUDA graphs held | first-hours growth expected (key-space saturation); never flattening = new key classes |
+| `velogb10_graph_cache_mixed_step_entries` | (v0.7.4) CUDA graphs captured for decode steps that mix short and long requests; captured on first use, one per step shape seen, not capped; also counted in `velogb10_graph_cache_entries` | information: growth is expected while new mixes of short and long requests appear (4 lanes can form 6 such shapes per sparse-grid bucket and penalty state; the first step of a new shape costs about 8 ms once) |
+| `velogb10_spec_mtp_off_events_total` | (v0.7.4) times speculation was switched off for a request. Events, not requests: one request can go off several times | information: a high rate means the workload's draft acceptance is low (see section 8) |
+| `velogb10_spec_mtp_reprobes_total` | (v0.7.4) probe windows opened after an off | information |
+| `velogb10_spec_mtp_reprobe_ok_total` | (v0.7.4) probe windows that ended with speculation back on | information: `reprobe_ok / reprobes` near 0 = speculation is not paying on this workload |
 | `velogb10_log_lines_dropped_total` | log lines dropped (reader stalled) | > 0 = fix the log collector |
 | `velogb10_requests_rejected_total` | requests refused at `--max-waiting` | sustained growth = clients outpacing lanes |
 | `velogb10_streams_cancelled_backlog_total` | streams cancelled at `--stream-backlog-events` | > 0 = a client stopped reading mid-stream |
@@ -133,3 +140,69 @@ abort; `velogb10_log_lines_dropped_total > 0`.
 > Note: the systemd units above are reviewed examples, not soak-tested artifacts — mark them
 > for verification on your first long run. The 11-min backlog figure assumes a 100 tok/s
 > single stream; log-volume estimates come from a code audit, not a measured day.
+
+## 8. Reading the per-request log lines (v0.7.4 additions)
+
+**Speculation (EXL3 server).** Every request ends with one `[mtp-stats]` line. Since v0.7.4 it
+ends with `off_events=N reprobes=N reprobe_ok=N` (after the existing `plain_steps=`, `temp=`
+and `ctrl=` fields), for example `... plain_steps=2699 temp=1.3 ctrl=2 off_events=4
+reprobes=3 reprobe_ok=0`: speculation was switched off four times, tried again three times and
+never stayed on, so the request ran mostly plain. The transitions print as they happen:
+
+    [exl3-serve] MTP off for this request (slot N): ... ms/tok (...) vs plain ... after N rounds
+    [exl3-serve] MTP re-probe (slot N): back ON after N plain steps ...
+    [exl3-serve] MTP re-probe FAILED (slot N): ... (next probe in N plain steps)
+    [exl3-serve] MTP re-probe OK (slot N): ...
+
+Under TP the node prints the same lines as the head (the decision is shared state).
+`--mtp-reprobe off` makes the first off final for the request, as before v0.7.4. With
+`--mtp off` (honoured on the EXL3 server since v0.7.4) the boot banner reads `MTP chain-verify
+OFF: MTP OFF (--mtp off)` and every `[mtp-stats]` line shows `rounds=0 drafted=0`.
+
+**Why a request stopped.** The `[gen]` line of a chat request ends with three more fields:
+
+| field | values |
+|---|---|
+| `stop_kind` | `eos` (a model stop token), `stop_string`, `length`, `loop` (the loop detector; the client still sees `finish_reason: "stop"` with `stop_reason: "loop_detected"`), `cancel`, `error`, `other` |
+| `stop_p` | for a stop-token finish: the probability the sampler gave the stop token (for a greedy request, its softmax probability at temperature 1); `0` = it had been truncated away; `na` otherwise |
+| `stop_rank` | for a stop-token finish: the token's rank among the logits (1 = the most likely); `na` otherwise |
+
+The two numbers settle from the log whether an unexpected end of an answer was a likely stop
+token or an unlikely one drawn by the sampler: in a test at temperature 1.5, two of six sampled
+requests stopped on the second most likely token (`stop_p=0.3575 stop_rank=2`). Both fields are
+`na` under TP, on the NVFP4 server, and when the very first generated token is the stop token. `/v1/completions`
+prints no `[gen]` line. A request that runs out of tokens inside its thinking block is counted
+under `reasoning_tokens` (before v0.7.4: under `content_tokens`).
+
+**Images.** A GPU vision-tower error no longer disables images. The lines to look for:
+
+    [vision] GPU tower failed (<cause>), falling back to CPU tower
+    [vision] GPU worker panicked (<cause>), falling back to CPU tower
+
+The request is then answered by the CPU tower, which is slow: 53.8 s for one image on one
+machine and 173 to 218 s on the head at TP=2 in our measurements, so a client timeout below
+that gives up first. Other requests and other images are not slowed, and the next image uses
+the GPU tower again. Each occurrence is one slow image request, not an outage.
+<!-- CUT: the next sentence describes finding F1 of the TP=2 verification; drop it if F1 is fixed before the cut -->
+One failure that was not injected was seen in 1,138 image requests at TP=2: an image request
+arrived while CUDA graphs were being captured, ten seconds after a boot.
+
+**Other new lines.**
+
+- The EXL3 server now clamps the context size instead of booting at a size the model was not
+  trained for, and says so:
+  `[warn] --max-seq-len N exceeds the model's trained window 262144 (max_position_embeddings) - clamping to 262144.`
+- `[tp] gid_idx=N auto-detected on <device> (sysfs type 'RoCE v2', gid ...)` or `[tp]
+  gid_idx=N (explicit --gid-idx)` at TP bring-up, on every rank.
+- `[exl3-serve] prefill interleave ON (--prefill-interleave N) ...` at boot, and per joining
+  prompt `[exl3-serve] prefill-interleave slot=N: ... scheduler step(s) at ... chunk
+  boundaries, ... ms of decode (not counted in the prefill line's ms / tok/s)`. Under TP the
+  boot line is `--prefill-interleave N IGNORED under TP (single-box only)`.
+- `[exl3] per-row attention regime LIVE: ...` once per boot, the first time a decode step
+  mixes requests on both sides of the 2,051-token switch, and `[exl3-serve] mixed-step graphs
+  idle: A->B captured since boot` when the number of such graphs has grown.
+
+**Test drills (never for serving).** `--mtp-reprobe-drill` forces the speculation off / re-arm
+cycle on a short schedule; greedy output stays byte-identical. `--vision-fail-gemm` fails the
+first GPU-tower matrix multiply of a boot once; on the EXL3 server it is armed only when
+another flag follows it on the command line. Both are listed by `--help-diag`.

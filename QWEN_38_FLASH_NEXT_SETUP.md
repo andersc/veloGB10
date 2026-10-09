@@ -302,6 +302,35 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
   2048` restores the previous grid) and `--qsa-key-rope full` (the indexer's pooled keys carry their
   full rotary dimensions; `half` keeps the old bytes for A/B only). Both change long-context output
   bytes versus v0.7.0.
+- **New in v0.7.4, on by default:**
+  - *Speculation is tried again inside a request* (`--mtp-reprobe auto`). When speculative
+    decoding stops paying for a request the engine turns it off for that request, as before;
+    it now needs a 10 % margin confirmed by a fresh measurement to do so, and it tries again
+    after 256 plain steps (doubling to 4,096 while the tries fail). `--mtp-reprobe off` is the
+    previous one-way behaviour. The per-request `[mtp-stats]` line ends with `off_events=`,
+    `reprobes=` and `reprobe_ok=`.
+  - *Attention is chosen per row* (`--qsa-row-regime`). A request at or below 2,051 tokens of
+    context that shares a decode step with a longer one keeps the kernels it runs alone, and a
+    speculative round stops at the 2,051-token switch. **This changes greedy output bytes
+    versus v0.7.3** for requests that cross about 2,051 tokens while generating and for short
+    requests that shared a step with a longer one; on v0.7.3 those bytes depended on timing
+    and on the other requests in flight. `--qsa-row-regime 0` restores the old rule.
+  - *`--max-seq-len` above 262,144 is clamped* with a warning line (before, the server booted
+    at the larger size and speculative rounds could write past a device buffer).
+  - *`--mtp off` is honoured* (it was ignored on this server before): plain decoding only.
+- **Images after a GPU error (v0.7.4).** A GPU vision-tower error is no longer an outage: that
+  one request is answered by the CPU tower and the next image uses the GPU tower again. The
+  CPU answer is slow (53.8 s for one image on one machine, 173 to 218 s on the head at TP=2 in
+  our measurements). The log line is `[vision] GPU tower failed (...), falling back to CPU
+  tower`.
+- **A long prompt joining running streams (v0.7.4, opt-in).** While a long prompt prefills,
+  the requests already generating wait: 14.1 s for a 20K-token prompt in our measurement.
+  `--prefill-interleave 1` lets them decode between the prefill chunks. The last chunk is the
+  largest and is never interleaved, so the setting pays with a smaller `--prefill-chunk`:
+  `--prefill-chunk 2048 --prefill-interleave 1` brought the longest stall to 2.7 s for a
+  joining request's first token at 15.6 s instead of 14.1 s. A smaller `--prefill-chunk`
+  changes the output of long prompts. One machine only: under TP the flag is ignored and a
+  boot line says so.
 
 ---
 
@@ -395,3 +424,29 @@ expect the pure-code end only when your workload is mostly code; agent conversat
 tools and prose sit at the lower end. All are single-request numbers; concurrency changes the
 picture as described in the README (v0.7.2 section).
 
+## 10. Known behaviours
+
+**Reasoning length can depend on small details of the tools block (issue #18).** Measured on
+one reported request: about 33K tokens of prompt with three tool definitions that the task
+never uses, the 4.05 bpw pack, temperature 1.0 / top_p 0.95 / top_k 20, a budget of 8,192
+tokens, one request at a time.
+
+| the three tool definitions in the prompt | veloGB10 v0.7.3 | ExLlamaV3 1.4.7, same pack, same token ids |
+|---|---|---|
+| as the client sent them (33,415 prompt tokens; what the model's chat template produces, here and in Hugging Face transformers) | 25 of 35 requests reason until the budget is used up | 7 of 10 |
+| re-serialised with another key order and two added fields (33,445 tokens) | 0 of 15; finished in 740 to 3,446 tokens, median 957 | 0 of 10 |
+| the same three definitions in reverse order (33,415 tokens, none added) | 0 of 10 | 0 of 10 |
+
+- Not every small change does this. Of ten renderings of the tools block tried (the original
+  included), six reach the budget in 4 to 8 of 10 requests, three almost never do (the two
+  above and one more: 1 of 10), and one is in between (3 of 10). Swapping only the second and
+  third tool leaves it at 8 of 10; reversing all three gives 0 of 10.
+- No engine setting moved the rate on the original rendering: KV cache precision, speculation
+  on or off, the sampling rule, sparse or dense attention.
+- A second runtime on the same weights and the same token ids shows both sides of it, so it is
+  a property of these weights on this prompt, not of how the engine decodes.
+- Why these few tokens matter is not known; no mechanism is claimed. Nothing in the
+  measurements says which rendering is the right one. The engine passes the client's tool JSON
+  through the model's chat template unchanged, keys in the order they were sent.
+- Limits of the measurement: one request, one pack (4.05 bpw), one sampler setting, 10 requests
+  per cell ("0 of 10" means below about 28 %, not never).
