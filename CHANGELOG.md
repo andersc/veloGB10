@@ -3,6 +3,402 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.7.4 — speculation re-arms inside a request, per-row attention regime, vision-tower recovery, five community pull requests
+
+This release fixes two defects of the EXL3 (Qwen3.8-Flash-Next) serving path that were found
+after v0.7.3: speculative decoding could switch itself off for the rest of a long request, and a
+request's greedy text could depend on what else was being served. It turns a GPU vision-tower
+error from an outage into a per-request event (issue #20), ports five community pull requests
+(#15, #16, #17, #21, #23), and closes a list of small defects. One new default changes output
+bytes in a narrow case: see "Behaviour change" under the per-row attention regime.
+
+<<CUT: release artifacts line: tarball name, binary sha256, release-source commit, dev commit>>
+
+### Fixed — speculation could stay off for the rest of a long request
+
+On the EXL3 server a per-request control compares the cost of speculative (MTP) rounds with
+plain decoding and turns speculation off for a request when it stops paying. Two things were
+wrong with it. The decision used a 2 % margin over a window of about 16 rounds, against a
+plain-decoding sample that is refreshed only once every 128 rounds (or 1,024). And it was
+final: nothing turned speculation back on for that request. In an engine log shared by a user,
+a request that had averaged 18.3 ms per token with speculation was switched off at round 250 on
+a short stretch measuring 27.84 ms per token against a plain sample of 27.22; the remaining
+1,640 of its 2,592 tokens (63 %) ran at plain speed. A second user's log shows the same after
+161 rounds (24.58 against 23.35 ms per token). Only generations of 64 rounds or more could be
+affected.
+
+What changed:
+
+- The cost is averaged over about 64 rounds and the margin is 10 %.
+- Before switching off, the engine takes a fresh plain-decoding measurement at the current
+  context, and switches off only if the margin still holds.
+- A request that was switched off keeps its draft head in step, and speculation is tried again
+  for a short probe (at most 32 rounds; a probe that is not paying fails after 16) once 256
+  plain steps have passed. Each failed probe doubles the wait, up to 4,096 steps; a successful
+  probe resets it.
+- `--mtp-reprobe <auto|off>` (default `auto`). `off` restores the previous one-way behaviour
+  exactly.
+
+Measured (3.05 bpw pack):
+
+- Eight long sampled requests of the kind in the first log (up to 3,200 tokens each,
+  temperature 0.7 / top_p 0.8 / top_k 20, one machine): 8 of 8 served with 0 off events; the
+  six requests served with speculation ran 2.57–4.28 tokens per round at 10.3–15.4 ms per
+  token.
+- A workload where speculation does not pay (temperature 1.3, 8 × 3,000 tokens): speculation
+  is switched off (for example after 207 rounds, 28.95 against 26.19 ms per token at 1.10
+  tokens per round), a probe follows after 256 plain steps and fails, and the waits double:
+  512, 1,024, 2,048. The same sequence runs on two machines (TP=2: 7 off events, 12 re-arms,
+  11 failed probes and 1 successful one over 8 requests, all served), with the same lines in
+  both ranks' logs.
+- Greedy output is unchanged: six recorded identity cells (one machine and TP=2) give their
+  recorded hashes while a test drill forces the off / re-arm cycle continuously (the head log
+  of one TP=2 run holds 416 off events and 631 re-probes, with both ranks in step throughout).
+- Cost when speculation is healthy: none measurable. Same binary with `auto` and with `off`,
+  alternating boots, one request of 256 tokens: code 84.5 / 83.7 against 84.5 / 84.3 tok/s,
+  prose 60.0 / 59.2 against 59.9 / 59.9 tok/s (inside the ±1 % run-to-run band).
+- Cost of keeping the draft head in step while off: requests that ran almost entirely plain
+  measured a median of 26.45 ms per token with it and 26.58 without, a difference below the
+  request-to-request spread (about 4 ms per token).
+- Upper bound of the probing cost on a request where speculation never pays (arithmetic, not a
+  measurement): 32 of 256 steps (12.5 %) for one period after the first failed probe, falling
+  to 32 of 4,096 (0.78 %) once the wait has reached its cap.
+
+What does not change: when draft acceptance stays low for a whole request, the probes fail and
+the request still runs mostly at plain-decoding speed. The fix is for a temporary trough that
+used to cost the rest of the request.
+
+Observability: the per-request `[mtp-stats]` log line now ends with
+`off_events=N reprobes=N reprobe_ok=N`; `/metrics` adds `velogb10_spec_mtp_off_events_total`
+(events, not requests: one request can go off several times), `velogb10_spec_mtp_reprobes_total`
+and `velogb10_spec_mtp_reprobe_ok_total`; the log prints `MTP re-probe (slot N): back ON after
+N plain steps`, `MTP re-probe FAILED (...next probe in N plain steps)` and `MTP re-probe OK`
+next to the existing `MTP off for this request` line.
+
+### Fixed — a request's greedy text could depend on what else was being served
+
+A decode step chose dense or sparse attention once for all of its rows, from the longest
+request in the step. The sparse path starts at 2,052 tokens of context on Flash-Next, so a
+request at or below 2,051 tokens that shared a batched step with a longer one was computed by
+the sparse kernels: the same attention, through a different rounding path. A second site of
+the same rule: a speculative round whose rows straddled the 2,051-token switch.
+
+Measured before the fix:
+
+- Two running requests (short prompts, 1,500 generated tokens) keep their texts when they run
+  alone; with a request of about 20,000 tokens joining, both texts changed in 3 of 3 runs. It
+  reproduces on the released v0.7.3 binary.
+- Two requests with prompts of about 1,500 tokens, each crossing the switch while generating,
+  were not stable from run to run even without a third request (two different texts in three
+  runs for one of them).
+- Size of the effect: after one step the logits differ by one 16-bit-float unit (relative L2
+  1.4e-3). Under teacher forcing the difference settles at a KL divergence of about 5e-4 to
+  8e-4 nats with no trend over 1,600 positions, and the top-1 token differs at 1 to 1.5 % of
+  positions, every one of them a near-tie. It is harmless for quality and real for
+  reproducibility: a free-running greedy text departs at its first near-tie.
+
+What changed (host side only; no kernel changed):
+
+- In a mixed step the rows at or below the switch keep the dense kernels they run alone, and
+  the scheduler orders such rows first.
+- A speculative round stops at the switch instead of straddling it (a few shorter rounds, once
+  per request that crosses 2,052 tokens).
+- `--qsa-row-regime <on|off>` (default `on`). `0` restores the previous rule.
+
+Measured on the fix (3.05 bpw pack unless stated):
+
+- Bit level (`--probe-exl3-regime`, a new diagnostic): a short row inside a mixed step is
+  bit-identical to the same row alone. 0 of 1,600 steps differ (before: 1,600 of 1,600), in
+  two-row and in three-row mixed steps.
+- Served: with a ~20,000-token request joining, 0 of 5 runs change a running request's text.
+  The two crossing requests give the same texts alone, with a joiner, and with speculation off.
+- Texts that were stable keep their bytes: the recorded identity cells are unchanged on one
+  machine and at TP=2, and the requests' alone texts equal those of v0.7.3.
+- Also checked on the release candidate: the 4.05 bpw pack's identity cell; 16 sampled requests
+  crossing the switch, alone and next to long requests (16 of 16 served, no error);
+  `--lane-order fcfs` (same texts alone and joined); TP=2 with and without speculation (same
+  texts alone and joined, both ranks in step).
+- Cost: about 0.8 % of aggregate tokens/s with four concurrent requests of mixed length (63.7
+  to 63.2 tok/s, two boots per side); nothing at one request (61.8 / 61.5 against 61.9 / 61.7)
+  or with four short requests (91.4 / 90.9 against 91.0 / 91.2). The first step of a new
+  (rows, short rows) shape costs about 8 ms once per server lifetime (40.8 ms against 33.05 ms
+  for a replay).
+
+**Behaviour change.** With the default (`--qsa-row-regime` on), two kinds of greedy request
+produce different bytes than on v0.7.3: a request whose context crosses about 2,051 tokens
+while it generates, and a short request that used to share a decode step with a longer one.
+The v0.7.3 bytes of those requests depended on timing and on the other requests in flight;
+the v0.7.4 bytes do not. Requests that never come near the switch and never shared a step
+with a longer request keep their bytes. `--qsa-row-regime 0` restores the old rule for
+comparison.
+
+New gauge: `velogb10_graph_cache_mixed_step_entries` (mixed-step CUDA graphs captured since
+boot; they are captured on first use, one per step shape seen, and are also counted in
+`velogb10_graph_cache_entries`). Found while testing pull request #23.
+
+### Fixed — a GPU vision-tower error disabled images until restart (issue #20, pull request #16)
+
+Reported by [@liorm0505](https://github.com/liorm0505) (issue #20); fix contributed by
+[@seanlinmt](https://github.com/seanlinmt) (pull request #16), ported into this tree.
+
+A cuBLAS error inside the GPU vision tower was a panic. The panic poisoned the tower's lock,
+and every later image request failed until the server was restarted. Reproduced before the
+port at TP=2 with two and three simultaneous images: 19 of 20 and 30 of 30 requests failed
+with HTTP 400.
+
+Now:
+
+- Tower errors (matrix multiply, attention, readback, synchronisation) are returned as errors.
+  The request is then served by the CPU tower, and the next request uses the GPU tower again.
+- A poisoned lock is recovered, and a slow CPU fallback does not hold the lock: other image
+  requests keep using the GPU tower meanwhile.
+- The tower's cuBLAS handle is pinned to the tower's own stream and its per-image scratch is
+  released (memory flat over 100 images: 69,869 to 69,903 MiB).
+- A failed image preparation is an HTTP 400 with its cause, never a 200 without the image.
+
+Measured: 202 image requests on one machine (100 one at a time, 102 three at a time), 0
+failures; at TP=2, 100 requests in groups of two and three, 0 failures. With a failure
+injected by a test drill, the request is answered by the CPU tower with the same text
+(53.8 s on one machine) and the following requests return to the GPU tower (274 ms, then
+104 ms). On the release candidate at TP=2: 1,138 image and 1,145 text requests over six
+boots, no wrong answer, both ranks in step, six injected failures all answered by the CPU
+tower, and 360 other image requests served by the GPU tower while those fallbacks ran.
+
+Limits: failures of other kinds inside the tower (a kernel launch, a pool allocation, the
+weight upload) still panic; they are caught by the worker's panic handler and the lock
+recovery, loudly. A GPU fault that the CPU tower cannot cover is reported as HTTP 400 with the
+error text, not as a 5xx. Two findings of the TP=2 run are under "Known limits".
+
+### Fixed — EXL3 served windows above the trained length (pull request #21)
+
+Reported and fixed by [@ccgauvin94](https://github.com/ccgauvin94) (pull request #21), ported
+into this tree.
+
+The EXL3 server did not clamp `--max-seq-len`. Above the trained window (262,144 tokens on
+Flash-Next) a scratch buffer of the sparse attention kept its trained-window size while the
+scorer wrote one block per served position, so above 262,147 a speculative round could write
+past it (at `--max-seq-len 524288` every round of five or more rows did, from the first one).
+v0.7.3 is affected. The defect is shown by the code path and its index arithmetic: in a 96-token probe
+at a 524,288 window the v0.7.3 binary showed no visible symptom, and the later CUDA
+illegal-address error described in the pull request was not reproduced here.
+
+Now: the buffer follows the served window; the EXL3 server clamps `--max-seq-len` to the
+trained window and prints the limit (`--max-seq-len N exceeds the model's trained window
+262144 (max_position_embeddings) - clamping to 262144.`); the bit-packed launch arguments are
+checked in release builds; the loader refuses a window they cannot carry.
+
+Measured: a boot with `--max-seq-len 524288` clamps and serves; a request of 255,656 prompt
+tokens plus 2,048 generated ends at position 257,704 of 262,144 with a correct answer (234 s);
+the recorded identity cells are unchanged; at TP=2 both ranks clamp to the same window.
+
+Behaviour changes: (1) an EXL3 `--max-seq-len` above the trained window is now clamped where
+it used to boot at the requested size. (2) The same checks are active on the NVFP4 path, where
+`--rope-yarn-factor 2 --max-seq-len 524288` used to overflow a packed field silently and now
+stops at the first attention launch with `bs_packed field overflow … lower --max-seq-len`.
+This second case was not run on a GPU.
+
+### Fixed — TP network bring-up (pull request #15) and TP image payload order (pull request #17)
+
+Contributed by [@seanlinmt](https://github.com/seanlinmt) (pull requests #15 and #17), ported
+into this tree.
+
+- **RoCE GID index.** The TP data plane used a fixed GID index (3). It is now detected: the
+  first IPv4-mapped RoCE v2 GID in sysfs, printed at bring-up with the sysfs evidence
+  (`[tp] gid_idx=3 auto-detected on <device> (sysfs type 'RoCE v2', gid ...)`); if none is
+  found the old fixed value is used. `--gid-idx <N>` sets it explicitly for every rail; a
+  wrong N fails at bind and is never re-scanned.
+- **Bring-up.** The CUDA device is selected explicitly in both bring-up paths, and a failed
+  pinned-memory allocation prints the CUDA error text and code.
+- **Image payloads under TP.** All image payloads of a scheduler step are read right after the
+  step frame, in admission order, before any prefill runs (a prefill uses the same control
+  stream).
+- **`--ple-headroom-per-lane-gb <F>`** (opt-in, default 0): extra headroom for the
+  `--ple-ram auto` decision, per additional lane on top of the fixed 16 GiB (for example 2
+  with `--max-batch 10` gives 16 + 2 × 9 = 34 GiB). The default reproduces the previous
+  decision exactly.
+
+Measured at TP=2: auto-detection picks index 3 on both ranks of the test pair (the value the
+fixed setting used), the recorded identity cells are unchanged, a boot with `--gid-idx 3`
+behaves the same, and after the head process is killed the node re-arms by itself (4 s) and
+serves the next head. On the release candidate the node re-armed across six consecutive head
+sessions, and 1,117 steps shipped image payloads (21 of them with two or more) with every
+answer naming its own image.
+
+Not ported: the environment-variable form of the GID option in #15 (the engine takes flags
+only); `--served-model-name` from #15 and the telemetry wiring from #17 (both already in
+v0.7.3); the 2 GiB-per-lane default of #17 (the option is there, the default stays 0); and a
+transport-side fallback scan for the GID, which was removed in review so that the transport
+binds exactly the index the engine resolved.
+
+### Added — `--prefill-interleave <N>` (EXL3, one machine, default 0; pull request #23)
+
+Contributed by [@adriangrassi](https://github.com/adriangrassi) (pull request #23), ported
+into this tree.
+
+A long prompt that joins while other requests are generating used to freeze those streams for
+its whole prefill. With `--prefill-interleave N` the server runs up to N decode steps for the
+running requests after each prefill chunk of the joining prompt except the last.
+
+Measured (two running streams, a joining prompt of about 20,000 tokens, one machine):
+
+| `--prefill-chunk` | interleave | longest stall of the running streams | joining request's time to first token |
+|---|---|---|---|
+| 4095 (default) | 0 | 14.1 s | 14.1 s |
+| 4095 (default) | 1 | 5.4 s | 14.5 s |
+| 2048 | 0 | 15.1 s | 15.1 s |
+| 2048 | 1 | 2.7 s | 15.6 s |
+| 1024 | 0 | 16.6–17.0 s | 16.75 s (mean of 3) |
+| 1024 | 1 | 1.35–1.47 s | 18.21 s (mean of 3, +8.7 %) |
+| 1024 | 2 | 1.35–1.55 s | 19.57 s (mean of 3, +17 %) |
+
+The last chunk is never interleaved and the tail of a prompt is merged into it, so the longest
+stall is the largest chunk of the grid: at the default chunk width the flag alone only brings
+the stall to 5.4 s. The useful settings combine it with a smaller `--prefill-chunk`, which
+prefills more slowly and changes the output of long prompts (as that flag is documented to
+do). The prefill rate itself is not slowed (1,210 against 1,203 tok/s in the server's prefill
+line); the added time to first token is the decode steps run for the other requests.
+
+Identity: with the per-row attention regime of this release, the running requests' greedy
+texts are the same in all nine joined runs and equal to their texts alone, and each joining
+request's text is the same at interleave 0, 1 and 2 (three joining documents, chunk 1024, one
+machine). Stress: 60 minutes at interleave 1 with long prompts joining, being cancelled during
+prefill and during generation, and re-sent (334 joining requests): 0 server errors, 0 panics.
+
+The option is ignored under TP, with a line on every rank
+(`--prefill-interleave N IGNORED under TP (single-box only)`); with the flag set, TP=2 output
+equals the recorded hashes. The server's prefill line excludes the interleaved decode time and
+a new line reports it (`prefill-interleave slot=N: ... scheduler step(s) ... ms of decode`).
+Not tested with the flag on: an image request as the joining request, and `--lane-order fcfs`.
+The NVFP4 server does not read this flag (it has its own `--prefill-sched`).
+
+### Changed
+
+- **`--mtp off` is honoured on the EXL3 server.** It used to be ignored there (the boot banner
+  kept saying `MTP chain-verify ON`). With `--mtp off` the banner reads `MTP chain-verify OFF:
+  MTP OFF (--mtp off)`, no draft head runs, and the `[mtp-stats]` lines show `rounds=0
+  drafted=0`. `--exl3-no-mtp` still works. On the EXL3 server `on` and `auto` mean the same
+  (speculation on, with the per-request control); an invalid value is refused at startup.
+- **`--help` says what the servers do.** `--max-tokens` is the default for a chat request that
+  omits `max_tokens`, not a cap: unset, the EXL3 server has no limit and the NVFP4 server uses
+  8192. `--default-presence-penalty` is 0.0 on the EXL3 server (1.5, or 2.0 on 2B, on NVFP4).
+  The sampler defaults are stated per endpoint (see "Known limits"). `--lane-order` carries the
+  measured numbers. Thirteen lines of `--help` that printed mis-encoded characters are fixed.
+- **`--mtp-lanes` and `--prefill-sched` are listed in `--help`.** Both are NVFP4-server flags
+  that were parsed but listed nowhere; they now refuse an unknown value at startup (before, an
+  unknown value silently meant the default). `--prefill-sched` defaults to `cursor`.
+- **TP launcher (`run_tp_server.sh`).** `--tp` now defaults to 1 + the number of `--node`
+  flags, and an explicit `--tp` that disagrees with that count is an error (exit 2). Two
+  `--node` flags are refused, because the engine serves a world of 2 or 4 only.
+- **`[gen]` log line.** Three fields are appended: `stop_kind` (`eos`, `stop_string`, `length`,
+  `loop`, `cancel`, `error`, `other`), and for a request that ends on a stop token `stop_p` and
+  `stop_rank`: the probability the sampler gave that token and its rank among the logits (for a
+  greedy request, the softmax probability at temperature 1). The cost is one read of a logits
+  row, once per request, on its last step, and only for a stop-token finish. The two fields
+  read `na` under TP, on the NVFP4 server, when the first generated token is the stop token,
+  and for every other kind of finish. A request that runs out of tokens inside its thinking
+  block is now counted as reasoning tokens in this line (it was counted as content).
+- **Streaming `/v1/completions` sends a usage chunk** when the request carries
+  `stream_options: {"include_usage": true}`: empty `choices`, top-level `usage` with
+  `prompt_tokens_details.cached_tokens`, after the finish chunk and before `[DONE]`. Without
+  the option the stream is byte-identical to before. (The chat endpoint sends its usage chunk
+  unless told not to; this endpoint sends it only when asked.)
+- **Benchmark and probe rounds** (`--bench-mtp` and two diagnostics) stop at the 2,051-token
+  switch like the server, so a losslessness run across the switch measures what is served.
+
+### Investigated — issue #18: no engine defect found
+
+Reported by [@hatemismail](https://github.com/hatemismail) (issue #18), with a complete
+reproducer: on one 33K-token request with three tool definitions, the model's reasoning ran to
+the 8,192-token budget on veloGB10 while a reference stack finished in about 1K tokens.
+
+Result, on the reporter's request, the 4.05 bpw pack, temperature 1.0 / top_p 0.95 / top_k 20:
+
+| prompt fed as token ids | veloGB10 v0.7.3 | ExLlamaV3 1.4.7, same pack |
+|---|---|---|
+| the request as veloGB10 and Hugging Face transformers render it (33,415 tokens) | 25 of 35 requests reach the budget | 7 of 10 |
+| the same request with the tool definitions serialised as the reference stack does (33,445 tokens, reconstructed from the reporter's description) | 0 of 15 | 0 of 10 |
+| the same three tool definitions in reverse order (33,415 tokens) | 0 of 10 | 0 of 10 |
+
+On identical token ids a second runtime on the same weights behaves as veloGB10 does, on each
+rendering. No engine setting moved the rate on the original rendering (KV cache precision,
+speculation on and off, the sampling rule, sparse against dense attention). The difference the
+reporter saw is reproduced by the difference in how the two stacks serialise the tool
+definitions; veloGB10 passes the client's tool JSON through the model's chat template
+unchanged. Of ten renderings of the tools block tried (the original included), six reach the
+budget often (4 to 8 of 10 requests), three almost never do (0 of 15, 0 of 10, 1 of 10) and
+one is in between (3 of 10). Why these few tokens matter is not known, and no mechanism is
+claimed. Not measured: the reporter's
+reference weights (NVFP4) fed the original rendering. The issue stays open for that
+measurement. The Flash-Next guide has a short note on this behaviour.
+
+### Verification on two machines (TP=2)
+
+- **The soak owed from v0.7.3.** The published v0.7.3 binary, in the configuration of the
+  issue #10 report (one request at a time, ~16K-token sampled prompts, a client cancel every
+  eighth request): 203,129 pre-verify rounds in 159.8 minutes, 0 aborts, 0 overwritten slots,
+  the round counters equal on both ranks, 368 completed requests and 52 client cancels with 0
+  request errors, memory flat.
+- **The v0.7.4 release candidate** (a development build of the same sources; the release
+  binary is built from the public tree and gated again): the six recorded TP=2 identity cells
+  give their recorded hashes; the same configuration as the soak above for 45.5 minutes:
+  58,057 pre-verify rounds, 0 aborts, 0 request errors; the speculation re-probe, the image
+  robustness run, the prefill-interleave identity and the attention-regime checks are reported
+  in their sections above.
+- **No drift across releases.** The published v0.7.2 and v0.7.3 binaries and the candidate
+  produce the same per-request texts in the 1-to-8-concurrent identity cell (`IDENT_ALL
+  44fe40977a57e9d9`), at every concurrency level.
+- **What the TP=2 checks do not show.** At default flags with three busy requests the TP=2
+  scheduler kept serial speculation, so those runs exercise the round stop at the switch and
+  not the mixed step; the mixed step at TP=2 was exercised with speculation off. More busy
+  requests at `--max-batch 16` were not tried.
+
+### Known limits
+
+- **A GPU vision-tower failure when an image request coincides with a CUDA graph capture**
+  (owner decision pending: dropped if F1 is fixed before the cut). Seen once in 1,138 image
+  requests at TP=2, ten seconds after a boot, while the scheduler was capturing graphs for
+  newly used step shapes. The request was answered correctly by the CPU tower; nothing else
+  was affected. The CUDA error involved exists only while a graph is being captured, which is
+  mostly in the first seconds after a boot and later whenever a new step shape is first used.
+  The mechanism was read from the code and is not confirmed by an experiment.
+- **The CPU-tower answer is slow at TP=2** (owner decision pending: dropped if F1 is fixed
+  before the cut). 173 to 218 s for one 448 × 448 image on the head (53.8 s on one machine).
+  Other requests and other images are not slowed, but a client with a 60 to 120 s timeout
+  gives up before the answer arrives.
+- **Not covered by the image verification:** image traffic on one machine (TP=1) against graph
+  capture, a continuous image hour without restarts, and TP=4.
+- **Sampler defaults differ between the two endpoints.** When a request omits the fields:
+  `/v1/chat/completions` on the EXL3 server uses temperature 1.0 / top_p 0.95 / top_k 20 when
+  the prompt opens a thinking block and 0.7 / 0.8 / 20 otherwise; on the NVFP4 server it uses
+  0.7 / 0.8 / 20 in both cases. `/v1/completions` uses 0.7 / 0.8 / 20 on both servers. The
+  penalties follow the `--default-*-penalty` flags on the chat endpoint (EXL3: 1.0 / 0.0 /
+  0.0; NVFP4: 1.0 / 1.5, or 2.0 on 2B / 0.0) and are fixed at 1.0 / 0.0 / 0.0 on
+  `/v1/completions`, which ignores those flags. `max_tokens`: the chat endpoint follows
+  `--max-tokens` (EXL3 unlimited when unset, NVFP4 8192); `/v1/completions` uses 16 and ignores
+  the flag. Greedy decoding needs an explicit `temperature: 0` on either endpoint. The chat
+  values are constants in the engine; they are not read from the pack's
+  `generation_config.json`.
+- **A non-streaming chat request that ends inside its thinking block** returns that text in
+  `content` with an empty `reasoning_content`; the streaming path sends the same text as
+  `reasoning_content`.
+- **The tuner's speculative rounds are not stopped at the 2,051-token switch.** The server and
+  the benchmark rounds are; the four rounds inside the autotune harness are not.
+- **`--prefill-interleave` at the default chunk width** leaves a stall of about 5.4 s for a
+  20K-token joining prompt (see its section); it is ignored under TP.
+- **TP agreement check, width field.** The per-step agreement word that the TP ranks compare
+  carries the row count of a step in 4 bits, so a 15-row and a 16-row step are not
+  distinguished by it. This predates v0.7.3 and no failure has been attributed to it; the
+  wider field is planned and is not in this release.
+- **Still open from earlier releases:** the legacy minimal DSV4 server does not report the
+  newer usage fields; two and three concurrent requests on the EXL3 path still share the
+  single-request aggregate rate (the packed multi-request verify is not wired into serving).
+
+### Not in this release
+
+YaRN for the EXL3 path (issue #19, pull request #22): planned; it builds on the window fix of
+#21, which is in this release. KV pool occupancy gauges on `/metrics` (issue #24): planned for
+the release after this one.
+
 ## v0.7.3 — reported-issue fixes: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
 
 This release closes the three open issues from the v0.7.2 feedback (#8, #9, #10), makes the
