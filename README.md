@@ -865,6 +865,7 @@ invariance), `--probe-state` (GDN state divergence), `--probe-reject` (rollback)
 idle GB10 ≈ 238 GB/s), `--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc
 transport audit), `--sweep-gemm`.
 
+<!-- CUT: drop the 'armed only when another flag follows it' clause below if the drill-flag fix (H2) is merged before the cut -->
 New in v0.7.4, all listed by `--help-diag`: `--probe-exl3-regime` (bit-level comparison of a
 row alone and inside a mixed dense/sparse decode step; options `--regime-runner`,
 `--regime-joiner`, `--regime-steps`, `--regime-order`, `--regime-csv`, `--regime-time`), and

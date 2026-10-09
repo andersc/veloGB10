@@ -164,6 +164,7 @@ injected by a test drill, the request is answered by the CPU tower with the same
 boots, no wrong answer, both ranks in step, six injected failures all answered by the CPU
 tower, and 360 other image requests served by the GPU tower while those fallbacks ran.
 
+<!-- CUT: re-check this paragraph and the two image entries under Known limits against the vision fix session's report if it is merged before the cut -->
 Limits: failures of other kinds inside the tower (a kernel launch, a pool allocation, the
 weight upload) still panic; they are caught by the worker's panic handler and the lock
 recovery, loudly. A GPU fault that the CPU tower cannot cover is reported as HTTP 400 with the
@@ -385,6 +386,7 @@ measurement. The Flash-Next guide has a short note on this behaviour.
   the benchmark rounds are; the four rounds inside the autotune harness are not.
 - **`--prefill-interleave` at the default chunk width** leaves a stall of about 5.4 s for a
   20K-token joining prompt (see its section); it is ignored under TP.
+<!-- CUT: drop the next entry if the agreement-word widening (AGREE16) is merged before the cut -->
 - **TP agreement check, width field.** The per-step agreement word that the TP ranks compare
   carries the row count of a step in 4 bits, so a 15-row and a 16-row step are not
   distinguished by it. This predates v0.7.3 and no failure has been attributed to it; the
@@ -395,6 +397,7 @@ measurement. The Flash-Next guide has a short note on this behaviour.
 
 ### Not in this release
 
+<!-- CUT: revise this paragraph if the KV gauges (issue #24) or YaRN (pull request #22) are merged before the cut -->
 YaRN for the EXL3 path (issue #19, pull request #22): planned; it builds on the window fix of
 #21, which is in this release. KV pool occupancy gauges on `/metrics` (issue #24): planned for
 the release after this one.

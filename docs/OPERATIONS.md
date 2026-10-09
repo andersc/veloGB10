@@ -179,6 +179,7 @@ under `reasoning_tokens` (before v0.7.4: under `content_tokens`).
     [vision] GPU tower failed (<cause>), falling back to CPU tower
     [vision] GPU worker panicked (<cause>), falling back to CPU tower
 
+<!-- CUT: re-check the CPU-tower timings below against the vision fix session's report (F2) if it is merged before the cut -->
 The request is then answered by the CPU tower, which is slow: 53.8 s for one image on one
 machine and 173 to 218 s on the head at TP=2 in our measurements, so a client timeout below
 that gives up first. Other requests and other images are not slowed, and the next image uses
@@ -202,6 +203,7 @@ arrived while CUDA graphs were being captured, ten seconds after a boot.
   mixes requests on both sides of the 2,051-token switch, and `[exl3-serve] mixed-step graphs
   idle: A->B captured since boot` when the number of such graphs has grown.
 
+<!-- CUT: drop the 'armed only when another flag follows it' clause below if the drill-flag fix (H2) is merged before the cut -->
 **Test drills (never for serving).** `--mtp-reprobe-drill` forces the speculation off / re-arm
 cycle on a short schedule; greedy output stays byte-identical. `--vision-fail-gemm` fails the
 first GPU-tower matrix multiply of a boot once; on the EXL3 server it is armed only when

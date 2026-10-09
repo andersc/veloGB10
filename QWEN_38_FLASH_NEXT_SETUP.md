@@ -318,6 +318,7 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
   - *`--max-seq-len` above 262,144 is clamped* with a warning line (before, the server booted
     at the larger size and speculative rounds could write past a device buffer).
   - *`--mtp off` is honoured* (it was ignored on this server before): plain decoding only.
+<!-- CUT: re-check the CPU-tower timings in the next bullet against the vision fix session's report (F2) if it is merged before the cut -->
 - **Images after a GPU error (v0.7.4).** A GPU vision-tower error is no longer an outage: that
   one request is answered by the CPU tower and the next image uses the GPU tower again. The
   CPU answer is slow (53.8 s for one image on one machine, 173 to 218 s on the head at TP=2 in
