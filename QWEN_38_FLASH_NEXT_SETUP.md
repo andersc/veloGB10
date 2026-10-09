@@ -401,12 +401,16 @@ well with a supervisor for unattended runs (see `docs/OPERATIONS.md`).
 **Tool-call values that quote tool-call syntax.** A parameter value may itself contain the
 text `</parameter>` (an agent writing a file that documents the tool-call format). The parser
 ends a value only at the *structural* `</parameter>` — the one followed by the next
-`<parameter=`, by the `</function>` closing the call, or by the end of the call block.
-Embedded close tags that fail this lookahead stay part of the value. Two residual ambiguities
-are inherent to the format: (1) a value that ends with the *complete* closing sequence
-(`</parameter>` + `</function>`) right at the end of the call block is indistinguishable from
-the structural close and will be cut there; (2) an embedded `</tool_call>` still ends the
-whole tool-call block. Advice for agent authors: when a tool must write text that quotes
+`<parameter=`, by the `</function>` closing the call, by another call's tag (`<function=`, or
+a line starting with `function=`), or by the end of the call block. Embedded close tags that
+fail this lookahead stay part of the value. Three ambiguities are inherent to the format:
+(1) a value that quotes a call with two or more parameters is cut at the first quoted
+`</parameter>`, because what follows it is a `<parameter=`, exactly as at a real parameter
+boundary (the same holds when a `<function=` tag or a line starting with `function=`
+follows; a value that quotes two calls with no `</function>` between them is then read as
+two calls); (2) a value that ends with the *complete* closing sequence (`</parameter>` +
+`</function>`) right at the end of the call block is indistinguishable from the structural
+close and is cut there; (3) an embedded `</tool_call>` still ends the whole tool-call block. Advice for agent authors: when a tool must write text that quotes
 tool-call syntax, prefer an edit/patch tool with a diff, or break the closing sequence (write
 `< /parameter>` or insert a blank line inside the tag) — the parser cannot recover a complete
 closing sequence at the very end of a value.
