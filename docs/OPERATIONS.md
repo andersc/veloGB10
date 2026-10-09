@@ -61,7 +61,7 @@ The release tarball's `run_tp_server.sh` / `run_tp_node.sh` wrap the same flags 
 both; `--dry-run` prints the exact engine command line) if you prefer scripts over units.
 Since v0.7.4 `run_tp_server.sh` derives `--tp` from the number of `--node` flags (one `--node`
 = TP=2, three = TP=4), refuses an explicit `--tp` that disagrees with that count, and refuses
-two `--node` flags (the engine serves a world of 2 or 4).
+two `--node` flags (the engine serves a power-of-two world only: TP=2 or TP=4).
 
 ## 3. Log handling
 
@@ -186,7 +186,8 @@ that gives up first. Other requests and other images are not slowed, and the nex
 the GPU tower again. Each occurrence is one slow image request, not an outage.
 <!-- CUT: the next sentence describes finding F1 of the TP=2 verification; drop it if F1 is fixed before the cut -->
 One failure that was not injected was seen in 1,138 image requests at TP=2: an image request
-arrived while CUDA graphs were being captured, ten seconds after a boot.
+arrived while CUDA graphs were being captured, about ten seconds after the boot's first
+request.
 
 **Other new lines.**
 

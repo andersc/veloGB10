@@ -121,9 +121,10 @@ Full setup (pack layout, node command, launch lines, expected output):
   it. It now needs a 10 % margin confirmed by a fresh measurement, and tries speculation again
   after a doubling wait (`--mtp-reprobe auto`, the default; `off` = the old behaviour).
 - **A request's greedy text no longer depends on what else is served.** Dense or sparse
-  attention is chosen per row (`--qsa-row-regime`, default on). This changes the greedy bytes
-  of requests that cross about 2,051 tokens of context and of short requests that shared a
-  step with a longer one, compared with v0.7.3, where those bytes depended on timing.
+  attention is chosen per row (`--qsa-row-regime`, default on). This can change the greedy bytes
+  of requests that cross about 2,051 tokens of context under speculation and of short
+  requests that shared a step with a longer one, compared with v0.7.3, where those bytes
+  depended on timing.
 - **Images survive a GPU vision-tower error** (issue #20, pull request #16): the request is
   answered by the CPU tower and the next one uses the GPU tower again.
 - **Community pull requests ported:** RoCE GID auto-detection and `--gid-idx` (#15), TP image
@@ -866,13 +867,14 @@ idle GB10 ≈ 238 GB/s), `--tp-barrier-bench` (transport gates, no model), `--ne
 transport audit), `--sweep-gemm`.
 
 <!-- CUT: drop the 'armed only when another flag follows it' clause below if the drill-flag fix (H2) is merged before the cut -->
-New in v0.7.4, all listed by `--help-diag`: `--probe-exl3-regime` (bit-level comparison of a
-row alone and inside a mixed dense/sparse decode step; options `--regime-runner`,
-`--regime-joiner`, `--regime-steps`, `--regime-order`, `--regime-csv`, `--regime-time`), and
-two test drills that are never for serving: `--mtp-reprobe-drill` (forces the speculation
-off / re-arm cycle on a short schedule) and `--vision-fail-gemm` (fails the first GPU-tower
-matrix multiply once, to exercise the CPU fallback; on the EXL3 server it is armed only when
-another flag follows it on the command line).
+New in v0.7.4: `--probe-exl3-regime` (bit-level comparison of a row alone and inside a mixed
+dense/sparse decode step; its options `--regime-runner`, `--regime-joiner`, `--regime-steps`,
+`--regime-order`, `--regime-csv` and `--regime-time` are listed by `--help-diag`, the probe
+itself only in their descriptions), and two test drills, listed by `--help-diag` and never for
+serving: `--mtp-reprobe-drill` (forces the speculation off / re-arm cycle on a short schedule)
+and `--vision-fail-gemm` (fails the first GPU-tower matrix multiply once, to exercise the CPU
+fallback; on the EXL3 server it is armed only when another flag follows it on the command
+line).
 
 ## Requirements
 

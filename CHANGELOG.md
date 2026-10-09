@@ -42,18 +42,21 @@ What changed:
 Measured (3.05 bpw pack):
 
 - Eight long sampled requests of the kind in the first log (up to 3,200 tokens each,
-  temperature 0.7 / top_p 0.8 / top_k 20, one machine): 8 of 8 served with 0 off events; the
-  six requests served with speculation ran 2.57–4.28 tokens per round at 10.3–15.4 ms per
-  token.
+  temperature 0.7 / top_p 0.8 / top_k 20, one machine; run on the first build of the fix,
+  before its review follow-ups, which changed the cost estimator's seeding and the hold-off
+  after a re-arm): 8 of 8 served with 0 off events; the six requests served with speculation
+  ran 2.57–4.62 tokens per round at 10.3–15.4 ms per token. The temperature-1.3 workload
+  below, the A/B and the identity cells were repeated on the final build.
 - A workload where speculation does not pay (temperature 1.3, 8 × 3,000 tokens): speculation
   is switched off (for example after 207 rounds, 28.95 against 26.19 ms per token at 1.10
   tokens per round), a probe follows after 256 plain steps and fails, and the waits double:
-  512, 1,024, 2,048. The same sequence runs on two machines (TP=2: 7 off events, 12 re-arms,
-  11 failed probes and 1 successful one over 8 requests, all served), with the same lines in
-  both ranks' logs.
+  512, 1,024, 2,048. The same sequence runs on two machines (TP=2: 7 switch-offs over 8 requests, all served; 12
+  re-probes, 11 of them failed and 1 successful, so 18 off events counting the failed probes),
+  with the same lines in both ranks' logs.
 - Greedy output is unchanged: six recorded identity cells (one machine and TP=2) give their
   recorded hashes while a test drill forces the off / re-arm cycle continuously (the head log
-  of one TP=2 run holds 416 off events and 631 re-probes, with both ranks in step throughout).
+  of one TP=2 run holds 416 off events and 398 re-probes, 233 of them successful, with both
+  ranks in step throughout).
 - Cost when speculation is healthy: none measurable. Same binary with `auto` and with `off`,
   alternating boots, one request of 256 tokens: code 84.5 / 83.7 against 84.5 / 84.3 tok/s,
   prose 60.0 / 59.2 against 59.9 / 59.9 tok/s (inside the ±1 % run-to-run band).
@@ -61,8 +64,8 @@ Measured (3.05 bpw pack):
   measured a median of 26.45 ms per token with it and 26.58 without, a difference below the
   request-to-request spread (about 4 ms per token).
 - Upper bound of the probing cost on a request where speculation never pays (arithmetic, not a
-  measurement): 32 of 256 steps (12.5 %) for one period after the first failed probe, falling
-  to 32 of 4,096 (0.78 %) once the wait has reached its cap.
+  measurement): a probe of 32 rounds per 256 plain steps (12.5 %) in the first period after a
+  switch-off, falling to 32 per 4,096 (0.78 %) once the wait has reached its cap.
 
 What does not change: when draft acceptance stays low for a whole request, the probes fail and
 the request still runs mostly at plain-decoding speed. The fix is for a temporary trough that
@@ -125,8 +128,10 @@ Measured on the fix (3.05 bpw pack unless stated):
   for a replay).
 
 **Behaviour change.** With the default (`--qsa-row-regime` on), two kinds of greedy request
-produce different bytes than on v0.7.3: a request whose context crosses about 2,051 tokens
-while it generates, and a short request that used to share a decode step with a longer one.
+can produce different bytes than on v0.7.3: a request whose context crosses about 2,051
+tokens while it generates under speculation, and a short request that used to share a decode
+step with a longer one. The two paths round the same attention differently, so the bytes
+change only where a near-tie resolves differently: a given request may or may not differ.
 The v0.7.3 bytes of those requests depended on timing and on the other requests in flight;
 the v0.7.4 bytes do not. Requests that never come near the switch and never shared a step
 with a longer request keep their bytes. `--qsa-row-regime 0` restores the old rule for
@@ -134,7 +139,9 @@ comparison.
 
 New gauge: `velogb10_graph_cache_mixed_step_entries` (mixed-step CUDA graphs captured since
 boot; they are captured on first use, one per step shape seen, and are also counted in
-`velogb10_graph_cache_entries`). Found while testing pull request #23.
+`velogb10_graph_cache_entries`).
+
+The defect itself was found while testing pull request #23.
 
 ### Fixed — a GPU vision-tower error disabled images until restart (issue #20, pull request #16)
 
@@ -289,7 +296,8 @@ The NVFP4 server does not read this flag (it has its own `--prefill-sched`).
   unknown value silently meant the default). `--prefill-sched` defaults to `cursor`.
 - **TP launcher (`run_tp_server.sh`).** `--tp` now defaults to 1 + the number of `--node`
   flags, and an explicit `--tp` that disagrees with that count is an error (exit 2). Two
-  `--node` flags are refused, because the engine serves a world of 2 or 4 only.
+  `--node` flags are refused, because the engine serves a power-of-two world only (TP=2 or
+  TP=4 in practice).
 - **`[gen]` log line.** Three fields are appended: `stop_kind` (`eos`, `stop_string`, `length`,
   `loop`, `cancel`, `error`, `other`), and for a request that ends on a stop token `stop_p` and
   `stop_rank`: the probability the sampler gave that token and its rank among the logits (for a
@@ -310,11 +318,12 @@ The NVFP4 server does not read this flag (it has its own `--prefill-sched`).
 
 Reported by [@hatemismail](https://github.com/hatemismail) (issue #18), with a complete
 reproducer: on one 33K-token request with three tool definitions, the model's reasoning ran to
-the 8,192-token budget on veloGB10 while a reference stack finished in about 1K tokens.
+the 8,192-token budget on veloGB10 while the reporter's reference stack finished in
+564–1,147 output tokens (the reporter's figures).
 
 Result, on the reporter's request, the 4.05 bpw pack, temperature 1.0 / top_p 0.95 / top_k 20:
 
-| prompt fed as token ids | veloGB10 v0.7.3 | ExLlamaV3 1.4.7, same pack |
+| prompt (identical token ids on both runtimes) | veloGB10 v0.7.3 | ExLlamaV3 1.4.7, same pack |
 |---|---|---|
 | the request as veloGB10 and Hugging Face transformers render it (33,415 tokens) | 25 of 35 requests reach the budget | 7 of 10 |
 | the same request with the tool definitions serialised as the reference stack does (33,445 tokens, reconstructed from the reporter's description) | 0 of 15 | 0 of 10 |
@@ -339,15 +348,16 @@ measurement. The Flash-Next guide has a short note on this behaviour.
   eighth request): 203,129 pre-verify rounds in 159.8 minutes, 0 aborts, 0 overwritten slots,
   the round counters equal on both ranks, 368 completed requests and 52 client cancels with 0
   request errors, memory flat.
-- **The v0.7.4 release candidate** (a development build of the same sources; the release
-  binary is built from the public tree and gated again): the six recorded TP=2 identity cells
+<!-- CUT: the candidate was built from master at the time of the run; if the release contains later engine changes (version bump, vision fix, gauges, agreement word), say so here or re-run the affected checks -->
+- **The v0.7.4 release candidate** (a development build made before the release cut; the
+  release binary is built from the public tree and gated again): the six recorded TP=2 identity cells
   give their recorded hashes; the same configuration as the soak above for 45.5 minutes:
   58,057 pre-verify rounds, 0 aborts, 0 request errors; the speculation re-probe, the image
   robustness run, the prefill-interleave identity and the attention-regime checks are reported
   in their sections above.
 - **No drift across releases.** The published v0.7.2 and v0.7.3 binaries and the candidate
-  produce the same per-request texts in the 1-to-8-concurrent identity cell (`IDENT_ALL
-  44fe40977a57e9d9`), at every concurrency level.
+  produce the same per-request texts in the 1/2/3/5/6/8-concurrent identity cell (`IDENT_ALL
+  44fe40977a57e9d9`), at every concurrency level of that cell.
 - **What the TP=2 checks do not show.** At default flags with three busy requests the TP=2
   scheduler kept serial speculation, so those runs exercise the round stop at the switch and
   not the mixed step; the mixed step at TP=2 was exercised with speculation off. More busy
@@ -357,7 +367,8 @@ measurement. The Flash-Next guide has a short note on this behaviour.
 
 - **A GPU vision-tower failure when an image request coincides with a CUDA graph capture**
   (owner decision pending: dropped if F1 is fixed before the cut). Seen once in 1,138 image
-  requests at TP=2, ten seconds after a boot, while the scheduler was capturing graphs for
+  requests at TP=2, about ten seconds after the boot's first request, while the scheduler was
+  capturing graphs for
   newly used step shapes. The request was answered correctly by the CPU tower; nothing else
   was affected. The CUDA error involved exists only while a graph is being captured, which is
   mostly in the first seconds after a boot and later whenever a new step shape is first used.

@@ -311,10 +311,11 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
     `reprobes=` and `reprobe_ok=`.
   - *Attention is chosen per row* (`--qsa-row-regime`). A request at or below 2,051 tokens of
     context that shares a decode step with a longer one keeps the kernels it runs alone, and a
-    speculative round stops at the 2,051-token switch. **This changes greedy output bytes
-    versus v0.7.3** for requests that cross about 2,051 tokens while generating and for short
-    requests that shared a step with a longer one; on v0.7.3 those bytes depended on timing
-    and on the other requests in flight. `--qsa-row-regime 0` restores the old rule.
+    speculative round stops at the 2,051-token switch. **This can change greedy output
+    bytes versus v0.7.3** for requests that cross about 2,051 tokens while generating under
+    speculation and for short requests that shared a step with a longer one (only where a
+    near-tie resolves differently); on v0.7.3 those bytes depended on timing and on the other
+    requests in flight. `--qsa-row-regime 0` restores the old rule.
   - *`--max-seq-len` above 262,144 is clamped* with a warning line (before, the server booted
     at the larger size and speculative rounds could write past a device buffer).
   - *`--mtp off` is honoured* (it was ignored on this server before): plain decoding only.
