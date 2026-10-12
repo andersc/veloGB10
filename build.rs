@@ -162,24 +162,85 @@ fn main() {
     // scheduler) WITHOUT touching the kernels — so the KERNEL_BUILD_ID handshake can't see them.
     // That hole shipped a wrong model once: TP legs with NO_STAGE=1 after a Rust-only change ran a
     // stale peer binary past the version check (the "garbage token-11" legs, 2026-07-20). Cover
-    // every src/*.rs + the C shim with a second stamp, appended to the handshake token.
-    let mut shasher = DefaultHasher::new();
-    let mut rust_files: Vec<PathBuf> = std::fs::read_dir("src")
-        .expect("read_dir src")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().map(|x| x == "rs").unwrap_or(false))
-        .collect();
-    rust_files.sort();          // stable order → stable hash
-    for f in &rust_files {
-        println!("cargo:rerun-if-changed={}", f.display());
-        std::fs::read(f).unwrap_or_else(|e| panic!("cannot read {}: {e}", f.display()))
-            .hash(&mut shasher);
+    // the engine's Rust sources + the C shim with a second stamp, appended to the handshake token.
+    //
+    // S-B9-CF-AGREE16B (W1): the stamp used to read the `.rs` FILES OF `src/` ONLY, so the 20 engine
+    // files in subdirectories (src/exl3_forward/** with the EXL3 TP sharder and forward, src/dflash2/*,
+    // src/dspark/*), the data baked in with include_str!/include_bytes!, Cargo.lock and this script
+    // were outside it: a head and a node that differed only there paired and ran different code.
+    // Now: every `.rs` under src/ at any depth, except src/ptx (this script writes it) and src/bin
+    // (separate executables), plus the included data files, the manifests and this script. Each
+    // file is hashed as (relative path, bytes) in sorted order, and watched PER FILE. `src/` itself
+    // is never watched as a directory (this script writes src/ptx: it would rerun on every build);
+    // the subdirectories are, so a file added to one reruns the script and joins the list.
+    // The list is baked in for the unit test `cluster::build_id_tests`, which walks the tree itself
+    // and fails on an engine source or an included file that is in neither stamp.
+    let mut src_files: Vec<String> = Vec::new();
+    let mut src_dirs: Vec<String> = Vec::new();
+    let mut stack = vec![PathBuf::from("src")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())).filter_map(|e| e.ok()) {
+            let p = e.path();
+            let rel = p.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                if rel == "src/ptx" || rel == "src/bin" { continue; }
+                src_dirs.push(rel);
+                stack.push(p);
+            } else if p.is_file() && p.extension().map(|x| x == "rs").unwrap_or(false) {
+                // `is_file()`: a dangling symlink or an editor lock file (`src/x/.#y.rs`) is not a source
+                // and must not be read (the read below would panic the build).
+                src_files.push(rel);
+            }
+        }
     }
-    println!("cargo:rerun-if-changed=native/net_shim.c");
-    std::fs::read("native/net_shim.c").expect("cannot read native/net_shim.c").hash(&mut shasher);
-    let source_id = format!("{:016x}", shasher.finish());
+    // the data compiled into the binary (include_str! / include_bytes! targets outside the kernels)
+    for (dir, ext) in [("data/ep_deal", "json"), ("src/tq_consts", "bin")] {
+        src_dirs.push(dir.to_string());
+        for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}")).filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_file() && p.extension().map(|x| x == ext).unwrap_or(false) {
+                src_files.push(p.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    for f in ["native/net_shim.c", "Cargo.lock", "Cargo.toml", "build.rs"] {
+        src_files.push(f.to_string());
+    }
+    // NOT in the stamp: tests/fixtures/loop_detect_vectors.txt (included by src/loop_detect.rs inside
+    // `#[cfg(test)]`). It is not an engine input, and a stamp that hashed it "when present" gave one tree
+    // two tokens depending on build history (with / without tests/); the include-target test
+    // (`cluster::build_id_tests`) names it as its one stated `#[cfg(test)]` exception.
+    src_files.sort();           // byte order of the relative path: stable order → stable hash
+    src_files.dedup();
+    src_dirs.sort();
+    src_dirs.dedup();
+    // FNV-1a 64 over (path, len, bytes) per file, in sorted order -- a stable, specified algorithm (as
+    // TUNE_BUILD_ID above), NOT std's DefaultHasher, whose output is unspecified across Rust releases: two
+    // machines that build the same commit with different toolchains must get the same token or they
+    // would be refused at the Hello. (KERNEL_BUILD_ID keeps DefaultHasher on purpose: it is baked into the
+    // PTX bytes, and moving it would change every PTX file without a kernel change.)
+    let mut sh: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |b: &[u8]| {
+        for &x in b {
+            sh ^= x as u64;
+            sh = sh.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for f in &src_files {
+        println!("cargo:rerun-if-changed={f}");
+        let bytes = std::fs::read(f).unwrap_or_else(|e| panic!("cannot read {f}: {e}"));
+        feed(f.as_bytes());
+        feed(&(bytes.len() as u64).to_le_bytes());
+        feed(&bytes);
+    }
+    for d in &src_dirs { println!("cargo:rerun-if-changed={d}"); }
+    let source_id = format!("{sh:016x}");
     println!("cargo:rustc-env=SOURCE_BUILD_ID={source_id}");
+    println!("cargo:rustc-env=SOURCE_BUILD_FILES={}", src_files.join(";"));
+    // what KERNEL_BUILD_ID hashes (the other half of `cluster::binary_version`), for the same test
+    let mut kernel_files: Vec<String> = kernels.iter().map(|(s, _, _)| format!("kernels/{s}")).collect();
+    kernel_files.push("native/tp_doorbell.h".to_string());
+    println!("cargo:rustc-env=KERNEL_BUILD_FILES={}", kernel_files.join(";"));
 
     if !nvcc.exists() {
         // Cross-compiling or a CI box with no CUDA: the checked-in PTX has to do. Say so clearly --

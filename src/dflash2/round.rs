@@ -1230,15 +1230,24 @@ impl Df2Round {
         if self.dev.synchronize().is_err() { return false; }
         let stream = self.stream.stream;
         let r = unsafe { sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) };
-        if r != sys::CUresult::CUDA_SUCCESS { return false; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("df2-inject", &format!("width {m}"), &format!("BeginCapture {r:?}")); // S-B9-REL-INTEG C1
+            return false;
+        }
         self.inject_kernels(m);
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r = unsafe { sys::cuStreamEndCapture(stream, &mut graph) };
-        if r != sys::CUresult::CUDA_SUCCESS { return false; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("df2-inject", &format!("width {m}"), &format!("{r:?}")); // S-B9-REL-VISIONFIX2 V2b
+            return false;
+        }
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         let r = unsafe { sys::cuGraphInstantiate_v2(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0) };
         unsafe { sys::cuGraphDestroy(graph); }
-        if r != sys::CUresult::CUDA_SUCCESS { return false; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("df2-inject", &format!("width {m}"), &format!("instantiate {r:?}")); // S-B9-REL-INTEG C1
+            return false;
+        }
         self.inject_graphs.insert(m, crate::gpu::CudaGraph::from_exec(exec, stream));
         true
     }
@@ -1605,16 +1614,27 @@ impl Df2Round {
         let nprev_save = self.nprev;
         self.nprev = self.max_c;
         let r = unsafe { sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) };
-        if r != sys::CUresult::CUDA_SUCCESS { self.nprev = nprev_save; return false; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            self.nprev = nprev_save;
+            crate::metrics::graph_capture_lost("df2-draft-round", "draft round graph", &format!("BeginCapture {r:?}")); // S-B9-REL-INTEG C1
+            return false;
+        }
         let ok = self.draft_round_kernels(0, true, None).is_ok();
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r = unsafe { sys::cuStreamEndCapture(stream, &mut graph) };
         self.nprev = nprev_save;
-        if !ok || r != sys::CUresult::CUDA_SUCCESS { return false; }
+        if !ok || r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("df2-draft-round", "draft round graph",
+                                               &if r != sys::CUresult::CUDA_SUCCESS { format!("{r:?}") } else { "body error".to_string() }); // S-B9-REL-VISIONFIX2 V2b
+            return false;
+        }
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         let r = unsafe { sys::cuGraphInstantiate_v2(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0) };
         unsafe { sys::cuGraphDestroy(graph); }
-        if r != sys::CUresult::CUDA_SUCCESS { return false; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("df2-draft-round", "draft round graph", &format!("instantiate {r:?}")); // S-B9-REL-INTEG C1
+            return false;
+        }
         self.round_graph = Some(crate::gpu::CudaGraph::from_exec(exec, stream));
         // keep the device ints alive for the lifetime of the graph (they are captured by addr)
         self.ntot_buf = Some(ntot_int);

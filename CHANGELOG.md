@@ -3,16 +3,44 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
-## v0.7.4 — speculation re-arms inside a request, per-row attention regime, vision-tower recovery, five community pull requests
+## v0.7.4 — tool-call parsing fixes, speculation that re-arms, per-row attention regime, vision-tower recovery, option-parsing guards, lane packing on by default, first stream chunk at the first token
 
-This release fixes two defects of the EXL3 (Qwen3.8-Flash-Next) serving path that were found
-after v0.7.3: speculative decoding could switch itself off for the rest of a long request, and a
-request's greedy text could depend on what else was being served. It turns a GPU vision-tower
-error from an outage into a per-request event (issue #20), ports five community pull requests
-(#15, #16, #17, #21, #23), and closes a list of small defects. One new default changes output
-bytes in a narrow case: see "Behaviour change" under the per-row attention regime.
+This is a fix release for the EXL3 (Qwen3.8-Flash-Next) serving path, with a few opt-in
+additions. It fixes defects found after v0.7.3: speculative decoding could switch itself off for
+the rest of a long request; a request's greedy text could depend on what else was being served;
+tool-call parsing returned wrong answers for responses that quote tool calls; a GPU vision-tower
+error disabled images until restart (issue #20); and the first streamed chunk reached a
+client's clock long before any output existed. It makes things that used to fail silently fail
+loudly or say what they did (an option that swallows the next flag, a head and a node of
+different builds, a `--max-batch` above the server's 16-request cap), adds KV occupancy gauges
+(issue #24), ports five community pull requests (#15, #16, #17, #21, #23), turns on by default
+`--lane-pack` (two concurrent requests share one speculative verification; `--lane-pack off`
+restores the previous behaviour), and adds a perplexity measurement tool.
 
-<<CUT: release artifacts line: tarball name, binary sha256, release-source commit, dev commit>>
+**It is not the speed release for sampled requests.** Most clients send no sampler settings,
+which means sampling, and a request that samples is slower than the greedy figures published
+for earlier releases. That work is the next release. "What is not included in this build" and
+"What's next", at the end of this entry, say what is and is not covered, and on what kind of
+request each figure was measured.
+
+Several defaults change what a client receives in narrow cases. They are listed together in the
+next section, each with the flag that restores the v0.7.3 reading.
+
+### Behaviour changes at default flags
+
+| what a client sees at default flags | restore the v0.7.3 reading with |
+|---|---|
+| Greedy text can differ from v0.7.3 for a request whose context crosses about 2,051 tokens under speculation, and for a short request that shared a decode step with a longer one (the v0.7.3 bytes of those depended on timing). Details under "a request's greedy text could depend on what else was being served" | `--qsa-row-regime off` |
+| A `</tool_call>` inside an argument value is text, and so is a quoted complete block; before, the first `</tool_call>` ended the block and cut the call there | `--tool-block-end first` |
+| A string argument loses exactly one wrapping newline instead of all of them (a file the model ends with a blank line arrives with its final newline) | `--tool-value-trim all` |
+| **`--lane-pack` is ON by default** (it was off): two concurrent requests share one speculative verification; greedy bytes are unchanged, sampled requests draw from the same distribution; it holds about 1.8 GiB of device memory per machine (a second 16-row scratch and its graphs, captured at boot); a posture it cannot serve boots with it inactive and one line saying why; a request with a penalty or an image never packs | `--lane-pack off` |
+| Streamed call whose argument holds `<think>`: no raw call markup as content and no split into reasoning. Thinking off and an argument holding `</think>`: the call is kept (it was thrown away). A Qwen call whose value mentions the Hy3 call tag stays a Qwen call. A JSON-bodied block whose string quotes `</tool_call>` is read whole | none: defect fixes |
+| A streamed chat response carries an SSE comment line `: keep-alive` every 10 s while it waits in the queue, prefills or buffers a tool call; the role chunk leaves with the first generated token (data events, bytes and order are unchanged) | `--sse-keepalive 0` for the lines; the role chunk's time has no flag |
+| A non-streaming chat response that ends inside its think block returns that text as `reasoning_content` with an empty `content` (as the streaming API always did) | `--unclosed-think content` |
+| A streamed response no longer carries its own stop string; an empty stop string (`stop: ""`) is ignored (before: an empty reply with finish `stop`); a streamed reply that ended in `<` or in the start of `<tool_call` / `<think>` / `</think>` now sends those characters | none: defect fixes |
+| After an engine error a stream carries nothing but the finish chunk (a held but unparsed tool-call span is dropped; a complete call is still delivered) | none |
+| An option that takes a free-form value and is followed by another `--flag`, or is last on the line, exits 2 naming both flags (before: the next flag was taken as its value, silently); the same for the flags the mode dispatch reads by hand, with a short documented list of flags whose value is optional | write `--option=value` |
+| A head and a node of different builds are refused at the hello (protocol 6); a v0.7.4 machine does not pair with a v0.7.3 one | run the same binary on every machine |
 
 ### Fixed — speculation could stay off for the rest of a long request
 
@@ -171,11 +199,56 @@ injected by a test drill, the request is answered by the CPU tower with the same
 boots, no wrong answer, both ranks in step, six injected failures all answered by the CPU
 tower, and 360 other image requests served by the GPU tower while those fallbacks ran.
 
-<!-- CUT: re-check this paragraph and the two image entries under Known limits against the vision fix session's report if it is merged before the cut -->
-Limits: failures of other kinds inside the tower (a kernel launch, a pool allocation, the
-weight upload) still panic; they are caught by the worker's panic handler and the lock
-recovery, loudly. A GPU fault that the CPU tower cannot cover is reported as HTTP 400 with the
-error text, not as a 5xx. Two findings of the TP=2 run are under "Known limits".
+Limits: a failed kernel launch inside the tower is still a panic (the worker's panic handler and
+the lock recovery catch it, loudly; sending it through the CPU fallback is not done). A GPU
+fault that the CPU tower cannot cover is reported as HTTP 400 with the error text, not as a 5xx.
+The two findings of the TP=2 run, a tower error while the scheduler was capturing CUDA graphs
+and the slow CPU answer, are the next two sections.
+
+### Fixed — an image request that coincided with a CUDA graph capture could lose the capture, the image worker, or the server
+
+Found by the TP=2 verification: once in 1,138 image requests, about ten seconds after a boot's
+first request, the GPU tower was refused by the CUDA driver while the scheduler was capturing
+graphs for newly used step shapes. The mechanism, reproduced without a model: while another
+thread records a CUDA graph, any call on the legacy default stream (an allocation, a copy, a
+synchronisation, a free; every "sync" helper of the CUDA binding is one) is refused and also
+invalidates the capture in progress. The tower made about eighteen such calls per image. On the
+served box the unfixed build lost a graph capture and an image worker in one boot and aborted
+the whole server process in another: two of five test boots with image traffic, the two that ran with
+`--graph-precapture off` (every graph is then captured under traffic); the fixed build ran the same
+five boots (three at default flags, two capture-heavy) with zero failures of any kind.
+
+Now the tower, after its construction, uses only its own stream: its own allocation, zero-fill,
+copies and drains (same kernels, same order, same arguments; the weights are still uploaded
+once at boot). Two matrix-multiply results in the tower's forward pass that were discarded
+without being checked are now propagated, so a failure there goes to the CPU fallback instead
+of returning embeddings computed from stale scratch.
+
+New counters: `velogb10_graph_capture_invalidated_total` and `velogb10_graph_capture_failed_total`
+(a capture that produced no graph, by cause; they also count the capture sites that used to
+return silently). Measured (3.05 pack, one machine, `--max-seq-len 32768 --max-batch 4`): the
+embeddings of three image sizes are bit-identical on the fixed and the previous build; text
+speed is unchanged (medians 70.6 to 72.5 tok/s over four interleaved boots).
+Not covered: a capture begun in the driver's `GLOBAL` mode by another thread would still
+refuse the tower's own-stream calls (no served image path has one); image traffic on one
+machine against graph capture beyond the five boots above, and TP=4.
+
+### Added — `--vision-cpu-threads <N>` (default 1) and a drill flag that arms in any position
+
+The CPU vision tower answers an image request only when the GPU tower failed. It is a
+single-threaded scalar reference, so the answer takes minutes, and it grows with the image
+(173 s for 448 x 448 at one thread on one machine; the 173 to 218 s seen at TP=2 is the image
+size, not the topology). `--vision-cpu-threads N` (1 to 64, default 1: unchanged) splits the
+tower's token rows over N threads; the embeddings are bit-identical for every N (tested at 1, 2,
+3, 7, 16 and 64 threads; on the real tower the same digest at 1, 4 and 8). 448 x 448 on one
+machine: 172.9 s at 1 thread, 44.8 s at 4, 31.0 s at 8. Not measured at the default
+`--image-max-edge 1024`: projected from those figures it is many minutes at one thread. The
+default stays 1 on purpose: more threads take worker cores for the duration of a rare fallback.
+
+`--vision-fail-gemm` (the test drill that fails the first GPU matrix multiply of the tower) was
+armed only when another argument followed it; as the last argument it was silently inert. It
+arms in any position now. `--vision-cpu` and `--parity` on the NVFP4 server had the same defect
+and are fixed too.
 
 ### Fixed — EXL3 served windows above the trained length (pull request #21)
 
@@ -237,6 +310,260 @@ only); `--served-model-name` from #15 and the telemetry wiring from #17 (both al
 v0.7.3); the 2 GiB-per-lane default of #17 (the option is there, the default stays 0); and a
 transport-side fallback scan for the GID, which was removed in review so that the transport
 binds exactly the index the engine resolved.
+
+### Fixed — tool calls that quote tool calls, and five more parser defects
+
+When a model writes a document ABOUT tool calls (a file, a test fixture, a prompt), the quoted
+calls contain the same tags as a real call, and the parser has to decide which tags are
+structure and which are text. The parser was reviewed by an outside expert and changed. What
+v0.7.4 does at default flags (each change only alters responses that were wrong before; the
+restore flags are in the behaviour table above):
+
+- A `</tool_call>` inside an argument value is text, and so is a quoted complete block inside a
+  value (`--tool-block-end after-function`; `first` restores v0.7.3). This follows the popular
+  engines: in vLLM's Qwen3 parser only `</function>` ends a call, and `</tool_call>` is looked
+  for after it.
+- A string argument loses exactly one wrapping newline, the one the chat template writes
+  before and after the value, instead of all of them, as vLLM does (`--tool-value-trim one`;
+  `all` restores v0.7.3).
+- A streamed call whose argument holds `<think>` no longer leaks raw call markup as content or
+  splits into reasoning; with thinking off, an argument holding `</think>` no longer loses the
+  call. A Qwen call whose value mentions the Hy3 call tag stays a Qwen call (before: no call and
+  the raw markup). A JSON-bodied block whose string quotes `</tool_call>` is read whole.
+- A hostile block (thousands of parameters, or junk after every close tag) took seconds to
+  parse; the parse is linear in the block for those shapes. One third shape remains quadratic:
+  a block made of a very large number of bare `function=` lines with no `<function=` tag (about
+  6 s for 500 KB, the same as v0.7.3).
+- **A block the model never closed** (no `</tool_call>`) is dropped, as in v0.7.3
+  (`--tool-unclosed drop`, the default). `--tool-unclosed complete` is available: when the model
+  ended by itself (finish `stop`) and a `<function=...>` element inside the block is closed with
+  `</function>`, that call is returned, as vLLM does; a call cut inside an argument, or any
+  response cut by the token limit, cancelled by the client or ended by an engine error, is
+  dropped whole under both settings, because it would run with missing arguments. It is not the
+  default because the evidence does not support it: in the 36 recorded outputs with an unclosed
+  wrapper that were replayed (one machine, 3.05 and 4.05 packs), no response had a closed
+  function element without its wrapper close (every real one was cut inside its element), and
+  the one output `complete` changed was a piece of prose about the call format whose stray tags
+  parse as a junk call. `velogb10_toolcall_unclosed_total{outcome="returned|dropped_cut|dropped_length"}`
+  counts what happens either way.
+
+**Not fixed by default: a value that quotes a call with two or more parameters.** The quoted
+`</parameter>` followed by a `<parameter=` looks exactly like a real parameter boundary, so at
+default flags such a document is read as a cut value plus extra calls, and a value that quotes
+two calls comes back as two calls (the second made of the quoted text, which an agent would
+execute). Measured with the v0.7.4 binary (one machine, 3.05 pack, streamed, default flags, 30
+offered tools): a response that quoted 40 two-parameter calls came back as 40 calls; the right
+answer was one `write_file`. On recorded outputs that copy such documents (non-streamed, mostly
+thinking off, client-set temperatures; 7 documents x 3 phrasings, resampled) the v0.7.3 reading
+returned a phantom call in 348 of 1,000 and a cut file in 506 of 1,000.
+
+Two opt-in readings handle it: `--tool-quote-pairing on` pairs each quoted open tag with its
+close and reads the document whole; `--tool-quote-pairing cost` picks the cheapest consistent
+reading and reads more. Neither is the default, because each has a class it reads worse than
+the default: `on` mishandles a value that mentions an open tag once, unclosed, followed by a
+real close; `cost` mishandles a real second call that follows a first argument holding a lone
+open tag. We do not yet know how often either class happens on real traffic. **To help us
+measure it:** start the server with `--tool-shadow-cost on` (diagnostic only: it also reads every
+tool-call response under the `cost` rule and counts how often the result would differ; it
+changes nothing that is returned and costs about 0.05 ms per response, 6 ms in the worst shape
+measured: 64 blocks of 8 KB with 100 tools offered). The counters are on `/metrics` as
+`velogb10_toolcall_*`. The counts, or a sample of responses where the readings differed with anything private removed, are what is
+needed to choose the default for the next release. The Flash-Next guide, section 8, has the
+advice for agent authors (escape or split quoted tags, or write the file through a path that
+does not go through a tool-call value).
+
+Where this was and was not run: one machine, EXL3 3.05 pack, streamed, thinking on, 30 offered
+tools, a handful of requests per case (not a frequency). Never on two or four machines and not
+on the NVFP4 server for these changes (the parser changes are head-only and independent of the
+topology; that is an argument, not a run). The Hy3 and DeepSeek V4 tool-call formats keep the
+old value and block rules.
+
+### Fixed — the first streamed chunk was not a first response (forum thread, post #46)
+
+The chat stream sent a role-only `choices` chunk about 5 ms after the request arrived and the
+first content or reasoning delta 1.6 to 1.7 s later (a 2,111-token prompt). A client that takes
+the first chunk with a `choices` entry as the first response, as the llama-benchy tool does,
+measured prompt processing at 431,582 to 514,059 tok/s on one machine of ours; the figure is
+1,292 to 1,362 tok/s after the change (c=1, 4.05 pack, one machine, the same tool).
+
+Now no chunk with a `choices` entry leaves the EXL3 server before the first generated token, and
+the role chunk leaves with that token (also when the reply is only a buffered tool call). Data
+events, bytes and order are the same as before on ten request shapes; only the role chunk's time
+moved. While a request waits in the queue or a long prefill runs, a streamed response now carries
+an SSE comment line (`: keep-alive`) every 10 s (`--sse-keepalive N`; `0` = off). The lines stop
+when the whole server has made no progress for 60 s (no decode round and no prefill chunk of any
+request), so a hung engine cannot hold a client open; a request that gets no event while other
+requests progress keeps receiving them. `/health` and the DEAD state remain the liveness signals.
+The same rule serves `/v1/completions` streams. Errors are unchanged on purpose: the status
+and headers still leave at once, and a failure before the first token is an SSE `error` event.
+
+Checked: one machine (EXL3, 4.05 pack, TP=1) and, in the integration gates, TP=2 (3.05 pack:
+role chunk with the first token, `prompt_ms` 117.9 against the role chunk at 119.6 ms; a waiting
+request received frames every 10 s through 90 s). The NVFP4 server shares the handler and was
+checked on one machine (role chunk with the first token; frames at `--sse-keepalive 2`, none at
+0). The DeepSeek V4 server's streamer was moved into the library with its tests and its
+`timings` block for greedy requests (which reported a fictional `prompt_per_second`) was
+corrected; **neither was run on a GPU**, and that server sends no keep-alive frames.
+
+Also in this group (all found by reviews of the streaming path, all without a flag):
+`stop: ""` and empty entries of a stop list are ignored; a streamed reply no longer contains its
+stop string (the non-streaming response never did); a streamed reply that ended in `<` or in
+the first characters of `<tool_call`, `<think>` or `</think>` lost those characters, and text
+after a `<tool_call` that was not a call tag was lost too; a stop string costs time linear in
+its length per token (it was quadratic: 308 ms per call at 200 KB); after an in-band engine
+error a stream carries only the finish chunk.
+`--unclosed-think reasoning|content` (default `reasoning`) is described in the behaviour table.
+
+### Fixed — the TP lockstep word could not tell a 15-row verify from a 16-row one; head and node must be the same build
+
+The per-step agreement word that the TP ranks compare carried a step's verify width in 4 bits,
+so a 15-row and a 16-row step were not distinguished by it. It carries 5 bits now (0 to 31).
+Checked on two machines with a drill that makes one rank report a different width: the fix
+aborts on it at the step, and the old word let it through in silence. No failure had been
+attributed to this before; a 16-row step needs `--max-batch` of 16 or more.
+
+The same work found that the stamp that makes a head refuse a node of a different build did
+not cover 20 engine sources (`src/exl3_forward/*`, `src/dflash2/*`, `src/dspark/*`), the data
+compiled in, `Cargo.toml`, `Cargo.lock` or `build.rs`: a head and a node that differed only in
+the TP sharder were not refused. It covers them now (FNV-1a over every file's path, length and
+bytes, so two machines that build one commit with different toolchains get the same stamp), and
+the protocol version is 6. A head and a node of different builds are refused at the hello with
+both stamps named, before any model is shipped; checked in both directions on two machines.
+**A v0.7.4 machine therefore does not pair with a v0.7.3 one: run the same binary on every
+machine of a TP group.**
+
+### Changed — `--lane-pack <on|off>` is ON by default (EXL3; `--lane-pack off` restores the previous behaviour)
+
+Two requests that run at the same time used to take turns, or to share one plain step with
+speculation off. With lane packing, two of them share ONE speculative verification (a
+packed round): the engine drafts for both, verifies both in one pass, and each request keeps
+its own tokens. The flag was opt-in in the release candidates; the maintainer decided on
+2026-10-12 to turn it on by default in this release.
+
+- Greedy requests are byte-identical packed or alone (the recorded identity cells on one machine
+  and at TP=2, with the packed-round counters equal on both ranks). Sampled requests join the same
+  rounds and are verified by the real-q ratio rule that a lone sampled round uses;
+  `--lane-pack-sampled-tp <on|off>` (default `on`) chooses whether they join under TP (`off`:
+  only greedy requests pack under TP).
+- A request that carries a repetition, presence or frequency penalty, or an image, never joins
+  a packed round; neither does any request on a server booted with a non-zero
+  `--default-*-penalty` (the boot prints a warning for that case).
+- A posture the packed arm was never gated under boots with packing INACTIVE and one line
+  saying what was asked, what the boot does instead and why, instead of refusing
+  (`--lane-order fcfs`, `--kv-cache` other than q8, `--exl3-mtp-k` other than its default,
+  `--qsa-row-regime off`, `--a-ctrl old`, `--max-batch 1`, `--graph-precapture off`, no live
+  draft head (`--mtp off`), and the model and kernel postures the packed verify cannot serve).
+  `velogb10_lane_pack_active{reason}` says which, and `--lane-pack off` silences the line. A
+  packed scratch or graph that cannot be built at boot (device memory) is the same fallback: the
+  boot continues without packing and says why; it never aborts. (Under TP a failure on one rank
+  only is caught by the boot agreement, loudly, rather than served.)
+- With the default on, the choice is made by every machine of a TP group from the same
+  resolved value (the head's value ships to the nodes), with no flag typed; the boot agreement
+  hashes the decision and its reason, so a head and a node that disagree refuse the boot.
+- At four busy requests with lane packing active, one shared plain step is tried every 16 rounds
+  while the engine has no measurement of it (then every 128), so the load-adaptive policy can
+  pick the cheaper arm from a measurement; before this, a packing boot rode packed
+  pairs for a whole request in 19 of 20 test boots although the shared step measured faster in
+  3 of the 4 standard cells.
+- Cost: about 1.7 to 1.8 GiB of device memory per machine (a second 16-row scratch and its
+  graphs, captured at boot), also for a server that never has two requests at once. The boot
+  line prints the free memory after the boot. Not measured for this release with the default
+  on: the free host memory before and after on the 4.05 pack at `--max-seq-len 262144
+  --max-batch 4` (the tight cell).
+
+Measured (request class stated on each line; all unpenalized, no sampler fields; every number
+below was taken with the flag typed `--lane-pack on`, before it became the default):
+
+- One machine (TP=1, 3.05 pack, `--max-seq-len 32768 --max-batch 4`, 512-token requests with
+  short prompts, thinking on and off, code and prose, three adjacent off/on pairs per cell):
+  two requests together ran 1.15 to 1.34 times as fast (mean of three pairs; the weakest cell,
+  code with thinking off, has the noisiest off arm); a single request is unchanged (0.97 to
+  1.05, the noise floor); packed rounds 98 to 217 per cell.
+- Two machines (TP=2, 3.05 pack, streamed, default sampling, window 262,144, five adjacent
+  off/on pairs per cell, recomputed by an independent review): two requests together ran 1.17
+  to 1.32 times as fast on short prompts (about 75 tokens, 512 forced tokens). On agent-style
+  prompts (about 5,500 tokens, a 14-tool catalogue, first turn, nothing cached) the gain was
+  about 12 % at best with thinking on (marginal) and within noise with thinking off, because
+  the prompt dominates the wall clock; three requests: no gain; four requests: between 8 %
+  slower (prose, thinking off) and about 14 % faster (code, thinking off).
+- Not measured: four machines, a conversation whose prompt is already cached (warm multi-turn),
+  a request with a penalty. The distribution check of the sampled packed round passes its
+  stated rule (alpha 0.01) at p = 0.035, is a single experiment, and would not pass at 0.05; the
+  48 byte-identity cells ran at a 32,768 window.
+- Robustness (TP=2, 3.05 pack, `--lane-pack on`): a 30-minute stress of 782 streamed requests
+  (default sampling plus a greedy share, one to three at once, 10 % cancelled): 0 errors, the
+  greedy ones identical to alone, the round counters equal on both ranks; a deliberately
+  injected width mismatch is caught on both ranks.
+- Counters: `velogb10_lane_pack_rounds_total{arm="packed|serial|shared_plain"}`,
+  `velogb10_lane_pack_lane_rounds_total{kind}`, `velogb10_lane_pack_skip_total{reason}` (why a
+  request was kept out of a packed round), `velogb10_lane_pack_disabled`,
+  `velogb10_lane_pack_active{reason}`.
+
+### Added — KV occupancy gauges (issue #24)
+
+Requested by [@liorm0505](https://github.com/liorm0505) (issue #24). On the EXL3 server's
+`/metrics`: `velogb10_kv_positions_{capacity,used,peak,cached}`, per lane
+`velogb10_kv_lane_positions_{capacity,used,peak,cached}{lane}`, and
+`velogb10_kv_allocated_bytes{kind}` (`trunk_kv`, `indexer_keys`, `draft_head`). A position is
+one token of one lane's context, not a byte; `used` counts running requests, `cached` counts
+the prompt positions that free lanes keep for the prefix cache. Reading them:
+`max(velogb10_kv_lane_positions_peak) / velogb10_kv_lane_positions_capacity` is how much of the
+window the longest context used, and `sum(velogb10_kv_allocated_bytes) /
+velogb10_kv_positions_capacity` is the bytes one position costs. Under `--tp` the byte series are
+the head's share. The NVFP4 server does not report them. Checked on one machine and at TP=2
+(two packed lanes: every lane's peak equals its request's final position; 0 used when idle).
+
+### Added — `--perplexity` on EXL3 packs: a measuring tool with checks that can fail
+
+`--perplexity --model-dir <pack> --text <file>` (or `--ppl-ids <file>`) scores held-out text on
+the SERVED chunked prefill, with every row of every window passed through the language-model
+head, and prints one line per window and a final `RESULT:` line. It is a measuring tool: it
+serves nothing, and it runs on one machine (TP=1). Options: `--window N`
+(default 1024), `--ppl-csv <file>` (per-token NLL), `--ppl-dump-ids <file>` (the scored ids, to
+feed another runtime the same tokens), `--ppl-label`, `--ppl-ref-windows N` (also run the first N
+windows through the single-token decode path, a different kernel set, and report the
+difference). The run exits 1 and prints no `RESULT:` line when a check fails: a language-model
+head that wrote nothing (the buffers are poisoned before every launch and scanned afterwards),
+a top-1 accuracy below `--ppl-min-top1` (0.02), or a perplexity outside `--ppl-min-ppl` (1.05)
+and `--ppl-max-ppl` (1000). **A printed `RESULT:` means "not catastrophically broken" and
+nothing more**: the bounds are wide, and correctness needs a reference of a different class.
+The tool refuses what would make a measurement ambiguous: an option repeated with different
+values (the registry options are last-wins while `--model-dir`, `--kv-cache`, `--prefill-chunk`
+and `--max-seq-len` are first-wins elsewhere), and a value-less `--text`, `--ppl-ids`,
+`--ppl-csv`, `--ppl-dump-ids`, `--ppl-label` or `--model-dir` followed by another flag
+(it would swallow that flag). `--perplexity off` does not run the mode.
+
+Measured (3.05 and 4.05 packs, three texts, 25 windows of 2,048 tokens = 51,175 scored tokens
+per cell, KV q8; perplexity):
+
+| text | 3.05 | 4.05 | ExLlamaV3 3.05 | ExLlamaV3 4.05 |
+|---|---|---|---|---|
+| code | 3.5264 | 3.5409 | 3.5483 | 3.5571 |
+| prose | 6.3994 | 6.4184 | 6.4221 | 6.4839 |
+| json | 2.3135 | 2.3179 | 2.3096 | 2.3162 |
+
+The 4.05 pack does not score better than the 3.05 pack on these texts, in either runtime (+0.13
+to +0.56 % in the first matrix; very slightly worse in 9 of 9 engine cells in the repeated
+measurement, about 0.1 to 0.2 % in perplexity, t = 0.5 to 2.1 per cell, sign test p about 0.002).
+Single-pass reference differences below about 0.5 % are noise: the ExLlamaV3 reference is not
+deterministic from call to call, so any comparison uses `--repeats 3` or more with its standard
+deviation (the reference script of this work does). KV precision (q8, fp8, f16) does not
+separate the cells beyond 0.22 %. In the first window the engine's loss is below the reference's
+by 0.05 to 0.44 nats per token from position 256 on, in every KV format, and on the first row of
+windows 2 to 25 it is lower in 18 of 18 cells; the candidate cause is the start token (the
+pack's `eos_token_id` 248044 against the engine's 248046), which is open. The probe that
+compares the served chunked prefill with token-by-token decode reports a recurrent-state
+difference (largest absolute value 0.73) that is byte-identical to the one recorded two weeks
+earlier; it has not been investigated as a defect, and nothing here claims it harmless.
+
+Found on the way: the generic (non-EXL3) loader read tensor bytes with a cast that requires
+the data's file offset to be aligned for its dtype, and a safetensors header length need not be a
+multiple of 8. On such a file v0.7.3 panicked at the first tensor it cast, and the panic left
+the loader's worker threads waiting for a flag nobody would set: the process then hung. Fixed:
+an unaligned read is copied, an aligned one is borrowed as before (the same perplexity to every
+printed digit on an aligned model; the misaligned copy of the same model now loads), and the
+panic no longer hangs the process. An EXL3 pack handed to a loader that cannot read it is now
+refused at once with a message naming the entry points that can.
 
 ### Added — `--prefill-interleave <N>` (EXL3, one machine, default 0; pull request #23)
 
@@ -313,14 +640,50 @@ The NVFP4 server does not read this flag (it has its own `--prefill-sched`).
   unless told not to; this endpoint sends it only when asked.)
 - **Benchmark and probe rounds** (`--bench-mtp` and two diagnostics) stop at the 2,051-token
   switch like the server, so a losslessness run across the switch measures what is served.
-<!-- CUT: if the parser is changed before the cut so that two quoted calls with no closing function tag between them are no longer read as two calls, drop that clause here and in the Flash-Next guide section 8; otherwise keep it -->
-- **Flash-Next guide: tool-call values that quote tool-call syntax.** The guide listed two
-  cases that the tool-call format cannot disambiguate; there are three. The one that was
-  missing: a value that quotes a call with two or more parameters is cut at the first quoted
-  `</parameter>`, and a value that quotes two calls with no `</function>` between them is
-  read as two calls. The parser is unchanged from v0.7.3; section 8 of the guide now lists
-  all three, with the same advice (use a diff-style edit tool, or break the closing sequence
-  when quoting tool-call syntax).
+- **Flash-Next guide, section 8: tool-call values that quote tool-call syntax** now
+  describes the parser as it is (the block rule, the newline rule, the three inherent ambiguities
+  and the opt-in readings), with the advice for agent authors.
+- **`--max-batch` above 16 on the EXL3 server** boots with 16 lanes and prints one line saying
+  so (`--max-batch 32: this server serves at most 16 requests at the same time; using 16;
+  further requests wait in the queue`); `velogb10_max_batch` reports 16 and the new
+  `velogb10_max_batch_requested` what the command line asked. Nothing is rejected: the 17th
+  request waits. At TP=2 the same value used to be refused before the network step; one
+  resolver now serves one machine, two and four, and both ranks resolve the same width.
+- **`--exl3-recon-min 0` (or above 32) on the 4.05 pack** boots and serves. The pack has 6-bit
+  modules that the wide trellis kernel cannot decode (3-, 4- and 5-bit only); those modules now
+  go through the reconstruct + cuBLASLt arm whatever the option says, with one line at the
+  first use and `velogb10_exl3_recon_forced_total{bits}`. Before, the boot's warm-up reached the
+  wide arm and died. The greedy text equals the default boot's (readiness hash
+  `6809e8685d17412e`). A pipelined prefill MoE kernel on a pack with 5-bit routed experts, and the
+  host-routed MoE arm on an expert width it has no path for, are refused with a message that
+  names the option (`--pf-moe-kernel off`) instead of computing garbage; no shipped pack is
+  affected. A plain step of 17 or more rows on a pack with 6-bit modules (`--max-batch` above 16
+  on such a pack) now fails loudly where it used to answer with garbage.
+- **Options that swallowed the next flag.** An option that takes a free-form value (text or
+  path) and is followed by another `--flag`, or is last on the line, exits 2 before any model
+  load, naming both flags and the escape: `--rdma-dev needs a value, but the next argument is
+  --tp; to give a value that really starts with "--" write --rdma-dev=--tp`. The `--option=value`
+  form is accepted everywhere. The flags that the mode dispatch reads by hand (among them
+  `--model-dir`, `--port`, `--nodes`, `--tp`, `--max-batch`, `--max-tokens`, `--prefix-cache`) are
+  covered by the same rule. Flags whose value is optional never refuse: `--tp` (bare `--tp` is
+  two machines and prints one info line on stderr; write `--tp 4` for four), `--head`,
+  `--probe-tq`, `--output-prompts`, `--probe-bandwidth-sustained`, `--splitk-gemm`.
+  Checked against 1,685 launch lines of the repository's scripts, docs and model cards: no real
+  launch line is refused. Integer, float, choice and boolean options already failed loudly on a
+  swallowed flag and are unchanged.
+- **Unknown flags warn.** A `--token` that no option or mode reads prints one startup line on
+  the head (`[opts] unknown option --max-bach: ignored; did you mean --max-batch?`, with up to
+  three nearest names) and the boot continues exactly as before; a misspelt flag used to
+  disappear silently. Nodes do not warn.
+- **`--help` and `--help-diag`** gained the options of this release, the TP drill paragraph and
+  the corrected `--lane-pack`, `--unclosed-think` and `--vision-cpu` texts. The release binary
+  carries no build-host directory in its panic locations or other strings.
+- **The server prints what it does when a limit or an unsupported combination is applied**
+  rather than refusing: lane packing with an ungated option, a `--max-batch` above 16, an
+  `--exl3-recon-min` the pack cannot serve. The refusals that remain are the ones where
+  continuing would serve wrong output or misstate what is served: a head and a node of
+  different builds, a TP world above 4, a pack the engine cannot read, a deliberately broken
+  KV control, and a wrong value of an option (the engine cannot know what was meant).
 
 ### Investigated — issue #18: no engine defect found
 
@@ -356,13 +719,21 @@ measurement. The Flash-Next guide has a short note on this behaviour.
   eighth request): 203,129 pre-verify rounds in 159.8 minutes, 0 aborts, 0 overwritten slots,
   the round counters equal on both ranks, 368 completed requests and 52 client cancels with 0
   request errors, memory flat.
-<!-- CUT: the candidate was built from master at the time of the run; if the release contains later engine changes (version bump, vision fix, gauges, agreement word), say so here or re-run the affected checks -->
-- **The v0.7.4 release candidate** (a development build made before the release cut; the
-  release binary is built from the public tree and gated again): the six recorded TP=2 identity cells
-  give their recorded hashes; the same configuration as the soak above for 45.5 minutes:
-  58,057 pre-verify rounds, 0 aborts, 0 request errors; the speculation re-probe, the image
-  robustness run, the prefill-interleave identity and the attention-regime checks are reported
-  in their sections above.
+- **A v0.7.4 development build, before the later changes** (the release binary is built from
+  the public tree and gated again): the six recorded
+  TP=2 identity cells give their recorded hashes; the same configuration as the soak above for
+  45.5 minutes: 58,057 pre-verify rounds, 0 aborts, 0 request errors; the speculation re-probe,
+  the image robustness run, the prefill-interleave identity and the attention-regime checks
+  are reported in their sections above. That build did not contain the lane packing, the
+  parser changes, the streaming changes, the lockstep-word change or the option-parsing
+  guards; those were gated separately on later builds, on the request classes named in their
+  sections.
+- **The integration build** (one TP=2 pair, 3.05 pack): a 20-minute run at `--max-seq-len 65536
+  --max-batch 16` with 10 to 16 greedy requests arriving and leaving (1,547 requests, 0 failed,
+  119 waves); a 10-minute image run (`--vision-fail-gemm`): 203 text and 201 image requests,
+  0 wrong, one injected failure served by the CPU tower in 36.3 s while eight GPU images were
+  answered; the banked identity cells again; the head-and-node mismatch refused in both
+  directions; the width drill caught.
 - **No drift across releases.** The published v0.7.2 and v0.7.3 binaries and the candidate
   produce the same per-request texts in the 1/2/3/5/6/8-concurrent identity cell (`IDENT_ALL
   44fe40977a57e9d9`), at every concurrency level of that cell.
@@ -373,20 +744,12 @@ measurement. The Flash-Next guide has a short note on this behaviour.
 
 ### Known limits
 
-- **A GPU vision-tower failure when an image request coincides with a CUDA graph capture**
-  (owner decision pending: dropped if F1 is fixed before the cut). Seen once in 1,138 image
-  requests at TP=2, about ten seconds after the boot's first request, while the scheduler was
-  capturing graphs for
-  newly used step shapes. The request was answered correctly by the CPU tower; nothing else
-  was affected. The CUDA error involved exists only while a graph is being captured, which is
-  mostly in the first seconds after a boot and later whenever a new step shape is first used.
-  The mechanism was read from the code and is not confirmed by an experiment.
-- **The CPU-tower answer is slow at TP=2** (owner decision pending: dropped if F1 is fixed
-  before the cut). 173 to 218 s for one 448 × 448 image on the head (53.8 s on one machine).
-  Other requests and other images are not slowed, but a client with a 60 to 120 s timeout
-  gives up before the answer arrives.
-- **Not covered by the image verification:** image traffic on one machine (TP=1) against graph
-  capture, a continuous image hour without restarts, and TP=4.
+- **Image traffic that was not covered by the verification:** one machine (TP=1) against
+  graph capture beyond the five boots of the vision section, a continuous image hour
+  without restarts, and TP=4.
+- **The CPU-tower answer is slow** (minutes for a 448 x 448 image at one thread, longer for a
+  larger image; `--vision-cpu-threads` shortens it). It runs only when the GPU tower failed. A
+  client with a 60 to 120 s timeout gives up before the answer arrives.
 - **Sampler defaults differ between the two endpoints.** When a request omits the fields:
   `/v1/chat/completions` on the EXL3 server uses temperature 1.0 / top_p 0.95 / top_k 20 when
   the prompt opens a thinking block and 0.7 / 0.8 / 20 otherwise; on the NVFP4 server it uses
@@ -398,28 +761,151 @@ measurement. The Flash-Next guide has a short note on this behaviour.
   the flag. Greedy decoding needs an explicit `temperature: 0` on either endpoint. The chat
   values are constants in the engine; they are not read from the pack's
   `generation_config.json`.
-- **A non-streaming chat request that ends inside its thinking block** returns that text in
-  `content` with an empty `reasoning_content`; the streaming path sends the same text as
-  `reasoning_content`.
 - **The tuner's speculative rounds are not stopped at the 2,051-token switch.** The server and
   the benchmark rounds are; the four rounds inside the autotune harness are not.
 - **`--prefill-interleave` at the default chunk width** leaves a stall of about 5.4 s for a
   20K-token joining prompt (see its section); it is ignored under TP.
-<!-- CUT: drop the next entry if the agreement-word widening (AGREE16) is merged before the cut -->
-- **TP agreement check, width field.** The per-step agreement word that the TP ranks compare
-  carries the row count of a step in 4 bits, so a 15-row and a 16-row step are not
-  distinguished by it. This predates v0.7.3 and no failure has been attributed to it; the
-  wider field is planned and is not in this release.
+- **Tool calls:** a value that quotes a call with two or more parameters is still read wrongly at
+  default flags (see "Fixed — tool calls that quote tool calls"). A quoted call whose last argument is
+  blank lets the quoted call after it through as a call, under every setting. The Hy3 and DeepSeek
+  V4 tool-call formats keep the old value and block rules. A tool call written inside an
+  unclosed think block is returned as a call (the parse of an unclosed block is deliberate: the
+  model sometimes jumps straight to a call).
+- **A non-streaming chat response that ends inside its thinking block** now returns its text in
+  `reasoning_content` (see the behaviour table); a client that reads `message.content` of a call
+  with a small `max_tokens` on a thinking prompt gets an empty string.
+- **Options that are still read by hand outside the option registry** (173 value-taking flags
+  of the mode dispatch) keep their own value readers, now guarded by the one swallow check; moving them into
+  the registry is planned.
+- **A 6-bit pack (the 4.05 pack) with `--max-batch` above 16**, and the host-routed MoE arm
+  (`--exl3-moe-devroute 0`, a diagnostic), have no boot-time refusal; the first fails loudly at the
+  first 17-row step, the second has no bit-width guard (no shipped pack has 6-bit routed experts).
+- **The count of ignored unknown options is not exported by v0.7.4.** The engine keeps the
+  count but does not render it on `/metrics` (a known gap, fixed in the next release). The
+  `[opts] unknown option ...` warning line printed at startup is the signal.
+  `scripts/owner_check.py` (shipped in the repository from this release) says "NOT EXPORTED by
+  this build" for a series that is absent and never reads an absent series as "all clear".
 - **Still open from earlier releases:** the legacy minimal DSV4 server does not report the
-  newer usage fields; two and three concurrent requests on the EXL3 path still share the
-  single-request aggregate rate (the packed multi-request verify is not wired into serving).
+  newer usage fields; a JSON schema sent in `response_format` is accepted but not enforced (the
+  reply header `x-json-schema-enforced: none` says so); on several machines an error in a step stops
+  the whole server, which then restarts.
 
-### Not in this release
+### What is not included in this build
 
-<!-- CUT: revise this paragraph if the KV gauges (issue #24) or YaRN (pull request #22) are merged before the cut -->
-YaRN for the EXL3 path (issue #19, pull request #22): planned; it builds on the window fix of
-#21, which is in this release. KV pool occupancy gauges on `/metrics` (issue #24): planned for
-the release after this one.
+v0.7.4 is a fix release. It closes reported defects and it does **not** contain the performance
+work for the kind of request most people actually send. We would rather say that here than
+have it found out with a stopwatch.
+
+**Speed with sampling (temperature above 0).** Most of the speed figures we have published were
+measured with greedy requests (temperature 0), one request at a time, often on code. Requests
+that sample, which is what a client gets when it sends no sampler settings, are slower: fewer of
+the tokens the engine drafts ahead are accepted, so each round yields less.
+
+- The headline decode figures for Qwen3.8-Flash-Next (137 / 186 / 221 tok/s on one / two / four
+  machines) are for a single request generating code with low reasoning effort. On the same
+  four-machine build we measured 228 tok/s for greedy code, 121 tok/s for greedy prose and about
+  100 tok/s for a single sampled request at temperature 0.8.
+- On one machine (3.05 bpw pack, 512-token replies, one request): a code prompt ran at about 94
+  tok/s greedy and about 97 tok/s sampled with thinking off (temperature 0.7). With thinking on
+  (temperature 1.0) the same prompt ran at 59 to 69 tok/s: the engine drafted 2.6 tokens ahead
+  per round and 58 % of them were accepted, against 5.8 and 68 % with thinking off. We have not
+  yet separated how much of that drop is the temperature and how much is the text itself
+  (reasoning text is harder to draft than code).
+- The settings that steer speculation (how far ahead to draft, when to stop drafting, when to
+  switch speculation off) were chosen on greedy measurements. They have not been re-tuned for
+  sampled text.
+
+**Two to four requests at the same time.** With two, three or four requests running, the server
+either lets them take turns or serves all of them in one shared step with speculation switched
+off. In both cases the **total** is about what a single request gets, and each request gets a
+fraction of it.
+
+- Measured on one machine with sampled requests (4.05 bpw pack, a single run): each request ran
+  at about 25 tok/s with two at once and about 15 tok/s with four.
+- The concurrency gains published earlier (for eight and sixteen requests) were measured with
+  greedy 256-token code requests.
+- **New in this build, ON by default: lane packing (`--lane-pack`; `--lane-pack off` restores
+  the previous behaviour)** (see its section for every figure and its request class). Two
+  requests share one verification pass. These figures are what was measured, and they are
+  smaller than the headline suggests: on one machine, with sampled requests and short prompts,
+  two together ran 1.15 to 1.34 times faster; on two machines, with short prompts of about 75
+  tokens and 512 forced tokens, 1.17 to 1.32 times faster, and on agent-style prompts of about
+  5,500 tokens (a first turn, nothing cached) about 12 % at best with thinking on and within
+  noise with thinking off; with three requests there is no gain; with four requests between 8 %
+  slower and about 14 % faster depending on the text. A conversation whose prompt is already
+  cached was not measured. A request that carries a repetition, presence or frequency penalty,
+  or an image, never takes part. It costs about 1.7 to 1.8 GiB of device memory per machine.
+  A failed packed round ends the engine under TP (loudly, on both ranks).
+
+**A new request pauses the others while its prompt is read.** The prompt of an arriving request
+is read in one go, and the requests that are already streaming stand still until that is done.
+On one machine a prompt of about 20,000 tokens paused two running streams for about 14 seconds;
+`--prefill-interleave` reduces that to about 5 seconds there (and to 1.4 to 2.7 s with a smaller
+`--prefill-chunk`, see its section). On two and four machines that option is not available, and we
+have not measured the pause. (On one machine at default flags, a fresh 4,566-token prefill
+coincided with a 3.4 s gap in a second running stream.)
+
+**The prompt cache belongs to a request slot.** A conversation's next turn reuses its cached
+prompt only if the slot that holds it is free. With several conversations interleaved, one can
+push another out, and the whole prompt is then read again (and the others pause, as above). In
+one real agent session on one machine, such re-reads took 23 % of the wall time.
+
+**Requests with a presence, repetition or frequency penalty.** A penalty adds a step to every
+token. The only measurements we have are single runs: about 6 to 18 % slower per token with a
+presence penalty of 1.5 on one machine, and 73.6 against 107.3 tok/s for two such requests on two
+machines. Such requests also do not take part in `--lane-pack`, and on several machines they use
+a heavier exchange between the machines.
+
+**Tool calls that quote tool calls.** See "Fixed — tool calls that quote tool calls": a value that
+quotes a call with two or more parameters is still read as a cut value plus extra calls at
+default flags. Two opt-in readings exist and neither is the default yet; `--tool-shadow-cost on`
+counts how often they would differ on a server's own traffic, which is how the default will be chosen.
+
+**Not run on hardware for this release** (every statement above that names a request class was
+measured on that class and no other):
+
+- **What was exercised on this build, stated plainly.** The maintainer exercised a single
+  machine, a single machine at `--max-batch 1`, TP=2 and TP=4 by hand, on the release build
+  before lane packing became the default (the flag typed `--lane-pack on`). No automated gate
+  chain was run on this exact binary, TP=4 included: the gates of the candidate
+  `7a4117643a52` (TP=1 and a TP=2 pair) are carried over by argument, since the changes after
+  it do not touch the serving path except as follows. The default path (the flag NOT typed)
+  differs from the typed-flag path only in how the option is resolved and agreed between
+  machines; that code was read, not booted by a test session; `--tool-unclosed drop` as the
+  default is the v0.7.3 reading, which the in-tree differential tests pin.
+- Four machines (TP=4): not run by any gate session; the maintainer's hand test is the only
+  evidence there. A warm multi-turn agent conversation with lane packing, and the four-request
+  off/on speed pairs after the shared-step probe of this release, were not measured.
+- The DeepSeek V4 server (the streamer move and the greedy `timings` correction), DFlash under
+  TP, images together with `--lane-pack`, and the NVFP4 `--rope-yarn-factor 2 --max-seq-len
+  524288` guard.
+- Long runs: the longest uninterrupted runs behind this release are 30 minutes at TP=2 with
+  lane packing on (782 streamed requests), 45.5 minutes at TP=2 at default flags on a
+  development build, and 159.8 minutes at TP=2 on the published v0.7.3 binary. No soak of the
+  v0.7.4 release binary was run; the maintainer will schedule a long comprehensive soak after
+  the release.
+
+### What's next
+
+The next release (v0.7.5) is about one thing: **speed for the requests people actually send.**
+In this order:
+
+1. **Measure first, and publish it.** A baseline at the settings a default client uses (sampling
+   at the model's defaults, thinking on, one to four requests at once, on one, two and four
+   machines, with realistic prompt sizes). From then on every speed figure we publish states its
+   sampler, the number of concurrent requests and the number of machines, and greedy figures are
+   labelled as such.
+2. **Speculation tuned for sampled text.** Draft depth, the acceptance rule and the stop
+   thresholds re-measured and re-set at those settings instead of greedy.
+3. **Two to four concurrent requests.** Packing for three and four requests, on several machines,
+   and for requests with a penalty (that code is written and has not yet run on hardware).
+4. **A new request must not freeze the others**, on one machine and on several.
+5. **A prompt cache that several conversations can share.**
+
+We will not put numbers on these before we have measured them. Also known and not in this
+release: the Hy3 and DeepSeek V4 tool-call formats (parked until those models are in scope),
+unclosed tool-call blocks cut inside an argument (still dropped), YaRN for the EXL3 path
+(issues #19 and #22), and moving the hand-read flags into the option registry.
 
 ## v0.7.3 — reported-issue fixes: TP=2 pre-verify race, exllamav3 1.5.x pack loading, cached-token accounting; tool-call parsing; long-running hardening
 

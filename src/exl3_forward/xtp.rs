@@ -808,6 +808,9 @@ pub fn rail2_nway_base_for(world: i32, base1: u16) -> Result<u16> {
 /// their W=4 hardware proof is the TP-4E gate list (PLAN/TP-4E_GATES.md).
 pub fn world_gt2_flag_refusals(world: i32) -> Result<()> {
     tp_reduce_refusal(tp_reduce_explicit_single(), world, dec_xport_mode())?;   // TP-4F2: refusal-only; `auto` / `rd` never refuse
+    // PACK4-REVIEW B1: the --lane-pack world rule, before any network: the head runs this ahead of
+    // discovery and the config ship, a node ahead of its link bring-up. (Runs at TP=1, TP=2 and TP=4.)
+    lane_pack_world_refusal(world, crate::opts::var(crate::opt!("lane-pack")).ok().as_deref())?;
     if world <= 2 { return Ok(()); }
     anyhow::ensure!(world == 4, "EXL3 TP: --tp 2 or --tp 4 only (got {world})");
     anyhow::ensure!(!crate::opts::var(crate::opt!("tp-oneshot")).map_or(false, |v| v != "0"),
@@ -817,6 +820,15 @@ pub fn world_gt2_flag_refusals(world: i32) -> Result<()> {
         "EXL3 TP world {world}: --tp-dec-grecv is world 2 only (the N-way proxy's recv loop has no rx_done skip, so the \
          GPU-side payload-tail receive can race it — TP-4F); leave the flag unset or pass --tp-dec-grecv 0");
     ep_deal4::flag_refusal(&ep_deal_kind(), world)?; // --ep-deal freq: world 4 only (table validated here, pre-load)
+    Ok(())
+}
+
+/// PACK4-REVIEW B1: the `--lane-pack` rule of `world_gt2_flag_refusals`, pure (value = the flag's raw
+/// text, None = unset): a world above `lane_pack::LANE_PACK_MAX_WORLD` (4) refuses `on` / `2`.
+pub(crate) fn lane_pack_world_refusal(world: i32, value: Option<&str>) -> Result<()> {
+    anyhow::ensure!(world <= crate::lane_pack::LANE_PACK_MAX_WORLD as i32 || value.map_or(true, |v| matches!(v.trim(), "" | "off")),
+        "EXL3 TP world {world}: --lane-pack runs at TP=1, TP=2 and TP=4 (no packed lockstep frame exists above four boxes) \
+         — start the head with --lane-pack off");
     Ok(())
 }
 
@@ -965,7 +977,10 @@ fn align_round_phase(dev: &Arc<CudaDevice>, kern: &crate::tp_xport::Kernels, str
 /// failure anywhere fails EVERY rank, loudly, in seconds. Runs only at world > 2
 /// (world 2 keeps its TP-F bring-up unchanged).
 fn rail2_preflight(rank: i32, dev2: &str) -> Result<()> {
-    let (ok, why) = rail_device_state(std::path::Path::new("/sys/class/infiniband"), dev2, crate::tp::GID_IDX);
+    // S-B9-REL-PRPORT3 (review R6): resolve ONCE and print the RESOLVED index in the refusal —
+    // the static GID_IDX default can differ from what the sysfs scan picked for this boot.
+    let gid_idx = crate::tp::resolve_gid_idx(dev2);
+    let (ok, why) = rail_device_state(std::path::Path::new("/sys/class/infiniband"), dev2, gid_idx);
     if !ok { println!("[exl3-tp] rank {rank}: rail 2 preflight FAILED locally: {why}"); }
     let all = crate::net::exchange_u32s_all(&[preflight_word(ok), rank as u32], 4)
         .context("TP-4E rail 2 preflight exchange (rail 1 control plane)")?;
@@ -974,7 +989,7 @@ fn rail2_preflight(rank: i32, dev2: &str) -> Result<()> {
         "TP-4E dual-rail bring-up refused before any rail-2 dial: {} (this rank: {why}). Every rank needs the second RDMA device \
          (--rdma-dev <first>,<second>; default second entry roceP2p1s0f1) present with port 1 state 4 (ACTIVE) and a non-zero \
          RoCE v2 GID at index {}; run with --tp-prefill-xport single only as an explicit, owner-consented opt-out",
-        bad.join("; "), crate::tp::GID_IDX);
+        bad.join("; "), gid_idx);
     Ok(())
 }
 
@@ -1095,7 +1110,7 @@ impl TpState {
                     let port = crate::tp::TP_PORT + TP_AUX_PORT_OFF;
                     if t.rank != 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
                     let l2 = crate::net::TpLink::connect(t.rank, if t.rank == 0 { "" } else { &peer_ip }, port, &dev2,
-                                                         crate::tp::GID_IDX, crate::tp::TP_SLOT_BYTES)
+                                                         crate::tp::resolve_gid_idx(&dev2), crate::tp::TP_SLOT_BYTES)
                         .with_context(|| format!("TP-F rail 2 ({dev2}, port {port}, peer {peer_ip})"))?;
                     (l2, format!("TCP {port}, peer {peer_ip}"))
                 } else {
@@ -1107,7 +1122,7 @@ impl TpState {
                     let base = rail2_nway_base(t.world)?;
                     let ips = crate::tp::resolve_topology(t.world)?;
                     let l2 = crate::net::TpLink::connect_nway(t.rank, t.world, &ips, base, &dev2,
-                                                              crate::tp::GID_IDX, crate::tp::TP_SLOT_BYTES)
+                                                              crate::tp::resolve_gid_idx(&dev2), crate::tp::TP_SLOT_BYTES)
                         .with_context(|| format!("TP-4E rail 2 N-way link ({dev2}, TCP base {base}, world {})", t.world))?;
                     (l2, format!("N-way, TCP base {base}, {} peers", t.world - 1))
                 };
@@ -1140,7 +1155,7 @@ impl TpState {
             let ips = crate::tp::resolve_topology(t.world)?;
             let dev1 = crate::tp::rdma_dev();
             let mut l3 = crate::net::TpLink::connect_nway_uniform(t.rank, t.world, &ips, base, &dev1,
-                                                                  crate::tp::GID_IDX, XPORT_MIN_BYTES)
+                                                                  crate::tp::resolve_gid_idx(&dev1), XPORT_MIN_BYTES)
                 .with_context(|| format!("TP-4F2 single-stage ctx ({dev1}, TCP base {base}, world {})", t.world))?;
             l3.set_payload(h * 4, true).context("single-stage ctx net_set_payload")?;
             l3.set_parent(addr);
@@ -1440,26 +1455,42 @@ impl FwdModel {
     /// -> merged ids in sc.argmax). Only a greedy, unpenalized, non-ratio-rule step / verify round
     /// with <= 16 rows takes it; everything else runs the replicated head.
     pub(super) fn vp_greedy(&self, sc: &Scratch, m: usize) -> bool {
-        self.lm_head_vp.is_some() && (1..=16).contains(&m) && !sc.samp_live && !sc.pen_live && !sc.rq_live
+        self.vp_greedy_st(sc.samp_live, sc.pen_live, sc.rq_live, m)
+    }
+
+    /// `vp_greedy` for an explicit sampler state (S-B9-CF-PACK5: the packed graph FAMILIES are keyed
+    /// and captured per state without mutating the packed scratch's shadows).
+    pub(super) fn vp_greedy_st(&self, samp: bool, pen: bool, rq: bool, m: usize) -> bool {
+        self.lm_head_vp.is_some() && (1..=16).contains(&m) && !samp && !pen && !rq
             && !GATE_VP_OFF.load(AtOrd::Relaxed) && !GATE_VP_GATHER.load(AtOrd::Relaxed)
     }
 
     /// TP-H2 (`--tp-vp-sampled`): the rows vp_greedy refuses (sampled / penalized / ratio-rule) take the
     /// shard GEMM + row all-gather tail (vp_gather_rows) and then the unchanged pen / argmax / sampler.
     pub(super) fn vp_gather(&self, sc: &Scratch, m: usize) -> bool {
+        self.vp_gather_st(sc.samp_live, sc.pen_live, sc.rq_live, m)
+    }
+
+    /// `vp_gather` for an explicit sampler state (see `vp_greedy_st`).
+    pub(super) fn vp_gather_st(&self, samp: bool, pen: bool, rq: bool, m: usize) -> bool {
         if self.lm_head_vp.is_none() || !(1..=16).contains(&m) || GATE_VP_OFF.load(AtOrd::Relaxed) { return false; }
         // the row all-gather has kernels at world 2 (TP-H2: peer rank ^ 1) and world 4 (TP-4H2: recursive
         // doubling) only — never live at another world, whatever the code says (resolve_vp_sampled resolves
         // it OFF / refuses there; this is the structural backstop)
         if self.tp.as_ref().map_or(true, |t| t.world != 2 && t.world != 4) { return false; }
         if GATE_VP_GATHER.load(AtOrd::Relaxed) { return true; }
-        vp_sampled_on() && (sc.samp_live || sc.pen_live || sc.rq_live)
+        vp_sampled_on() && (samp || pen || rq)
     }
 
     /// Graph-key bits for the vp tails: bit 45 = the greedy key-exchange tail (TP-H #4), bit 46 = the
     /// TP-H2 row all-gather tail. Both are capture-time properties of the graph.
     pub(super) fn vp_key(&self, sc: &Scratch, m: usize) -> usize {
-        ((self.vp_greedy(sc, m) as usize) << 45) | ((self.vp_gather(sc, m) as usize) << 46)
+        self.vp_key_st(sc.samp_live, sc.pen_live, sc.rq_live, m)
+    }
+
+    /// `vp_key` for an explicit sampler state (see `vp_greedy_st`).
+    pub(super) fn vp_key_st(&self, samp: bool, pen: bool, rq: bool, m: usize) -> usize {
+        ((self.vp_greedy_st(samp, pen, rq, m) as usize) << 45) | ((self.vp_gather_st(samp, pen, rq, m) as usize) << 46)
     }
 
     /// TP-H2: the shard GEMM into sc.vp_rows [m][n_sh], then the row all-gather into sc.logits [m][V]
@@ -1844,6 +1875,16 @@ fn sha256_hex(path: &str) -> String {
         Ok(b) => { let d = Sha256::digest(&b); d.iter().map(|x| format!("{x:02x}")).collect() }
         Err(_) => "missing".to_string(),
     }
+}
+
+/// The per-step tripwire of the harness passes (`run_tp_xtp`): both ranks publish (step, argmax) and COMPARE.
+/// S-B9-CF-AGREE16B (W6): the three passes used to test `agree_ext(..).is_none()` alone, which at TP=2 is
+/// only "the link is up": `net_agree` hands back the PEER's token and nobody looked at it, so two ranks
+/// with different argmaxes agreed step after step (the served path has compared since TP-E; at world > 2
+/// the hub compares inside `agree_ext`). `tp_agree_eq` is that comparison; on a mismatch the link is
+/// aborted so the peer fails at its next collective instead of at a 10 s timeout.
+fn probe_agree(step: u64, argmax: u32) -> std::result::Result<(), String> {
+    crate::exl3_serve::tp_agree_eq(step, 0, 1, argmax).map_err(|why| { crate::net::abort_link(); why })
 }
 
 /// `TP-IDENT` — binary sha256 + the two PTX modules this path loads + the build token.
@@ -2669,7 +2710,7 @@ fn gates_inner(model: &FwdModel, psc: Option<&mut PrefillScratch>, prompt: &[u32
                sync: &mut dyn FnMut(u64, u32) -> Result<u32>) -> Result<(bool, Vec<String>)> {
     let v = model.cfg.vocab_size;
     let w = nmax.max(2);
-    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim, model.max_pos)?;
     let plen = prompt.len();
     anyhow::ensure!(plen >= 2 && nmax >= 1 && nmax <= MTP_MAX_K + 1, "gates: prompt >= 2 tokens, 1 <= N <= {}", MTP_MAX_K + 1);
     let mut psc = psc;
@@ -2947,7 +2988,7 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
     println!("{}", identity_line("xtp-ref"));
     println!("XTP_REF program {} (prompt {} tokens, gen {gen})", opts.to_mode(), prompt.len());
     let model = FwdModel::load(dir, 1, max_pos)?;
-    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1)?;
+    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1, model.max_pos())?;
     let mut psc_store = match opts.pf_chunk { Some(c) => Some(model.prefill_scratch(c)?), None => None };
     let plen = prompt.len();
     anyhow::ensure!(plen >= 2 && gen >= 1, "xtp: need a prompt of >= 2 tokens and gen >= 1");
@@ -3149,6 +3190,17 @@ fn sp_check(tag: &str, ent: &Caps, names_bad: &mut BTreeMap<String, usize>, firs
     Ok((r_whole.len() + s_glob.len() + (1 + all.len().saturating_sub(1)) * s_own.len(), bad))
 }
 
+/// S-B9-REL-INTEG A5: the `G-T1-b RANK_IDENTITY FAIL` line printed when pass 1 ENDS IN AN ERROR (the per-step
+/// agreement tripwire, a dead link): the class table of everything compared up to that step, then the error.
+fn rank_identity_abort_line(n_dig: usize, steps_seen: usize, steps_ok: usize, pf_dig: usize, pf_chunks: usize, pf_bad: usize,
+                            names_bad: &BTreeMap<String, usize>, first_bad: Option<&str>, why: &str) -> String {
+    format!("G-T1-b RANK_IDENTITY FAIL — pass 1 ABORTED after {steps_seen} decode steps ({n_dig} replicated decode buffers \
+             compared{}); steps fully identical {steps_ok}/{steps_seen}; mismatches by class {:?}{}; the error: {why}",
+            if pf_chunks > 0 { format!(", + {pf_dig} whole-chunk prefill digests over {pf_chunks} chunks ({pf_bad} bad)") } else { String::new() },
+            names_bad,
+            first_bad.map(|s| format!("; first: {s}")).unwrap_or_default())
+}
+
 /// The TP=W xtp run (W = ctx.world), every rank (SPMD). `ref_dir` = Some on rank 0 unless `ident` — it reads the
 /// reference and broadcasts the teacher-forced sequence; the node receives it over the link.
 /// `head_prompt` = (prompt, gen) on rank 0 for an `ident` run (no reference).
@@ -3189,7 +3241,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     let model = FwdModel::load_tp(pack_dir, 1, max_pos, Some(TpAttach { rank, world, link }))?;
     println!("[exl3-tp] rank {rank}/{world}: loaded in {:.1}s — trunk per rank: {} q heads / {} kv heads, GDN {} k / {} v heads",
              t_load.elapsed().as_secs_f32(), model.tc.num_heads, model.tc.num_kv_heads, model.tc.lin_num_k_heads, model.tc.lin_num_v_heads);
-    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1)?;
+    let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1, model.max_pos())?;
     let mut psc_store = match opts.pf_chunk { Some(c) => Some(model.prefill_scratch(c)?), None => None };
     let cmp = plen - 1;
     let prompt = seq[..plen].to_vec();
@@ -3200,6 +3252,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     let mut first_bad: Option<String> = None;
     let mut n_dig = 0usize;
     let mut steps_ok = 0usize;
+    let mut steps_seen = 0usize;
     let (mut pf_dig, mut pf_bad, mut pf_chunks) = (0usize, 0usize, 0usize);
     let mut check = |tag: &str, ent: &Caps, names_bad: &mut BTreeMap<String, usize>, first_bad: &mut Option<String>| -> Result<(usize, usize)> {
         let rep: Vec<&(String, Vec<f32>)> = ent.iter().filter(|(n, _)| !rank_local_capture(n)).collect();
@@ -3229,7 +3282,9 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     }
     let t1 = std::time::Instant::now();
     let forced = if opts.ident_only { None } else { Some(seq.as_slice()) };
-    let p1 = trace_pass(&model, &mut sc, psc_store.as_mut(), true, &prompt, forced, gen, cmp, None, rank == 0,
+    // (a `let` of its own: the closures below are temporaries of THIS statement, so the tallies they borrow are free
+    // again for the abort report; in a `match` scrutinee they would live to the end of the match)
+    let r1 = trace_pass(&model, &mut sc, psc_store.as_mut(), true, &prompt, forced, gen, cmp, None, rank == 0,
         &mut |k, ent| {
             let (n, bad) = if ent.iter().any(|(n, _)| n.starts_with("R:")) {
                 sp_check(&format!("prefill chunk {k}"), ent, &mut nb2, &mut fb2, &mut spt, rank as usize)?
@@ -3242,13 +3297,25 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         &mut |t, ent, am| {
             let (n, bad) = check(&format!("step {t}"), ent, &mut names_bad, &mut first_bad)?;
             n_dig += n;
+            steps_seen += 1;
             if bad == 0 { steps_ok += 1; }
             // the per-step agreement tripwire (argmax + step), AGENTS §2.10
-            if crate::net::agree_ext(t as u64, 0, 1, am).is_none() {
-                anyhow::bail!("TP agree() failed at step {t} (argmax {am}) — ranks diverged or the link aborted");
-            }
+            probe_agree(t as u64, am).map_err(|why| anyhow::anyhow!("TP agree() failed at step {t} (argmax {am}): {why} — \
+                ranks diverged or the link aborted"))?;
             Ok(())
-        })?;
+        });
+    let p1 = match r1 {
+        Ok(p) => p,
+        Err(e) => {
+            // S-B9-REL-INTEG A5: a divergence that flips an argmax fails the per-step tripwire above and used to return
+            // through `?` BEFORE the class table was printed; the digests of the steps compared so far are the evidence.
+            for (k, v) in &nb2 { *names_bad.entry(format!("prefill:{k}")).or_default() += v; }
+            if first_bad.is_none() { first_bad = fb2.clone(); }
+            println!("{}", rank_identity_abort_line(n_dig, steps_seen, steps_ok, pf_dig, pf_chunks, pf_bad, &names_bad,
+                                                    first_bad.as_deref(), &format!("{e:#}")));
+            return Err(e);
+        }
+    };
     let pass1_s = t1.elapsed().as_secs_f64();
     let (am1, lg1, lay1, pt0) = (p1.am, p1.lg, p1.at_cmp, p1.t0);
     let total_steps = am1.len();
@@ -3276,9 +3343,8 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     let t2 = std::time::Instant::now();
     let p2 = trace_pass(&model, &mut sc, psc_store.as_mut(), false, &prompt, None, gen, cmp, None, false, &mut |_, _| Ok(()),
         &mut |t, _ent, am| {
-            if crate::net::agree_ext((1 << 20) + t as u64, 0, 1, am).is_none() {
-                anyhow::bail!("TP agree() failed in the greedy pass at step {t}");
-            }
+            probe_agree((1 << 20) + t as u64, am).map_err(|why| anyhow::anyhow!("TP agree() failed in the greedy pass at \
+                step {t} (argmax {am}): {why}"))?;
             Ok(())
         })?;
     let pass2_s = t2.elapsed().as_secs_f64();
@@ -3310,9 +3376,8 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     // ---- TP-B: untraced timing pass (eager; not a perf claim) ----
     if opts.time_tokens > 1 {
         let (pf_s, ms, ids) = time_pass(&model, &mut sc, psc_store.as_mut(), &prompt, opts.time_tokens, &mut |i, am| {
-            if crate::net::agree_ext((2 << 20) + i as u64, 0, 1, am).is_none() {
-                anyhow::bail!("TP agree() failed in the timing pass at token {i}");
-            }
+            probe_agree((2 << 20) + i as u64, am).map_err(|why| anyhow::anyhow!("TP agree() failed in the timing pass at \
+                token {i} (argmax {am}): {why}"))?;
             Ok(())
         })?;
         println!("XTP_TIME TP={world} rank {rank}: prefill {pf_s:.3}s ({plen} tok{}) | decode eager {ms:.2} ms/token over {} tokens (48 x 3 all-reduces per token){}",
@@ -3430,6 +3495,7 @@ impl FwdModel {
         unsafe {
             if sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut n) != sys::CUresult::CUDA_SUCCESS {
                 println!("TP-SPINE {what} m={m}: node query failed — graph discarded (eager)");
+                crate::metrics::graph_capture_lost(what, &format!("spine audit, width/index {m}"), "tp_spine_audit: node query failed");
                 return false;
             }
         }
@@ -3446,6 +3512,7 @@ impl FwdModel {
         });
         if !ok_e {
             println!("TP-SPINE {what} m={m}: edge query failed — graph discarded (eager)");
+            crate::metrics::graph_capture_lost(what, &format!("spine audit, width/index {m}"), "tp_spine_audit: edge query failed");
             return false;
         }
         let idx: std::collections::HashMap<usize, usize> = nodes.iter().enumerate().map(|(i, &p)| (p as usize, i)).collect();
@@ -3489,7 +3556,11 @@ impl FwdModel {
         }
         let ok = bad == 0;
         if ok { SPINE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        else { SPINE_BAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        else {
+            SPINE_BAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // S-B9-REL-INTEG C1: the refusal discards the graph (the shape runs eager): it is a lost capture
+            crate::metrics::graph_capture_lost(what, &format!("spine audit, width/index {m}"), "tp_spine_audit: a barrier has a concurrent node");
+        }
         // TP-H2: also log the first graph of every new (class, width, doorbell count) — the sampled-row gather
         // graphs are captured at runtime, after the boot precapture has used up the first 24 lines
         let new_shape = SPINE_SEEN.lock().map(|mut s| s.insert((what.to_string(), m, bells.len()))).unwrap_or(false);
@@ -3535,6 +3606,39 @@ mod geometry_tests {
         // TP-4E: the DEFAULT dual-rail prefill transport is admitted at world 4 (its second rail is an N-way link)
         assert!(world_gt2_flag_refusals(4).is_ok(), "the default posture must be admitted at world 4: {:?}",
                 world_gt2_flag_refusals(4).err());
+    }
+
+    /// PACK4-REVIEW B1: `--lane-pack on` is refused by the SAME pre-network hook the other flag
+    /// refusals use (head: before discovery; node: before the link), at every world above the gated
+    /// one, and the default (off / unset) boots everywhere. Order pinned in source: the hook runs it
+    /// BEFORE the world <= 2 early return.
+    #[test]
+    fn lane_pack_is_refused_by_the_pre_network_hook() {
+        let max = crate::lane_pack::LANE_PACK_MAX_WORLD as i32;
+        assert_eq!(max, 4, "TP=1, TP=2 and TP=4 (owner 2026-10-10: the TP=4 refusal is lifted)");
+        for w in 1..=8 {
+            for v in [None, Some(""), Some("off"), Some(" off ")] {
+                assert!(lane_pack_world_refusal(w, v).is_ok(), "world {w} {v:?}: the default must boot");
+            }
+            for v in [Some("on"), Some("2")] {
+                assert_eq!(lane_pack_world_refusal(w, v).is_err(), w > max, "world {w} {v:?}");
+                if w > max {
+                    let e = lane_pack_world_refusal(w, v).unwrap_err().to_string();
+                    assert!(e.contains("--lane-pack") && e.contains(&format!("world {w}")), "{e}");
+                }
+            }
+        }
+        let src = include_str!("xtp.rs");
+        let f = &src[src.find("pub fn world_gt2_flag_refusals(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        let call = f.find("lane_pack_world_refusal(world, crate::opts::var(crate::opt!(\"lane-pack\")).ok().as_deref())?;").expect("wired");
+        assert!(call < f.find("if world <= 2 { return Ok(()); }").unwrap(), "before the early return");
+        // the call sites that matter: the serve head before discovery, the node before its link
+        let main = include_str!("../main.rs");
+        let head = &main[main.find("fn run_exl3_tp_serve_head(").unwrap()..];
+        assert!(head.find("world_gt2_flag_refusals(world as i32)").unwrap() < head.find("run_head_retain(").unwrap());
+        let node = &main[main.find("fn exl3_tp_node_prelink(").unwrap()..];
+        assert!(node.contains("world_gt2_flag_refusals(tpc.world as i32)?;"));
     }
 
     #[test]
@@ -3677,7 +3781,7 @@ mod geometry_tests {
         // device state against a fake sysfs tree (state + GID 3 + its type)
         let root = std::env::temp_dir().join(format!("tp4e_ib_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        const GOOD_GID: &str = "0000:0000:0000:0000:0000:ffff:c0a8:b10d\n";
+        const GOOD_GID: &str = "0000:0000:0000:0000:0000:ffff:c000:020d\n"; // 192.0.2.13 (RFC 5737), IPv4-mapped
         let mk = |dev: &str, state: Option<&str>, gid: Option<&str>, ty: Option<&str>| {
             let p = root.join(dev).join("ports/1");
             for d in ["gids", "gid_attrs/types"] { std::fs::create_dir_all(p.join(d)).unwrap(); }
@@ -3952,5 +4056,54 @@ mod geometry_tests {
         }
         assert_eq!(c.num_experts / 4, 128);
         assert_eq!((c.vocab_size / 4, c.vocab_size / 4 / 128), (62080, 485), "vocab shard at W=4");
+    }
+}
+
+/// S-B9-CF-AGREE16B (W6): the harness passes compare the peer's word. The sites need a live link, so they
+/// are pinned in the source; the comparison itself (`exl3_serve::tp_agree_eq` -> `tp_agree_decide`) has its
+/// own exhaustive tests.
+#[cfg(test)]
+mod agree16b_tests {
+    #[test]
+    fn the_harness_passes_compare_the_peers_agree_word() {
+        let src: String = include_str!("xtp.rs").lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let src = &src[..src.find("mod agree16b_tests").unwrap()];   // (not this module's own needles)
+        let raw = ["agree", "_ext("].concat();
+        assert_eq!(src.matches(&raw).count(), 0, "a harness pass calls the raw agree and can only test `is_none()` on it");
+        let probe = ["probe", "_agree("].concat();
+        assert_eq!(src.matches(&probe).count(), 4, "one definition and the three passes (identity, greedy, timing)");
+        let def = &src[src.find("fn probe_agree(").expect("probe_agree")..];
+        let def = &def[..def.find("\n}").unwrap()];
+        assert!(def.contains("crate::exl3_serve::tp_agree_eq(step, 0, 1, argmax)") && def.contains("abort_link()"), "{def}");
+        // what that comparison does with a peer whose argmax differs (the case the old sites let through)
+        let peer = |am: u32| crate::net::agree_token_reply(crate::net::agree_token(7, 0, 1, am));
+        assert_eq!(crate::exl3_serve::tp_agree_decide(0, 1, 1234, Some(peer(1234))), Ok(()));
+        for other in [1235u32, 0, 1234 ^ (1 << 31), 1234 ^ (1 << 27)] {
+            assert!(crate::exl3_serve::tp_agree_decide(0, 1, 1234, Some(peer(other))).is_err(), "argmax 1234 vs {other}");
+        }
+        assert!(crate::exl3_serve::tp_agree_decide(0, 1, 1234, None).is_err(), "an aborted link");
+    }
+
+    /// S-B9-REL-INTEG A5: a divergence that flips an argmax fails the per-step tripwire INSIDE pass 1; the class
+    /// table of what was compared must be printed before the error propagates (it used to return through `?` first).
+    #[test]
+    fn a_pass_one_error_still_prints_the_class_table() {
+        let mut nb = std::collections::BTreeMap::new();
+        nb.insert("yatt".to_string(), 3usize);
+        nb.insert("prefill:xpre".to_string(), 1usize);
+        let l = super::rank_identity_abort_line(480, 10, 7, 96, 2, 1, &nb, Some("step 9 buffer yatt12"),
+                                                "TP agree() failed at step 9 (argmax 5): ranks diverged");
+        assert!(l.starts_with("G-T1-b RANK_IDENTITY FAIL"), "{l}");
+        for needle in ["mismatches by class {\"prefill:xpre\": 1, \"yatt\": 3}", "steps fully identical 7/10",
+                       "first: step 9 buffer yatt12", "2 chunks (1 bad)", "the error: TP agree() failed at step 9"] {
+            assert!(l.contains(needle), "{needle:?} missing from {l}");
+        }
+        // the wiring: pass 1's Result is inspected (Err prints the line, then returns it), not `?`-propagated
+        let src: String = include_str!("xtp.rs").lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let src = &src[..src.find("mod agree16b_tests").unwrap()];
+        let at = src.find("let r1 = trace_pass(").expect("pass 1 keeps its Result");
+        let tail = &src[at..];
+        let tail = &tail[..tail.find("let pass1_s").unwrap()];
+        assert!(tail.contains("rank_identity_abort_line(") && tail.contains("return Err(e)"), "{tail}");
     }
 }

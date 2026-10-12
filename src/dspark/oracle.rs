@@ -57,8 +57,8 @@
 //!   `Qwen3_5RMSNorm` is `(1+w)·x`; the workdoc binding rule pins `(1+w)` — flag the naming trap).
 //!
 //! * **(G) k_verify convention.** `k_verify` is the verify WIDTH (`[1..8]`, 7 drafts + bonus), the
-//!   same quantity the existing `agree_ext` folds into the hash word at bits `[27..31)` as a
-//!   4-bit value (`(k_verify & 0xF) << 27`, see `src/net.rs::agree_ext` + `src/batch.rs::tp_agree_step`).
+//!   same quantity `agree_ext` carries in the token's low word at bits 27..31 (a 5-bit field of its
+//!   own since S-B9-CF-AGREE16, see `src/net.rs::agree_word` + `src/batch.rs::tp_agree_step`).
 //!   Truncation is against the CUMULATIVE survival product (addendum §3.1 K-DSP4: "cumulative
 //!   survival product and the truncation index"), NOT the per-position marginal (the addendum §1
 //!   one-liner "first position below confidence threshold" is read as the survival curve). The

@@ -1,6 +1,6 @@
 [package]
 name = "gb10_inference"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 
 [dependencies]
@@ -53,6 +53,9 @@ zip = "2.2"
 
 [dev-dependencies]
 criterion = "0.5"
+# Paused (virtual) time for the SSE timing tests: `#[tokio::test(start_paused = true)]`. A
+# dev-dependency feature: with resolver 2 (edition 2021) it is not part of `cargo build`.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [build-dependencies]
 cc = "1.0"

@@ -2231,6 +2231,112 @@ pub(crate) fn host_shard_nvfp4_row(wt: &[u8], st: &[u8], m: usize, k: usize, ran
     (q_new, s_new, k_local)
 }
 
+// ---- Launch-argument bit-packings (public PR #21) -------------------------------------------------
+// Several kernels take a geometry tuple packed into one word (the 12-argument launch cap). The fields
+// are fixed-width and the kernels unpack them with fixed masks, so a value one past its width lands in
+// the NEIGHBOURING field: a wrong cache stride, i.e. reads and writes at the wrong device addresses.
+// These checks were debug_assert! (compiled out of every served build); they are release asserts now,
+// and each packing has ONE function so the layout and its bound cannot drift apart.
+
+/// `nh_packed` = nkv(bits 0-9) | hd(10-19) | nh(20-30); gqa_attn_splitk / reduce / sel_prefill unpack
+/// `>> 20`, `(>> 10) & 0x3FF`, `& 0x3FF` from a signed int (nh < 2048 keeps the sign bit clear).
+pub(crate) fn pack_nh(nh: usize, hd: usize, nkv: usize) -> i32 {
+    assert!(nh < 2048 && hd <= 1023 && nkv <= 1023,
+            "nh_packed field overflow (nh {nh} < 2048, hd {hd} <= 1023, nkv {nkv} <= 1023)");
+    ((nh << 20) | (hd << 10) | nkv) as i32
+}
+
+/// `bs_packed` = stride(bits 0-18) | ns_grid(19-24) | batch(25-30) | q_pitch(31-49), a u64 (the
+/// splitk family unpacks `& 0x7FFFF`, `(>> 19) & 0x3F`, `(>> 25) & 0x3F`, `(>> 31) & 0x7FFFF`).
+/// `stride` is the KV cache's positions per slot, i.e. the served window.
+pub(crate) fn pack_bs(stride: usize, ns_grid: usize, batch: usize, q_pitch: usize) -> u64 {
+    assert!(stride < (1 << 19) && ns_grid < (1 << 6) && batch < (1 << 6) && q_pitch < (1 << 19),
+            "bs_packed field overflow (stride {stride} and q_pitch {q_pitch} < 2^19, ns_grid {ns_grid} and \
+             batch {batch} < 2^6) - lower --max-seq-len");
+    ((q_pitch as u64) << 31) | ((batch as u64) << 25) | ((ns_grid as u64) << 19) | (stride as u64)
+}
+
+/// `stride_nkv` = kv_stride(bits 0-18) | nkv(19-31) for rmsnorm_rope_kvwrite_b / _q4_b (`& 0x7FFFF`,
+/// `(unsigned) >> 19`). `kv_stride` is the KV cache's positions per slot.
+pub(crate) fn pack_stride_nkv(nkv: usize, kv_stride: usize) -> u32 {
+    assert!(kv_stride < (1 << 19) && nkv < (1 << 13),
+            "stride_nkv field overflow (kv_stride {kv_stride} < 2^19 cache positions per slot, nkv {nkv} < 2^13) \
+             - lower --max-seq-len");
+    ((nkv as u32) << 19) | (kv_stride as u32)
+}
+
+/// The QSA geometry word = stride(bits 0-19) | qk_dim(20-39) | nblk_stride(40-59); the qsa_* kernels
+/// unpack three `& 0xFFFFF` fields (bits 60+ are kernel flags, OR-ed in by the caller). `stride` is the
+/// key plane's positions per slot: the served window (`max_pos` on the EXL3 engine).
+pub(crate) fn pack_qsa_geom(stride: usize, qk_dim: usize, nblk_stride: usize) -> u64 {
+    assert!(stride < (1 << 20) && qk_dim < (1 << 20) && nblk_stride < (1 << 20),
+            "qsa geom field overflow (stride {stride}, qk_dim {qk_dim}, nblk_stride {nblk_stride}: 20 bits each) \
+             - lower --max-seq-len");
+    (stride as u64) | ((qk_dim as u64) << 20) | ((nblk_stride as u64) << 40)
+}
+
+#[cfg(test)]
+mod geom_pack_tests {
+    //! The unpack expressions below are the kernels' own (gpu_batch.cu: gqa_attn_splitk for nh_packed
+    //! and bs_packed, rmsnorm_rope_kvwrite_b for stride_nkv, qsa_score_b for the geometry word).
+    use super::*;
+
+    fn unpack_nh(w: i32) -> (i32, i32, i32) { (w >> 20, (w >> 10) & 0x3FF, w & 0x3FF) }
+    fn unpack_bs(w: u64) -> (u64, u64, u64, u64) { (w & 0x7FFFF, (w >> 19) & 0x3F, (w >> 25) & 0x3F, (w >> 31) & 0x7FFFF) }
+    fn unpack_stride_nkv(w: u32) -> (u32, u32) { (w & 0x7FFFF, w >> 19) }
+    fn unpack_geom(w: u64) -> (u64, u64, u64) { (w & 0xFFFFF, (w >> 20) & 0xFFFFF, (w >> 40) & 0xFFFFF) }
+
+    /// Every field survives the round trip at its widest value, and at the shipped shapes.
+    #[test]
+    fn fields_round_trip_at_their_widest_values() {
+        assert_eq!(unpack_nh(pack_nh(2047, 1023, 1023)), (2047, 1023, 1023));
+        assert_eq!(unpack_nh(pack_nh(32, 256, 4)), (32, 256, 4));
+        assert_eq!(unpack_bs(pack_bs(524_287, 63, 63, 524_287)), (524_287, 63, 63, 524_287));
+        assert_eq!(unpack_bs(pack_bs(262_144, 32, 8, 10_240)), (262_144, 32, 8, 10_240));
+        assert_eq!(unpack_stride_nkv(pack_stride_nkv(8191, 524_287)), (524_287, 8191));
+        assert_eq!(unpack_stride_nkv(pack_stride_nkv(4, 262_144)), (262_144, 4));
+        assert_eq!(unpack_geom(pack_qsa_geom(1_048_575, 1_048_575, 1_048_575)), (1_048_575, 1_048_575, 1_048_575));
+        assert_eq!(unpack_geom(pack_qsa_geom(262_145, 640, 65_536)), (262_145, 640, 65_536));
+    }
+
+    /// What the old release build did with a window one past the field: the unchecked expression puts
+    /// the stride's top bit into ns_grid and hands the kernel stride 0 (every slot aliases slot 0).
+    #[test]
+    fn the_unchecked_expression_spills_into_the_neighbour() {
+        let (stride, ns_grid, batch, q_pitch) = (1usize << 19, 2usize, 1usize, 0usize);
+        let old = ((q_pitch as u64) << 31) | ((batch as u64) << 25) | ((ns_grid as u64) << 19) | (stride as u64);
+        assert_eq!(unpack_bs(old), (0, 3, 1, 0), "stride 2^19 reads back as stride 0 with ns_grid 2 -> 3");
+        let old_geom = ((1u64 << 20)) | (640u64 << 20) | (262_144u64 << 40);
+        assert_eq!(unpack_geom(old_geom), (0, 641, 262_144), "max_pos 2^20 reads back as 0 with qk_dim 640 -> 641");
+    }
+
+    #[test]
+    #[should_panic(expected = "nh_packed field overflow")]
+    fn nh_packed_refuses_an_oversized_head_dim() { pack_nh(32, 1024, 4); }
+
+    #[test]
+    #[should_panic(expected = "bs_packed field overflow")]
+    fn bs_packed_refuses_an_oversized_stride() { pack_bs(1 << 19, 1, 1, 1); }
+
+    #[test]
+    #[should_panic(expected = "bs_packed field overflow")]
+    fn bs_packed_refuses_an_oversized_batch() { pack_bs(4096, 1, 64, 1); }
+
+    #[test]
+    #[should_panic(expected = "stride_nkv field overflow")]
+    fn stride_nkv_refuses_an_oversized_window() { pack_stride_nkv(4, 1 << 19); }
+
+    /// `max_pos` is this word's first field: its 20 bits are what caps the EXL3 window
+    /// (`exl3_forward::MAX_POS_PACKED`).
+    #[test]
+    #[should_panic(expected = "qsa geom field overflow")]
+    fn qsa_geom_refuses_an_oversized_window() { pack_qsa_geom(crate::exl3_forward::MAX_POS_PACKED, 640, 1); }
+
+    #[test]
+    #[should_panic(expected = "qsa geom field overflow")]
+    fn qsa_geom_refuses_an_oversized_block_count() { pack_qsa_geom(4096, 640, 1 << 20); }
+}
+
 impl GpuModel {
     /// Synchronize the inference stream (blocks until all GPU work on our stream completes).
     pub fn sync_stream(&self) {
@@ -2626,6 +2732,15 @@ impl GpuModel {
                  \x20 CONVERTED NVFP4 model (not a raw or differently-quantized checkpoint). See the README.",
                 model_dir, cause, classification)
         };
+        // S-B9-REL-PPL: an EXL3 pack is a different container (`.trellis`/`.suh`/`.svh`, no `.weight`
+        // tensors). This loader cannot read it; before this check it reached the first shard, hit
+        // the alignment panic and then hung. Refuse with the way forward instead (a Result, exit 1).
+        if crate::exl3_serve::is_exl3_pack(model_dir) {
+            return Err(anyhow::anyhow!(
+                "Error loading model from {model_dir}: this is an EXL3 pack (trellis-coded weights), which the \
+                 generic NVFP4/bf16 loader cannot read.\n\
+                 \x20 Use an EXL3-aware entry point: --server, --perplexity, --bench-mtp, --probe-state, --probe-exl3-*."));
+        }
         let config_path = format!("{}/config.json", model_dir.trim_end_matches('/'));
         let cfg = crate::qwen::Config::from_config_json(&config_path)
             .map_err(|e| load_error("corrupted",
@@ -4169,6 +4284,18 @@ impl GpuModel {
                 // Each shard's parts are drained by the workers while the next shard is read,
                 // so the resident raw stays ~1-2 shards (the 122B previously held all ~56 GB
                 // until every shard was read — the OOM of 2026-08-07).
+                // S-B9-REL-PPL (the v0.7.3 `--perplexity` HANG): a PANIC in the shard loop below (the
+                // bytemuck alignment panic on an EXL3 pack was the first) skipped the `jdone` store +
+                // notify of the Err path, so every worker sat in `cvar.wait` forever and
+                // `std::thread::scope` — which joins its threads BEFORE it resumes an unwind — never
+                // returned: the panic message, then a silent hang. This guard runs on every exit of
+                // the scope body (return, `?`, unwind) and releases the workers; the lock makes the
+                // store+notify atomic against a worker that is between its `jdone` check and its wait.
+                let _release_workers = ReleaseWorkers(|| {
+                    let _held = jq.0.lock().unwrap_or_else(|e| e.into_inner());
+                    jdone.store(true, std::sync::atomic::Ordering::Relaxed);
+                    jq.1.notify_all();
+                });
                 let shard_result: anyhow::Result<()> = (|| -> anyhow::Result<()> {
         for (i, sf_path) in safetensors_files.iter().enumerate() {
             let t_iter0 = std::time::Instant::now();
@@ -4309,7 +4436,7 @@ impl GpuModel {
                 // `weight_scale_inv` BF16 [M/128, K/128] — w = code·scale_inv per 128x128 block
                 // (direction verified numerically against the BF16 source: rel-L2 2.65e-2).
                 let (scales, nb_k) = if let Some(sv) = st.tensor(&format!("{}.weight_scale", stem)).ok() {
-                    (bytemuck::cast_slice::<u8, f32>(sv.data()).to_vec(), 0usize)
+                    (crate::podread::pod_vec::<f32>(sv.data()), 0usize)
                 } else {
                     let sv = st.tensor(&format!("{}.weight_scale_inv", stem))?;
                     assert_eq!(sv.dtype(), Dtype::BF16, "weight_scale_inv must be BF16: {}", wname);
@@ -4317,7 +4444,7 @@ impl GpuModel {
                             "block-128 fp8 needs M,K % 128 == 0: {} ({}x{})", wname, m, k);
                     assert_eq!(sv.shape(), &[m / 128, k / 128],
                                "weight_scale_inv shape mismatch: {}", wname);
-                    (bytemuck::cast_slice::<u8, half::bf16>(sv.data()).iter()
+                    (crate::podread::pod_cow::<half::bf16>(sv.data()).iter()
                         .map(|x| x.to_f32()).collect::<Vec<f32>>(), k / 128)
                 };
                 if dequant_at_load {
@@ -4355,10 +4482,11 @@ impl GpuModel {
                 let dt = match view.dtype() { Dtype::BF16 => "BF16", Dtype::F16 => "F16", Dtype::F32 => "F32", _ => "OTHER" };
                 let data = view.data();
                 if needs_f32(&name) {
+                    // S-B9-REL-PPL: file-derived bytes are not guaranteed aligned (see podread.rs)
                     let mut fv: Vec<f32> = if dt == "F32" {
-                        bytemuck::cast_slice(data).to_vec()
+                        crate::podread::pod_vec::<f32>(data)
                     } else {
-                        bytemuck::cast_slice::<u8, half::bf16>(data).iter().map(|x| x.to_f32()).collect()
+                        crate::podread::pod_cow::<half::bf16>(data).iter().map(|x| x.to_f32()).collect()
                     };
                     // hy_v3's RMSNorm is the PLAIN T5-style `weight * x` (HYV3RMSNorm), while the
                     // rmsnorm kernels hard-code qwen3_5's zero-centered `(1 + weight) * x`. Store
@@ -4411,12 +4539,13 @@ impl GpuModel {
                     let owned: Option<Vec<half::bf16>> = if dt == "BF16" || dt == "F16" {
                         None
                     } else {
-                        let fv: &[f32] = bytemuck::cast_slice(data);
+                        let fv = crate::podread::pod_cow::<f32>(data);
                         Some(fv.iter().map(|&x| half::bf16::from_f32(x)).collect())
                     };
+                    let bv_cow: std::borrow::Cow<[half::bf16]>;
                     let bv: &[half::bf16] = match &owned {
                         Some(v) => v,
-                        None => bytemuck::cast_slice(data),
+                        None => { bv_cow = crate::podread::pod_cow::<half::bf16>(data); &bv_cow }
                     };
 
                     // Apply simulated NVFP4 if this tensor is in scope. Only 2-D weights with K%16==0
@@ -5394,7 +5523,7 @@ impl GpuModel {
                     std::fs::write("/tmp/pf8_dump_ws.bin", sb).unwrap();
                     let mut ob = Vec::with_capacity(oh.len() * 2); for v in &oh { ob.extend_from_slice(&v.to_le_bytes()); }
                     std::fs::write("/tmp/pf8_dump_out.bin", ob).unwrap();
-                    eprintln!("[pf8-dump] wrote x/wt/ws/out for outn={outn} inn={inn} batch={batch}");
+                    eprintln!("[pf8-dump] wrote the x, wt, ws and out dumps for outn={outn} inn={inn} batch={batch}");
                 }
             }
 
@@ -9841,14 +9970,14 @@ impl GpuModel {
         let attn = pool.get_bf16(nh*hd*batch);
         // nh_packed carries (nh, hd, nkv) bit-packed: nh<2048 (bits 20+), hd<=1023 (bits 10-19),
         // nkv<=1023 (bits 0-9). gqa_attn_splitk/reduce unpack the same layout.
-        debug_assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow");
+        // (pack_nh asserts the three widths in release builds too.)
         // TRAP-7 envelope: gqa_attn_sel_prefill2 sizes fixed per-lane arrays for hd/32 <= 8 (hd <= 256;
         // Flash-Next is exactly 256) — the dispatch below routes wider hd to gqa_attn_sel_prefill,
         // which is parameterized by SK_DPL_MAX (hd <= SK_HD_MAX == 512). Assert the whole QSA
         // envelope so a wider config fails here instead of producing silent garbage (the hd=128
         // hardcode OOB precedent, AGENTS §7).
         assert!(hd <= 512, "qwen4_exp QSA selection kernels cover hd <= 512 only (got hd={hd}); raise SK_HD_MAX / SEL arrays first");
-        let nh_packed = ((nh << 20) | (hd << 10) | nkv) as i32;
+        let nh_packed = pack_nh(nh, hd, nkv);
 
         // ===================== THE LOSSLESS-MTP CONTRACT =====================
         //
@@ -9915,8 +10044,7 @@ impl GpuModel {
         // bs_packed = stride(bits 0-18) | ns_grid(19-24) | batch(25-30) | q_pitch(31-49), a u64
         // (the splitk family unpacks long long) — stride packed to fit the 12-arg launch cap; ranges:
         // stride<=262144<2^19, ns_grid<=32<2^6, batch<2^6, q_pitch<2^19 (the fused qkv mtot / nh*hd).
-        debug_assert!(stride < (1<<19) && ns_grid < (1<<6) && batch < (1<<6) && q_pitch < (1<<19), "bs_packed field overflow");
-        let bs_packed: u64 = ((q_pitch as u64) << 31) | ((batch as u64) << 25) | ((ns_grid as u64) << 19) | (stride as u64);
+        let bs_packed: u64 = pack_bs(stride, ns_grid, batch, q_pitch);
         // GQA ratio and escape hatch are shared by the q4 and bf16 dispatch below.
         let gqa_ratio = nh / nkv.max(1);
         // A/B + escape hatch: --no-gqpack=1 forces the per-head kernel. Read per call (the
@@ -9972,7 +10100,7 @@ impl GpuModel {
             } else if use_e_cols {
                 // Independent columns (plain batched decode of several lanes): one batch-1 `_e` launch per
                 // column, outputs/inputs offset to the column — the same kernel a lone request runs.
-                let bs1: u64 = ((q_pitch as u64) << 31) | (1u64 << 25) | ((ns_grid as u64) << 19) | (stride as u64);
+                let bs1: u64 = pack_bs(stride, ns_grid, 1, q_pitch);
                 let (qp, pmp, plp, pap) = (d(q), d(&pm), d(&pl), d(&pa));
                 for c in 0..batch as u64 {
                     let part = c * (nh * ns_grid) as u64;
@@ -10189,7 +10317,7 @@ impl GpuModel {
                     KVCacheMode::Bf16 => "rmsnorm_rope_kvwrite_b",
                     _ => unreachable!("F4 fused kvwrite: TQ/K8v4 use the old pipeline"),
                 };
-                let stride_nkv = ((nkv as u32) << 19) | (kv_stride as u32);
+                let stride_nkv = pack_stride_nkv(nkv, kv_stride);
                 let hd_rdim = ((hd as u32) << 16) | (rdim as u32);
                 blaunch!(self, kvwrite, ((batch*nkv) as u32,1,1), (256,1,1), (hd*4) as u32,
                     (kc_ptr, vc_ptr, d(fb), d(&fa.k_norm), d(cos), d(sin), *pos_dev.device_ptr() as u64, slot_ids_ptr,
@@ -11276,22 +11404,30 @@ impl GpuModel {
         core(pool, bufs);
         self.sync_stream();
         unsafe {
-            if sys::cuStreamBeginCapture_v2(
-                stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                != sys::CUresult::CUDA_SUCCESS {
+            let r = sys::cuStreamBeginCapture_v2(
+                stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+            if r != sys::CUresult::CUDA_SUCCESS {
+                crate::metrics::graph_capture_lost("nvfp4-decode-sample", "decode sample graph", &format!("BeginCapture {r:?}")); // S-B9-REL-INTEG C1
                 return None;
             }
         }
         core(pool, bufs);
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         unsafe {
-            if sys::cuStreamEndCapture(stream, &mut graph) != sys::CUresult::CUDA_SUCCESS { return None; }
+            let e = sys::cuStreamEndCapture(stream, &mut graph);
+            if e != sys::CUresult::CUDA_SUCCESS {
+                crate::metrics::graph_capture_lost("nvfp4-decode-sample", "decode sample graph", &format!("{e:?}")); // S-B9-REL-VISIONFIX2 V2b
+                return None;
+            }
         }
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         unsafe {
             let r = sys::cuGraphInstantiate_v2(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0);
             sys::cuGraphDestroy(graph);
-            if r != sys::CUresult::CUDA_SUCCESS { return None; }
+            if r != sys::CUresult::CUDA_SUCCESS {
+                crate::metrics::graph_capture_lost("nvfp4-decode-sample", "decode sample graph", &format!("instantiate {r:?}")); // S-B9-REL-INTEG C1
+                return None;
+            }
         }
         Some(CudaGraph { exec, stream })
     }
@@ -11369,6 +11505,7 @@ impl GpuModel {
             let r = sys::cuStreamBeginCapture_v2(
                 stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
+                crate::metrics::graph_capture_lost("nvfp4-decode", "decode graph", &format!("BeginCapture {r:?}")); // S-B9-REL-INTEG C1
                 return None;
             }
         }
@@ -11378,14 +11515,20 @@ impl GpuModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         unsafe {
             let r = sys::cuStreamEndCapture(stream, &mut graph);
-            if r != sys::CUresult::CUDA_SUCCESS { return None; }
+            if r != sys::CUresult::CUDA_SUCCESS {
+                crate::metrics::graph_capture_lost("nvfp4-decode", "decode graph", &format!("{r:?}")); // S-B9-REL-VISIONFIX2 V2b
+                return None;
+            }
         }
 
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         unsafe {
             let r = sys::cuGraphInstantiate_v2(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0);
             sys::cuGraphDestroy(graph);
-            if r != sys::CUresult::CUDA_SUCCESS { return None; }
+            if r != sys::CUresult::CUDA_SUCCESS {
+                crate::metrics::graph_capture_lost("nvfp4-decode", "decode graph", &format!("instantiate {r:?}")); // S-B9-REL-INTEG C1
+                return None;
+            }
         }
 
         Some(CudaGraph { exec, stream })
@@ -13136,7 +13279,10 @@ impl GpuModel {
         pool.release_bf16(warm, 1);
 
         let r = unsafe { sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) };
-        if r != sys::CUresult::CUDA_SUCCESS { return None; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("nvfp4-verify", &format!("verify graph, slot {slot}"), &format!("BeginCapture {r:?}")); // S-B9-REL-INTEG C1
+            return None;
+        }
         pool.capturing.set(true);
 
         // The capture pass: kernels are RECORDED, nothing executes (state untouched by design).
@@ -13172,11 +13318,17 @@ impl GpuModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r = unsafe { sys::cuStreamEndCapture(stream, &mut graph) };
         pool.capturing.set(false);
-        if r != sys::CUresult::CUDA_SUCCESS { return None; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("nvfp4-verify", &format!("verify graph, slot {slot}"), &format!("{r:?}")); // S-B9-REL-VISIONFIX2 V2b
+            return None;
+        }
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         let r = unsafe { sys::cuGraphInstantiate_v2(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0) };
         unsafe { sys::cuGraphDestroy(graph); }
-        if r != sys::CUresult::CUDA_SUCCESS { return None; }
+        if r != sys::CUresult::CUDA_SUCCESS {
+            crate::metrics::graph_capture_lost("nvfp4-verify", &format!("verify graph, slot {slot}"), &format!("instantiate {r:?}")); // S-B9-REL-INTEG C1
+            return None;
+        }
         Some(CudaGraph { exec, stream })
     }
 
@@ -13616,7 +13768,7 @@ impl GpuModel {
                                 KVCacheMode::Bf16 => "rmsnorm_rope_kvwrite_b",
                                 _ => unreachable!("F4 fused kvwrite: TQ/K8v4 use the old pipeline"),
                             };
-                            let stride_nkv = ((nkv as u32) << 19) | (kv_stride as u32);
+                            let stride_nkv = pack_stride_nkv(nkv, kv_stride);
                             let hd_rdim = ((hd as u32) << 16) | (rdim as u32);
                             blaunch!(self, kvwrite, ((n*nkv) as u32,1,1), (256,1,1), (hd*4) as u32,
                                 (kc_ptr, vc_ptr, d(fb), d(&fa.k_norm), d(&cos), d(&sin), *self.sc_pos.device_ptr() as u64, slot_ids_ptr,
@@ -18216,12 +18368,19 @@ impl GpuModel {
             for &t in &out_tokens[emitted_before..] { hsh = hsh.rotate_left(5) ^ t; }
             let cnt = (out_tokens.len() - emitted_before) as u8;
             // B8/G1: the verify WIDTH joins the extended token (k_verify = BLOCK here). agree_ext
-            // folds it into bits [27..31), so fold the local hash the same way before comparing —
-            // raw-vs-folded mismatches by exactly (BLOCK<<27) otherwise.
-            let hsh_ext = (hsh ^ ((dblock as u32 & 0xF) << 27)) as u32;
-            match crate::net::agree_ext(step_no, cnt, dblock as u8, hsh) {
-                Some((pc, ph)) if pc == cnt && ph == hsh_ext => {}
+            // sends net::agree_word (width in bits 27..31, digest folded to 27 bits), so the local
+            // word comes from the same function before comparing.
+            // S-B9-CF-AGREE16B (W5): the range check sees the whole usize, before the narrowing
+            // (`dblock as u8` first would turn 256 + k into k and slip past agree_ext's own check).
+            let Some(kv) = crate::net::agree_width(dblock) else {
+                crate::net::abort_link();
+                panic!("[dflash] TP agree REFUSED at step {step_no}: block {dblock} does not fit the lockstep token's \
+                       verify-width field (max {})", crate::net::AGREE_WIDTH_MAX);
+            };
+            match crate::net::agree_ext(step_no, cnt, kv, hsh) {
+                Some((pc, ph)) if pc == cnt && ph == crate::net::agree_word(kv, hsh) => {}
                 Some((pc, ph)) => {
+                    let hsh_ext = crate::net::agree_word(kv, hsh);
                     crate::net::abort_link();
                     panic!("[dflash] TP AGREE MISMATCH at step {step_no}: local (count {cnt}, hash {hsh_ext:#010x}) \
                            vs peer (count {pc}, hash {ph:#010x}) — the ranks verified different chains");
@@ -23502,9 +23661,8 @@ impl GpuModel {
         blaunch!(self, "qsa_key_write_b", grid(batch*hdx), (256,1,1), 0,
             (keys_ptr, d(&qk), pos_ptr, slot_ids_ptr, stride as i32, 0i32, qk_dim as i32, (heads*hdx) as i32, hdx as i32, batch as i32));
         let nblk_stride = (max_pc / ratio).max(1);
-        debug_assert!(stride < (1 << 20) && qk_dim < (1 << 20) && nblk_stride < (1 << 20), "qsa geom overflow");
         let scores = pool.get(batch * nblk_stride);
-        let geom: u64 = (stride as u64) | ((qk_dim as u64) << 20) | ((nblk_stride as u64) << 40);
+        let geom: u64 = pack_qsa_geom(stride, qk_dim, nblk_stride);
         blaunch!(self, "qsa_score_b", (nblk_stride.div_ceil(8) as u32, batch as u32, 1), (256,1,1), 0,
             (d(&scores), d(&qk), keys_ptr, logical_ptr, slot_ids_ptr, path_ptr, cps_ptr, d(&idx.params), geom as i64));
         let sel_max = self.qsa_limit();
@@ -23638,8 +23796,7 @@ impl GpuModel {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn qsa_attn_prefill_ptrs(&self, attn: &mut B, q: &B, kc_ptr: u64, vc_ptr: u64, stride: usize,
                                         nh: usize, nkv: usize, hd: usize, scale: f32, n: usize, sel_ptr: u64, pos_sel_ptr: u64) {
-        debug_assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow");
-        let nh_packed = ((nh << 20) | (hd << 10) | nkv) as i32;
+        let nh_packed = pack_nh(nh, hd, nkv);
         if hd <= 256 && crate::opts::var(crate::opt!("qsa-sel-v1")).is_err() {
             // v2: K/V rows fetched once per 4-head group, 4 keys in flight (bit-identical to v1).
             let ngroups = (nh / nkv).div_ceil(4);
@@ -24933,4 +25090,118 @@ pub fn probe_bandwidth(sustained: Option<u64>) -> anyhow::Result<()> {
         println!("        a contended roofline once read 234 and skewed every efficiency number.");
     }
     Ok(())
+}
+
+/// S-B9-REL-PPL: runs `F` when dropped — on return, `?` AND unwind. The generic loader's shard
+/// pipeline wraps its worker release in this so a panic in the shard loop cannot leave the scoped
+/// workers parked on their condvar (`std::thread::scope` joins before it resumes an unwind: that
+/// was the v0.7.3 `--perplexity` hang).
+pub(crate) struct ReleaseWorkers<F: FnMut()>(pub F);
+impl<F: FnMut()> Drop for ReleaseWorkers<F> {
+    fn drop(&mut self) { (self.0)() }
+}
+
+#[cfg(test)]
+mod release_workers_tests {
+    use super::ReleaseWorkers;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// The loader's worker shape: pop a job or wait on the condvar until `done`.
+    fn worker(jq: &(Mutex<VecDeque<u32>>, Condvar), done: &AtomicBool) {
+        loop {
+            let job = {
+                let mut g = jq.0.lock().unwrap();
+                loop {
+                    if let Some(j) = g.pop_front() { break Some(j); }
+                    if done.load(Ordering::Relaxed) { break None; }
+                    g = jq.1.wait(g).unwrap();
+                }
+            };
+            if job.is_none() { break; }
+        }
+    }
+
+    type Jq = Arc<(Mutex<VecDeque<u32>>, Condvar)>;
+
+    /// Spawn a thread that runs `scope { 4 workers; body panics }`, with or without the guard.
+    /// Returns the result channel and the handles needed to release the workers by hand.
+    fn run_scope(with_guard: bool) -> (std::sync::mpsc::Receiver<bool>, Jq, Arc<AtomicBool>) {
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let jq: Jq = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let (jq_t, done_t) = (jq.clone(), done.clone());
+        std::thread::spawn(move || {
+            let (jq, done) = (jq_t, done_t);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|s| {
+                    for _ in 0..4 {
+                        let (jq, done) = (jq.clone(), done.clone());
+                        s.spawn(move || worker(&jq, &done));
+                    }
+                    // let the workers park on the condvar before the body panics
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let _release = if with_guard {
+                        Some(ReleaseWorkers(|| {
+                            let _held = jq.0.lock().unwrap_or_else(|e| e.into_inner());
+                            done.store(true, Ordering::Relaxed);
+                            jq.1.notify_all();
+                        }))
+                    } else { None };
+                    panic!("simulated shard-loop panic (bytemuck alignment)");
+                })
+            }));
+            let _ = tx.send(r.is_err());
+        });
+        (rx, jq, done)
+    }
+
+    /// A panic in the scope body returns promptly WITH the guard. Runs on a watchdog thread so a
+    /// regression fails the test instead of hanging the suite.
+    #[test]
+    fn a_panic_in_the_scope_body_releases_the_workers() {
+        let (rx, _jq, _done) = run_scope(true);
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(panicked) => assert!(panicked, "the body's panic must still propagate (not be swallowed)"),
+            Err(_) => panic!("scope did not return: the workers were never released (the hang)"),
+        }
+    }
+
+    /// NEGATIVE CONTROL: the pre-fix shape (no guard) really does hang — so the test above can
+    /// tell the bug from the fix. The parked workers are released by hand afterwards.
+    #[test]
+    fn without_the_guard_the_scope_hangs_the_original_bug() {
+        let (rx, jq, done) = run_scope(false);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(3)).is_err(),
+                "control failed: the unguarded scope returned, so this harness cannot see the hang");
+        {
+            let _held = jq.0.lock().unwrap();
+            done.store(true, Ordering::Relaxed);
+            jq.1.notify_all();
+        }
+        let panicked = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("released scope returns");
+        assert!(panicked);
+    }
+
+    /// The normal path is unchanged: the guard fires once at the end and is harmless.
+    #[test]
+    fn the_normal_path_still_completes() {
+        let jq = Arc::new((Mutex::new(VecDeque::<u32>::new()), Condvar::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                let (jq, done) = (jq.clone(), done.clone());
+                s.spawn(move || worker(&jq, &done));
+            }
+            let _release = ReleaseWorkers(|| {
+                let _held = jq.0.lock().unwrap_or_else(|e| e.into_inner());
+                done.store(true, Ordering::Relaxed);
+                jq.1.notify_all();
+            });
+            for j in 0..10 { jq.0.lock().unwrap().push_back(j); jq.1.notify_all(); }
+        });
+        // reaching this line IS the claim: the scope joined (no hang) after the guard released the workers
+        assert!(done.load(Ordering::Relaxed));
+    }
 }

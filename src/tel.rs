@@ -182,6 +182,24 @@ static X_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static X_DRAFTS: AtomicU64 = AtomicU64::new(0);
 static X_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 
+// S-B9-REL-MTPREPROBE: per-request MTP off / re-probe outcomes, added with [mtp-stats].
+static X_MTP_OFF: AtomicU64 = AtomicU64::new(0);
+static X_REPROBES: AtomicU64 = AtomicU64::new(0);
+static X_REPROBE_OK: AtomicU64 = AtomicU64::new(0);
+
+/// EXL3: add one finished request's MTP off/re-probe counts (off events, re-probes, ok).
+pub fn add_mtp_reprobe(off_events: u64, reprobes: u64, reprobe_ok: u64) {
+    X_MTP_OFF.fetch_add(off_events, Relaxed);
+    X_REPROBES.fetch_add(reprobes, Relaxed);
+    X_REPROBE_OK.fetch_add(reprobe_ok, Relaxed);
+}
+
+/// Cumulative MTP off/re-probe outcomes (off events, re-probes, successful re-probes).
+/// Feeds `/metrics`.
+pub fn mtp_reprobe_totals() -> (u64, u64, u64) {
+    (X_MTP_OFF.load(Relaxed), X_REPROBES.load(Relaxed), X_REPROBE_OK.load(Relaxed))
+}
+
 /// EXL3: add one finished request's speculation counts (rounds, drafted, accepted).
 pub fn add_spec(rounds: u64, drafted: u64, accepted: u64) {
     X_ROUNDS.fetch_add(rounds, Relaxed);

@@ -250,6 +250,34 @@ mod tests {
         }
     }
 
+    /// S-B9-CF-AGREE16: the frames carry the width and the accept count as whole u32 words, so a 16-row
+    /// round reads back as 16 and no two widths (or accept counts) in 0..=17 share a frame.
+    #[test]
+    fn frames_keep_every_width_and_accept_count_0_to_17_apart() {
+        let world = 4;
+        let f16 = rnd_frame(&rin(9, 16, 16, 0xABCD, 0, 1.0));
+        assert_eq!((f16[2], f16[3]), (16, 16), "a 16-row round with 16 accepted ids rides the frame as (16, 16)");
+        assert_eq!(pv_frame(0x40_0005, 16, 0xDEAD_BEEF, 7)[2], 16);
+        for a in 0..=17usize {
+            for b in 0..=17usize {
+                // rank 1 ran width b / accept b, the others a; the words hash is the same everywhere
+                let mut rw: Vec<Vec<u32>> = (0..world).map(|_| rnd_frame(&rin(9, 3, a, 0xABCD, 0, 1.0)).to_vec()).collect();
+                rw[1] = rnd_frame(&rin(9, 3, b, 0xABCD, 0, 1.0)).to_vec();
+                let mut ra: Vec<Vec<u32>> = (0..world).map(|_| rnd_frame(&rin(9, a, 17, 0xABCD, 0, 1.0)).to_vec()).collect();
+                ra[1] = rnd_frame(&rin(9, b, 17, 0xABCD, 0, 1.0)).to_vec();
+                let mut pv: Vec<Vec<u32>> = (0..world).map(|_| pv_frame(0x40_0005, a, 0xDEAD_BEEF, 7).to_vec()).collect();
+                pv[1] = pv_frame(0x40_0005, b, 0xDEAD_BEEF, 7).to_vec();
+                if a == b {
+                    assert!(rnd_verdict(&rw, world).is_ok() && rnd_verdict(&ra, world).is_ok() && pv_verdict(&pv, world).is_ok(), "{a}");
+                } else {
+                    assert!(rnd_verdict(&rw, world).err().expect("round width").contains("rank 1 verify width"), "width {a} vs {b}");
+                    assert!(rnd_verdict(&ra, world).err().expect("round accept").contains("rank 1 accept count"), "accept {a} vs {b}");
+                    assert!(pv_verdict(&pv, world).unwrap_err().contains("rank 1 width"), "pre-verify width {a} vs {b}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn ident_counts_digests_where_any_rank_differs() {
         let world = 4;

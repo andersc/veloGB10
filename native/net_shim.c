@@ -803,27 +803,60 @@ NetCtx* net_init(int rank, int world, const char* const* peer_ips, int n_peers,
                          fp32_capacity_bytes, payload_bytes);
 }
 
-// The pre-P3 single-QP bring-up, byte-for-byte. MUST NOT change (world==2 fast path).
-// S-B9-REL-TP2RACE side item (REL-NGRAM one transient bring-up failure): the link pinned regions
-// are small but a cudaHostAlloc can fail transiently right after the model + primary rail came up
-// (unified-memory squeeze) — the head never reached its TCP listener and the node logged
+// PR #15 (review R2, S-B9-REL-PRPORT3): the GID index is resolved ONCE at boot on the Rust side
+// (tp::resolve_gid_idx: explicit --gid-idx wins, else the sysfs RoCE-v2 scan — which checks the
+// GID *type*, not just the IPv4-mapped prefix — else the static default) and passed to every
+// shim bring-up. The shim binds EXACTLY that index: if it does not query back a valid non-zero
+// GID, bring-up fails LOUDLY (the callers log `query_gid` and bail). The earlier fallback scan
+// here matched only the IPv4-mapped bytes without checking the GID type, so on an all-zero or
+// stale index it could silently re-bind a RoCE v1 GID — a wire mismatch with the peer instead
+// of a loud failure, and a contradiction of the "explicit --gid-idx skips the scan" help text.
+static int get_valid_roce_gid(struct ibv_context *ctx, int port_num, int *gid_idx, union ibv_gid *out_gid) {
+    if (ibv_query_gid(ctx, port_num, *gid_idx, out_gid) == 0) {
+        static const unsigned char zero_gid[16] = {0};
+        if (memcmp(out_gid, zero_gid, 16) != 0) {
+            return 0; // the Rust-resolved index is live — bind it
+        }
+        LOGE("query_gid: GID at index %d reads back ALL-ZERO (stale index; resolve_gid_idx picked it — re-run bring-up)", *gid_idx);
+        return -1;
+    }
+    LOGE("query_gid: index %d not queryable on port %d (resolve_gid_idx picked it — re-run bring-up)", *gid_idx, port_num);
+    return -1;
+}
+
+// The world==2 single-QP bring-up (the P3 shape; still the world==2 fast path). The QP/ring setup
+// below is unchanged; the cudaHostAlloc retry + named-CUDA-error logging in the allocator are
+// deliberate hardening (S-B9-REL-TP2RACE REL-NGRAM transient bring-up failure; PR #15 error text)
+// on top of it — not "byte-for-byte pre-P3" anymore, by design.
+// REL-NGRAM background: a cudaHostAlloc can fail transiently right after the model + primary rail
+// came up (unified-memory squeeze) — the head never reached its TCP listener and the node logged
 // `connect :29600 refused`. Retry a few times before giving up; persistent failure stays loud.
 static void* host_alloc_with_retry(size_t bytes) {
     void* p = NULL;
+    cudaError_t err = cudaSuccess;
     for (int i = 0; i < 5; i++) {
-        if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped|cudaHostAllocPortable) == cudaSuccess) {
+        err = cudaHostAlloc(&p, bytes, cudaHostAllocMapped|cudaHostAllocPortable);
+        if (err == cudaSuccess) {
             if (i) LOGE("cudaHostAlloc(%zu) succeeded on retry %d", bytes, i);
             return p;
         }
-        LOGE("cudaHostAlloc(%zu) failed (attempt %d/5) — retrying in 1 s", bytes, i + 1);
+        // PR #15: name the CUDA error — a bare "cudaHostAlloc(N)" line hid the actual cause.
+        LOGE("cudaHostAlloc(%zu) failed (attempt %d/5): %s (code %d) — retrying in 1 s",
+             bytes, i + 1, cudaGetErrorString(err), (int)err);
         struct timespec d = { .tv_sec = 1, .tv_nsec = 0 };
         nanosleep(&d, NULL);
     }
+    LOGE("cudaHostAlloc(%zu) failed after 5 attempts: %s (code %d)",
+         bytes, cudaGetErrorString(err), (int)err);
     return NULL;
 }
 
 static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, const char* dev_name,
                                int gid_idx, int fp32_capacity_bytes, int payload_bytes) {
+    // PR #15: pin the calling thread to device 0 before any cudaHostAlloc — the shim can be
+    // brought up from a thread that never touched CUDA, and an unpinned context makes the
+    // mapped-alloc fail (or bind to the wrong device on multi-GPU boxes).
+    cudaSetDevice(0);
     NetCtx* c = (NetCtx*)calloc(1, sizeof(NetCtx));
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
@@ -905,7 +938,8 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
     if (ibv_modify_qp(c->qp,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS)){ LOGE("INIT"); return NULL; }
 
     union ibv_gid mygid;
-    if (ibv_query_gid(c->ctx,c->port_num,gid_idx,&mygid)){ LOGE("query_gid"); return NULL; }
+    if (get_valid_roce_gid(c->ctx, c->port_num, &gid_idx, &mygid) != 0){ LOGE("query_gid"); return NULL; }
+    c->gid_idx = gid_idx;   // PR #15: record the index actually bound (the Rust-resolved one, unchanged here)
     Exch lo, re; memset(&lo,0,sizeof(lo));
     lo.qpn=c->qp->qp_num; lo.psn=0x1000+rank*333; lo.addr=(uint64_t)c->hbuf; lo.rkey=c->mr->rkey; lo.gid=mygid;
     // Liveness responder BEFORE the handshake: the peer can start probing the moment it connects.
@@ -950,6 +984,7 @@ static NetCtx* net_init_world2(int rank, const char* peer_ip, int tcp_port, cons
 static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
                              int tcp_port, const char* dev_name, int gid_idx,
                              int fp32_capacity_bytes, int payload_bytes) {
+    cudaSetDevice(0);   // PR #15: same device pin as world2 (see net_init_world2)
     NetCtx* c = (NetCtx*)calloc(1, sizeof(NetCtx));
     c->port_num = 1; c->gid_idx = gid_idx; c->rank = rank; c->rng = 0x9E3779B9u ^ (unsigned)rank;
     c->payload_bytes = (unsigned)payload_bytes;
@@ -1071,7 +1106,8 @@ static NetCtx* net_init_nway(int rank, int world, const char* const* peer_ips,
     }
 
     union ibv_gid mygid;
-    if (ibv_query_gid(c->ctx, c->port_num, gid_idx, &mygid)){ LOGE("query_gid"); return NULL; }
+    if (get_valid_roce_gid(c->ctx, c->port_num, &gid_idx, &mygid) != 0){ LOGE("query_gid"); return NULL; }
+    c->gid_idx = gid_idx;   // PR #15: record the index actually bound (the Rust-resolved one, unchanged here)
 
     // One QP per peer. The lower rank listens, the higher connects (deterministic, matches tcp_exchange).
     for (int p = 0; p < world; p++) {

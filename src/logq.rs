@@ -385,8 +385,11 @@ mod h5_direct_print_baseline_tests {
             ("src/bin/dsv4_replay.rs", 10),
             ("src/bin/dsv4_stage_debug.rs", 2),
             ("src/bin/vision_cross.rs", 6),
+            // S-B9-REL-VISIONFIX: a new dev tool (GPU tower embedding hashes, gate 2), and two more
+            // lines of the CPU-tower tool (forward time, embedding hash). Dev tools, not served paths.
+            ("src/bin/vision_gpu_hash.rs", 2),
             ("src/bin/w2_preproc_golden.rs", 8),
-            ("src/bin/w2_vision_cpu.rs", 8),
+            ("src/bin/w2_vision_cpu.rs", 10),
             ("src/bin/w2_vision_gpu.rs", 8),
             ("src/bin/w2_vision_load.rs", 6),
             ("src/cluster.rs", 56),
@@ -408,9 +411,24 @@ mod h5_direct_print_baseline_tests {
             ("src/exl3_forward/dhead.rs", 11),
             ("src/exl3_forward/w4s.rs", 8),
             ("src/exl3_forward/wp16.rs", 12),
-            ("src/exl3_forward/xtp.rs", 74),
+            ("src/exl3_forward/xtp.rs", 75), // S-B9-REL-INTEG A5: +1, the harness's RANK_IDENTITY FAIL line when pass 1 errors (a probe, not a served path)
             ("src/exl3_kvnll.rs", 9),
-            ("src/exl3_serve.rs", 85),
+            // S-B9-REL-PPL: the one-shot `--perplexity` EXL3 tool prints its identity / per-window /
+            // reference / RESULT lines directly (a CLI measurement tool, not a served path; the order
+            // and immediacy of its output is the product, like exl3_kvnll.rs above).
+            // S-B9-REL-PPL2 W5: 9 -> 10, the PPL_BOUNDS line (the bounds a run was judged by, printed
+            // next to PPL_STATS before the checks; the same one-shot tool-output class).
+            // S-B9-REL-PPL2 1b: 10 -> 4. The per-window lines, the PPL_HEAD_CHECK / PPL_STATS /
+            // PPL_BOUNDS lines and RESULT are written through a `&mut dyn Write` handed to `score_all` /
+            // `finish_run` (stdout in the tool, a buffer in the unit tests that prove a failed run prints no
+            // RESULT line); what is left direct is the header, PPL_IDENT and the decode-reference lines.
+            ("src/exl3_ppl.rs", 4),
+            ("src/exl3_regime.rs", 1), // S-B9-REL-QSAREGIME: the probe prints through one closure (not a served path)
+            // MTPREPROBE2 W1.5: +2 = the two step_plain a-xcheck record-failure branches
+        // (eprintln, matching the existing sibling site in finish()/xcheck drain).
+        // S-B9-REL-SMALLFIXES item 1: 87 -> 86, the two MTP boot-banner println! became one
+        // (the line is built by the testable mtp_banner()).
+        ("src/exl3_serve.rs", 87), // +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
             ("src/exl3_tune.rs", 7),
             ("src/exl3_wp27.rs", 8),
             ("src/gptq.rs", 42),
@@ -418,19 +436,54 @@ mod h5_direct_print_baseline_tests {
             ("src/json_schema.rs", 1),
             ("src/kernels.rs", 3),
             ("src/logq.rs", 3),
-            ("src/main.rs", 1552),
+            // +3 (S-B9-REL-PRPORT4): the --prefill-interleave lines of --help (one-time banner class);
+            // +1 (S-B9-REL-QSAREGIME): the PROBE_REGIME_FAIL line of the --probe-exl3-regime dispatch (probe exit path)
+            // +7 (S-B9-REL-PPL): 5 --help lines naming the EXL3 --perplexity flags (one-time help class)
+            // + 2 PERPLEXITY_EXL3_FAIL exit-path lines of the --perplexity EXL3 dispatch (probe exit path)
+            // S-B9-REL-SURFACE2 item 5: the hand-written --mtp (4 lines) and --prefill-interleave
+            // (3 lines) entries left print_help (each option is listed once, by its registry
+            // line) and the SPECULATION header went from 1 line to 2: -6.
+            // Both together: 1556 + 7 - 6 = 1557; -2: the hand-written --vision-cpu help lines left print_help
+            // (VISIONFIX2 made it a registry flag: listed once, by its registry line) = 1555.
+            // S-B9-REL-PPL2 W4: 1557 -> 1552: -4 and -3 hand-written --perplexity help lines (the mode line
+            // in MODES and the entry in the second block left print_help: the tool's options are registry
+            // rows now and are listed once, under PERPLEXITY TOOL), +1 pointer line in MODES, +1 the
+            // legacy path's `--window < 2` refusal (a CLI exit path, like PERPLEXITY_EXL3_FAIL).
+            ("src/main.rs", 1554), // F9b: +1 the bare-tp info line (stderr, one line, once) // S-B9-REL-INTEG A1: +2 --help lines (the two TP drill flags, one line each)
             ("src/memwatch.rs", 3),
             ("src/model.rs", 3),
-            ("src/net.rs", 13),
-            ("src/opts.rs", 1),
+            ("src/net.rs", 14), // +1 AGREE16: the width-refusal line of agree_ext (printed once, right before the link abort)
+            // S-B9-REL-FINALFIX F7 (2026-10-11): opts.rs = 2 direct prints.
+            // 1 = the FATAL env-var rejection line at boot (served, pre-router, by design);
+            // +1 = the #[ignore]d f7_differential long-run progress line (test-only).
+            ("src/opts.rs", 3), // F9: +1 the f9_differential count line, test code read with --nocapture
             ("src/pp.rs", 14),
             ("src/quant.rs", 5),
             ("src/qwen.rs", 7),
-            ("src/server.rs", 19),
+            // S-B9-REL-BENCHFIX2: +2 = the "[serve] sse keep-alive: ..." boot line (println!, the
+            // one-time banner class, printed by http_listen before the socket exists) and the
+            // FATAL line of fatal_option (direct by the H7 rule above: printed, then flush_and_exit)
+            ("src/server.rs", 21),
             ("src/shard_plan.rs", 7),
             ("src/tokenizer.rs", 9),
-            ("src/tools.rs", 3),
-            ("src/tp.rs", 12),
+            // S-B9-REL-SURFACE2 item 10: + 2, the ignored `tool_quote_probe` instrument (test code).
+            // S-B9-REL-SURFACE2B R1: + 5, the count tables of `exhaustive_small_blocks` and the
+            // timing line of the 1 MB test (test code, read with --nocapture).
+            // S-B9-TOOLPARSE3: + 4 in tools.rs (the megabyte-block and shadow-cost instrument lines, test
+            // code, read with --nocapture), and src/tools/cost.rs: 32, the measurement tables of the
+            // cost model (ignored instruments and one pinned test, test code only).
+            ("src/tools.rs", 15),
+            ("src/tools/cost.rs", 32),
+            // S-B9-TOOLPARSE3 part B: the in-tree default-identity test and the frozen v0.7.3 parser it
+            // compares with (test builds only; the frozen copy keeps the original's two alarm prints).
+            ("src/tools/default_identity.rs", 3),
+            ("src/tools/v073_frozen.rs", 2),
+            // rel/prport3 (review R8): the tp.rs bring-up evidence lines now go through
+            // reprintln! (they fire before the log router exists; reprintln! prints directly
+            // until one does), so tp.rs returns to 12. main.rs: the --vision-fail-gemm help
+            // block moved into opts_table (Cat::Diag -> --help-diag), 1554 -> 1552.
+            // Conscious updates, not conversion misses.
+        ("src/tp.rs", 12),
             ("src/tp_bench.rs", 75),
             ("src/w4a4.rs", 1),
             ("src/wp24.rs", 8),

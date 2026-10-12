@@ -386,6 +386,12 @@ impl Exl3Pack {
                 }
             };
             let bits = shape[2] / 16;
+            // This check is the only one the loader makes: it ACCEPTS 1..=8 bits. Whether a kernel decodes a
+            // width is the dispatch's business, and the wide trellis family decodes 3..=5 only
+            // (`exl3_forward::wide_trellis_supports_bits`; the K=6 module adds 6 to the m16 / grouped switches,
+            // not to the wide ones). The comment "loader refuses other rates" in the wide kernel's switch
+            // (kernels/exl3_bench.cu) is therefore wrong; it is left as is so the kernel build id, and with
+            // it every PTX byte, stays what the previous gates ran (S-B9-REL-INTEG D1).
             if shape[2] % 16 != 0 || bits == 0 || bits > 8 {
                 bail!(
                     "EXL3 pack {dir}: {name}: trellis last dim {} is not 16*bits (bits 1..8)",

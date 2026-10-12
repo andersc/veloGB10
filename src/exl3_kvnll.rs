@@ -252,11 +252,11 @@ fn fnv1a(ids: &[u32]) -> u64 {
 }
 
 /// Per-row log-softmax summary of f16 logits.
-struct RowScore { lse: f64, argmax: u32, top5: [u32; 5], nonfinite: bool }
+pub(super) struct RowScore { pub(super) lse: f64, pub(super) argmax: u32, pub(super) top5: [u32; 5], pub(super) nonfinite: bool }
 
-fn f16_lut() -> Vec<f32> { (0..=u16::MAX).map(|b| f16::from_bits(b).to_f32()).collect() }
+pub(super) fn f16_lut() -> Vec<f32> { (0..=u16::MAX).map(|b| f16::from_bits(b).to_f32()).collect() }
 
-fn score_row(row: &[u16], lut: &[f32]) -> RowScore {
+pub(super) fn score_row(row: &[u16], lut: &[f32]) -> RowScore {
     let mut mx = f32::NEG_INFINITY;
     let mut am = 0u32;
     let mut nonfinite = false;
@@ -280,7 +280,7 @@ fn score_row(row: &[u16], lut: &[f32]) -> RowScore {
 }
 
 /// KL(ref || arm) in nats over the full vocabulary (non-finite logits skipped on both sides).
-fn kl_rows(r: &[u16], rs: &RowScore, a: &[u16], as_: &RowScore, lut: &[f32]) -> f64 {
+pub(super) fn kl_rows(r: &[u16], rs: &RowScore, a: &[u16], as_: &RowScore, lut: &[f32]) -> f64 {
     let mut kl = 0.0f64;
     for (&rb, &ab) in r.iter().zip(a) {
         let (lr, la) = (lut[rb as usize], lut[ab as usize]);
@@ -306,7 +306,7 @@ struct WinStats {
     top5_ovl: f64,
 }
 
-fn pct(v: &mut [f64], q: f64) -> f64 {
+pub(super) fn pct(v: &mut [f64], q: f64) -> f64 {
     if v.is_empty() { return 0.0; }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[((v.len() - 1) as f64 * q).round() as usize]
@@ -330,7 +330,7 @@ impl WinStats {
     }
 }
 
-fn read_ids(p: &str) -> Result<Vec<u32>> {
+pub(super) fn read_ids(p: &str) -> Result<Vec<u32>> {
     let s = std::fs::read_to_string(p).with_context(|| format!("read {p}"))?;
     serde_json::from_str(&s).or_else(|_| {
         s.split_whitespace().map(|x| x.parse::<u32>()).collect::<std::result::Result<Vec<_>, _>>()
@@ -480,7 +480,7 @@ pub fn probe_kv_nll(a: &KvNllArgs) -> Result<()> {
              a.label, kv_rowbytes(fmt, hd), a.max_pos, ids.len(), a.chunk, nd.len(), qsa_splits_dec());
     let v = model.cfg.vocab_size;
     anyhow::ensure!(used.iter().all(|&t| (t as usize) < v), "corpus has token ids >= vocab {v}");
-    let mut sc = Scratch::new(&model.dev, &model.cfg, vw, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, vw, model.cfg.rotary_dim, model.max_pos())?;
     let mut psc_opt: Option<PrefillScratch> = Some(model.prefill_scratch(a.chunk)?);
     model.reset_slot(0)?;
 
@@ -632,10 +632,12 @@ pub fn probe_kv_nll(a: &KvNllArgs) -> Result<()> {
             model.mtp_seam_prime(&mut sc, psc_opt.as_ref(), head, prompt[plen - 1] as i32, plen, 0)?;
             let mut out_toks: Vec<u32> = vec![b0 as u32];
             let (mut b, mut p, mut tap_row) = (b0, plen, 0usize);
-            let (mut acc, mut rounds) = (0usize, 0usize);
+            let (mut acc, mut rounds, mut drafted) = (0usize, 0usize, 0usize);
             while out_toks.len() < a.accept_new && !EOS_IDS.contains(&b) {
-                let o = model.mtp_round(&mut sc, head, 0, depth, b, p, tap_row)?;
+                // clamped at the sparse switch like the serve (S-B9-REL-SMALLFIXES item 2)
+                let o = model.mtp_round_clamped(&mut sc, head, 0, depth, b, p, tap_row)?;
                 acc += o.a;
+                drafted += o.drafts.len();
                 rounds += 1;
                 out_toks.extend(o.emitted.iter().map(|&e| e as u32));
                 b = o.last_tok;
@@ -644,10 +646,10 @@ pub fn probe_kv_nll(a: &KvNllArgs) -> Result<()> {
             }
             let emitted = out_toks.len() - 1;
             println!("KVNLL_ACCEPT arm={} fmt={fname} prompt={name} ctx={plen} depth={depth} rounds={rounds} accepted={acc}/{} ({:.2}%) emitted/round={:.3} tokens_hash={:016x} head={:?}",
-                     a.label, rounds * depth, 100.0 * acc as f64 / (rounds * depth).max(1) as f64,
+                     a.label, drafted, 100.0 * acc as f64 / drafted.max(1) as f64,
                      emitted as f64 / rounds.max(1) as f64, fnv1a(&out_toks), &out_toks[..out_toks.len().min(12)]);
             tot_acc += acc;
-            tot_drafted += rounds * depth;
+            tot_drafted += drafted;
             tot_rounds += rounds;
             tot_emit += emitted;
         }

@@ -49,8 +49,103 @@ fn erf(x: f32) -> f32 {
     sign * y
 }
 
+// ---- S-B9-REL-VISIONFIX F2: the CPU tower's thread count -----------------------------------
+// The CPU tower is the scalar reference: every output element is one left-to-right dot product
+// (`acc = b; acc += x[k] * w[k]`), which is what the oracle validated and what must stay
+// bit-exact. One 448 x 448 image is 3.6e11 such multiply-adds and the time grows with the image
+// (the 53.8 s of the first measurement was a smaller image, not a faster path). The first
+// implementation ran ONE dependent add chain at a time (about 3 minutes for 448 x 448 on a GB10
+// core: latency-bound, a fraction of the core's throughput); `gemm_rows` now advances 16 tokens'
+// chains side by side (see there). Numbers are in PLAN/REL_VISIONFIX_REPORT.md, not here: they go
+// stale with every build.
+//
+// What can change without changing a single bit: WHICH thread computes a token row, and the order
+// in which (token, output) pairs are visited. `--vision-cpu-threads N` splits the token rows over N
+// threads (default 1). Every dot product is still summed in the same order, so the embeddings are
+// identical for every N and equal to the first implementation's (unit-tested).
+
+static CPU_TOWER_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// `--vision-cpu-threads N` (set once at boot by the servers; 1 = single-threaded, the default).
+pub fn set_cpu_tower_threads(n: usize) {
+    CPU_TOWER_THREADS.store(n.clamp(1, 64), std::sync::atomic::Ordering::Relaxed);
+}
+/// The thread count `forward_cpu` uses.
+pub fn cpu_tower_threads() -> usize {
+    CPU_TOWER_THREADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run `f(first_row, rows_out)` over `n` rows of `per_row` outputs each, split into `threads`
+/// contiguous row ranges, one per thread (`threads` <= 1, or one row: inline on this thread).
+/// Threads spawned here inherit the calling thread's CPU affinity (the server's worker mask).
+fn par_rows(n: usize, per_row: usize, out: &mut [f32], threads: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+    assert_eq!(out.len(), n * per_row);
+    let t = threads.clamp(1, n.max(1));
+    if t == 1 || per_row == 0 {
+        f(0, out);
+        return;
+    }
+    let chunk = n.div_ceil(t);
+    std::thread::scope(|sc| {
+        let f = &f;
+        for (c, part) in out.chunks_mut(chunk * per_row).enumerate() {
+            sc.spawn(move || f(c * chunk, part));
+        }
+    });
+}
+
+/// Rows `first .. first + out.len() / outn` of `[N, inn] @ [inn, outn]^T + bias`, weights
+/// row-major `[outn, inn]`. Tokens are taken `TOKENS` at a time: the block is transposed once to
+/// `[k][token]`, and every weight row is applied to all of its tokens in one pass over `k`, with one
+/// accumulator per token. A dot product is a serial add chain (about 4 cycles per add), so one chain
+/// at a time runs at a fraction of the core; the `TOKENS` independent chains advance side by side,
+/// and the weight matrix (tens of MB) streams past once per block instead of once per token.
+/// BITS: each token's accumulator starts at `b[o]` and adds `x[k] * w[k]` for ascending `k`, one
+/// multiply and one add, exactly the order and the operations of the first implementation, so the
+/// result is identical to it (unit-tested bit for bit, partial blocks included). Padded lanes of a
+/// partial block hold zeros and are never stored.
+fn gemm_rows(x: &[f32], wt: &[f32], b: &[f32], out: &mut [f32], first: usize, inn: usize, outn: usize) {
+    const TOKENS: usize = 16;
+    if outn == 0 { return; } // nothing to produce (the first implementation's loops were no-ops too)
+    let rows = out.len() / outn;
+    let mut xt = vec![0f32; inn * TOKENS];
+    let mut i0 = 0;
+    while i0 < rows {
+        let nt = (rows - i0).min(TOKENS);
+        // [k][token]: lane t of step k is token i0 + t's k-th input (zero past the block's end)
+        for t in 0..TOKENS {
+            if t < nt {
+                let xr = &x[(first + i0 + t) * inn..(first + i0 + t + 1) * inn];
+                for k in 0..inn { xt[k * TOKENS + t] = xr[k]; }
+            } else {
+                for k in 0..inn { xt[k * TOKENS + t] = 0.0; }
+            }
+        }
+        for o in 0..outn {
+            let w = &wt[o * inn..(o + 1) * inn];
+            let mut acc = [b[o]; TOKENS];
+            for (k, &wk) in w.iter().enumerate() {
+                let xk: &[f32; TOKENS] = xt[k * TOKENS..(k + 1) * TOKENS].try_into().unwrap();
+                for t in 0..TOKENS {
+                    acc[t] += xk[t] * wk;
+                }
+            }
+            for t in 0..nt {
+                out[(i0 + t) * outn + o] = acc[t];
+            }
+        }
+        i0 += nt;
+    }
+}
+
 /// Generic GEMM `[N, inn] @ [inn, outn]^T + bias`, weights row-major `[outn, inn]`.
 fn gemm_vec(x: &[f32], wt: &[f32], b: &[f32], out: &mut [f32], inn: usize, outn: usize, n: usize) {
+    par_rows(n, outn, &mut out[..n * outn], cpu_tower_threads(), |first, part| gemm_rows(x, wt, b, part, first, inn, outn));
+}
+
+/// The first implementation of `gemm_vec`, kept as the bit-exactness reference of the tests.
+#[cfg(test)]
+fn gemm_vec_reference(x: &[f32], wt: &[f32], b: &[f32], out: &mut [f32], inn: usize, outn: usize, n: usize) {
     for i in 0..n {
         let xr = &x[i * inn..(i + 1) * inn];
         for o in 0..outn {
@@ -178,17 +273,7 @@ impl VisualTower {
 
         // 1. patch_embed [N,wpv] @ [wpv,hidden]^T + b
         let mut h = vec![0.0f32; n * hidden];
-        for i in 0..n {
-            let row = &pixel_values[i * wpv..(i + 1) * wpv];
-            for o in 0..hidden {
-                let w = &self.patch_embed_w[o * wpv..(o + 1) * wpv];
-                let mut acc = self.patch_embed_b[o];
-                for k in 0..wpv {
-                    acc += row[k] * w[k];
-                }
-                h[i * hidden + o] = acc;
-            }
-        }
+        gemm_vec(pixel_values, &self.patch_embed_w, &self.patch_embed_b, &mut h, wpv, hidden, n);
         // 2. pos-embed bilinear
         let pe = pos_embed_bilinear(&self.pos_embed_w, gh, gw, d.num_side(), hidden, merge);
         for i in 0..n {
@@ -266,33 +351,39 @@ fn block_attn(blk: &crate::vision_tower::VisualBlock, x: &[f32], cos: &[f32], si
     apply_rope_vision(&mut k, cos, sin, n, heads, hd);
     let scale = (hd as f32).powf(-0.5);
     let mut out = vec![0.0f32; n * heads * hd];
-    for i in 0..n {
-        for hh in 0..heads {
-            let qi = i * heads * hd + hh * hd;
-            let mut scores = vec![0.0f32; n];
-            for j in 0..n {
-                let kj = j * heads * hd + hh * hd;
-                let mut acc = 0.0f32;
-                for d in 0..hd {
-                    acc += q[qi + d] * k[kj + d];
+    // each query row is independent (it reads q, k, v and writes its own row of `out`): the rows
+    // are split over the tower's threads, every sum in the order it always had
+    let (q, k, v) = (&q, &k, &v);
+    par_rows(n, heads * hd, &mut out, cpu_tower_threads(), |first, part| {
+        let mut scores = vec![0.0f32; n];
+        for (r, row) in part.chunks_mut(heads * hd).enumerate() {
+            let i = first + r;
+            for hh in 0..heads {
+                let qi = i * heads * hd + hh * hd;
+                for j in 0..n {
+                    let kj = j * heads * hd + hh * hd;
+                    let mut acc = 0.0f32;
+                    for d in 0..hd {
+                        acc += q[qi + d] * k[kj + d];
+                    }
+                    scores[j] = acc * scale;
                 }
-                scores[j] = acc * scale;
-            }
-            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut ssum = 0.0f32;
-            for s in scores.iter_mut() {
-                *s = ((*s - mx) as f64).exp() as f32;
-                ssum += *s;
-            }
-            for j in 0..n {
-                let kj = j * heads * hd + hh * hd;
-                let wj = scores[j] / ssum;
-                for d in 0..hd {
-                    out[qi + d] += wj * v[kj + d];
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut ssum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = ((*s - mx) as f64).exp() as f32;
+                    ssum += *s;
+                }
+                for j in 0..n {
+                    let kj = j * heads * hd + hh * hd;
+                    let wj = scores[j] / ssum;
+                    for d in 0..hd {
+                        row[hh * hd + d] += wj * v[kj + d];
+                    }
                 }
             }
         }
-    }
+    });
     let mut proj = vec![0.0f32; n * hidden];
     gemm_vec(&out, &blk.proj_w, &blk.proj_b, &mut proj, hidden, hidden, n);
     proj
@@ -538,6 +629,125 @@ pub fn prepare_vision_request_gpu(
     }
     let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &infos, gvt.host().image_pad);
     Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
+}
+
+/// S-B9-REL-VISIONFIX F2: the CPU tower's thread count changes who computes a row, never a bit.
+#[cfg(test)]
+mod cpu_tower_thread_tests {
+    use super::*;
+    use crate::vision_tower::{TowerDims, VisualBlock};
+
+    /// `forward_cpu` reads a process-global thread count: the tests that set it run one at a time.
+    static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lcg(seed: u64) -> impl FnMut(usize, f32, f32) -> Vec<f32> {
+        let mut x = seed | 1;
+        move |n, scale, bias| (0..n).map(|_| {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            bias + scale * (((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+        }).collect()
+    }
+
+    fn small_tower() -> VisualTower {
+        let dims = TowerDims { hidden: 48, depth: 2, inter: 96, heads: 3, num_pos: 64, patch: 2, temporal: 2, merge: 2, in_ch: 3, out_hidden: 40 };
+        let mut w = lcg(0xC0FFEE);
+        let (h, i, mi) = (dims.hidden, dims.inter, dims.merge_inter());
+        let blocks = (0..dims.depth).map(|_| VisualBlock {
+            norm1_w: w(h, 0.2, 1.0), norm1_b: w(h, 0.1, 0.0), norm2_w: w(h, 0.2, 1.0), norm2_b: w(h, 0.1, 0.0),
+            qkv_w: w(3 * h * h, 0.25, 0.0), qkv_b: w(3 * h, 0.1, 0.0), proj_w: w(h * h, 0.25, 0.0), proj_b: w(h, 0.1, 0.0),
+            fc1_w: w(i * h, 0.25, 0.0), fc1_b: w(i, 0.1, 0.0), fc2_w: w(h * i, 0.25, 0.0), fc2_b: w(h, 0.1, 0.0),
+        }).collect();
+        VisualTower {
+            dims,
+            preproc: crate::vision_preproc::VisionPreprocConfig { patch_size: 2, merge_size: 2, temporal_patch_size: 2, in_channels: 3,
+                                                                  min_pixels: 16, max_pixels: 1 << 20, max_edge: 0 },
+            image_pad: 0,
+            patch_embed_w: w(h * dims.wpv(), 0.5, 0.0), patch_embed_b: w(h, 0.1, 0.0), pos_embed_w: w(dims.num_pos * h, 0.5, 0.0),
+            blocks,
+            merger_norm_w: w(h, 0.2, 1.0), merger_norm_b: w(h, 0.1, 0.0),
+            merger_fc1_w: w(mi * mi, 0.1, 0.0), merger_fc1_b: w(mi, 0.1, 0.0),
+            merger_fc2_w: w(dims.out_hidden * mi, 0.1, 0.0), merger_fc2_b: w(dims.out_hidden, 0.1, 0.0),
+            source: "synthetic".into(),
+        }
+    }
+
+    /// The GEMM as it is now (token blocks, any thread count) against the first implementation,
+    /// bit for bit: shapes that are not multiples of the block or of the thread count included.
+    #[test]
+    fn the_blocked_threaded_gemm_is_bit_identical_to_the_first_implementation() {
+        let _g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = lcg(7);
+        for (n, inn, outn) in [(1usize, 5usize, 3usize), (16, 8, 8), (17, 33, 9), (50, 24, 70), (131, 48, 96)] {
+            let (x, wt, b) = (w(n * inn, 2.0, 0.0), w(outn * inn, 2.0, 0.0), w(outn, 1.0, 0.0));
+            let mut want = vec![0f32; n * outn];
+            gemm_vec_reference(&x, &wt, &b, &mut want, inn, outn, n);
+            for threads in [1usize, 2, 3, 8, 64] {
+                set_cpu_tower_threads(threads);
+                let mut got = vec![9f32; n * outn];
+                gemm_vec(&x, &wt, &b, &mut got, inn, outn, n);
+                assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "n={n} inn={inn} outn={outn} threads={threads}");
+            }
+        }
+        set_cpu_tower_threads(1);
+    }
+
+    /// Instrument (ignored): the first implementation against the blocked kernel at the served MLP
+    /// shape (784 tokens of a 448 x 448 image, 1152 -> 4304), one thread, bits compared.
+    #[test]
+    #[ignore]
+    fn instrument_gemm_timing_at_a_served_shape() {
+        let _g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = lcg(11);
+        let (n, inn, outn) = (784usize, 1152usize, 1152usize);
+        let (x, wt, b) = (w(n * inn, 2.0, 0.0), w(outn * inn, 0.1, 0.0), w(outn, 1.0, 0.0));
+        set_cpu_tower_threads(1);
+        let (mut want, mut got) = (vec![0f32; n * outn], vec![0f32; n * outn]);
+        let t = std::time::Instant::now();
+        gemm_vec_reference(&x, &wt, &b, &mut want, inn, outn, n);
+        let t_ref = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        gemm_vec(&x, &wt, &b, &mut got, inn, outn, n);
+        let t_new = t.elapsed().as_secs_f64();
+        assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "bits differ");
+        println!("GEMM {n}x{inn}x{outn}: first implementation {t_ref:.3} s, blocked {t_new:.3} s, x{:.2}", t_ref / t_new);
+    }
+
+    /// The whole tower: every thread count gives the embeddings of one thread, bit for bit, on
+    /// square and non-square grids (attention rows, patch embed, MLPs and the merger all split).
+    #[test]
+    fn the_cpu_tower_is_bit_identical_for_every_thread_count() {
+        let _g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let tower = small_tower();
+        for (gh, gw) in [(4usize, 4usize), (6, 4), (2, 10)] {
+            let pv: Vec<f32> = (0..gh * gw * tower.dims.wpv()).map(|i| ((i * 37 + gh) % 255) as f32 / 127.5 - 1.0).collect();
+            set_cpu_tower_threads(1);
+            let one = tower.forward_cpu(&pv, gh, gw);
+            assert!(one.iter().all(|v| v.is_finite()) && one.iter().any(|v| *v != 0.0));
+            for threads in [2usize, 3, 7, 16, 64] {
+                set_cpu_tower_threads(threads);
+                let many = tower.forward_cpu(&pv, gh, gw);
+                assert!(one.len() == many.len() && one.iter().zip(&many).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "grid {gh}x{gw}: {threads} threads differ from 1");
+            }
+        }
+        set_cpu_tower_threads(1);
+    }
+
+    /// The option: default 1, a registry option with no environment variable, validated range.
+    #[test]
+    fn the_thread_option_is_a_flag_with_the_old_default() {
+        let o = &crate::opts::REG[crate::opts::idx("vision-cpu-threads")];
+        assert_eq!((o.def, o.env), ("1", ""));
+        assert!(o.help.contains("bit-identical") && o.help.contains("Default 1"));
+        for (v, want) in [("1", Some(1usize)), ("8", Some(8)), (" 64 ", Some(64)), ("0", None), ("65", None), ("-1", None), ("many", None), ("", None)] {
+            assert_eq!(crate::vision_tower::parse_cpu_tower_threads(v).ok(), want, "{v:?}");
+        }
+        // the clamp of the setter itself (a caller that bypasses the parser cannot ask for 0)
+        let _g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        set_cpu_tower_threads(0);
+        assert_eq!(cpu_tower_threads(), 1);
+        set_cpu_tower_threads(1);
+    }
 }
 
 #[cfg(test)]

@@ -56,6 +56,16 @@ pub enum TokEvent {
     /// cached count to 0. Feeds `usage.prompt_tokens_details.cached_tokens` and
     /// `velogb10_prompt_tokens_cached_total`.
     Admitted { cached_tokens: u32 },
+    /// S-B9-REL-SMALLFIXES item 5(a): sent at most once per request, right BEFORE its `Finish`,
+    /// when the request ended on a model stop token and the scheduler could read that step's
+    /// logits row (`exl3_forward::stop_token_stats`). `rank` = 1 + the number of tokens with a
+    /// greater logit. `p` is a probability under one of TWO laws, and `sampled` says which:
+    /// true = the law the sampler drew from (temperature-scaled, then top-k / min-p / top-p
+    /// truncated and renormalized; 0 = the token was truncated away); false = a greedy request,
+    /// where nothing is drawn: the plain softmax at temperature 1. The two are not comparable.
+    /// Log-only: it feeds `stop_p` / `stop_rank` / `stop_p_law` of the `[gen]` line. An engine
+    /// that never sends it logs `na` for all three.
+    StopInfo { p: f32, rank: u32, sampled: bool },
 }
 
 /// A request submitted to the scheduler.
@@ -1671,6 +1681,7 @@ impl BatchScheduler {
     /// prompt — measured at 25,370 ms across a 16,800-token admission (P0). Now it waits for at
     /// most one window (12.6 s), and the window formula itself is unchanged (§3.2).
     pub async fn run(mut self) {
+        self.tp_drill_notice();   // S-B9-CF-AGREE16B (W3): a lockstep drill flag at TP=1 is INERT, said once
         loop {
             // F8 diagnosis (temporary, --loop-trace): split the wall around decode_step so the
             // serve-vs-bench per-step gap (261 vs 188 ms) can be attributed.
@@ -1729,6 +1740,16 @@ impl BatchScheduler {
         }
     }
 
+    /// S-B9-CF-AGREE16B (W3): one boot line per lockstep drill flag this process carries: armed, or
+    /// why it is inert here (`net::drill_plan`). Called where the rank is known (the TP serve loops).
+    fn tp_drill_notice(&self) {
+        let tp = if self.gpu.tp_world() > 1 { Some((self.gpu.tp_rank(), self.gpu.tp_world())) } else { None };
+        for l in crate::net::drill_plan(crate::opts::get(crate::opt!("tp-agree-drill")).as_deref(),
+                                        crate::opts::get(crate::opt!("tp-width-drill")).as_deref(), false, tp).lines {
+            crate::reprintln!("{l}");
+        }
+    }
+
     /// TP item D — per-step SPMD divergence guard. After every executed decode step, both ranks
     /// exchange `(step, cumulative emitted, state hash)` over the link's agreement channel
     /// (`net::agree`, 10 s deadline) and REFUSE to continue on mismatch or timeout. The hash folds
@@ -1738,7 +1759,7 @@ impl BatchScheduler {
     /// (kernels no-op through the stream, I9) and return Err — the head's die-with-it guard exits
     /// the server and the mirror's supervisor re-arms, rather than serve one more divergent token.
     /// `--tp-agree-drill=<step>` corrupts this rank's hash at one step (the forced-divergence
-    /// drill gate; env read directly, test-only).
+    /// drill gate; a CLI flag, test-only, NVFP4 packs).
     fn tp_agree_step(&self, step: u64) -> anyhow::Result<()> {
         let mut h: u32 = 0x811c9dc5;                     // FNV-1a over the lane/policy state
         let mut mix = |x: u32| { h ^= x; h = h.wrapping_mul(0x0100_0193); };
@@ -1766,19 +1787,28 @@ impl BatchScheduler {
         mix(self.mtp_lanes as u32);
         // B8/G1: k_verify (the verify WIDTH this step ran) joins the extended agree token — ranks
         // that disagree on the width execute different barrier sequences (I9 class). agree_ext
-        // folds it into the hash word at bits [27..31); the depth IS the width for chain MTP.
-        let k_verify = if self.mtp.active() { self.mtp.depth() as u8 } else { 0u8 };
+        // carries it in bits 27..31 of the token's low word; the depth IS the width for chain MTP.
+        // S-B9-CF-AGREE16B (W5): the range check sees the whole usize, BEFORE the narrowing (a
+        // `depth() as u8` first would turn 256 + k into k and slip past agree_ext's own check).
+        let k_real: usize = if self.mtp.active() { self.mtp.depth() } else { 0 };
+        let Some(k_verify) = crate::net::agree_width(k_real) else {
+            crate::net::abort_link();
+            anyhow::bail!("TP agree REFUSED at step {step}: verify width {k_real} does not fit the lockstep token (max {}) — \
+                           link aborted instead of sending a width the peer could mistake for another",
+                          crate::net::AGREE_WIDTH_MAX);
+        };
         if let Ok(d) = crate::opts::var(crate::opt!("tp-agree-drill")) {
             if d.parse::<u64>().ok() == Some(step) {
                 eprintln!("[tp-agree] DRILL: corrupting this rank's hash at step {step}");
-                h ^= 0xDEAD;
+                // S-B9-CF-AGREE16B (W3): rank-dependent (it was `h ^= 0xDEAD` on every rank: two armed
+                // ranks corrupted alike and agreed)
+                h ^= crate::net::drill_hash_flip(self.gpu.tp_rank());
             }
         }
         let count = (total_generated & 0xFF) as u8;
-        // B8: agree_ext folds k_verify into the hash word's low bits [27..31); fold it here too so
-        // the comparison is against the SAME wire shape. Raw-vs-folded mismatches by exactly
-        // (k_verify<<27) whenever MTP is active (k_verify = depth > 0) — the step-0 stall masked this.
-        let h_ext = (h ^ ((k_verify as u32 & 0xF) << 27)) as u32;
+        // B8: agree_ext sends net::agree_word(k_verify, h) (width in bits 27..31, the digest folded to
+        // 27 bits); compare against the SAME function's word. A raw-hash comparison mismatches whenever
+        // MTP is active (k_verify = depth > 0) — the step-0 stall masked this.
         let (pc, ph) = match crate::net::agree_ext(step, count, k_verify, h) {
             Some(x) => x,
             None => {
@@ -1787,6 +1817,8 @@ impl BatchScheduler {
                 anyhow::bail!("TP agree: link aborted/timeout at step {step}");
             }
         };
+        // (after agree_ext: it has refused a width the word cannot carry)
+        let h_ext = crate::net::agree_word(k_verify, h);
         if pc != count || ph != h_ext {
             eprintln!("[tp-agree] MISMATCH at step {step}: local (count {count}, hash {h_ext:#010x}) \
                        vs peer (count {pc}, hash {ph:#010x}) — aborting rather than serving \
@@ -1819,6 +1851,7 @@ impl BatchScheduler {
     /// send `ServingMsg::Shutdown` and return.
     pub async fn run_tp_head(mut self, mut streams: Vec<std::net::TcpStream>) -> anyhow::Result<()> {
         self.tp_serving = true;
+        self.tp_drill_notice();
         let mut step: u64 = 0;
         let mut closed = false;
         // PERSISTENT across iterations (cursor scheduler). With one prefill cursor at a time, a
@@ -1921,6 +1954,7 @@ impl BatchScheduler {
     /// its own: cancels arrive exclusively as wire events (see `Lane::tp_cancelled`).
     pub async fn run_tp_mirror(mut self, mut stream: std::net::TcpStream) -> anyhow::Result<()> {
         self.tp_serving = true;
+        self.tp_drill_notice();
         let mut keepalive: Vec<mpsc::UnboundedReceiver<TokEvent>> = Vec::new();
         let mut step: u64 = 0;
         loop {
@@ -2055,6 +2089,7 @@ impl BatchScheduler {
                     TokEvent::Finish { .. } => {}
                     // #8.2: admission telemetry — no action for a bench drain.
                     TokEvent::Admitted { .. } => {}
+                    TokEvent::StopInfo { .. } => {} // [gen]-line data only
                 }
             }
             // Keep the source set for the next job's ADMIT (the lane priming consults it).

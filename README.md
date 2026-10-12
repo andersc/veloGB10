@@ -115,6 +115,18 @@ Full setup (pack layout, node command, launch lines, expected output):
 
 ### New in v0.7.4
 
+This is a fix release for the EXL3 path. **It is not the speed release for sampled requests**
+(requests that send no sampler settings, which is most of them): that is v0.7.5. What this build
+does not include, and on what kind of request each figure was measured, is in the
+[CHANGELOG](CHANGELOG.md) under "What is not included in this build".
+
+- **Tool-call parsing.** A `</tool_call>` inside an argument is text, an argument loses one
+  wrapping newline instead of all of them, a `<think>` inside an argument no longer leaks the
+  call. A block the model never closed is dropped, as in v0.7.3 (`--tool-unclosed complete` returns
+  its closed `<function=...>` elements when the model ended by itself). A value that quotes a call with two or more parameters is still
+  read wrongly at default flags; two opt-in readings exist
+  (`--tool-quote-pairing on|cost`) and `--tool-shadow-cost on` measures how often they would
+  differ on a server's own traffic. Each change has a flag that restores the v0.7.3 reading.
 - **Speculation re-arms inside a request.** The per-request control that turns speculative
   decoding off when it stops paying used a 2 % margin against one stale measurement and was
   final for the request; in a user's log 63 % of a long request ran at plain speed because of
@@ -125,20 +137,41 @@ Full setup (pack layout, node command, launch lines, expected output):
   of requests that cross about 2,051 tokens of context under speculation and of short
   requests that shared a step with a longer one, compared with v0.7.3, where those bytes
   depended on timing.
+- **Streaming.** No chunk with a `choices` entry leaves the EXL3 server before the first
+  generated token (a benchmark that took the role chunk for the first response read hundreds
+  of thousands of tokens per second); keep-alive comment lines while a request waits
+  (`--sse-keepalive`, default 10 s); a streamed reply no longer carries its stop string.
 - **Images survive a GPU vision-tower error** (issue #20, pull request #16): the request is
-  answered by the CPU tower and the next one uses the GPU tower again.
+  answered by the CPU tower and the next one uses the GPU tower again. An image request that
+  coincided with a CUDA graph capture could lose the capture, the image worker or the server;
+  the tower now uses only its own stream. `--vision-cpu-threads` shortens the CPU answer.
+- **Lane packing is on by default** (`--lane-pack`; `--lane-pack off` restores the previous
+  behaviour). Two concurrent requests share one speculative verification. Measured gains are for
+  two requests and for the request classes the CHANGELOG names; none at three, mixed at four; it
+  costs about 1.8 GiB of device memory per machine; a posture it cannot serve boots with it
+  inactive and one line saying why. No automated gate chain ran on the TP=4 path.
+- **Options fail loudly or say what they did.** An option that would swallow the next flag exits
+  2; an unknown flag prints one warning with the nearest names; `--max-batch` above 16 boots
+  with 16 and says so; a head and a node of different builds are refused (protocol 6: run the
+  same binary on every machine); bare `--tp` is two machines and says so.
+- **KV occupancy gauges** on `/metrics` (issue #24), and a **`--perplexity`** measuring tool
+  for EXL3 packs with checks that can fail.
 - **Community pull requests ported:** RoCE GID auto-detection and `--gid-idx` (#15), TP image
   payload order and `--ple-headroom-per-lane-gb` (#17), the served-window memory fix and the
   `--max-seq-len` clamp on the EXL3 server (#21), `--prefill-interleave` (#23, opt-in).
 - **Smaller changes:** `--mtp off` is honoured on the EXL3 server; `--help` corrected
   (`--max-tokens`, penalties, sampler defaults); the TP launcher derives `--tp` from the
   `--node` count; the `[gen]` log line carries `stop_kind` / `stop_p` / `stop_rank`; streaming
-  `/v1/completions` can send a usage chunk.
+  `/v1/completions` can send a usage chunk; the 4.05 pack boots with `--exl3-recon-min 0`;
+  the release binary carries no build-host directory.
 - **New on `/metrics`:** `velogb10_spec_mtp_off_events_total`,
   `velogb10_spec_mtp_reprobes_total`, `velogb10_spec_mtp_reprobe_ok_total`,
-  `velogb10_graph_cache_mixed_step_entries`.
+  `velogb10_graph_cache_mixed_step_entries`, `velogb10_graph_capture_invalidated_total`,
+  `velogb10_graph_capture_failed_total`, `velogb10_kv_positions_*`, `velogb10_kv_lane_positions_*`,
+  `velogb10_kv_allocated_bytes`, `velogb10_lane_pack_*`, `velogb10_toolcall_*`,
+  `velogb10_max_batch_requested`, `velogb10_exl3_recon_forced_total`.
 
-Numbers, credits, the behaviour change in full and the known limits: [CHANGELOG](CHANGELOG.md).
+Numbers, credits, the behaviour changes in full and the known limits: [CHANGELOG](CHANGELOG.md).
 
 ### New in v0.7.3
 
@@ -160,8 +193,8 @@ environment variables. Details: [CHANGELOG](CHANGELOG.md).
   step across all of them (`--spec-lanes-max auto`): on one node aggregate throughput rises from about
   4 busy requests, to roughly ×1.45 at 8 and ×1.9 at 16; TP=2 and TP=4 gain proportionally. A single
   request is untouched, and every request's greedy output is byte-identical to running it alone. **Two
-  and three concurrent requests still take turns** (aggregate stays at the single-request rate); a packed
-  multi-request verify for that range is in development. Numbers: **[CHANGELOG.md](CHANGELOG.md)**.
+  and three concurrent requests still took turns** (aggregate stayed at the single-request rate); v0.7.4 packs two concurrent
+  requests into one verify by default (`--lane-pack off` restores the previous behaviour). Numbers: **[CHANGELOG.md](CHANGELOG.md)**.
 - **Qwen3.8-Flash-Next at 4.05 bpw** — [doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-4.05bpw)
   (~108 GB), TP=1 (n-gram table on SSD), TP=2 and TP=4, with images. Verified bit-exact against the
   exllamav3 reference implementation.
@@ -775,16 +808,26 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--tokenizer <FILE>` | — | Legacy: tokenizer.json path (implied by `--model-dir`) |
 | `--port <N>` | 8000 | Listen port |
 | `--host <ADDR>` | `0.0.0.0` | HTTP bind address (`127.0.0.1` = this machine only) |
-| `--max-batch <N>` | 8 | Max concurrent sequences (lanes). EXL3: every lane's KV is allocated up front (~5.6 GB per lane at 262K context, 2.8 GB at 131K) |
+| `--max-batch <N>` | 8 | Max concurrent sequences (lanes). EXL3: every lane's KV is allocated up front (~5.6 GB per lane at 262K context, 2.8 GB at 131K); at most 16: a larger value boots with 16 and prints one line saying so (further requests wait in the queue; `velogb10_max_batch_requested` keeps what was asked) |
 | `--spec-lanes-max <auto\|N\|0>` | auto | EXL3 multi-request mode: pick per round between serial speculation and one shared batched step by estimated aggregate tok/s; `N` shares only above N busy requests, `0` = never |
 | `--lane-order <rr\|fcfs>` | rr | Order of serial speculative rounds with several busy requests: `rr` = a round per lane per step (all finish late); `fcfs` = run one lane to completion at a time (measured: −23%/−30% mean completion at 2/3 equal-length concurrent; two 512-token turns at quantum 1024: −20–24%; worse TTFT for later lanes; aggregate unchanged; `rr` wins the mean on mixed lengths; greedy output identical) |
 | `--lane-quantum <N>` | 256 | The `--lane-order=fcfs` turn cap in generated tokens (bounds a pathologically long turn) |
+| `--lane-pack <on\|off>` | **on** | EXL3: two concurrent requests share ONE speculative verification (greedy output byte-identical; sampled requests verified by the real-q ratio rule); `off` restores the behaviour before v0.7.4. Needs the EXL3 server, a live MTP draft head, `--lane-order rr`, `--max-batch` of 2 or more, `--graph-precapture on`, `--kv-cache q8` and the default `--exl3-mtp-k`; a posture it cannot serve (or a packed scratch that cannot be built at boot) boots with packing inactive and one line saying why, and `/metrics` `velogb10_lane_pack_active{reason}` carries it. A request with a repetition, presence or frequency penalty, or with an image, never packs. About 1.7–1.8 GiB of device memory per machine. Gains are class-specific and none at three requests; TP=4 was exercised by hand, no gate chain ran there: see the CHANGELOG |
+| `--lane-pack-sampled-tp <on\|off>` | on | With lane packing active under TP: sampled requests join packed rounds (`off`: only greedy requests pack under TP) |
+| `--sse-keepalive <N>` | 10 | Streamed responses: after N seconds without an event (queue wait, prefill, a tool call being buffered) send one SSE comment line `: keep-alive`. 0 = off. The lines stop when the whole scheduler has completed no decode round and no prefill chunk for 60 s |
+| `--unclosed-think <reasoning\|content>` | reasoning | Non-streaming chat whose generation ends inside the think block: `reasoning` returns the text as `reasoning_content` with an empty `content` (what streaming sends); `content` = the v0.7.3 bytes |
+| `--tool-block-end <after-function\|first>` | after-function | XML tool calls: a `</tool_call>` inside an argument is text (after-function; the popular engines' rule) or ends the block (`first` = v0.7.3) |
+| `--tool-value-trim <one\|all>` | one | XML tool calls: remove exactly one wrapping newline from a value (vLLM's rule) or all of them (`all` = v0.7.3) |
+| `--tool-quote-pairing <off\|on\|cost>` | off | XML tool calls: how a value that quotes tool-call tags ends. `off` = the v0.7.3 rule (an argument that quotes a call with two or more parameters is cut at the first quoted `</parameter>`); `on` pairs quoted tags; `cost` picks the cheapest consistent reading. Neither opt-in is the default: each reads one class worse than `off` (CHANGELOG) |
+| `--tool-unclosed <complete\|drop>` | **drop** | XML tool calls: a `<tool_call>` block the model never closed. `drop` (default) = v0.7.3: the whole block is dropped; `complete` returns the closed `<function=...>` elements when the model ended by itself |
+| `--tool-shadow-cost <off\|on>` | off | Diagnostic: also read every tool-call response under the cost rule and count where it would differ (`velogb10_toolcall_parse_disagreement_total{other="cost"}`); nothing of it is served |
 | `--ple-ram <auto\|ram\|ssd>` | auto | EXL3 n-gram table location: RAM, or read from SSD (frees 30–39 GB, decode ~1–4% slower); `auto` decides after the boot and refuses impossible configurations before the load |
 | `--ple-headroom-per-lane-gb <F>` | 0 | Opt-in: extra headroom for the `--ple-ram auto` decision, this many GiB per additional lane on top of the fixed 16 GiB (2 with `--max-batch 10` → 16 + 2 × 9 = 34 GiB). 0 = the decision as before v0.7.4 |
 | `--max-tokens <N>` | EXL3: unlimited; NVFP4: 8192 | Output length for a **chat** request that omits `max_tokens`. A default, not a cap: a request may ask for more, up to the room left in the context. `/v1/completions` requests that omit it get 16 and ignore this flag |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family); since v0.7.4 the EXL3 server clamps too and prints the limit (before, a larger value booted and could corrupt device memory). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
 | `--prefill-interleave <N>` | 0 | EXL3, one machine: after each prefill chunk (except the last) of a prompt that joins while other requests are generating, run up to N decode steps for those requests. Measured with a 20K-token joining prompt: longest stall 14.1 s → 5.4 s at the default `--prefill-chunk 4095`, 15.1 s → 2.7 s at 2048, 16.6–17.0 s → 1.35–1.47 s at 1024, for +3 % to +9 % time to first token of the joining request. The joining request's output is unchanged. Ignored under TP (a boot line says so) |
-| `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch. Since v0.7.4 a GPU-tower error falls back to the CPU tower for that one request by itself |
+| `--vision-cpu` | off | NVFP4 server: force the CPU vision tower (reference path) instead of the GPU tower; a diagnostic escape. The EXL3 server always builds the GPU tower and says so if this is given; since v0.7.4 a GPU-tower error there falls back to the CPU tower for that one request by itself |
+| `--vision-cpu-threads <N>` | 1 | Threads of the CPU tower (1 to 64; used when the GPU tower failed, or with `--vision-cpu`). The embeddings are bit-identical for every N; 448 x 448 on one machine: 172.9 s at 1, 44.8 s at 4, 31.0 s at 8 |
 | `--reasoning-effort <e>` | template default | Reasoning level in the chat template (`no_think`/`low`/`medium`/`high`/`xhigh`); per-request `reasoning_effort` overrides |
 | `--output-prompts [n]` | off | Log each chat request human-readable (params, messages, rendered prompt); optional render cap `n` |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` = speculation with the profitability control (NVFP4: calibrated at boot and re-picked live; EXL3: the per-request auto-off and re-probe); greedy verify is bitwise-lossless, temp>0 distribution-exact. `off` = plain decoding only, on every server (the EXL3 server honours it since v0.7.4; it ignored the flag before). `on` forces it on NVFP4 (benchmarking) and equals `auto` on EXL3 |
@@ -866,15 +909,24 @@ invariance), `--probe-state` (GDN state divergence), `--probe-reject` (rollback)
 idle GB10 ≈ 238 GB/s), `--tp-barrier-bench` (transport gates, no model), `--net-test` (2-proc
 transport audit), `--sweep-gemm`.
 
-<!-- CUT: drop the 'armed only when another flag follows it' clause below if the drill-flag fix (H2) is merged before the cut -->
-New in v0.7.4: `--probe-exl3-regime` (bit-level comparison of a row alone and inside a mixed
-dense/sparse decode step; its options `--regime-runner`, `--regime-joiner`, `--regime-steps`,
-`--regime-order`, `--regime-csv` and `--regime-time` are listed by `--help-diag`, the probe
-itself only in their descriptions), and two test drills, listed by `--help-diag` and never for
-serving: `--mtp-reprobe-drill` (forces the speculation off / re-arm cycle on a short schedule)
-and `--vision-fail-gemm` (fails the first GPU-tower matrix multiply once, to exercise the CPU
-fallback; on the EXL3 server it is armed only when another flag follows it on the command
-line).
+New in v0.7.4: `--perplexity` on EXL3 packs (a measuring tool with checks that can fail;
+`--text <file>` or `--ppl-ids <file>`, `--window N`, `--ppl-csv`, `--ppl-dump-ids`,
+`--ppl-label`, `--ppl-ref-windows N`, `--ppl-min-top1`, `--ppl-min-ppl`, `--ppl-max-ppl`; one
+machine; a printed `RESULT:` means "not catastrophically broken" and nothing more; an option repeated with different values, or a value-less path option followed by another flag, is refused),
+`--probe-exl3-regime` (bit-level comparison of a row alone and inside a mixed dense/sparse
+decode step; its options `--regime-runner`, `--regime-joiner`, `--regime-steps`,
+`--regime-order`, `--regime-csv` and `--regime-time` are listed by `--help-diag`), and test
+drills, listed by `--help-diag` and never for serving: `--mtp-reprobe-drill` (forces the
+speculation off / re-arm cycle on a short schedule), `--vision-fail-gemm` (fails the first
+GPU-tower matrix multiply once, to exercise the CPU fallback), `--tp-width-drill N` (one rank
+reports a wrong verify width once: the lockstep check must abort), `--inject-stall
+ROUND:SECONDS` (a scheduler sleep, for the keep-alive bound) and `--lane-pack-drill-skip-sparse`
+(one rank skips its sparse packed graphs: the boot agreement must refuse).
+
+`scripts/owner_check.py --base http://HOST:PORT` (v0.7.4) reads a running server's `/metrics` and
+reports in plain words what it did for its traffic (how rounds were served, whether speculation
+and lane packing engaged, how tool-call responses were parsed, why requests were kept out of a
+packed round); a series the server does not export is reported as "NOT EXPORTED", never as zero.
 
 ## Requirements
 
@@ -969,7 +1021,7 @@ This project does not link extensively against any other project (other than the
 
 Areas that are in flight or planned. These are tracked openly — progress and timelines are as honest as I can make them, and this list changes as work lands.
 
-- **Concurrency.** Shipped in v0.7.2 for the EXL3 path from about four busy requests (see the CHANGELOG for numbers). **Two and three concurrent requests do not scale yet**; a packed multi-request speculative verify for that range is the next item. The NVFP4 models run requests as a plain batch above one lane.
+- **Concurrency.** Shipped in v0.7.2 for the EXL3 path from about four busy requests (see the CHANGELOG for numbers). Two requests share one speculative verification by default since v0.7.4 (`--lane-pack`; `off` restores the previous behaviour); **three and four concurrent requests do not scale yet, and sampled requests are the next release's subject.** The NVFP4 models run requests as a plain batch above one lane.
 - **Fix Tencent Hy3 support.** Hy3 regressed over the last few weeks as the engine evolved; restoring it to a fully working, gated state is a priority.
 - **Video input.** Image input is supported on every topology, including the EXL3 / Qwen3.8-Flash-Next path. Video (and audio) parts are not served yet — they return `400` — and that is the remaining vision work, along with widening coverage across the rest of the Qwen family.
 - **Qwen3.5 397B MoE (incl. Ornith 1.5).** Large-model port; the engine already serves this architecture at 122B, so the work is the TP=2/TP=4 capacity bring-up (large weight footprint) plus the correctness gates at that size.

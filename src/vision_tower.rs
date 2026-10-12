@@ -172,6 +172,14 @@ pub struct VisualBlock {
     pub fc2_b: Vec<f32>,   // [HIDDEN]
 }
 
+/// `--vision-cpu-threads`: a whole number of threads, 1..=64.
+pub(crate) fn parse_cpu_tower_threads(v: &str) -> Result<usize> {
+    match v.trim().parse::<usize>() {
+        Ok(n) if (1..=64).contains(&n) => Ok(n),
+        _ => Err(anyhow!("--vision-cpu-threads must be a whole number from 1 to 64, got {v:?}")),
+    }
+}
+
 /// The complete vision tower weights, plus the resolved geometry that produced them.
 #[derive(Clone, Debug)]
 pub struct VisualTower {
@@ -655,6 +663,14 @@ fn load_preproc(dir: &Path, dims: &TowerDims) -> Result<crate::vision_preproc::V
     if let Ok(v) = crate::opts::var(crate::opt!("image-max-edge")) {
         cfg.max_edge = v.trim().parse().map_err(|_| anyhow!("--image-max-edge must be a pixel count (0 = no cap), got {v:?}"))?;
     }
+    // S-B9-REL-VISIONFIX F2: --vision-cpu-threads N (default 1 = single-threaded, as before)
+    if let Ok(v) = crate::opts::var(crate::opt!("vision-cpu-threads")) {
+        let n = parse_cpu_tower_threads(&v)?;
+        crate::vision_encoder::set_cpu_tower_threads(n);
+        if n > 1 {
+            crate::rprintln!("[vision] CPU reference tower: {n} threads (--vision-cpu-threads; it runs only when the GPU tower failed; embeddings identical for any count)");
+        }
+    }
     if cfg.patch_size != dims.patch || cfg.merge_size != dims.merge
         || cfg.temporal_patch_size != dims.temporal || cfg.in_channels != dims.in_ch
     {
@@ -672,11 +688,31 @@ fn load_preproc(dir: &Path, dims: &TowerDims) -> Result<crate::vision_preproc::V
 mod tests {
     use super::*;
 
+    /// Locate the fixture `models/<name>` for pack-dependent tests with NO environment variable and NO
+    /// lab path: walk up from the crate root (the compile-time manifest dir) and take the first ancestor
+    /// that has `models/<name>`. That is the repo root in the main checkout (its `models` symlink) and the
+    /// parent directory of the checkout in a `git worktree` (a worktree has no `models` of its own, which is
+    /// why this test used to fail there: the old relative path only resolved from the main checkout).
+    fn test_model_dir(name: &str) -> Option<std::path::PathBuf> {
+        let mut d = Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        while let Some(p) = d {
+            let c = p.join("models").join(name);
+            if c.is_dir() { return Some(c); }
+            d = p.parent();
+        }
+        None
+    }
+
     #[test]
     fn strict_load_333() {
-        let dir = std::env::var("GB10_TEST_MODEL_DIR")
-            .unwrap_or_else(|_| "models/3.8-27b-nvfp4-full-all".to_string());
-        let t = VisualTower::load(&dir).unwrap();
+        // The fixture is the 27B NVFP4 pack (27 blocks, merger 5120 x 4608), not a Flash-Next pack. Tests SKIP
+        // (never fail) on a box without it, the convention of the tokenizer tests: say so loudly.
+        let Some(dir) = test_model_dir("3.8-27b-nvfp4-full-all") else {
+            eprintln!("SKIP strict_load_333: no `models/3.8-27b-nvfp4-full-all` in any ancestor of the crate root \
+                       (needs the 27B NVFP4 pack; not part of the repository)");
+            return;
+        };
+        let t = VisualTower::load(dir.to_str().expect("utf-8 fixture path")).unwrap();
         assert_eq!(t.tensor_count(), 333, "visual tensor count");
         assert_eq!(t.blocks.len(), 27);
         assert_eq!(t.patch_embed_w.len(), 1152 * 3 * 2 * 16 * 16);

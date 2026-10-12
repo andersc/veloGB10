@@ -21,7 +21,13 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PROTOCOL_VERSION: u32 = 5;   // v5: + DraftManifest/DraftReady — the DFlash2 drafter rides the sync
+const PROTOCOL_VERSION: u32 = 6;   // v6 (S-B9-CF-AGREE16/16B): every pairwise lockstep word changed (the
+                                     //     verify width is a 5-bit field of its own, the digest folded to 27
+                                     //     bits, the step-go fence an FNV of (step, events)) and the hub RND
+                                     //     frame carries the real accept / width. No frame changed size, so
+                                     //     this number is what tells a v5 pair apart from a v6 one by NAME
+                                     //     (the source stamp differs too, but only says "another build").
+                                     // v5: + DraftManifest/DraftReady — the DFlash2 drafter rides the sync
                                      //     into the node's blob cache (v4: per-epoch payload lengths)
 const DISCOVERY_PORT: u16 = 29499;          // UDP; TCP control plane defaults to 29500 (--port)
 const DISCOVERY_MAGIC: &str = "GB10-TP-DISCOVER";
@@ -29,8 +35,21 @@ const DISCOVERY_MAGIC: &str = "GB10-TP-DISCOVER";
 /// behavior. Cheaper than hashing the 15 MB executable each launch, and it is exactly what must
 /// match across boxes. `-k` covers the kernels (KERNEL_BUILD_ID), `-r` the Rust sources + C shim
 /// (SOURCE_BUILD_ID): the sharders/protocol/scheduler change behavior without touching a .cu.
+///
+/// It is a SOURCE stamp on purpose, not the executable's sha256: two machines that build the same
+/// commit must pair, and their binaries need not be byte-identical. What `-r` covers is the file
+/// list `build.rs` bakes in (`SOURCE_BUILD_FILES`): every `.rs` under src/ at any depth except
+/// src/bin and src/ptx, the included data files, native/net_shim.c, Cargo.lock, Cargo.toml and
+/// build.rs. `build_id_tests` walks the tree and fails on an engine file outside both stamps.
 fn binary_version() -> String {
     format!("v{}-k{}-r{}", PROTOCOL_VERSION, env!("KERNEL_BUILD_ID"), env!("SOURCE_BUILD_ID"))
+}
+
+/// The one comparison both ends of the Hello make. `Err` carries the message a refused pair prints
+/// (and the node sends to the head): it names both tokens, so the differing part (`v` protocol,
+/// `k` kernels, `r` sources) can be read off the log.
+fn version_match(head: &str, node: &str) -> std::result::Result<(), String> {
+    if head == node { Ok(()) } else { Err(format!("binary mismatch: head {head} vs node {node}")) }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -921,11 +940,11 @@ mod ipv4_tests {
 
     #[test]
     fn slash24_with_brd_uses_kernel_value() {
-        let s = "2: eth0    inet 192.168.177.13/24 brd 192.168.177.255 scope global eth0";
+        let s = "2: eth0    inet 192.0.2.13/24 brd 192.0.2.255 scope global eth0";
         let (ip, prefix, bcast) = ipv4_of_str(s).expect("parse");
-        assert_eq!(ip, Ipv4Addr::new(192, 168, 177, 13));
+        assert_eq!(ip, Ipv4Addr::new(192, 0, 2, 13));
         assert_eq!(prefix, 24);
-        assert_eq!(bcast, Ipv4Addr::new(192, 168, 177, 255));
+        assert_eq!(bcast, Ipv4Addr::new(192, 0, 2, 255));
     }
 
     #[test]
@@ -1110,9 +1129,9 @@ fn assemble_model_dir(model_id: &str, artifacts: &[Artifact]) -> Result<PathBuf>
 fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp::TpConfig, TcpStream)> {
     match recv_msg(&mut s)? {
         Msg::Hello { version, hostname, .. } => {
-            if version != binary_version() {
-                send_msg(&mut s, &Msg::Error { msg: format!("binary mismatch: head {version} vs node {}", binary_version()) })?;
-                bail!("head/node binary mismatch");
+            if let Err(why) = version_match(&version, &binary_version()) {
+                send_msg(&mut s, &Msg::Error { msg: why.clone() })?;
+                bail!("head/node {why}");
             }
             eprintln!("  [node] head '{hostname}' connected (binary {version})");
         }
@@ -1226,6 +1245,33 @@ pub fn run_node(tcp_port: u16)
 // Head: discover-and-push
 // ---------------------------------------------------------------------------------------------------
 
+/// The head's half of the Hello: send ours (`mine` = `binary_version()`), read the node's, and REFUSE a
+/// node whose version token differs. S-B9-CF-AGREE16B: the head used to accept any `Msg::Hello` here and
+/// relied on the node's own comparison (`node_handle`) and, without `--nodes`, on the discovery filter.
+/// A node built from this source always refuses first (the comparison is the same string inequality, so
+/// its `Msg::Error` arrives instead of a Hello); this check is for a node that does not, and it keeps the
+/// guarantee on the head, the side the operator reads. Nothing of the model is shipped before it.
+fn head_hello(s: &mut TcpStream, node: &NodeInfo, mine: &str) -> Result<()> {
+    send_msg(s, &Msg::Hello { version: mine.to_string(), role: "head".into(), hostname: hostname() })?;
+    // TP-4D (C4): a node whose session process is wedged (accepted the connection, never answers) must not hang
+    // the head forever; the bound covers only the Hello exchange, the later replies wait for pack hashing.
+    s.set_read_timeout(Some(HEAD_HELLO_WAIT)).ok();
+    let hello = recv_msg(s).with_context(|| format!(
+        "node {} ({}) did not answer the Hello within {} s — a wedged `--node` session process there? (kill its child; the supervisor re-arms)",
+        node.hostname, node.addr, HEAD_HELLO_WAIT.as_secs()))?;
+    s.set_read_timeout(None).ok();
+    match hello {
+        Msg::Hello { version, .. } => {
+            if let Err(why) = version_match(mine, &version) {
+                bail!("node {} ({}) refused by the head: {why}", node.hostname, node.addr);
+            }
+            Ok(())
+        }
+        Msg::Error { msg } => bail!("node rejected: {msg}"),
+        _ => bail!("expected node Hello"),
+    }
+}
+
 /// Push the model to one node: Hello -> Manifest -> receive Missing -> stream blobs -> Ready, then
 /// ship our TP config (`Msg::Config`) so the node runs with ZERO GB10_TP_* env vars. The shipped
 /// config is a per-node clone: `node_rank` identifies this node and `topology` is the full
@@ -1240,19 +1286,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
         .with_context(|| format!("connect {}", node.addr))?;
     s.set_nodelay(true).ok();
     harden_or_warn(&s, "head"); // TP-4D (C3/C9): both ends of the retained stream
-    send_msg(&mut s, &Msg::Hello { version: binary_version(), role: "head".into(), hostname: hostname() })?;
-    // TP-4D (C4): a node whose session process is wedged (accepted the connection, never answers) must not hang
-    // the head forever; the bound covers only the Hello exchange, the later replies wait for pack hashing.
-    s.set_read_timeout(Some(HEAD_HELLO_WAIT)).ok();
-    let hello = recv_msg(&mut s).with_context(|| format!(
-        "node {} ({}) did not answer the Hello within {} s — a wedged `--node` session process there? (kill its child; the supervisor re-arms)",
-        node.hostname, node.addr, HEAD_HELLO_WAIT.as_secs()))?;
-    s.set_read_timeout(None).ok();
-    match hello {
-        Msg::Hello { .. } => {}
-        Msg::Error { msg } => bail!("node rejected: {msg}"),
-        _ => bail!("expected node Hello"),
-    }
+    head_hello(&mut s, node, &binary_version())?;
     send_msg(&mut s, &Msg::Manifest { model_id: model_id.into(), artifacts: artifacts.to_vec() })?;
     let missing = match recv_msg(&mut s)? {
         Msg::Missing { hashes } => hashes,
@@ -1779,22 +1813,22 @@ mod tests {
         }
     }
 
-    // Synthetic RoCE rails: rail 1 = 192.168.177.0/24, rail 2 = 192.168.178.0/24.
+    // Synthetic RoCE rails: rail 1 = 192.0.2.0/24, rail 2 = 198.51.100.0/24.
     fn rails() -> Vec<Roce> {
         vec![
             Roce {
                 ib: "rocep1s0f1".into(),
                 netdev: "r1".into(),
-                ip: "192.168.177.1".parse().unwrap(),
-                bcast: "192.168.177.255".parse().unwrap(),
+                ip: "192.0.2.1".parse().unwrap(),
+                bcast: "192.0.2.255".parse().unwrap(),
                 mask: 0xffffff00,
                 rail: 1,
             },
             Roce {
                 ib: "roceP2p1s0f1".into(),
                 netdev: "r2".into(),
-                ip: "192.168.178.1".parse().unwrap(),
-                bcast: "192.168.178.255".parse().unwrap(),
+                ip: "198.51.100.1".parse().unwrap(),
+                bcast: "198.51.100.255".parse().unwrap(),
                 mask: 0xffffff00,
                 rail: 2,
             },
@@ -1807,9 +1841,9 @@ mod tests {
         // rail-1 .13, rail-1 .12, rail-2 .99, non-RoCE .1 -> expected order.
         let mut nodes = vec![
             node("a", "10.0.0.1", 29500),
-            node("b", "192.168.178.99", 29500),
-            node("c", "192.168.177.13", 29500),
-            node("d", "192.168.177.12", 29500),
+            node("b", "198.51.100.99", 29500),
+            node("c", "192.0.2.13", 29500),
+            node("d", "192.0.2.12", 29500),
         ];
         assign_ranks(&mut nodes, &ifaces);
         let order: Vec<String> = nodes.iter().map(|n| n.hostname.clone()).collect();
@@ -1817,10 +1851,10 @@ mod tests {
 
         // Reassign with the same set in a different input order -> identical result.
         let mut shuffled = vec![
-            node("d", "192.168.177.12", 29500),
-            node("b", "192.168.178.99", 29500),
+            node("d", "192.0.2.12", 29500),
+            node("b", "198.51.100.99", 29500),
             node("a", "10.0.0.1", 29500),
-            node("c", "192.168.177.13", 29500),
+            node("c", "192.0.2.13", 29500),
         ];
         assign_ranks(&mut shuffled, &ifaces);
         let order2: Vec<String> = shuffled.iter().map(|n| n.hostname.clone()).collect();
@@ -1831,17 +1865,17 @@ mod tests {
     fn topology_is_full_and_indexed_by_rank() {
         let ifaces = rails();
         let mut nodes = vec![
-            node("b", "192.168.178.99", 29500),
-            node("c", "192.168.177.13", 29500),
-            node("d", "192.168.177.12", 29500),
+            node("b", "198.51.100.99", 29500),
+            node("c", "192.0.2.13", 29500),
+            node("d", "192.0.2.12", 29500),
         ];
         assign_ranks(&mut nodes, &ifaces);
         let topo = build_topology(&nodes, &ifaces, 4).unwrap();
         assert_eq!(topo.len(), 4);
-        assert_eq!(topo[0], "192.168.177.1"); // head = rail 1
-        assert_eq!(topo[1], "192.168.177.12"); // rail 1, lowest ip
-        assert_eq!(topo[2], "192.168.177.13"); // rail 1, next ip
-        assert_eq!(topo[3], "192.168.178.99"); // rail 2 last
+        assert_eq!(topo[0], "192.0.2.1"); // head = rail 1
+        assert_eq!(topo[1], "192.0.2.12"); // rail 1, lowest ip
+        assert_eq!(topo[2], "192.0.2.13"); // rail 1, next ip
+        assert_eq!(topo[3], "198.51.100.99"); // rail 2 last
     }
 
     #[test]
@@ -2077,5 +2111,203 @@ mod pack_manifest_tests {
         std::thread::sleep(Duration::from_millis(250));
         w.disarm(&streams);
         assert_eq!(streams[0].read_timeout().unwrap(), None);
+    }
+}
+
+/// S-B9-CF-AGREE16B (W1, W2): what the head/node build guard covers, and that both ends apply it.
+#[cfg(test)]
+mod build_id_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// `(including file, include target)` pairs that are test-only: the include sits inside `#[cfg(test)]`,
+    /// the target is a lab fixture under `tests/` (absent from a source tree shipped without `tests/`),
+    /// and it is deliberately in NO stamp (see build.rs). Adding a pair here is a review decision.
+    const CFG_TEST_ONLY_INCLUDES: &[(&str, &str)] =
+        &[("src/loop_detect.rs", "tests/fixtures/loop_detect_vectors.txt")];
+
+    fn root() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")) }
+    fn hashed() -> BTreeSet<&'static str> { env!("SOURCE_BUILD_FILES").split(';').collect() }
+    fn kernel() -> BTreeSet<&'static str> { env!("KERNEL_BUILD_FILES").split(';').collect() }
+
+    /// Every `.rs` under `src/`, at any depth, as a path relative to the crate root. The walk is this
+    /// test's own (build.rs has another): `src/bin` (separate executables) and `src/ptx` (build output)
+    /// are the only directories left out, and they are named here, so a new one is walked.
+    fn engine_sources() -> Vec<String> {
+        let (root, mut out, mut stack) = (root(), Vec::new(), vec![root().join("src")]);
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                let rel = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if rel != "src/bin" && rel != "src/ptx" { stack.push(p); }
+                } else if p.is_file() && p.extension().map_or(false, |x| x == "rs") {
+                    out.push(rel);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The W1 hole: `SOURCE_BUILD_ID` read the `.rs` files of `src/` only, so a head and a node that
+    /// differed only in `src/exl3_forward/xtp.rs` (or any of 19 more files) passed the handshake.
+    #[test]
+    fn the_source_stamp_covers_every_engine_source_file_at_any_depth() {
+        let (hashed, on_disk) = (hashed(), engine_sources());
+        let missing: Vec<&String> = on_disk.iter().filter(|f| !hashed.contains(f.as_str())).collect();
+        assert!(missing.is_empty(), "engine sources OUTSIDE the head/node build stamp (a pair that differs only there would \
+                 not be refused). If the file is new and build.rs has not rerun since, touch build.rs; otherwise fix the walk \
+                 in build.rs:\n{missing:#?}");
+        // the files the old stamp missed, by name, and the count: 20 in subdirectories at the time of the fix
+        for f in ["src/exl3_forward/xtp.rs", "src/exl3_forward/xtp/ep_deal4.rs", "src/exl3_forward/dense.rs",
+                  "src/exl3_forward/dhead.rs", "src/exl3_forward/w4s.rs", "src/exl3_forward/wp16.rs",
+                  "src/dflash2/round.rs", "src/dflash2/mod.rs", "src/dspark/round.rs", "src/dspark/mod.rs",
+                  "src/cluster.rs", "src/net.rs", "src/main.rs", "src/opts_table.rs"] {
+            assert!(hashed.contains(f), "{f} is not in the build stamp");
+        }
+        let nested = on_disk.iter().filter(|f| f.matches('/').count() >= 2).count();
+        assert!(nested >= 20, "the walk found only {nested} engine sources below src/<dir>/ (20 when this test was written): \
+                 is the test still walking subdirectories?");
+        // not the engine: separate executables and the build's own output
+        assert!(!hashed.iter().any(|f| f.starts_with("src/bin/") || f.starts_with("src/ptx/")), "{hashed:?}");
+        // every listed file exists (a stale list would mean the stamp was computed from another tree)
+        for f in &hashed { assert!(root().join(f).is_file(), "{f} is in the build stamp but not on disk"); }
+    }
+
+    /// The other inputs of the binary: the manifests, the build script, the C shim, and every file an
+    /// engine source pulls in with `include_str!` / `include_bytes!` / `include!`. Each include target
+    /// must be in the source stamp or the kernel stamp (the two halves of `binary_version`).
+    #[test]
+    fn the_stamps_cover_the_manifests_and_every_included_file() {
+        let (hashed, kernel, root) = (hashed(), kernel(), root());
+        for f in ["Cargo.lock", "Cargo.toml", "build.rs", "native/net_shim.c", "data/ep_deal/qwen38_flash_next_tp2.json",
+                  "data/ep_deal/qwen38_flash_next_tp4.json", "src/tq_consts/Pi.bin", "src/tq_consts/Pit.bin",
+                  "src/tq_consts/S.bin", "src/tq_consts/codebooks.bin", "src/tq_consts/scale.bin"] {
+            assert!(hashed.contains(f), "{f} is not in the source stamp");
+        }
+        assert!(kernel.contains("native/tp_doorbell.h") && kernel.contains("kernels/gpu_batch.cu")
+                && kernel.contains("kernels/exl3_bench.cu"), "{kernel:?}");
+        let (mut seen, mut bad) = (0usize, Vec::new());
+        for src in engine_sources() {
+            let text = std::fs::read_to_string(root.join(&src)).unwrap();
+            // (this module spells the three macro names as needles: scan this file up to it)
+            let text = if src == "src/cluster.rs" { &text[..text.find("mod build_id_tests").unwrap()] } else { &text[..] };
+            let dir = Path::new(&src).parent().unwrap().to_path_buf();
+            for mac in ["include_str!(", "include_bytes!(", "include!("] {
+                let mut from = 0;
+                while let Some(k) = text[from..].find(mac) {
+                    let at = from + k + mac.len();
+                    from = at;
+                    // a literal path is the only spelling in the tree; anything else (concat!, a macro
+                    // variable) is reported, because this test could not say what it pulls in
+                    let rest = text[at..].trim_start();
+                    let Some(lit) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                        bad.push(format!("{src}: a non-literal {mac}..) the test cannot resolve: {:?}", rest.chars().take(40).collect::<String>()));
+                        continue;
+                    };
+                    // normalize dir/lit (".." pops) into a path relative to the crate root
+                    let mut parts: Vec<String> = dir.iter().map(|c| c.to_string_lossy().to_string()).collect();
+                    for c in lit.split('/') {
+                        match c { ".." => { parts.pop(); } "." | "" => {} c => parts.push(c.to_string()) }
+                    }
+                    let target = parts.join("/");
+                    seen += 1;
+                    // The one stated exception: a TEST fixture included from inside `#[cfg(test)]` is not an
+                    // input of the engine binary, so it is in no stamp (a stamp that hashed it "when present"
+                    // gave one tree two tokens). The exception is narrow: this exact (file, target) pair, and
+                    // only an include that sits after a `#[cfg(test)]` line of that file.
+                    if CFG_TEST_ONLY_INCLUDES.contains(&(src.as_str(), target.as_str()))
+                        && text[..at].contains("#[cfg(test)]") {
+                        continue;
+                    }
+                    if !hashed.contains(target.as_str()) && !kernel.contains(target.as_str()) {
+                        bad.push(format!("{src} includes {target}: in neither the source stamp nor the kernel stamp (add it in build.rs)"));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        assert!(seen >= 30, "the scan resolved only {seen} include targets (40 when written): did it stop matching?");
+    }
+
+    /// W2: the lockstep words of AGREE16 are a protocol change, named as one.
+    #[test]
+    fn the_version_token_names_protocol_kernels_and_sources() {
+        assert_eq!(PROTOCOL_VERSION, 6, "AGREE16 changed every pairwise lockstep word: protocol 6");
+        let v = binary_version();
+        assert_eq!(v, format!("v6-k{}-r{}", env!("KERNEL_BUILD_ID"), env!("SOURCE_BUILD_ID")));
+        assert!(env!("SOURCE_BUILD_ID").len() == 16 && env!("KERNEL_BUILD_ID").len() == 16);
+        assert_eq!(version_match(&v, &v), Ok(()));
+        // a difference in any one part refuses, and the message names both tokens
+        for other in [v.replacen("v6-", "v5-", 1), format!("{v}0"), v.replacen("-r", "-r0", 1), String::new()] {
+            let e = version_match(&v, &other).unwrap_err();
+            assert_eq!(e, format!("binary mismatch: head {v} vs node {other}"));
+            assert!(version_match(&other, &v).is_err(), "the comparison is symmetric");
+        }
+    }
+
+    /// The node's half, the real `node_handle` over loopback: a head with another version token is told
+    /// `binary mismatch` and nothing follows (no manifest is read).
+    #[test]
+    fn a_node_refuses_a_head_built_from_other_sources() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let node = std::thread::spawn(move || { let (s, _) = l.accept().unwrap(); node_handle(s).map(|_| ()) });
+        let mut h = TcpStream::connect(addr).unwrap();
+        let theirs = binary_version().replacen("-r", "-rdead", 1);
+        send_msg(&mut h, &Msg::Hello { version: theirs.clone(), role: "head".into(), hostname: "t".into() }).unwrap();
+        match recv_msg(&mut h).unwrap() {
+            Msg::Error { msg } => assert_eq!(msg, format!("binary mismatch: head {theirs} vs node {}", binary_version())),
+            other => panic!("the node must refuse, got {other:?}"),
+        }
+        let e = node.join().unwrap().expect_err("node_handle must fail");
+        assert!(format!("{e:#}").contains("binary mismatch"), "{e:#}");
+    }
+
+    /// The head's half, the real `head_hello` over loopback. Before AGREE16B the head accepted any Hello:
+    /// a node that does not compare (here: a fake one that answers Hello whatever it was sent) got the
+    /// manifest and the model. Now the head compares the node's token itself.
+    #[test]
+    fn a_head_refuses_a_node_built_from_other_sources_even_if_the_node_does_not_check() {
+        let run = |node_version: String| -> Result<()> {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let fake = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let got = recv_msg(&mut s).unwrap();
+                send_msg(&mut s, &Msg::Hello { version: node_version, role: "node".into(), hostname: "fake".into() }).unwrap();
+                // what the head sends next, if anything (None = it hung up: nothing was shipped)
+                (got, recv_msg(&mut s).ok())
+            });
+            let mut s = TcpStream::connect(addr).unwrap();
+            let ni = NodeInfo { hostname: "fake".into(), addr };
+            let r = head_hello(&mut s, &ni, &binary_version());
+            if r.is_ok() { send_msg(&mut s, &Msg::Manifest { model_id: "m".into(), artifacts: Vec::new() }).unwrap(); }
+            drop(s);
+            let (first, next) = fake.join().unwrap();
+            assert!(matches!(first, Msg::Hello { ref role, .. } if role == "head"));
+            assert_eq!(next.is_some(), r.is_ok(), "a refused node is sent nothing after the Hello");
+            r
+        };
+        assert!(run(binary_version()).is_ok(), "the same build pairs");
+        let other = binary_version().replacen("-r", "-rdead", 1);
+        let e = format!("{:#}", run(other.clone()).expect_err("the head must refuse a node with another version token"));
+        assert!(e.contains(&format!("binary mismatch: head {} vs node {other}", binary_version())), "{e}");
+        let old = binary_version().replacen("v6-", "v5-", 1);
+        assert!(run(old).is_err(), "a v5 node is refused by protocol number");
+    }
+
+    /// The two call sites, pinned: `head_sync_one` goes through `head_hello` before it ships the manifest,
+    /// and discovery still filters on the same token.
+    #[test]
+    fn the_head_checks_the_version_before_the_manifest() {
+        let src = include_str!("cluster.rs");
+        let body = &src[src.find("fn head_sync_one(").unwrap()..];
+        let body = &body[..body.find("\nfn ").unwrap()];
+        let (hello, manifest) = (body.find("head_hello(&mut s, node, &binary_version())?;").expect("head_sync_one calls head_hello"),
+                                 body.find("Msg::Manifest").expect("head_sync_one ships the manifest"));
+        assert!(hello < manifest, "the version check comes before the manifest");
+        assert!(src.contains("if r.version != binary_version() {"), "discovery filters on the version token");
     }
 }

@@ -86,14 +86,27 @@ diagnostics, so:
 | `velogb10_open_fds` | open file descriptors | monotonic growth over 6 h = fd leak |
 | `velogb10_mem_available_bytes` | box `MemAvailable` (the watchdog metric) | trending toward the `--mem-watchdog-gb` floor (default 5 GB) |
 | `velogb10_mem_min_available_bytes` | minimum `MemAvailable` since boot | post-incident triage: how close did we get |
-| `velogb10_scheduler_steps_total` | scheduler rounds completed | flat while requests are in flight = stall (grab logs + `/metrics`) |
-| `velogb10_scheduler_busy` | 1 = scheduler work in progress; 0 = idle-waiting | alert **only together with the age gauge** |
+| `velogb10_scheduler_steps_total` | scheduler rounds STARTED (the HELP of v0.7.3 said completed) | flat while requests are in flight = stall (grab logs + `/metrics`) |
+| `velogb10_scheduler_busy` | 1 = from the start of a decode round until the scheduler next blocks idle; 0 = idle-waiting (a server that was idle reads 0 while it admits and prefills its first request) | alert **only together with the age gauge** |
 | `velogb10_scheduler_last_step_age_seconds` | seconds since the last COMPLETED round or prefill chunk | alert on `scheduler_busy == 1 AND age > 120` **only**. With `busy == 0` the server is idle-waiting and a high age is EXPECTED — not a wedge, not an admission stall |
 | `velogb10_graph_cache_entries` | CUDA graphs held | first-hours growth expected (key-space saturation); never flattening = new key classes |
 | `velogb10_graph_cache_mixed_step_entries` | (v0.7.4) CUDA graphs captured for decode steps that mix short and long requests; captured on first use, one per step shape seen, not capped; also counted in `velogb10_graph_cache_entries` | information: growth is expected while new mixes of short and long requests appear (4 lanes can form 6 such shapes per sparse-grid bucket and penalty state; the first step of a new shape costs about 8 ms once) |
 | `velogb10_spec_mtp_off_events_total` | (v0.7.4) times speculation was switched off for a request. Events, not requests: one request can go off several times | information: a high rate means the workload's draft acceptance is low (see section 8) |
 | `velogb10_spec_mtp_reprobes_total` | (v0.7.4) probe windows opened after an off | information |
 | `velogb10_spec_mtp_reprobe_ok_total` | (v0.7.4) probe windows that ended with speculation back on | information: `reprobe_ok / reprobes` near 0 = speculation is not paying on this workload |
+| `velogb10_kv_positions_{capacity,used,peak,cached}` | (v0.7.4, EXL3) KV positions: allocated (`--max-batch` lanes x the served window), held by running requests, the highest `used` since boot, and prompt positions that free lanes keep for the prefix cache. A position is one token of one lane's context, not a byte | `peak / capacity` near 1 = the window is the limit; `used` flat at 0 while requests run = a bug to report |
+| `velogb10_kv_lane_positions_{capacity,used,peak,cached}{lane}` | (v0.7.4, EXL3) the same per lane | `max(peak) / capacity` sizes `--max-seq-len` |
+| `velogb10_kv_allocated_bytes{kind}` | (v0.7.4, EXL3) bytes allocated at boot for per-position state: `trunk_kv`, `indexer_keys`, `draft_head` (with `--tp`: the head's share) | `sum / velogb10_kv_positions_capacity` = bytes per position |
+| `velogb10_graph_capture_invalidated_total` | (v0.7.4) CUDA graph captures that ended invalidated (a call that is illegal inside stream capture landed in the window) | > 0 = look for the `[graph]` line; the step ran eagerly and is captured again at its next use |
+| `velogb10_graph_capture_failed_total` | (v0.7.4) captures that produced no graph for another reason (begin refused, instantiate failed, the TP graph audit refused) | > 0 = same; three graphs captured once at boot are not retried |
+| `velogb10_lane_pack_rounds_total{arm}` | (v0.7.4, EXL3) rounds by arm: `packed` (one verify serving two requests; lane packing is on by default, `--lane-pack off` disables it), `serial`, `shared_plain` | `packed` stuck at 0 under two or more busy requests = look at `velogb10_lane_pack_skip_total` and `velogb10_lane_pack_active` |
+| `velogb10_lane_pack_skip_total{reason}` | (v0.7.4) lane rounds that ran alone while packing was active and at least two requests were busy, by reason (`penalty`, `sampled`, `odd_lane`, `control`, ...) | information |
+| `velogb10_lane_pack_active{reason}` | (v0.7.4) 1 when lane packing is active on this boot (it is on by default); 0 with the reason when the boot serves without packed rounds (a posture it cannot serve, a packed scratch that could not be built), or `--lane-pack off` | 0 with a reason = the boot printed one `NOT ACTIVE` line saying why |
+| `velogb10_lane_pack_disabled` | (v0.7.4) 1 once a packed round failed and the packed arm was turned off for the rest of the boot | > 0 = restart to re-enable; report the log |
+| `velogb10_max_batch`, `velogb10_max_batch_requested` | (v0.7.4) the lane capacity served (at most 16) and what `--max-batch` asked | differ = the boot was capped (the boot log prints the line) |
+| `velogb10_exl3_recon_forced_total{bits}` | (v0.7.4) prefill GEMMs of modules the wide trellis kernel cannot decode that went through the reconstruct arm | information (the 4.05 pack's 6-bit modules) |
+| `velogb10_toolcall_blocks_total`, `velogb10_toolcall_unclosed_total{outcome}`, `velogb10_toolcall_rules_info`, `velogb10_toolcall_parse_seconds` | (v0.7.4) `<tool_call>` blocks read; responses that ended inside a block the model never closed (`returned`, `dropped_cut`, `dropped_length`); the served parser rules; the time the serving thread spent in the parser | `dropped_*` growing = agents seeing turns end without a call (see the guide, section 8) |
+| `velogb10_toolcall_shadow_compared_total`, `velogb10_toolcall_parse_disagreement_total{other,kind,fewer}`, `velogb10_toolcall_cost_declined_total` | (v0.7.4) where an alternative reading of the same text differed from the served one; with `--tool-shadow-cost on` also the cost reading. Nothing counted here changes what is served | the counts are what choose the next default (guide, section 8) |
 | `velogb10_log_lines_dropped_total` | log lines dropped (reader stalled) | > 0 = fix the log collector |
 | `velogb10_requests_rejected_total` | requests refused at `--max-waiting` | sustained growth = clients outpacing lanes |
 | `velogb10_streams_cancelled_backlog_total` | streams cancelled at `--stream-backlog-events` | > 0 = a client stopped reading mid-stream |
@@ -102,6 +115,16 @@ diagnostics, so:
 Also still current: `velogb10_requests_waiting` (queue depth), `velogb10_engine_alive`,
 `velogb10_max_batch`, the TTFT/end-to-end/prefill/decode histograms, the token and
 speculation counters, and `velogb10_build_info`.
+
+**`scripts/owner_check.py --base http://HOST:PORT`** (v0.7.4; stdlib Python, no dependency) reads
+a running server's `/metrics` and says in plain words what it did for the traffic it saw: how many
+requests and tokens, how rounds were served (packed, serial, shared), whether speculation paid,
+which prompt tokens came from the cache, how the tool-call parser read the responses, and why
+requests were kept out of a packed round. `--window-seconds N` reports only what happened in the
+last N seconds. A series the server does not export is reported as "NOT EXPORTED by this build"
+and is never read as zero or as an all-clear; in particular the number of ignored unknown
+options is not exported by v0.7.4 (the `[opts] unknown option` warning line at startup is the
+signal).
 
 ## 5. Admission and stream bounds (defaults)
 
@@ -179,15 +202,18 @@ under `reasoning_tokens` (before v0.7.4: under `content_tokens`).
     [vision] GPU tower failed (<cause>), falling back to CPU tower
     [vision] GPU worker panicked (<cause>), falling back to CPU tower
 
-<!-- CUT: re-check the CPU-tower timings below against the vision fix session's report (F2) if it is merged before the cut -->
-The request is then answered by the CPU tower, which is slow: 53.8 s for one image on one
-machine and 173 to 218 s on the head at TP=2 in our measurements, so a client timeout below
-that gives up first. Other requests and other images are not slowed, and the next image uses
-the GPU tower again. Each occurrence is one slow image request, not an outage.
-<!-- CUT: the next sentence describes finding F1 of the TP=2 verification; drop it if F1 is fixed before the cut -->
-One failure that was not injected was seen in 1,138 image requests at TP=2: an image request
-arrived while CUDA graphs were being captured, about ten seconds after the boot's first
-request.
+The request is then answered by the CPU tower, which is slow and grows with the image: 172.9 s
+for a 448 x 448 image on one machine at the default one thread (the 173 to 218 s seen at TP=2
+is the same image size, not the topology), 44.8 s at `--vision-cpu-threads 4` and 31.0 s at 8
+(the embeddings are bit-identical for every thread count). A client timeout below that gives
+up first. Other requests and other images are not slowed, and the next image uses the GPU
+tower again. Each occurrence is one slow image request, not an outage.
+
+Before v0.7.4 an image request that arrived while the scheduler was capturing CUDA graphs
+(mostly in the first seconds after a boot) could make the tower fail, and could also cost the
+scheduler a capture; the tower no longer issues any call that is illegal during a capture.
+`velogb10_graph_capture_invalidated_total` and `velogb10_graph_capture_failed_total` count
+captures that produced no graph, and the `[graph]` log line names the cause.
 
 **Other new lines.**
 
@@ -204,8 +230,33 @@ request.
   mixes requests on both sides of the 2,051-token switch, and `[exl3-serve] mixed-step graphs
   idle: A->B captured since boot` when the number of such graphs has grown.
 
-<!-- CUT: drop the 'armed only when another flag follows it' clause below if the drill-flag fix (H2) is merged before the cut -->
 **Test drills (never for serving).** `--mtp-reprobe-drill` forces the speculation off / re-arm
 cycle on a short schedule; greedy output stays byte-identical. `--vision-fail-gemm` fails the
-first GPU-tower matrix multiply of a boot once; on the EXL3 server it is armed only when
-another flag follows it on the command line. Both are listed by `--help-diag`.
+first GPU-tower matrix multiply of a boot once (armed in any position on the command line).
+`--tp-width-drill N` makes one rank report a wrong verify width once per head session, which
+the lockstep check must abort on (a boot line says whether the drill is armed or inert).
+`--inject-stall ROUND:SECONDS` puts the scheduler to sleep once, to watch the keep-alive
+bound. All are listed by `--help-diag`.
+
+**Streaming keep-alive.** With `--sse-keepalive 10` (the default) a streamed response carries
+an SSE comment line `: keep-alive` after every 10 s without an event: while a request waits in
+the queue, prefills, or a tool call is buffered. The lines stop when the whole scheduler has
+completed no decode round and no prefill chunk, of any request, for 60 s, so a hung engine does
+not hold clients open for ever; the bound is server-wide, so one stuck request among progressing
+ones keeps receiving lines, and `/health` and the DEAD state remain the liveness signals.
+`--sse-keepalive 0` turns the lines off. Telemetry: `stream_start` is recorded when the server
+starts the stream (before the queue wait and the prefill); the role chunk the client receives
+leaves with the first generated token, so the time to the first output is the first
+`stream_delta` minus `stream_start`.
+
+**Option and boot lines.**
+
+- `[opts] unknown option --max-bach: ignored; did you mean --max-batch?`: one line per unknown
+  flag on the head at startup (the boot continues). `FATAL: --rdma-dev needs a value, but the
+  next argument is --tp; ...` exits 2 before any model load.
+- `[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: <reason>; ...` and `[exl3-serve]
+  --max-batch 32: this server serves at most 16 requests at the same time; using 16; ...`.
+- `[exl3] --exl3-recon-min 0: this pack has 6-bit modules the wide trellis kernel cannot
+  decode ...`: the modules named go through the reconstruct arm.
+- A head and a node of different builds: `head error: node rejected: binary mismatch: head
+  v6-k<kernel>-r<source> vs node v6-k<kernel>-r<source>`, before any model load.

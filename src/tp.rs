@@ -521,6 +521,57 @@ pub fn rdma_dev() -> String {
         .unwrap_or_else(|| DEFAULT_RDMA_DEV.to_string())
 }
 
+/// PR #15 (ported): scan `<sysfs>/class/infiniband/<dev>/ports/1` for the first GID whose type is
+/// `RoCE v2` and whose value is IPv4-mapped (`::ffff:a.b.c.d`). Pure function over a directory
+/// root so the unit tests below can drive it with fixtures; returns (index, type, gid) as read.
+pub fn scan_rocev2_gid(sysfs: &std::path::Path, dev: &str) -> Option<(i32, String, String)> {
+    let base = sysfs.join(dev).join("ports/1");
+    for idx in 0..64 {
+        // indexes are sparse: a missing file means "no GID at this index", not "abort the scan"
+        let t = match std::fs::read_to_string(base.join("gid_attrs/types").join(idx.to_string())) {
+            Ok(t) => t, Err(_) => continue,
+        };
+        let g = match std::fs::read_to_string(base.join("gids").join(idx.to_string())) {
+            Ok(g) => g, Err(_) => continue,
+        };
+        let (t, g) = (t.trim().to_string(), g.trim().to_string());
+        if t == "RoCE v2" && g.starts_with("0000:0000:0000:0000:0000:ffff:") {
+            return Some((idx, t, g));
+        }
+    }
+    None
+}
+
+/// PR #15 (ported): the GID index the TP links bind. Explicit `--gid-idx N` wins; otherwise the
+/// sysfs auto-detect; otherwise the static default (GID_IDX = 3, the index every GB10 box here
+/// has used since the first TP run). Logs the evidence so a bring-up line always shows which
+/// index was chosen and why.
+pub fn resolve_gid_idx(dev: &str) -> i32 {
+    if let Ok(s) = crate::opts::var(crate::opt!("gid-idx")) {
+        if let Ok(v) = s.trim().parse::<i32>() {
+            crate::reprintln!("[tp] gid_idx={v} (explicit --gid-idx)");
+            return v;
+        }
+    }
+    resolve_gid_idx_at(std::path::Path::new("/sys/class/infiniband"), dev)
+}
+
+/// S-B9-REL-PRPORT3 (review R9): the auto-detect half factored over a `sysfs` root so unit
+/// tests can drive the RESOLUTION layer (scan hit, v1/zero traps, no hit, unreadable sysfs)
+/// with fixtures — beyond the pure `scan_rocev2_gid` parser tests below.
+pub(crate) fn resolve_gid_idx_at(sysfs: &std::path::Path, dev: &str) -> i32 {
+    match scan_rocev2_gid(sysfs, dev) {
+        Some((idx, t, g)) => {
+            crate::reprintln!("[tp] gid_idx={idx} auto-detected on {dev} (sysfs type '{t}', gid {g})");
+            idx
+        }
+        None => {
+            crate::reprintln!("[tp] gid_idx={} (static default: no RoCE v2 IPv4-mapped GID found on {dev})", GID_IDX);
+            GID_IDX
+        }
+    }
+}
+
 pub struct TpContext {
     pub rank: i32,
     pub world: i32,
@@ -537,12 +588,14 @@ impl TpContext {
 
     /// Head side (rank 0): listen for the node's QP handshake on the RoCE device.
     pub fn bring_up_head(world: i32) -> Result<Self> {
-        eprintln!("[tp] rank 0/{} — bringing up RDMA data-plane link on {} (listening) ...", world, rdma_dev());
+        let dev = rdma_dev();
+        let gid = resolve_gid_idx(&dev);
+        eprintln!("[tp] rank 0/{} — bringing up RDMA data-plane link on {} gid_idx={} (listening) ...", world, dev, gid);
         let link = if world == 2 {
-            TpLink::connect(0, "", TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect(0, "", TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         } else {
             let ips = resolve_topology(world)?;
-            TpLink::connect_nway(0, world, &ips, TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect_nway(0, world, &ips, TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         };
         eprintln!("[tp] rank 0/{} — link UP", world);
         Ok(TpContext { rank: 0, world, link })
@@ -550,12 +603,14 @@ impl TpContext {
 
     /// Node side: connect the QP to the head's RoCE IP (seen during the cluster sync).
     pub fn bring_up_node(head_ip: IpAddr, rank: i32, world: i32) -> Result<Self> {
-        eprintln!("[tp] rank {}/{} — connecting RDMA data-plane link to head {head_ip} on {} ...", rank, world, rdma_dev());
+        let dev = rdma_dev();
+        let gid = resolve_gid_idx(&dev);
+        eprintln!("[tp] rank {}/{} — connecting RDMA data-plane link to head {head_ip} on {} gid_idx={} ...", rank, world, dev, gid);
         let link = if world == 2 {
-            TpLink::connect(rank, &head_ip.to_string(), TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect(rank, &head_ip.to_string(), TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         } else {
             let ips = resolve_topology(world)?;
-            TpLink::connect_nway(rank, world, &ips, TP_PORT, &rdma_dev(), GID_IDX, TP_SLOT_BYTES)?
+            TpLink::connect_nway(rank, world, &ips, TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         };
         eprintln!("[tp] rank {}/{} — link UP", rank, world);
         Ok(TpContext { rank, world, link })
@@ -778,5 +833,94 @@ impl TpBranch {
             TpBranch::StateTp => 0x71,
             TpBranch::Exl3Xtp => 0x80,
         }
+    }
+}
+
+#[cfg(test)]
+mod gid_tests {
+    //! PR #15: `scan_rocev2_gid` fixture tests — the pure sysfs parser behind `resolve_gid_idx`.
+    use super::{scan_rocev2_gid, resolve_gid_idx_at, GID_IDX};
+    use std::path::PathBuf;
+
+    fn fixture(name: &str, entries: &[(usize, &str, &str)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("gb10_gid_fixture_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (idx, ty, gid) in entries {
+            let base = root.join("rocep1s0f1/ports/1");
+            std::fs::create_dir_all(base.join("gid_attrs/types")).unwrap();
+            std::fs::create_dir_all(base.join("gids")).unwrap();
+            std::fs::write(base.join("gid_attrs/types").join(idx.to_string()), ty).unwrap();
+            std::fs::write(base.join("gids").join(idx.to_string()), gid).unwrap();
+        }
+        root
+    }
+
+    const V4: &str = "0000:0000:0000:0000:0000:ffff:c000:020d"; // ::ffff:192.0.2.13 (documentation range)
+    const V6: &str = "fe80:0000:0000:0000:0a58:d7ff:fefd:8b47"; // link-local (RoCE v1 style)
+    const ZERO: &str = "0000:0000:0000:0000:0000:0000:0000:0000";
+
+    #[test]
+    fn picks_the_first_ipv4_mapped_rocev2_gid() {
+        let r = fixture("present", &[(1, "RoCE v1", V6), (3, "RoCE v2", V4)]);
+        assert_eq!(scan_rocev2_gid(&r, "rocep1s0f1"), Some((3, "RoCE v2".into(), V4.into())));
+    }
+
+    #[test]
+    fn no_rocev2_type_is_none() {
+        let r = fixture("absent", &[(1, "RoCE v1", V6), (5, "InfiniBand", V6)]);
+        assert_eq!(scan_rocev2_gid(&r, "rocep1s0f1"), None);
+    }
+
+    #[test]
+    fn all_zero_gid_is_skipped_even_if_typed() {
+        // index 3 typed RoCE v2 but zero: the scan must NOT return it (the PR's motivation —
+        // an all-zero GID at the configured index is the broken bring-up).
+        let r = fixture("zero", &[(3, "RoCE v2", ZERO), (4, "RoCE v2", V4)]);
+        assert_eq!(scan_rocev2_gid(&r, "rocep1s0f1"), Some((4, "RoCE v2".into(), V4.into())));
+    }
+
+    #[test]
+    fn multiple_candidates_return_the_lowest_index() {
+        let r = fixture("multi", &[(2, "RoCE v2", V4), (3, "RoCE v2", ZERO), (5, "RoCE v2", V4)]);
+        assert_eq!(scan_rocev2_gid(&r, "rocep1s0f1"), Some((2, "RoCE v2".into(), V4.into())));
+    }
+
+    #[test]
+    fn wrong_device_is_none() {
+        let r = fixture("otherdev", &[(3, "RoCE v2", V4)]);
+        assert_eq!(scan_rocev2_gid(&r, "roceP2p1s0f1"), None);
+    }
+
+    // S-B9-REL-PRPORT3 (review R9): the RESOLUTION layer on top of the pure scan.
+    #[test]
+    fn resolve_layer_returns_the_scan_index() {
+        let r = fixture("resolve_hit", &[(1, "RoCE v1", V6), (3, "RoCE v2", V4)]);
+        assert_eq!(resolve_gid_idx_at(&r, "rocep1s0f1"), 3);
+    }
+
+    #[test]
+    fn resolve_layer_skips_a_v1_mapped_gid_and_a_zero_gid() {
+        // the trap the old shim-side fallback fell into: index 2 is IPv4-mapped but RoCE v1
+        let r = fixture("resolve_trap", &[(2, "RoCE v1", V4), (3, "RoCE v2", ZERO), (5, "RoCE v2", V4)]);
+        assert_eq!(resolve_gid_idx_at(&r, "rocep1s0f1"), 5);
+    }
+
+    #[test]
+    fn resolve_layer_none_hits_the_static_default() {
+        let r = fixture("resolve_none", &[(1, "RoCE v1", V6)]);
+        assert_eq!(resolve_gid_idx_at(&r, "rocep1s0f1"), GID_IDX);
+    }
+
+    #[test]
+    fn resolve_layer_unreadable_sysfs_is_the_static_default() {
+        use std::os::unix::fs::PermissionsExt;
+        let r = fixture("resolve_unreadable", &[(3, "RoCE v2", V4)]);
+        let ty = r.join("rocep1s0f1/ports/1/gid_attrs/types/3");
+        std::fs::set_permissions(&ty, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&ty).is_ok() {
+            eprintln!("skipped: running as root, chmod 000 stays readable");
+            return;
+        }
+        assert_eq!(resolve_gid_idx_at(&r, "rocep1s0f1"), GID_IDX);
     }
 }

@@ -1,0 +1,6 @@
+# Release builds: keep the build host's directories out of the binary.
+# scripts/rustc_remap.sh adds --remap-path-prefix to every rustc call (no environment variable is
+# read). The key is relative to the directory that holds .cargo; a RUSTC_WRAPPER set by the user
+# overrides it (the remap is then absent; nothing else changes).
+[build]
+rustc-wrapper = "scripts/rustc_remap.sh"

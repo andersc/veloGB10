@@ -144,7 +144,11 @@ pub fn unit_decode(i: usize, nr: usize, rq: usize) -> (usize, usize, usize) {
 /// fills each rank's shard rows with this (position dependent, so a misplaced column can never match) and
 /// every rank checks the assembled rows against it. Not a NaN filter: the gather moves raw bits.
 pub fn ref_half(s: usize, row: usize, col: usize) -> u16 {
-    let x = (s as u64) * 0x9E37_79B9_7F4A_7C15 ^ (row as u64 + 1) * 0xBF58_476D_1CE4_E5B9 ^ (col as u64 + 7) * 0x94D0_49BB_1331_11EB;
+    // wrapping multiplies: the release build always wrapped these (the bit pattern the bench fills
+    // and every pinned reference expects); the debug build panicked on the same multiplies instead
+    // (pre-existing on master, surfaced by this branch's debug lib-suite run). Identical values in
+    // both profiles; the position dependence is unchanged.
+    let x = (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (row as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (col as u64 + 7).wrapping_mul(0x94D0_49BB_1331_11EB);
     let x = (x ^ (x >> 29)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
     (x >> 40) as u16
 }

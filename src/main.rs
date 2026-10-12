@@ -1,4 +1,5 @@
 use gb10_inference::{engine::GB10InferenceEngine, server::{create_router, AppState}, tokenizer::QwenTokenizer};
+use gb10_inference::dsv4_sse::{dsv4_partial_overlap, dsv4_sse_chunk, Dsv4SseStreamer};
 use std::env;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ fn print_help() {
     let prog = std::path::Path::new(&arg0)
         .file_name().unwrap_or_default().to_string_lossy();
 
-    println!("gb10_inference â from-scratch Rust+CUDA inference on NVIDIA GB10 (DGX Spark): Qwen3.5/3.6/3.8 incl. Qwen3.8-Flash-Next EXL3");
+    println!("gb10_inference — from-scratch Rust+CUDA inference on NVIDIA GB10 (DGX Spark): Qwen3.5/3.6/3.8 incl. Qwen3.8-Flash-Next EXL3");
     println!();
     println!("USAGE:");
     println!("  {prog} <MODE> [OPTIONS]");
@@ -15,7 +16,7 @@ fn print_help() {
     println!("MODES:");
     println!("  --server            OpenAI-compatible HTTP server (this is the one you want)");
     println!("  --quantize          Offline NVFP4/FP8 quantizer (--model-dir <in> --out <dir> --recipe <r>)");
-    println!("  --perplexity        Perplexity on held-out text (--text <file> --window N --max-windows N)");
+    println!("  (also the --perplexity mode, a measuring tool: its options are listed once, under PERPLEXITY TOOL below)");
     println!("  --bench-mtp         End-to-end MTP probe: proves greedy is bitwise lossless, reports tok/s");
     println!("  --bench-verify      MTP verify == sequential decode, bitwise (add --draws N to fuzz)");
     println!("  --bench-accept      Diagnose acceptance: coverage by target confidence, n-gram run-length");
@@ -27,9 +28,9 @@ fn print_help() {
     println!("  (default)           Interactive CLI: load model, generate from a prompt");
     println!("  --help, -h          Show this help");
     println!();
-    println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
-    println!("  SERVER MODE (--server) â OpenAI-compatible, continuous batching");
-    println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
+    println!("═══════════════════════════════════════════════════════════════════════════");
+    println!("  SERVER MODE (--server) — OpenAI-compatible, continuous batching");
+    println!("═══════════════════════════════════════════════════════════════════════════");
     println!();
     println!("  Endpoints:  POST /v1/chat/completions   POST /v1/tokenize   POST /v1/detokenize   GET /v1/models[/:id]   GET /health");
     println!();
@@ -44,34 +45,36 @@ fn print_help() {
     println!("  SERVING");
     println!("    --port <N>                 Listen port                                          [8000]");
     println!("    --max-batch <N>            Max concurrent sequences (lanes)                        [8]");
-    println!("    --max-tokens <N>           Default generation cap when a request omits max_tokens [8192]");
+    println!("    --max-tokens <N>           Output length for a CHAT request that omits max_tokens. A default,\n\
+\x20                              not a cap: a request may ask for more, up to the room left in\n\
+\x20                              the context. Unset: EXL3 server = no limit (a stop token or the\n\
+\x20                              end of the context ends the answer); NVFP4 server = 8192.\n\
+\x20                              /v1/completions requests that omit it get 16.\n\
+\x20                                                             [EXL3: unlimited; NVFP4: 8192]");
     println!("    --prefill-chunk <N>        EXL3: rows per prefill chunk, max 4095 (default since v0.7.1; 2048");
     println!("                               = the pre-v0.7.1 grid; output-changing on long prompts) [4095]");
     println!();
-    println!("  CONTEXT LENGTH  (this is how you set context size â the KV cache is sized to it)");
+    println!("  CONTEXT LENGTH  (this is how you set context size — the KV cache is sized to it)");
     println!("    --max-seq-len <N>          KV cache depth in tokens = the max context (prompt+gen) a");
     println!("                               request may use. The KV cache is allocated to exactly this");
     println!("                               size. Clamped to the model's max_position_embeddings (256K");
     println!("                               for this family). A prompt longer than this is rejected; a");
     println!("                               request whose prompt+max_tokens would exceed it has its");
     println!("                               generation clamped (logged as '[req] max_tokens clamped').");
-    println!("                               MEMORY: KV â (full-attn layers Ã kv_heads Ã head_dim Ã 4B) per");
-    println!("                               token per lane â ~64 KB/token on 27B. So 256K Ã batch-2 â 34");
+    println!("                               MEMORY: KV ≈ (full-attn layers × kv_heads × head_dim × 4B) per");
+    println!("                               token per lane — ~64 KB/token on 27B. So 256K × batch-2 ≈ 34");
     println!("                               GB (fine on 128 GB, but a 256K prefill is slow). Above ~12K,");
     println!("                               CUDA graphs are skipped (measured zero cost on GB10).   [4096]");
     println!();
-    println!("  SPECULATION  (auto-tuned; you normally set none of these)");
-    println!("    --mtp <auto|on|off>        Multi-token (MTP) speculative decoding. 'auto' measures");
-    println!("                               whether it pays and self-tunes depth from live acceptance.");
-    println!("                               Greedy verify is bitwise lossless; temp>0 is distribution-");
-    println!("                               exact. on/off force it (benchmarking).                 [auto]");
+    println!("  SPECULATION  (auto-tuned; you normally set none of these. The switch itself, auto|on|off,");
+    println!("                is listed once, with the other speculation options, under ENGINE OPTIONS below)");
     println!("    --mtp-depth <N>            Pin the draft depth instead of auto-picking (benchmarking).");
     println!("    --ngram-draft <N>          EXPERIMENTAL prompt-lookup drafting, n-gram order N (0=off).");
     println!("                               Lossless but measured net-negative as a plain replacement.   [0]");
     println!();
     println!("  PREFIX CACHE");
     println!("    --prefix-cache <on|off>    Reuse a conversation's cached prefix instead of re-prefilling");
-    println!("                               it â ~3x faster follow-up turns on multi-turn/agent traffic.");
+    println!("                               it — ~3x faster follow-up turns on multi-turn/agent traffic.");
     println!("                               NOT bit-exact: reuse re-chunks the prefill and cuBLAS picks a");
     println!("                               kernel per shape, so a cached turn can word an answer");
     println!("                               differently than a cold one. Greedy MTP stays lossless.  [off]");
@@ -83,7 +86,7 @@ fn print_help() {
     println!();
     println!("  SAMPLING DEFAULTS  (server-level; every request may override in its JSON body)");
     println!("    --default-repetition-penalty <F>  Repetition penalty, 1.0 = off                    [1.0]");
-    println!("    --default-presence-penalty <F>    Presence penalty       [2.0 on 2B, else 1.5]");
+    println!("    --default-presence-penalty <F>    Presence penalty  [EXL3: 0.0; NVFP4: 2.0 on 2B, else 1.5]");
     println!("    --default-frequency-penalty <F>   Frequency penalty                                [0.0]");
     println!("    --penalty-range <N>        EXL3: repetition/presence/frequency window, the reference");
     println!("                               engine's semantics: N tokens at full strength + N fading   [1024]");
@@ -100,17 +103,17 @@ fn print_help() {
     println!("                               distribution-exact; ratio changes seeded output bytes. Greedy");
     println!("                               requests are unaffected                                  [match]");
     println!("    --draft-temperature <T>    EXL3 ratio mode: the draft sampling temperature  [= request's T]");
-    println!("    (temperature / top_p / top_k / seed are per-REQUEST only â defaults 0.7 / 0.8 / 20)");
+    println!("    (temperature / top_p / top_k / seed are per-REQUEST only. Unsent: 0.7 / 0.8 / 20; an EXL3\n\
+\x20    chat request whose prompt opens a thinking block: 1.0 / 0.95 / 20. The penalty defaults\n\
+\x20    above apply to /v1/chat/completions; /v1/completions uses 1.0 / 0.0 / 0.0)");
     println!();
-    println!("  VISION  (optional capability â never a boot blocker)");
+    println!("  VISION  (optional capability — never a boot blocker)");
     println!("    The image tower is loaded ONLY when the pack declares a COMPATIBLE `model.visual`");
     println!("    tower (config.json vision_config -> TowerDims). A pack with NO vision tower, an");
     println!("    absent/incompatible model.visual set, or a geometry that cannot be served");
     println!("    SOFT-FAILS to text-only (a [vision] log line, never a boot panic); image traffic");
     println!("    on such a pack -> clean BAD_REQUEST. The 27B VL tower and ANY valid Qwen-family");
     println!("    tower still load + serve images.");
-    println!("    --vision-cpu            Force the CPU vision reference tower for image requests");
-    println!("                            (disables the GPU fast path; diagnostic escape hatch)");
     println!();
     println!("  OBSERVABILITY  (OTel generation telemetry — OFF by default: absent --otel-endpoint =");
     println!("                  zero cost; even ON it never touches the compute path. Pushes go");
@@ -139,9 +142,9 @@ fn print_help() {
     println!("    {prog} --server --model-dir <dir> --otel-endpoint http://127.0.0.1:4318 \\");
     println!("        --otel-include-tokens on   # stream the generation to an OTel receiver");
     println!();
-    println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
+    println!("═══════════════════════════════════════════════════════════════════════════");
     println!("  BENCH-BATCH MODE (--bench-batch)");
-    println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
+    println!("═══════════════════════════════════════════════════════════════════════════");
     println!();
     println!("  Runs M identical prompts through batched decode and reports");
     println!("  aggregate throughput. Verifies token-exact correctness.");
@@ -157,9 +160,9 @@ fn print_help() {
     println!("  Example:");
     println!("    {prog} --bench-batch --batch 16 --max-new-tokens 64");
     println!();
-    println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
+    println!("═══════════════════════════════════════════════════════════════════════════");
     println!("  CLI MODE (default)");
-    println!("âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ");
+    println!("═══════════════════════════════════════════════════════════════════════════");
     println!();
     println!("  Loads the model, encodes a prompt, and generates tokens.");
     println!();
@@ -331,9 +334,11 @@ fn print_help() {
     println!("  head's resolved options (TpConfig) to the node, whose command line carries only its");
     println!("  per-box options (--port, --rdma-dev, --tp-cache). Mixer sharding is default-on under");
     println!("  --tp/--head (--no-shard-mixers turns it off). Test drills: --tp-tail-drill (invert");
-    println!("  commit/payload every 4096th epoch), --tp-agree-drill N (corrupt this rank's agree hash");
-    println!("  at step N), --tp-race-probe <ms> (issue #10: force the world-2 pre-verify exchange/epoch");
-    println!("  slot race) — see --help-diag.");
+    println!("  commit/payload every 4096th epoch), --tp-agree-drill N (NVFP4 packs: corrupt this rank's agree hash");
+    println!("  at step N, once), --tp-width-drill N (EXL3 packs: this rank reports width N-1-rank for the FIRST");
+    println!("  N-row round, once). Both drills are one-shot per HEAD SESSION: a resident node supervisor started");
+    println!("  with one re-arms it for every head that connects. --tp-race-probe <ms> (issue #10: force the");
+    println!("  world-2 pre-verify exchange/epoch slot race) — see --help-diag.");
     println!();
     println!("  TYPICAL");
     println!("    peer: ./gb10_inference --node --port 29500");
@@ -484,7 +489,6 @@ fn print_help() {
     println!("                           FFN/experts) — draft path carries reduce sites; DEFAULT ON");
     println!("  --net-test               Transport + FP32-partial audit, 2 procs (--rank 0|1 --peer)");
     println!("  --sweep-gemm             GEMM shape sweep");
-    println!("  --perplexity             PPL on held-out text (--text <file> --window N --max-windows N)");
     println!("  --quantize               bf16 dir -> NVFP4/FP8 artifact (--model-dir <in> --out <dir> --recipe <r>)");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
@@ -561,7 +565,7 @@ fn print_help() {
     println!();
     println!("Note: speculation is auto-tuned per request");
     println!("(greedy => argmax verify, bitwise lossless; temp>0 => speculative rejection");
-    println!("sampling, distribution-exact). --mtp=on|off and --mtp-depth exist for benches.");
+    println!("sampling, distribution-exact). --mtp on|off and --mtp-depth exist for benches and ablations.");
     println!();
 }
 
@@ -590,9 +594,30 @@ fn main() {
     // engine used to read is refused here, loudly, naming its flag; then the registry is filled
     // from argv once, before any worker / GPU thread starts.
     gb10_inference::opts::reject_env();
-    if let Err(e) = gb10_inference::opts::parse_cli(&args) {
+    // (then the HTTP-layer options whose values the registry cannot range-check by type, e.g.
+    // --inject-stall ROUND:SECONDS: refused here, in milliseconds, not after the model has loaded)
+    if let Err(e) = gb10_inference::opts::parse_cli(&args).and_then(|_| gb10_inference::server::check_serve_options(&args)) {
         eprintln!("FATAL: {e}");
         std::process::exit(2);
+    }
+    // F9 (owner decision A, 2026-10-11): the hand-read value flags refuse the same swallow the
+    // registry refuses (F7) - one pass over argv before any warning, --help, --print-config,
+    // mode dispatch, model load or TP shipping; nodes included (their own --node/--port line).
+    if let Some(msg) = gb10_inference::opts::refuse_hand_flag_swallows(&args) {
+        eprintln!("FATAL: {msg}");
+        std::process::exit(2);
+    }
+    // F9b: one info line when --tp is bare (stderr only; --print-config stdout stays byte-identical)
+    if let Some(hint) = gb10_inference::opts::tp_bare_hint(&args) {
+        eprintln!("{hint}");
+    }
+    // F7b (owner ruling 2026-10-11): a "--"-token that is no option at all gets ONE warning line
+    // and is ignored exactly as before — warn, never refuse. Printed here on the head only: a TP
+    // node's options arrive resolved on TpConfig, so a node never repeats the line.
+    if !args.iter().any(|a| a == "--node") {
+        let unknown = gb10_inference::opts::unknown_warnings(&args);
+        for w in &unknown { gb10_inference::reprintln!("[opts] {w}"); }
+        if !unknown.is_empty() { gb10_inference::metrics::set_unknown_options(unknown.len() as u64); }
     }
     // DF2 block-16: resolve the draft block FIRST, before any DFlash2 buffer or round is built.
     // It is a process global read by every sizing/launch site in src/dflash2/, so it must be
@@ -1307,6 +1332,31 @@ fn main() {
         };
         gb10_inference::exl3_forward::probe_kv_nll(&a).unwrap_or_else(|e| {
             eprintln!("PROBE_KVNLL_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // S-B9-REL-QSAREGIME: a short row's logits alone vs inside a decode step that also carries a row
+    // past the sparse-attention switch (teacher-forced; served forward_step, graphs included).
+    //   ./gb10_inference --probe-exl3-regime --model-dir <EXL3-pack> --regime-runner r.txt --regime-joiner j.txt
+    //     [--regime-steps 1600] [--regime-csv out.csv] [--regime-order short-first|long-first] [--regime-time 0]
+    //     [--prefill-chunk 2048] [--max-seq-len 32768]
+    if args.iter().any(|a| a == "--probe-exl3-regime") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-regime requires --model-dir <DIR>");
+        let num = |k: &str, d: usize| parse_arg(&args, k).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+        let a = gb10_inference::exl3_forward::RegimeArgs {
+            dir: dir.to_string(),
+            max_pos: num("--max-seq-len", 32768),
+            chunk: num("--prefill-chunk", 2048),
+            runner: parse_arg(&args, "--regime-runner").expect("--probe-exl3-regime requires --regime-runner <file>").to_string(),
+            joiner: parse_arg(&args, "--regime-joiner").expect("--probe-exl3-regime requires --regime-joiner <file>").to_string(),
+            steps: num("--regime-steps", 1600),
+            out_csv: parse_arg(&args, "--regime-csv").map(|s| s.to_string()),
+            long_first: parse_arg(&args, "--regime-order") == Some("long-first"),
+            time_steps: num("--regime-time", 0),
+        };
+        gb10_inference::exl3_forward::probe_regime(&a).unwrap_or_else(|e| {
+            eprintln!("PROBE_REGIME_FAIL: {e:#}");
             std::process::exit(1);
         });
         return;
@@ -2057,8 +2107,8 @@ fn main() {
         return;
     }
 
-    // Perplexity on held-out text â the quality gate for quantization.
-    if args.iter().any(|a| a == "--perplexity") {
+    // Perplexity on held-out text — the quality gate for quantization.
+    if gb10_inference::opts::on(gb10_inference::opt!("perplexity")) {
         run_perplexity(&args);
         return;
     }
@@ -3584,7 +3634,7 @@ fn run_dsv4_bench_decode(args: &[String]) {
 
 fn run_bench_batch(args: &[String]) {
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
-        // Always pass the directory â Model::load handles directory vs file
+        // Always pass the directory — Model::load handles directory vs file
         (dir.to_string(), format!("{}/tokenizer.json", dir.trim_end_matches('/')))
     } else {
         (parse_arg(args, "--model").unwrap_or("model/model.safetensors").to_string(),
@@ -3631,7 +3681,7 @@ fn run_bench_batch(args: &[String]) {
 /// `--bench-accept --model-dir <d> --prompt <p> [--depth N] [--max-new-tokens N]`
 ///
 /// Buckets MTP acceptance by the TARGET's own confidence. See `GpuModel::bench_accept`.
-/// `--bench-tree --model-dir <d> [--prompt <p>] [--depth N]` â twin-chain planted-tree byte gate.
+/// `--bench-tree --model-dir <d> [--prompt <p>] [--depth N]` — twin-chain planted-tree byte gate.
 fn run_bench_tree(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--bench-tree requires --model-dir");
     let tok_path = format!("{}/tokenizer.json", dir.trim_end_matches('/'));
@@ -3686,7 +3736,7 @@ fn run_bench_tree(args: &[String]) {
         println!("\nRESULT: TREE_OK (verify ancestor-pure; accept-walk emits the greedy sequence; KV \
                   compaction moves the accepted path to contiguous slots)");
     } else {
-        println!("\nRESULT: TREE_MISMATCH ({total_mism} diverged) â the tree verify is NOT ancestor-pure");
+        println!("\nRESULT: TREE_MISMATCH ({total_mism} diverged) — the tree verify is NOT ancestor-pure");
         std::process::exit(1);
     }
 }
@@ -3803,7 +3853,7 @@ fn run_bench_accept(args: &[String]) {
         Ok(x) => x,
         Err(e) => { eprintln!("bench_accept FAILED (no acceptance number from an aborted run): {e:#}"); std::process::exit(1); }
     };
-    assert!(!s.is_empty(), "bench_accept produced NO samples â it measured nothing, which is not a result");
+    assert!(!s.is_empty(), "bench_accept produced NO samples — it measured nothing, which is not a result");
     assert!(generated.len() > 8, "bench_accept generated almost nothing ({} tokens)", generated.len());
 
     let acc = s.iter().filter(|x| x.accepted).count() as f32 / s.len() as f32;
@@ -3850,12 +3900,12 @@ fn run_bench_accept(args: &[String]) {
 
     // ---- FORK COVERAGE: what a top-2/top-3 fork would rescue (Step 0.5 of tree drafting).
     //
-    // `accepted` = target argmax â head top-1. `covered_top2/3` = target argmax â head top-2/3. The GAP
-    // (covered_top2 â accepted) is the fraction of positions a k=2 fork would newly rescue. The review's
-    // yield arithmetic keys the whole payoff on POSITION-1 coverage (câ), because a wrong position-1
-    // guess gates the entire chain â so that row is the one that sets the Step-3 gate.
-    println!("\n  FORK COVERAGE â target argmax in the head's top-k (this sets the yield target):");
-    println!("    position    n     top1(=accept)   top2       top3      fork rescue (top2âtop1)");
+    // `accepted` = target argmax ∈ head top-1. `covered_top2/3` = target argmax ∈ head top-2/3. The GAP
+    // (covered_top2 − accepted) is the fraction of positions a k=2 fork would newly rescue. The review's
+    // yield arithmetic keys the whole payoff on POSITION-1 coverage (c₁), because a wrong position-1
+    // guess gates the entire chain — so that row is the one that sets the Step-3 gate.
+    println!("\n  FORK COVERAGE — target argmax in the head's top-k (this sets the yield target):");
+    println!("    position    n     top1(=accept)   top2       top3      fork rescue (top2−top1)");
     let cov = |v: &[&gb10_inference::gpu::AcceptSample]| {
         let n = v.len().max(1) as f32;
         (v.iter().filter(|x| x.accepted).count() as f32 / n,
@@ -3866,7 +3916,7 @@ fn run_bench_accept(args: &[String]) {
         let b: Vec<_> = s.iter().filter(|x| x.depth_idx == d).collect();
         if b.is_empty() { continue; }
         let (t1, t2, t3) = cov(&b);
-        let mark = if d == 1 { "  <- câ (sets the gate)" } else { "" };
+        let mark = if d == 1 { "  <- c₁ (sets the gate)" } else { "" };
         println!("    pos {d:<2}    {:5}    {:5.1}%       {:5.1}%    {:5.1}%      +{:4.1}%{mark}",
                  b.len(), 100.0*t1, 100.0*t2, 100.0*t3, 100.0*(t2-t1));
     }
@@ -3874,7 +3924,7 @@ fn run_bench_accept(args: &[String]) {
     let (t1, t2, t3) = cov(&all);
     println!("    ALL      {:5}    {:5.1}%       {:5.1}%    {:5.1}%      +{:4.1}%",
              all.len(), 100.0*t1, 100.0*t2, 100.0*t3, 100.0*(t2-t1));
-    // Yield ceiling of a k=2 fork at position 1 (review Â§5.2): 1 + (câ/pâ)Â·A, A = mean accepted drafts.
+    // Yield ceiling of a k=2 fork at position 1 (review §5.2): 1 + (c₁/p₁)·A, A = mean accepted drafts.
     let p1 = if t1 > 0.0 {
         let pos1: Vec<_> = s.iter().filter(|x| x.depth_idx == 1).collect();
         cov(&pos1).0
@@ -3890,9 +3940,9 @@ fn run_bench_accept(args: &[String]) {
     if p1 > 0.0 {
         let ceiling = 1.0 + (c1 / p1) * a_drafts;
         println!("\n    chain yield Y = 1 + A = 1 + {:.2} = {:.2} tok/fwd (measured here)", a_drafts, 1.0 + a_drafts);
-        println!("    fork@1 yield CEILING (perfect top-2 rescue) â 1 + (câ/pâ)Â·A = 1 + ({:.2}/{:.2})Â·{:.2} = {:.2} tok/fwd",
+        println!("    fork@1 yield CEILING (perfect top-2 rescue) ≈ 1 + (c₁/p₁)·A = 1 + ({:.2}/{:.2})·{:.2} = {:.2} tok/fwd",
                  c1, p1, a_drafts, ceiling);
-        println!("    (review Â§5.2: realistic is BELOW this â rescues are conditioned on the head having just missed)");
+        println!("    (review §5.2: realistic is BELOW this — rescues are conditioned on the head having just missed)");
     }
 
     // ---- Could an N-GRAM LOOKUP have drafted these tokens, for free?
@@ -3934,9 +3984,9 @@ fn run_bench_accept(args: &[String]) {
                  100.0 * proposals as f32 / total as f32);
     }
 
-    // N-GRAM RUN LENGTH (review Â§5.4): once a 3-gram match fires, how many CONSECUTIVE tokens does the
-    // copy stay correct? A copy fires long. If the median run â¥ 3, the n-gram branch should get MORE
-    // depth than the head branch (asymmetric tree: head chain d_a + n-gram chain m, 1 + (d_aâ1) + m â¤ 16).
+    // N-GRAM RUN LENGTH (review §5.4): once a 3-gram match fires, how many CONSECUTIVE tokens does the
+    // copy stay correct? A copy fires long. If the median run ≥ 3, the n-gram branch should get MORE
+    // depth than the head branch (asymmetric tree: head chain d_a + n-gram chain m, 1 + (d_a−1) + m ≤ 16).
     let mut runs: Vec<usize> = Vec::new();
     {
         let n = 3usize;
@@ -3967,7 +4017,7 @@ fn run_bench_accept(args: &[String]) {
         let ge3 = runs.iter().filter(|&&r| r >= 3).count();
         println!("\n  3-gram RUN LENGTH (consecutive correct copies): {} runs, median {}, mean {:.1}, max {}",
                  runs.len(), median, mean, max);
-        println!("    runs of length â¥3: {}/{} ({:.0}%)  â  {} the n-gram branch deeper than the head branch",
+        println!("    runs of length ≥3: {}/{} ({:.0}%)  →  {} the n-gram branch deeper than the head branch",
                  ge3, runs.len(), 100.0 * ge3 as f32 / runs.len() as f32,
                  if median >= 3 { "MAKE" } else { "do NOT make" });
     }
@@ -6047,7 +6097,8 @@ fn run_bench_df2_matrix(args: &[String]) {
     // chat template + enable_thinking + reasoning_effort, temp 1.0 / top-p 0.95 / top-k 20,
     // long generations (>=1024). --parity forces exactly that (thinking=xhigh, math domain only);
     // --thinking <effort> applies the thinking template without forcing the other knobs.
-    let parity = parse_arg(args, "--parity").is_some();
+    // (S-B9-REL-VISIONFIX2 V5: a registry flag; `parse_arg` is the value reader and ignored it as the last argument)
+    let parity = gb10_inference::opts::on(gb10_inference::opt!("parity"));
     let thinking = if parity { Some("xhigh".to_string()) } else { parse_arg(args, "--thinking").map(str::to_string) };
     let (temp, top_p, top_k, max_new) = if parity {
         let mn: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(1024);
@@ -7756,8 +7807,8 @@ fn run_bench_verify(args: &[String]) {
 
     // `--draws N`: run N RANDOMIZED (ctx, offset, depth) draws in ONE process.
     //
-    // A gate must be a loop, not a single run â the split-K bug passed most runs, because a 1-ulp
-    // difference rarely flips an argmax (AGENTS.md Â§4.13). But one process per draw meant reloading a
+    // A gate must be a loop, not a single run — the split-K bug passed most runs, because a 1-ulp
+    // difference rarely flips an argmax (AGENTS.md §4.13). But one process per draw meant reloading a
     // 6 GB artifact 13 times: ~11 s of model load to run ~1 s of gate. Loading once turns a 3-minute
     // gate into a 20-second one, which is the difference between a gate you run and a gate you skip.
     //
@@ -7833,7 +7884,7 @@ fn run_bench_verify(args: &[String]) {
             if !ok { break; }   // SPRT: one failure is enough
         }
         if failed > 0 {
-            println!("RESULT: MISMATCH ({} draw(s) diverged) â MTP verify is NOT lossless", failed);
+            println!("RESULT: MISMATCH ({} draw(s) diverged) — MTP verify is NOT lossless", failed);
             std::process::exit(1);
         }
         println!("RESULT: LOSSLESS_OK ({} randomized draws, seed {})", draws, seed);
@@ -7857,7 +7908,7 @@ fn run_bench_verify(args: &[String]) {
         println!("RESULT: LOSSLESS_OK (verify_forward == sequential greedy for all {} positions)", depth);
     } else {
         let nmismatch = matches.iter().filter(|&&b| !b).count();
-        println!("RESULT: MISMATCH ({} of {} positions diverged) â MTP verify is NOT lossless", nmismatch, depth);
+        println!("RESULT: MISMATCH ({} of {} positions diverged) — MTP verify is NOT lossless", nmismatch, depth);
         std::process::exit(1);
     }
 }
@@ -9154,7 +9205,10 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
         eprintln!("EXL3 TP serve: --tp 2 or --tp 4 only (got {world})");
         std::process::exit(2);
     }
-    if let Err(e) = gb10_inference::exl3_forward::xtp::world_gt2_flag_refusals(world as i32) { eprintln!("{e}"); std::process::exit(2); }
+    // S-B9-CF-AGREE16B (W4): + the TP=2 `--max-batch` bound of the pairwise lockstep token, here, before discovery
+    // and the pack sync (it used to be refused inside build_serve, after the sync and the RDMA attach)
+    if let Err(e) = gb10_inference::exl3_forward::xtp::world_gt2_flag_refusals(world as i32)
+        .and_then(|_| gb10_inference::exl3_serve::tp_lane_width_refusal(args, world as u32)) { eprintln!("{e}"); std::process::exit(2); }
     let dir_abs = std::fs::canonicalize(model_dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| model_dir.to_string());
     let explicit = parse_arg(args, "--nodes").map(|s| {
         s.split(',').map(|p| {
@@ -9178,7 +9232,10 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
         if i + 1 < node_args.len() { node_args[i + 1] = dir_abs.clone(); }
     }
     tpc.exl3_mode = format!("serve:{}", serde_json::to_string(&node_args).expect("argv json"));
-    tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    // Public PR #21: the shipped window is the clamped one. Every rank's build_serve resolves the same
+    // clamp from the same argv and pack config, and logs the line naming the limit.
+    tpc.max_seq_len = gb10_inference::exl3_serve::resolve_max_seq_len(
+        &dir_abs, parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096)).0;
     if args.iter().any(|a| a == "--tp-trace") { tpc.trace = true; }
     exl3_tp_cli_knobs(args, &mut tpc);
     println!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,
@@ -9276,6 +9333,8 @@ fn exl3_tp_node_prelink(tpc: &gb10_inference::tp::TpConfig) -> anyhow::Result<Ex
     if let Some(j) = tpc.exl3_mode.strip_prefix("serve:") {
         let argv: Vec<String> = serde_json::from_str(j).map_err(|e| anyhow::anyhow!("serve argv from the head: {e}"))?;
         println!("[node] EXL3 TP serve: head argv {argv:?}");
+        // S-B9-CF-AGREE16B (W4): the same pre-network refusal as on the head, from the head's argv, before the link
+        gb10_inference::exl3_serve::tp_lane_width_refusal(&argv, tpc.world as u32)?;
         return Ok(Exl3NodeProgram::Serve(argv));
     }
     if tpc.exl3_mode.starts_with("spec") {
@@ -10453,145 +10512,6 @@ fn dspark_stream_sync(m: &gb10_inference::dsv4_model::Dsv4GpuModel, ds: &gb10_in
     }
 }
 
-/// Item 3.4 — SSE streaming for the DSpark server path (the tool-eval harness streams every
-/// perf request and turn 1 of every scenario, so a DSpark server must stream too). Mirrors the
-/// greedy stream path's per-token reasoning→content split (THINKING_END_TOKEN boundary, partial
-/// close-tag hold-back) — one SSE delta per generated TOKEN (not per accept-burst), so the
-/// harness's token-per-chunk counting stays honest. `dsv4_sse_chunk` + `dsv4_partial_overlap`
-/// are shared with the greedy path.
-struct Dsv4SseStreamer<'a> {
-    tok: &'a QwenTokenizer,
-    sock: &'a mut std::net::TcpStream,
-    raw_completion: bool,
-    thinking_mode: &'a str,
-    model_id: &'a str,
-    acc: String,
-    reason_emitted: usize,
-    content_emitted: usize,
-    content_start: Option<usize>,
-    t0: std::time::Instant,
-    first_tok: Option<std::time::Instant>,
-    n_emitted: usize,
-    include_usage: bool,
-}
-
-impl<'a> Dsv4SseStreamer<'a> {
-    fn new(
-        tok: &'a QwenTokenizer,
-        sock: &'a mut std::net::TcpStream,
-        raw_completion: bool,
-        thinking_mode: &'a str,
-        model_id: &'a str,
-        include_usage: bool,
-        t0: std::time::Instant,
-    ) -> Self {
-        // thinking mode starts INSIDE the think block (prompt primed `imd`); raw completion
-        // and chat mode are all content (no reasoning split).
-        let content_start = if !raw_completion && thinking_mode == "thinking" { None } else { Some(0) };
-        Self { tok, sock, raw_completion, thinking_mode, model_id, acc: String::new(),
-               reason_emitted: 0, content_emitted: 0, content_start,
-               t0, first_tok: None, n_emitted: 0, include_usage }
-    }
-
-    /// Feed one generated token (the EOS token itself is not emitted — mirrors the greedy
-    /// stream path's break-before-push).
-    fn feed(&mut self, t: u32) -> anyhow::Result<()> {
-        if t == 1 { return Ok(()); } // eos
-        if self.first_tok.is_none() { self.first_tok = Some(std::time::Instant::now()); }
-        self.n_emitted += 1;
-        let think_close = gb10_inference::dsv4_chat::THINKING_END_TOKEN;
-        let Ok(piece) = self.tok.decode(std::slice::from_ref(&t), false) else { return Ok(()) };
-        if piece.is_empty() { return Ok(()); }
-        self.acc.push_str(&piece);
-        match self.content_start {
-            None => {
-                if let Some(idx) = self.acc[self.reason_emitted..].find(think_close).map(|i| self.reason_emitted + i) {
-                    if idx > self.reason_emitted {
-                        let d = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-                            "choices":[{"index":0,"delta":{"reasoning_content":&self.acc[self.reason_emitted..idx]},"finish_reason":null}]});
-                        dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&d)?)?;
-                    }
-                    let cs = idx + think_close.len();
-                    let mut lead = cs;
-                    while lead < self.acc.len() && matches!(self.acc.as_bytes()[lead], b'\n'|b'\r'|b' '|b'\t') { lead += 1; }
-                    if lead < self.acc.len() {
-                        let d = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-                            "choices":[{"index":0,"delta":{"content":&self.acc[lead..self.acc.len()]},"finish_reason":null}]});
-                        dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&d)?)?;
-                    }
-                    self.content_start = Some(lead);
-                    self.content_emitted = self.acc.len();
-                } else {
-                    let overlap = dsv4_partial_overlap(&self.acc, think_close);
-                    let safe = self.acc.len() - overlap;
-                    if safe > self.reason_emitted {
-                        let d = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-                            "choices":[{"index":0,"delta":{"reasoning_content":&self.acc[self.reason_emitted..safe]},"finish_reason":null}]});
-                        dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&d)?)?;
-                        self.reason_emitted = safe;
-                    }
-                }
-            }
-            Some(_) => {
-                if self.acc.len() > self.content_emitted {
-                    let d = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-                        "choices":[{"index":0,"delta":{"content":&self.acc[self.content_emitted..self.acc.len()]},"finish_reason":null}]});
-                    dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&d)?)?;
-                    self.content_emitted = self.acc.len();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Flush the held-back tail, the final chunk, usage chunk (if enabled), and the SSE terminator.
-    fn finish(&mut self, hit_eos: bool, prompt_len: usize) -> anyhow::Result<()> {
-        match self.content_start {
-            Some(_) => {
-                if self.acc.len() > self.content_emitted {
-                    let d = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-                        "choices":[{"index":0,"delta":{"content":&self.acc[self.content_emitted..self.acc.len()]},"finish_reason":null}]});
-                    dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&d)?)?;
-                }
-            }
-            None => {
-                if self.acc.len() > self.reason_emitted {
-                    let d = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-                        "choices":[{"index":0,"delta":{"reasoning_content":&self.acc[self.reason_emitted..self.acc.len()]},"finish_reason":null}]});
-                    dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&d)?)?;
-                }
-            }
-        }
-        let finish = if hit_eos { "stop" } else { "length" };
-        let final_chunk = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":self.model_id,
-            "choices":[{"index":0,"delta":{},"finish_reason":finish}]});
-        dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&final_chunk)?)?;
-        if self.include_usage {
-            let timings = gb10_inference::make_timings(self.t0, self.first_tok, prompt_len, self.n_emitted);
-            let usage_chunk = serde_json::json!({
-                "id": "dsv4-tp-1", "object": "chat.completion.chunk", "model": self.model_id,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": prompt_len,
-                    "completion_tokens": self.n_emitted,
-                    "total_tokens": prompt_len + self.n_emitted,
-                },
-                "timings": {
-                    "prompt_ms": timings.prompt_ms,
-                    "predicted_ms": timings.predicted_ms,
-                    "prompt_per_second": timings.prompt_per_second,
-                    "predicted_per_second": timings.predicted_per_second,
-                },
-            });
-            dsv4_sse_chunk(&mut self.sock, &serde_json::to_string(&usage_chunk)?)?;
-        }
-        use std::io::Write;
-        self.sock.write_all(b"data: [DONE]\r\n\r\n")?;
-        self.sock.flush()?;
-        Ok(())
-    }
-}
-
 /// Item 3.4 — DSpark decode machinery for the persistent DSV4 server (the `--server-dspark`
 /// path). The HEAD and the NODE each own one of these and run the IDENTICAL SPMD sequence per
 /// request: prefix-cached prefill with main_hidden capture → draft-ring warm → the same
@@ -11178,10 +11098,13 @@ fn dsv4_tp_serve_server(
                 let t0 = std::time::Instant::now();
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
                 sock.write_all(head.as_bytes())?;
-                let role = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":model_id_str,
-                    "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]});
-                dsv4_sse_chunk(&mut sock, &serde_json::to_string(&role)?)?;
-                let mut streamer = Dsv4SseStreamer::new(&tok, &mut sock, raw_completion, thinking_mode, &model_id_str, include_usage, t0);
+                // S-B9-REL-BENCHFIX2 (W1): no role chunk here. `decode_request` begins with the
+                // prefill; a `choices` chunk written before it made a client's "first chunk" a
+                // few milliseconds (the defect fixed in src/server.rs). The streamer writes the
+                // role chunk with the first generated token (or before the finish chunk when
+                // none is generated): gb10_inference::dsv4_sse.
+                let decode = |t: u32| tok.decode(std::slice::from_ref(&t), false).ok();
+                let mut streamer = Dsv4SseStreamer::new(decode, &mut sock, raw_completion, thinking_mode, &model_id_str, include_usage, t0);
                 let gen = st.decode_request(&prompt_i32, priming_len, max_new, &mut prefix_cache,
                                             prefix_cache_on, ctl_mut.as_mut(), true, Some(&mut |t| streamer.feed(t)))?;
                 let hit_eos = gen.last().copied() == Some(eos);
@@ -11263,6 +11186,12 @@ fn dsv4_tp_serve_server(
         let m = m.as_mut().expect("greedy server owns the model");
         // R3.2: under TP the next token comes from the vocab-parallel maxloc head.
         let maxloc = m.rt.tp_ctx_dptr != 0 && m.tp_rank >= 0;
+        // The request clock of the `timings` block starts HERE, before the prefill: `prompt_ms`
+        // is request -> first token, so `prompt_per_second` is the prefill rate. It used to be
+        // taken after the prefill (in both branches below), and the first token already exists
+        // when the decode loop starts: prompt tokens divided by a few microseconds, a fictional
+        // rate (S-B9-REL-SURFACE2B R6f; the DSpark branch above always started its clock first).
+        let t0 = std::time::Instant::now();
         let mut next: u32 = if maxloc {
             if prefix_cache_on {
                 m.forward_prefix_cached_next(&prompt_i32, priming_len, &mut prefix_cache)?
@@ -11305,12 +11234,14 @@ fn dsv4_tp_serve_server(
             // `parse_completion` would produce. decode is per-token with skip_special=false so
             // the close marker stays visible for the split; a partial close-tag prefix
             // straddling two decode chunks is held back (dsv4_partial_overlap).
-            let t0 = std::time::Instant::now();
             let mut first_tok: Option<std::time::Instant> = None;
             let mut n_emitted: usize = 0;
             let think_close = gb10_inference::dsv4_chat::THINKING_END_TOKEN;
             let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
             sock.write_all(head.as_bytes())?;
+            // The role chunk (the first chunk with `choices`) is written HERE, after the prefill:
+            // `next` above is already the first generated token. (The headers go out here too, so
+            // this path sends nothing at all during its prefill.)
             let role = serde_json::json!({"id":"dsv4-tp-1","object":"chat.completion.chunk","model":model_id_str,
                 "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]});
             dsv4_sse_chunk(&mut sock, &serde_json::to_string(&role)?)?;
@@ -11423,7 +11354,6 @@ fn dsv4_tp_serve_server(
             sock.flush()?;
             eprintln!("[dsv4-server] streamed {} tokens (finish={finish}, {} mode) — ready for next request", generated.len(), if raw_completion { "raw" } else { thinking_mode });
         } else {
-            let t0 = std::time::Instant::now();
             let mut first_tok: Option<std::time::Instant> = None;
             for step in 0..max_new {
                 if next == eos { eprintln!("[dsv4-server] EOS at step {step}"); hit_eos = true; break; }
@@ -11692,22 +11622,6 @@ fn dsv4_argmax(x: &[f32]) -> usize {
         }
     }
     best
-}
-
-/// Write one SSE frame (`data: <json>\r\n\r\n`) and flush. Mirrors the axum `Event::default().data`
-/// framing the main engine uses (src/server.rs). Used by the DSV4 TP streaming path only.
-fn dsv4_sse_chunk<W: std::io::Write>(sock: &mut W, json: &str) -> std::io::Result<()> {
-    sock.write_all(b"data: ")?;
-    sock.write_all(json.as_bytes())?;
-    sock.write_all(b"\r\n\r\n")?;
-    sock.flush()
-}
-
-/// Longest suffix of `s` that is a proper (partial) prefix of `marker` — mirrors
-/// src/server.rs:partial_overlap. Held back during streaming so a think-close marker arriving
-/// across decode chunks is not partially forwarded as reasoning_content.
-fn dsv4_partial_overlap(s: &str, marker: &str) -> usize {
-    (1..marker.len()).rev().find(|&k| s.ends_with(&marker[..k])).unwrap_or(0)
 }
 
 /// `--probe-dflash <ctx-file> [tokens.json]`: E29-B1 DFlash drafter probe. Loads the
@@ -13075,26 +12989,26 @@ fn run_sweep_gemm(args: &[String]) {
     gpu.probe_gemm_binv(conv_dim, cfg.hidden_size);
 }
 
-/// MTP end-to-end probe: runs full speculative decoding (draft â verify â accept â rollback) and
+/// MTP end-to-end probe: runs full speculative decoding (draft → verify → accept → rollback) and
 /// checks the output is token-for-token identical to sequential greedy (lossless), while reporting
 /// the acceptance rate and speedup vs sequential.
-/// `--quantize --model-dir <in> --out <dir> --recipe <spec>` â the offline quantizer.
+/// `--quantize --model-dir <in> --out <dir> --recipe <spec>` — the offline quantizer.
 ///
 /// Emits **compressed-tensors** layout, byte-compatible with HF (so our artifacts and theirs are
-/// mutually loadable â and so the format is one we already validated against a real checkpoint):
+/// mutually loadable — and so the format is one we already validated against a real checkpoint):
 ///
 /// ```text
 ///   NVFP4:  {name}.weight_packed        U8       [M, K/2]   nibble-packed E2M1
 ///           {name}.weight_scale         F8_E4M3  [M, K/16]  block scales
-///           {name}.weight_global_scale  F32      [1]        (6*448)/amax â DIVIDE on dequant
+///           {name}.weight_global_scale  F32      [1]        (6*448)/amax — DIVIDE on dequant
 ///   FP8:    {name}.weight               F8_E4M3  [M, K]
 ///           {name}.weight_scale         F32      [M]        one per output row
-///   else:   {name}.weight               copied through unchanged (norms, conv1d, A_log, dt_biasâ¦)
+///   else:   {name}.weight               copied through unchanged (norms, conv1d, A_log, dt_bias…)
 /// ```
 ///
 /// Recipe is the same syntax as the fake-quant knob, e.g. `all`, `all,gdn:fp8`, `all:fp8`.
-/// Measured on 9B (held-out prose+code, bf16 PPL 7.622): `all` â 8.332 (+9.3%),
-/// `all,gdn:fp8` â 8.036 (+5.4%), `all:fp8` â 7.673 (+0.7%).
+/// Measured on 9B (held-out prose+code, bf16 PPL 7.622): `all` → 8.332 (+9.3%),
+/// `all,gdn:fp8` → 8.036 (+5.4%), `all:fp8` → 7.673 (+0.7%).
 /// `--df2-bake-nvfp4 | --df2-bake-fp8` `--draft-dir <src> --out <dst>` — PLAN/25 §1a/§1a-fp8:
 /// weight-only bake of the DFlash2 drafter. Emits a baked artifact DIR (see
 /// `dflash2::load::load_quantized` for the layout): `nvfp4.safetensors` (packed linears,
@@ -13144,7 +13058,8 @@ fn run_df2_bake(args: &[String], fp8: bool) {
         let view = st.tensor(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(view.dtype() == Dtype::BF16, "{name}: not BF16");
         assert!(view.shape() == &vec![*m, *k], "{name}: shape {:?}", view.shape());
-        let w: &[half::bf16] = bytemuck::cast_slice(view.data());
+        let w_cow = gb10_inference::podread::pod_cow::<half::bf16>(view.data()); // S-B9-REL-PPL: offsets may be unaligned
+        let w: &[half::bf16] = &w_cow;
         if fp8 {
             let q = gb10_inference::quant::quantize_fp8(w, *m, *k);
             bytes_q += (q.qweight.len() + q.row_scale.len() * 4) as u64;
@@ -13240,7 +13155,8 @@ fn run_df2_quant_fidelity(args: &[String]) {
     for (name, m, k) in &quant_inv {
         let view = st.tensor(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(view.dtype() == safetensors::Dtype::BF16, "{name}: not BF16");
-        let w: &[half::bf16] = bytemuck::cast_slice(view.data());
+        let w_cow = gb10_inference::podread::pod_cow::<half::bf16>(view.data()); // S-B9-REL-PPL: offsets may be unaligned
+        let w: &[half::bf16] = &w_cow;
         let orig_f32: Vec<f32> = w.iter().map(|x| x.to_f32()).collect();
 
         let q4 = gb10_inference::quant::quantize_nvfp4(w, *m, *k);
@@ -13345,7 +13261,7 @@ fn run_quantize(args: &[String]) {
                 && last == quant::PLE_DIM && name.contains(".ngram_embedding.shard_") {
             let ple_shard_i: u64 = name.rsplit_once("shard_").unwrap().1
                 .split('.').next().unwrap().parse().expect("ple shard index");
-            let (rec, gs) = quant::quantize_ple_rows(bytemuck::cast_slice(data), m_eff);
+            let (rec, gs) = quant::quantize_ple_rows(&gb10_inference::podread::pod_cow::<half::bf16>(data), m_eff);
             use std::io::Write;
             let mut st = ple_state.borrow_mut();
             st.0.write_all(&rec).expect("write ple records");
@@ -13386,7 +13302,8 @@ fn run_quantize(args: &[String]) {
             return;
         }
         let (m, k) = (m_eff, last);
-        let w: &[half::bf16] = bytemuck::cast_slice(data);
+        let w_cow = gb10_inference::podread::pod_cow::<half::bf16>(data); // S-B9-REL-PPL: offsets may be unaligned
+        let w: &[half::bf16] = &w_cow;
         let stem = name.strip_suffix(".weight").unwrap_or(&name).to_string();
         match fmt {
             Fmt::Nvfp4 => {
@@ -13534,7 +13451,7 @@ fn run_quantize(args: &[String]) {
                  &mut outs, &mut n_q4, &mut n_q8, &mut n_copy, &mut bytes_out);
             if outs_bytes(&outs) >= SHARD_BYTES { write_shard(&mut outs, &mut weight_map, &mut shard_idx); }
         }
-        // shard bytes dropped here â peak memory is one shard + the (much smaller) output
+        // shard bytes dropped here — peak memory is one shard + the (much smaller) output
     }
 
     // Drain any bases still pending at the end (e.g. the 122B's single MTP block, whose fusion triggers
@@ -13620,10 +13537,10 @@ fn run_quantize(args: &[String]) {
     println!("  wrote {} in {:.0}s", outd.display(), t0.elapsed().as_secs_f32());
 }
 
-/// `--perplexity --model-dir <d> --text <file>` â perplexity on held-out text.
+/// `--perplexity --model-dir <d> --text <file>` — perplexity on held-out text.
 ///
 /// The quality gate for quantization. Combine with `--fake-quant=<groups>` to measure what
-/// 4 bits actually costs, per tensor group, in the real engine â without needing any 4-bit kernel.
+/// 4 bits actually costs, per tensor group, in the real engine — without needing any 4-bit kernel.
 // Derive a gdn4 (GDN-nvfp4) artifact from a mixed (GDN-fp8) one — no bf16 needed. Only the fp8 GDN
 // in/out-proj tensors are re-quantized (dequant fp8 → bf16 → nvfp4); everything else (already nvfp4 or
 // bf16) is copied byte-for-byte. Output is streamed in ~12 GB shards (bounded RAM, works for the 397B).
@@ -13693,7 +13610,7 @@ fn run_requant_gdn(args: &[String]) {
                 let (m, k) = (wv.shape()[0], wv.shape()[1]);
                 let fp8 = quant::Fp8Tensor {
                     qweight: wv.data().to_vec(),
-                    row_scale: bytemuck::cast_slice::<u8, f32>(sv.data()).to_vec(),
+                    row_scale: gb10_inference::podread::pod_vec::<f32>(sv.data()),
                     m, k,
                 };
                 let bf = quant::dequantize_fp8(&fp8);
@@ -14229,6 +14146,22 @@ fn write_mtp_calib(path: &Option<std::path::PathBuf>, stamp: &str, buckets: &[(u
 }
 
 fn run_perplexity(args: &[String]) {
+    // S-B9-REL-PPL: an EXL3 pack runs on the EXL3 engine — the served chunked prefill with every row
+    // of each window through the lm_head (the generic loader cannot read this container: on the
+    // v0.7.3 binary it panicked on a misaligned tensor and then hung).
+    if let Some(dir) = parse_arg(args, "--model-dir") {
+        if gb10_inference::exl3_serve::is_exl3_pack(dir) {
+            let a = gb10_inference::exl3_forward::PplArgs::from_args(args).unwrap_or_else(|e| {
+                eprintln!("PERPLEXITY_EXL3_FAIL: {e:#}");
+                std::process::exit(2);
+            });
+            gb10_inference::exl3_forward::perplexity_exl3(&a).unwrap_or_else(|e| {
+                eprintln!("PERPLEXITY_EXL3_FAIL: {e:#}");
+                std::process::exit(1);
+            });
+            return;
+        }
+    }
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
         (dir.to_string(), format!("{}/tokenizer.json", dir.trim_end_matches('/')))
     } else {
@@ -14239,6 +14172,11 @@ fn run_perplexity(args: &[String]) {
     let window: usize = parse_arg(args, "--window").and_then(|s| s.parse().ok()).unwrap_or(1024);
     let max_windows: usize = parse_arg(args, "--max-windows").and_then(|s| s.parse().ok()).unwrap_or(8);
     let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    if window < 2 {
+        // a scored position needs two tokens; this used to run and print `mean_nll=NaN`
+        eprintln!("--window must be >= 2 (one scored position needs two tokens), got {window}");
+        std::process::exit(2);
+    }
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let text = std::fs::read_to_string(&text_path).expect("read --text file");
@@ -14274,7 +14212,7 @@ fn run_perplexity(args: &[String]) {
     println!("RESULT: tokens={}  mean_nll={:.5}  PERPLEXITY={:.4}", total_tok, mean, mean.exp());
 }
 
-/// `--profile-mtp` â attribute the cost of one stochastic-MTP step.
+/// `--profile-mtp` — attribute the cost of one stochastic-MTP step.
 /// DEBUG PROBE: `--probe-moe --model-dir <D> --batch B --out-x <f> --out <f>` — run the first MoE
 /// layer's `moe_batch` on a deterministic input and write input+output (f32, space-separated) so a
 /// numpy reference over that layer's checkpoint weights can validate the block numerically.
@@ -14976,13 +14914,13 @@ fn run_profile_mtp(args: &[String]) {
     println!("  Projected speedup at this step cost: {:.2}x", 1.76 / (step / base));
 }
 
-/// `--bench-mtp-sample` â the distribution-exactness gate for stochastic MTP.
+/// `--bench-mtp-sample` — the distribution-exactness gate for stochastic MTP.
 ///
 /// Greedy MTP is bitwise-lossless and `--bench-mtp` proves it by direct comparison. Stochastic MTP is
 /// only *distribution*-exact, so it is gated statistically instead: hold the prefix fixed and draw
 /// many emissions through the real kernels, then compare the emitted-token histogram against the
 /// distribution the plain sampler is defined to produce. The plain sampler's own histogram is drawn
-/// alongside as a control â it fixes the sampling-noise floor at this trial count, which is the bar
+/// alongside as a control — it fixes the sampling-noise floor at this trial count, which is the bar
 /// the MTP path has to reach (being merely "small" is not enough).
 fn run_bench_mtp_sample(args: &[String]) {
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
@@ -15012,7 +14950,7 @@ fn run_bench_mtp_sample(args: &[String]) {
         gb10_inference::gpu::GpuModel::new(&host).expect("gpu init")
     };
     if !gpu.mtp_present() {
-        println!("No MTP head â cannot run the stochastic-MTP gate.");
+        println!("No MTP head — cannot run the stochastic-MTP gate.");
         std::process::exit(1);
     }
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
@@ -15029,8 +14967,8 @@ fn run_bench_mtp_sample(args: &[String]) {
     // 100k trials even a flawless sampler sits near 0.009 and would fail a "TVD < 0.01" rule. And it
     // does not gate against a host-computed analytic nucleus: the top-p cut is float-sensitive deep in
     // the tail, so the host and the kernels disagree on the cutoff by a token or two and BOTH paths
-    // "fail" the analytic reference in lockstep. The claim we need is reference-free â MTP emits from
-    // the same law as the plain sampler â so we test the two empirical histograms against each other.
+    // "fail" the analytic reference in lockstep. The claim we need is reference-free — MTP emits from
+    // the same law as the plain sampler — so we test the two empirical histograms against each other.
     // The vs-analytic numbers are still printed, as diagnostics.
     const ZBAR: f32 = 4.0;
     let mut all_pass = true;
@@ -15047,7 +14985,7 @@ fn run_bench_mtp_sample(args: &[String]) {
             && p_agree < 1e-3;                           // device and host agree on p(x_draft)
         all_pass &= pass;
 
-        println!("temp={:.2}  draft={} nucleus={} p(draft)={:.4} (device {:.4}, Î={:.1e})",
+        println!("temp={:.2}  draft={} nucleus={} p(draft)={:.4} (device {:.4}, Δ={:.1e})",
                  temp, s.x_draft, s.nucleus_size, s.p_draft_analytic, s.p_draft_device, p_agree);
         println!("   accept rate   {:.4}  vs p(draft) {:.4}   z={:+.2}",
                  s.accept_rate, s.p_draft_analytic, s.accept_z);
@@ -15131,7 +15069,7 @@ fn run_bench_mtp(args: &[String]) {
     if gpu.mtp_present() {
         println!("MTP head loaded.");
     } else {
-        println!("No MTP head â cannot run MTP probe.");
+        println!("No MTP head — cannot run MTP probe.");
         std::process::exit(1);
     }
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
@@ -15155,7 +15093,7 @@ fn run_bench_mtp(args: &[String]) {
     } else {
         // Find first divergence for diagnostics; print a window of context around it.
         let div = mtp_tokens.iter().zip(seq_tokens.iter()).position(|(a, b)| a != b);
-        println!("RESULT: MISMATCH at token {:?} â MTP is NOT lossless", div);
+        println!("RESULT: MISMATCH at token {:?} — MTP is NOT lossless", div);
         if let Some(d) = div {
             let lo = d.saturating_sub(6);
             let hi = (d + 6).min(mtp_tokens.len()).min(seq_tokens.len());
@@ -15391,8 +15329,9 @@ fn run_server(args: &[String]) {
     let model_name = gb10_inference::server::resolve_model_name(
         parse_arg(args, "--model-name"), parse_arg(args, "--served-model-name"), &model_path);
     let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8192);
-    // Model-card presence-penalty default varies by model size (2B: 2.0, 4B+: 1.5). Temperature
-    // and top_p defaults are applied per-request via serde defaults in server.rs.
+    // Model-card presence-penalty default varies by model size (2B: 2.0, 4B+: 1.5). Temperature,
+    // top_p and top_k defaults are resolved per request in server.rs (AppState::sampling_defaults
+    // on the chat path, default_temperature()/.. on the legacy completions path).
     let is_2b = model_path.contains("2b");
     let default_presence_penalty = if is_2b { 2.0 } else { 1.5 };
 
@@ -15603,7 +15542,7 @@ fn run_server(args: &[String]) {
         // Clamp --max-seq-len to what the model actually supports. The RoPE cos/sin tables are sized to
         // `max_position_embeddings` (262144 for this family), so a KV cache bigger than that would ask
         // for rotations past the end of the tables. Going UP to the model max is fully supported (KV is
-        // ~64 KB/token â 256K/batch-2 â 34 GB, fine on 128 GB, just slow to prefill); going beyond is not.
+        // ~64 KB/token — 256K/batch-2 ≈ 34 GB, fine on 128 GB, just slow to prefill); going beyond is not.
         let model_max = cfg.max_position_embeddings;
         // E5 (512K mandate): a trunk YaRN factor > 1 EXTENDS the rope tables (build_rope_tables
         // sizes them to factor x native), so the seq-len ceiling rises with it - clamp against
@@ -15665,7 +15604,7 @@ fn run_server(args: &[String]) {
         };
 
         // STOP ON EVERY TURN TERMINATOR, not just the one config.json advertises. Qwen3.5 declares
-        // eos_token_id = <|endoftext|> (248044), but a CHAT turn ends with <|im_end|> (248046) â which
+        // eos_token_id = <|endoftext|> (248044), but a CHAT turn ends with <|im_end|> (248046) — which
         // is what the model actually emits. Stopping only on the advertised id let the assistant run
         // past the end of its own turn and hallucinate the next one: a fabricated `user` message, a new
         // `<think>` block, sometimes a second conflicting tool call. See QwenTokenizer::stop_token_ids.
@@ -15898,18 +15837,18 @@ fn run_server(args: &[String]) {
                      });
         }
 
-        // Prefix caching is OPT-IN. It skips re-prefilling a conversation's history â on a 5-turn tool
+        // Prefix caching is OPT-IN. It skips re-prefilling a conversation's history — on a 5-turn tool
         // conversation that is 97% of the prefill, and follow-up turns get ~3x faster. The price is that
         // reusing a prefix re-chunks the prefill, and prefill runs on cuBLAS, which picks a different
         // kernel per shape: a cached turn is NOT bit-identical to a cold one, so the same conversation
         // can word an answer slightly differently depending on cache state. That is a trade the operator
         // makes, not one we make for them. (Value parsed above, next to the TP config build.)
         if prefix_cache {
-            println!("Prefix cache: ON â a conversation's history is reused instead of re-prefilled \
+            println!("Prefix cache: ON — a conversation's history is reused instead of re-prefilled \
                       (~3x faster follow-up turns). Cached turns are NOT bit-identical to cold ones: \
                       reuse re-chunks the prefill and cuBLAS picks a kernel per shape.");
         } else {
-            println!("Prefix cache: off â every request prefills its whole prompt (bit-exact, and \
+            println!("Prefix cache: off — every request prefills its whole prompt (bit-exact, and \
                       slow on multi-turn agents: ~88% of prefill is recomputed). Enable: --prefix-cache on");
         }
 
@@ -15921,7 +15860,7 @@ fn run_server(args: &[String]) {
         // proposes the n-gram token as an ADDITIONAL candidate (tree verify, backlog #7), not a
         // replacement. Kept behind a flag for that work. `--ngram-draft 3` to experiment.
         if ngram_draft > 0 {
-            println!("Prompt-lookup drafting: ON (order {ngram_draft}) â EXPERIMENTAL, measured net-negative vs MTP");
+            println!("Prompt-lookup drafting: ON (order {ngram_draft}) — EXPERIMENTAL, measured net-negative vs MTP");
         }
 
         if tree_draft { println!("Tree drafting: ON (k=2 fork-then-chain) — EXPERIMENTAL, lossless, gated on yield"); }
@@ -15964,6 +15903,56 @@ fn run_server(args: &[String]) {
         scheduler.set_df2_carry(
             matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
                      "on" | "true" | "1" | "yes"));
+        // S-B9-REL-VISIONFIX2 V2d: the vision tower is built HERE, before the scheduler is spawned, not
+        // after. `GpuVisualTower::new_with_drill` uploads its weights through the legacy (NULL) stream
+        // (332 `htod_sync_copy(..).unwrap()`, a cuBLAS handle, a module load): a call that is refused,
+        // and that invalidates another thread's open graph capture, if the scheduler task is capturing
+        // at that moment (tests/vision_capture_race_test.rs). The scheduler's own boot captures ran
+        // inside `BatchScheduler::with_df2` on this thread, so before this point nothing can be capturing and
+        // nothing else touches the device; the spawn below is the first moment it can.
+        // Vision tower load, geometry-driven. The whole Qwen3.5/3.8 VL family is supported:
+        // dimensions come from `config.json` `vision_config` (TowerDims) and the `nvfp4-*` dirs'
+        // packed MLP weights are dequantized at load. Any model that declares `vision_config`
+        // but fails the strict load gets a visible notice and serves text-only (image traffic →
+        // clean BAD_REQUEST, never a crash). Text-only models (no `vision_config`) load nothing.
+        let vision_tower = match gb10_inference::vision_tower::vision_geometry(&model_path) {
+            Ok(Some(_)) => match gb10_inference::vision_tower::VisualTower::load(&model_path) {
+                Ok(t) => Some(std::sync::Arc::new(t)),
+                Err(e) => {
+                    eprintln!("[vision] tower load failed ({e}); serving text-only (image requests are rejected)");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[vision] vision geometry probe failed ({e}); serving text-only");
+                None
+            }
+        };
+        // S-B9-REL-VISIONFIX2 V5: `--vision-cpu` is a registry flag. `parse_arg` is the VALUE reader: as the LAST
+        // argument it was silently ignored (the GPU tower served), and `--vision-cpu=0` forced the CPU tower.
+        let vision_cpu = gb10_inference::opts::on(gb10_inference::opt!("vision-cpu"));
+        // PR #16 drill: fail the FIRST GPU-tower GEMM once (then back to the GPU path).
+        // S-B9-REL-PRPORT3 (review R7): registered in opts_table (Cat::Diag -> --help-diag) and
+        // consumed through the registry — the hand parse silently dropped the flag when it was
+        // the LAST argv token, and `=0` armed it.
+        let vision_fail_gemm = gb10_inference::opts::on(gb10_inference::opt!("vision-fail-gemm"));
+        gb10_inference::memwatch::phase("srv:post-vision-cpu-flag");
+        // GPU vision fast path: build on the shared device (same primary context as the serving model).
+        // Soft-fail — a GPU-less / PTX-less box keeps the CPU tower (or text-only behavior).
+        let vision_gpu = if vision_cpu { None } else {
+            vision_tower.as_ref().and_then(|t| {
+                let dev = match cudarc::driver::CudaDevice::new(0) {
+                    Ok(d) => d,
+                    Err(e) => { eprintln!("[vision] no CUDA device ({e}); image requests use the CPU path."); return None; }
+                };
+                match gb10_inference::vision_gpu::GpuVisualTower::new_with_drill(dev, t, vision_fail_gemm) {
+                    Ok(v) => Some(std::sync::Arc::new(std::sync::Mutex::new(v))),
+                    Err(e) => { eprintln!("[vision] GPU tower unavailable ({e}); image requests use the CPU path."); None }
+                }
+            })
+        };
+
         // If the scheduler dies, the server must DIE WITH IT. It used to be a bare tokio::spawn: a panic
         // inside (an OOM, say) killed the task silently, and the HTTP layer went on accepting requests
         // and answering every one of them with ZERO TOKENS, forever. A loud crash is recoverable; a
@@ -16015,42 +16004,6 @@ fn run_server(args: &[String]) {
             }
         }
         gb10_inference::memwatch::phase("srv:post-scheduler");
-
-        // Vision tower load, geometry-driven. The whole Qwen3.5/3.8 VL family is supported:
-        // dimensions come from `config.json` `vision_config` (TowerDims) and the `nvfp4-*` dirs'
-        // packed MLP weights are dequantized at load. Any model that declares `vision_config`
-        // but fails the strict load gets a visible notice and serves text-only (image traffic →
-        // clean BAD_REQUEST, never a crash). Text-only models (no `vision_config`) load nothing.
-        let vision_tower = match gb10_inference::vision_tower::vision_geometry(&model_path) {
-            Ok(Some(_)) => match gb10_inference::vision_tower::VisualTower::load(&model_path) {
-                Ok(t) => Some(std::sync::Arc::new(t)),
-                Err(e) => {
-                    eprintln!("[vision] tower load failed ({e}); serving text-only (image requests are rejected)");
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(e) => {
-                eprintln!("[vision] vision geometry probe failed ({e}); serving text-only");
-                None
-            }
-        };
-        let vision_cpu = parse_arg(args, "--vision-cpu").is_some();
-        gb10_inference::memwatch::phase("srv:post-vision-cpu-flag");
-        // GPU vision fast path: build on the shared device (same primary context as the serving model).
-        // Soft-fail — a GPU-less / PTX-less box keeps the CPU tower (or text-only behavior).
-        let vision_gpu = if vision_cpu { None } else {
-            vision_tower.as_ref().and_then(|t| {
-                let dev = match cudarc::driver::CudaDevice::new(0) {
-                    Ok(d) => d,
-                    Err(e) => { eprintln!("[vision] no CUDA device ({e}); image requests use the CPU path."); return None; }
-                };
-                match gb10_inference::vision_gpu::GpuVisualTower::new(dev, t) {
-                    Ok(v) => Some(std::sync::Arc::new(std::sync::Mutex::new(v))),
-                    Err(e) => { eprintln!("[vision] GPU tower unavailable ({e}); image requests use the CPU path."); None }
-                }
-            })
-        };
 
         // OTel emitter: build the sink and spawn THE sender (one timer-polled task; never wakes
         // per token, never runs on a GPU thread, does no GPU work). `None` when --otel-endpoint

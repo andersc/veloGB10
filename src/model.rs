@@ -269,12 +269,15 @@ impl Qwen3Model {
 
         // Helper to copy tensor data
         fn copy_tensor<T: bytemuck::Pod>(dst: &mut [T], src: &[u8], name: &str) -> anyhow::Result<()> {
-            let src_t = bytemuck::try_cast_slice(src)
-                .map_err(|e| anyhow::anyhow!("Failed to cast tensor {}: {}", name, e))?;
+            // alignment-safe (S-B9-REL-PPL): a tensor at an odd file offset is copied, not refused
+            anyhow::ensure!(src.len() % std::mem::size_of::<T>() == 0,
+                            "Failed to cast tensor {}: {} bytes is not a whole number of {}-byte elements",
+                            name, src.len(), std::mem::size_of::<T>());
+            let src_t = crate::podread::pod_cow::<T>(src);
             if dst.len() != src_t.len() {
                 anyhow::bail!("Size mismatch for {}: expected {}, got {}", name, dst.len(), src_t.len());
             }
-            dst.copy_from_slice(src_t);
+            dst.copy_from_slice(&src_t);
             Ok(())
         }
 

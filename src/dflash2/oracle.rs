@@ -73,7 +73,7 @@
 //! * **(G) Verify width is a CONSTANT 8.** DFlash2 has NO confidence head and NO k_verify
 //!   truncation (the DSpark mechanism is gone): the block is always [anchor + 7 drafts], the
 //!   verify width is always `block_size` (model.py:234 `verify_size = min(block_size, …)`).
-//!   S5F note: `k_verify ≡ 8` folds into the `agree_ext` hash word at bits [27..31) as a CONSTANT
+//!   S5F note: `k_verify ≡ 8` rides the `agree_ext` token word's width field (bits 27..31) as a CONSTANT
 //!   — the wire format is unchanged. RETIRED-BY-CONSTRUCTION (the checkpoint inventory proves the
 //!   head's absence: 81 tensors, no confidence).
 //!

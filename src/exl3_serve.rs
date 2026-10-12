@@ -58,6 +58,10 @@ struct Lane {
     // really cost ~22, turning MTP off on every request (2026-09-25, owner: "SUPER SLOW").
     ema_ms: f64,
     ema_tok: f64,
+    // S-B9-REL-MTPREPROBE2 W1.1: rounds counted since the last estimator reset
+    // (request start / re-arm) — the re-probe path blends a RUNNING MEAN over the
+    // first 64 of them (see mtp_reprobe::blend_cost_ema), never a one-round seed.
+    ema_n: usize,
     mtp_rounds: usize,
     wp23: Wp23Lane, // WP23: DDS cost-guard fit + per-width round counts (the [dds] line)
     // per-request round anatomy, logged at finish ([mtp-stats]): comparable to the reference implementation's
@@ -68,9 +72,21 @@ struct Lane {
     st_ms: f64,
     st_plain: usize,
     st_ctrl: usize, // WP03: control rounds this request ran (the cadence gate reads it)
+    // S-B9-CF-PACK4S: which arm ran each of this request's rounds (`[mtp-stats] packed=`, and
+    // `arms=` with --round-trace): the provenance of every emitted token.
+    arms: crate::lane_pack::ArmTrace,
+    // the request's first generated token ids (seam token first; at most FIRST_TOKS), printed
+    // with --round-trace as `toks=`: the distribution gate's statistic, read with `arms=`
+    first_toks: Vec<u32>,
     // S-A3-f-d: chain-verify state. tap_row = taps_keep row holding the tap that
     // predicted last_tok (usize::MAX after a control round: resid holds it).
     mtp: Option<usize>,
+    // S-B9-REL-MTPREPROBE: re-probe state for the §6 per-request MTP auto-off
+    // (src/mtp_reprobe.rs). mtp=None + phase Off = speculation off but the draft head
+    // stays primed and a re-probe comes after a backoff; force_control = a pending
+    // confirm wants ONE fresh control round at the current context.
+    reprobe: crate::mtp_reprobe::ReProbe,
+    force_control: bool,
     // CF-FCFS: this request's admission order (the scheduler's monotonically increasing admit
     // counter at admit time). fcfs lane order is the ONLY thing that reads it. It is a pure
     // function of replicated state — every TP rank runs the same admits in the same head-driven
@@ -79,7 +95,71 @@ struct Lane {
     // CF-FCHS: tokens this lane has generated since it last became the fcfs front lane. Reset when
     // a lane rotates to the back; compared against --lane-quantum to bound one turn's monopoly.
     fcfs_credit: usize,
+    // S-B9-CF-PACK4: an image request (its slot carries a 3-axis RoPE map) — never packed in v1.
+    img: bool,
     tx: crate::server::TokTx,
+}
+
+/// S-B9-CF-PACK4: host-side anatomy of the packed rounds since boot: wall ms of the three stages
+/// (the head re-prime is enqueued, so its GPU time lands in the next round's first draft pass,
+/// exactly as the lone round's device re-prime does). The sums are CUMULATIVE; the idle line
+/// prints their per-round means, and only when a round ran since the previous line.
+#[derive(Default, Clone, Copy)]
+struct PackStats {
+    rounds: u64,
+    rows: u64,
+    toks: u64,
+    ms_draft: f64,
+    ms_verify: f64,
+    ms_finish: f64,
+    // the verify's own parts (FwdModel::pack_verify): staging, graph replay + sync, readback
+    ms_stage: f64,
+    ms_graph: f64,
+    ms_read: f64,
+    // per packed width R (index = rows, 0..=16): rounds, graph-and-sync ms, tokens emitted — the served cost curve
+    by_r: [(u64, f64, u64); 17],
+    printed: u64,
+    // S-B9-CF-PACK4S: packed rounds that replayed the real-q family, and lane rounds of sampled
+    // lanes (real-q, match rule) and of greedy lanes served by packed verifies
+    rq_rounds: u64,
+    lanes_rq: u64,
+    lanes_match: u64,
+    lanes_greedy: u64,
+    // S-B9-CF-PACK5: host ms of the packed round's two lockstep points (TP only): the pre-verify
+    // (wasted-pass drain + exchange + agree) and the post-verify tp_round (fence A + exchange + fence B)
+    ms_pre: f64,
+    ms_post: f64,
+    // PACK4-REVIEW A3: true from the moment a pair round starts its packed part (after the
+    // control-cadence fallback) until it completes; an error that leaves it set came from the
+    // packed round, and the arm is disabled for the rest of the boot (`pack_disable`)
+    in_round: bool,
+}
+
+/// S-B9-REL-INTEG: the boot warning of lane packing (on by default since F10) under non-default penalty defaults (None = the defaults are
+/// the no-op 1.0 / 0 / 0, so an unpenalized request packs). A request that sends no penalty field inherits the
+/// server default, so with `--default-presence-penalty 1.5` EVERY such request is penalized and none of them packs
+/// (`Skip::Penalty`); a request that sends `presence_penalty: 0` (and the other two neutral) overrides the default
+/// and does pack. This is the owner's posture: his hand test showed 0 packed rounds for exactly this reason.
+fn lane_pack_penalty_warning(rep: f32, pres: f32, freq: f32) -> Option<String> {
+    if crate::exl3_forward::PenParams::new(rep, pres, freq, 1, 0).is_none() { return None; }
+    Some(format!("[exl3-serve] lane-pack WARNING: this server's penalty defaults are repetition {rep}, presence {pres}, frequency {freq} \
+(--default-repetition-penalty / --default-presence-penalty / --default-frequency-penalty). A request that sends no penalty \
+field inherits them and is a PENALIZED request, and a penalized request never joins a packed verify (it runs its own \
+lone round: /metrics velogb10_lane_pack_skip_total{{reason=\"penalty\"}}). With these defaults lane packing (--lane-pack, on by default) changes \
+nothing for such requests; a request that sends presence_penalty 0, frequency_penalty 0 and repetition_penalty 1 itself \
+does pack. The packed arm for penalized requests is not built"))
+}
+
+/// May SAMPLED lanes join a packed verify under TP? `--lane-pack-sampled-tp on|off`, default ON
+/// (owner 2026-10-10: real requests are sampled, and a feature is not kept away from them because
+/// its gates have not run: his TP=4 hand test showed 0 packed rounds and 898 `skip sampled`).
+/// The sampled tail of a packed verify under TP (the match-rule and real-q families keyed by their
+/// vocabulary-parallel tail) was built by S-B9-CF-PACK5 (`lane_pack::fams`, `FwdModel::pack_fam_key`)
+/// and has NOT run its hardware gates. `off` = a sampled lane runs its own lone round under TP
+/// (counted and logged as `skip sampled`). Spmd scope: the head ships the value, and the boot agree
+/// carries `pack_sampled`, so ranks cannot differ.
+fn pack_sampled_under_tp() -> bool {
+    crate::opts::choice(crate::opt!("lane-pack-sampled-tp")) != "off"
 }
 
 struct Exl3Scheduler {
@@ -89,6 +169,10 @@ struct Exl3Scheduler {
     lanes: Vec<Option<Lane>>,
     eos: Vec<u32>,
     chunk: usize, // S-A3-f-b: prefill chunk width (tokens per forward sweep)
+    /// `--prefill-interleave N` (public PR #23): scheduler steps run for the lanes already decoding
+    /// after each non-final prefill chunk of a joining prompt. 0 (default) = none: the whole prompt
+    /// prefills before the next step, exactly as before. Always 0 under TP (build_serve).
+    interleave: usize,
     psc: Option<crate::exl3_forward::PrefillScratch>,
     // S-A3-f-d MTP policy: depth k (--exl3-mtp-k, default MTP_MAX_K = 7 since WP23), auto-disable
     // when the measured per-token cost loses to plain (§6), control-round bookkeeping.
@@ -101,13 +185,33 @@ struct Exl3Scheduler {
     lane_quantum: usize,
     admit_ctr: u64,
     fcfs_rots: usize,
+    /// S-B9-CF-PACK4 `--lane-pack` (see step_packed): the mode, the packed verify's own scratch
+    /// (Some only with the flag on), which regime families are captured [dense, sparse], the
+    /// rotation counter, the skip-line budget, "a prefill is in flight" and the idle-line stats.
+    lane_pack: crate::lane_pack::LanePack,
+    scp: Option<Scratch>,
+    pack_ready: [bool; 2],
+    /// S-B9-CF-PACK5: sampled lanes may pack on this boot (TP=1: yes; under TP: `--lane-pack-sampled-tp`,
+    /// see `pack_sampled_under_tp`). A function of the topology and a shipped option: the same on every rank.
+    pack_sampled: bool,
+    pack_rot: u64,
+    pack_logs: usize,
+    in_prefill: bool,
+    pack_stats: PackStats,
     /// CF-P1e auto policy: learned scale of the shared-step time model, the last decision (hysteresis) and the
     /// consecutive shared-step count (stale-estimate refresh). All updated from lockstep-adopted values.
     shared_scale: f64,
     shared_last: bool,
     shared_streak: usize,
+    /// F4 (PACK5G finding 1): rounds riding the packed/serial arm at >=4 busy lanes since the
+    /// last shared plain step, under `--lane-pack on` + Auto (the shared-cost probe; see step()).
+    shared_probe_ctr: u32,
     policy_logs: usize,
     ctrl_round: usize,
+    /// S-B9-REL-MTPREPROBE: the re-probe schedule (shrunken by --mtp-reprobe-drill) and the
+    /// master switch (--mtp-reprobe=off = the previous one-way behaviour, exactly).
+    reprobe_cfg: crate::mtp_reprobe::ReProbeCfg,
+    reprobe_on: bool,
     // API-parity G1: plain decode cost (ms/token at m=1), refreshed by control rounds. It is
     // a property of the ENGINE (not of the content), so it persists across requests; the
     // MTP side is per request (Lane::ema_mtp) because acceptance is a property of content.
@@ -155,6 +259,9 @@ struct Exl3Scheduler {
     // VIS-4: the last image admit's (image tokens, rope delta, FNV of the fp16 rows) — proven equal on
     // every rank by the seam lockstep (None = a text admit)
     vis_seam: Option<(u32, i32, u64)>,
+    // Public issue #24: the prefill in flight as /metrics sees it — (slot, positions written so
+    // far). Set per completed chunk, cleared when the admit ends (the lane then carries `pos`).
+    kv_pf: Option<(usize, usize)>,
 }
 
 /// WP24 gate: MTP round anatomy of one arm (non-plain rounds only) + the first-round drafts.
@@ -253,13 +360,45 @@ pub(crate) struct TpSync {
     /// TP-D: the serve control plane (rank 0: one stream per node; a node: the stream to the head).
     /// Empty in the TP-C harness (run_spec), where nothing is head-decided mid-step.
     ctl: Vec<std::net::TcpStream>,
+    /// `--tp-width-drill N` (test drill, per box, one-shot; None = not armed): see `width_said`.
+    drill_width: Option<usize>,
+    /// rounds the drill has lied about: 0, then 1 for the rest of the boot (it is one-shot)
+    pub drill_hits: u64,
 }
 
 impl TpSync {
     pub(crate) fn new(rank: i32, world: i32) -> Self {
         let deadline_ms = if world > 2 { lockstep_deadline_ms() } else { 0 };
+        // S-B9-CF-AGREE16B (W3): the drill is armed (or declared inert) HERE, once, with a boot line
+        // either way; `net::drill_plan` is the pure decision.
+        let plan = crate::net::drill_plan(crate::opts::get(crate::opt!("tp-agree-drill")).as_deref(),
+                                          crate::opts::get(crate::opt!("tp-width-drill")).as_deref(), true, Some((rank, world)));
+        for l in &plan.lines { crate::reprintln!("{l}"); }
         TpSync { rank, world, deadline_ms, epoch_warns: 0, step: 0, ident: false, ident_bufs: 0, ident_bad: 0, agrees: 0,
-                 pre_agrees: 0, ctl: Vec::new(), wp: WaitProf::default() }
+                 pre_agrees: 0, ctl: Vec::new(), wp: WaitProf::default(), drill_width: plan.width, drill_hits: 0 }
+    }
+
+    /// The verify width this rank REPORTS in a round's lockstep words: the real one, except ONCE under the
+    /// `--tp-width-drill N` test drill, where the first round of width N is reported as `N - 1 - rank` on
+    /// the box that carries the flag (on the head, N = 16: "this rank believes 15, the peer 16"). The
+    /// forward itself is untouched: only the reported word lies, so a guard that cannot tell the two widths
+    /// apart lets the drill pass in silence and one that can aborts the link at that round.
+    ///
+    /// S-B9-CF-AGREE16B: it was `--tp-agree-drill N`, it lied on EVERY N-row round, and every rank said
+    /// N - 1. Two armed ranks then agreed on the lie, and a real 15-against-16 disagreement stayed masked
+    /// for the whole boot. One shot bounds that to one round, and the rank term makes two armed ranks
+    /// report different widths (`net::drill_plan` arms only where `N > rank`, so this cannot underflow).
+    fn width_said(&mut self, m: usize) -> usize {
+        match self.drill_width {
+            Some(n) if n == m && self.drill_hits == 0 && m > self.rank as usize => {
+                self.drill_hits = 1;
+                let said = m - 1 - self.rank as usize;
+                eprintln!("[tp-agree] DRILL (one-shot, now spent): rank {} reports verify width {said} for a {m}-row round \
+                           (lockstep step {}); from here on it reports the truth", self.rank, self.step);
+                said
+            }
+            _ => m,
+        }
     }
 
     /// TP-D: a boolean the HEAD decides inside a step (a prefill chunk boundary's "client gone"),
@@ -309,7 +448,7 @@ impl TpSync {
         // the fence takes the next lockstep step number (a plain agree field, like fence A): its field
         // then differs from the stale fence-B (bit 23) token it replaces and from the next pre-verify's.
         self.step += 1;
-        let r = tp_agree_eq(agree_field(self.step, AGREE_GO), 0, 0, (hs as u32) ^ ((hn as u32) << 24) ^ 0x60);
+        let r = tp_agree_eq(agree_field(self.step, AGREE_GO), 0, 0, go_fence_word(hs, hn));
         self.wp.rec(7, t0, s0);
         if let Err(why) = r {
             crate::net::abort_link();
@@ -373,12 +512,75 @@ impl TpSync {
                           self.step + 1, peer, e_last & 7, g & 7);
         }
         let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
-        let r = tp_agree_eq(step, w.min(255) as u8, (w + 1).min(15) as u8, h);
+        let r = tp_agree_eq(step, w, w + 1, h);
         self.wp.rec(4, t0, s0);
         if let Err(why) = r {
             crate::net::abort_link();
             anyhow::bail!("TP pre-verify agree FAILED (round {}, draft width {w}, drafts hash {h:08x}: {why}) — ranks chose \
                            different verify widths or drafts; link aborted before the verify", self.step + 1);
+        }
+        self.pre_agrees += 1;
+        Ok(())
+    }
+
+    /// S-B9-CF-PACK5: the PACKED round's pre-verify lockstep point — ONE exchange + ONE agree for a
+    /// pair (the serial arm does one per lane), after BOTH lanes drafted and before the packed verify
+    /// graph (whose R-keyed barrier sequence every rank must run alike) launches.
+    ///
+    /// `r` = the total verify rows R = m_0 + m_1 (the explicit number the barrier sequence depends
+    /// on), `m0` = the first segment's rows, `words` = `lane_pack::pre_words` (per segment: rows,
+    /// slot, position, bonus token, drafts — the design's OQ1 combined hash: self-delimiting, so a
+    /// single FNV over the concatenation catches every disagreement a per-request vector would),
+    /// `launched` = the SUM of both lanes' head draft passes issued on this rank.
+    ///
+    /// Same shape and slot discipline as `pre_verify` (exchange = rendezvous, then agree = fence;
+    /// the wire sizes are unchanged: [tag, R, hash, launched] + the 16-byte tail guard). The width
+    /// the exchange and the agree carry is R (<= 16; AGREE16 made the token's 5-bit field exact
+    /// up to 31), the accept byte carries m0; `--tp-width-drill N` lies about a pack of R = N rows
+    /// HERE (before the verify), so the drill proves the guard fires before the verify.
+    fn pre_verify_pack(&mut self, r: usize, m0: usize, words: &[i32], launched: usize) -> Result<()> {
+        let r_said = self.width_said(r);
+        if self.world > 2 {
+            let mut x = crate::net::link_hub(self.deadline_ms)?;
+            return self.pre_verify_hub(&mut x, r_said, words, launched);
+        }
+        let step = agree_field(self.step + 1, AGREE_PV);
+        // a domain of its own (tag 0x9F.., seed 0x9AC5_0001): a rank that planned a PACK where its peer ran
+        // a lone round (whose pre-verify uses 0x9E.. / 0x5EED) is caught by the exchange word itself,
+        // exactly, not by two hashes over different word lists happening to differ
+        let h = fnv32(0x9AC5_0001, words.iter().map(|&d| d as u32));
+        let tag = 0x9F00_0000u32 | (step as u32 & 0xFFFF);
+        let mine = [tag, r_said as u32, h, launched as u32];
+        // the race probe's deterministic alignment, exactly as `pre_verify` applies it (the pack's
+        // exchange has the same slot-aliasing exposure, so the REL-TP2RACE drills cover it)
+        let e_last = crate::net::traced_device_epoch();
+        let g0 = crate::net::traced_xchg_gen();
+        let g = if crate::net::race_probe_hold_ms() > 0 {
+            let g1 = crate::net::traced_gen_add(crate::net::probe_gen_delta(g0, e_last & 7));
+            crate::reprintln!("[tp-race-probe] rank {}: pack pre-verify aligned xchg gen {g0} -> {g1} onto epoch {e_last} \
+                       (device_epoch&7 = {}, gen&7 = {}), hold {} ms on rank 1",
+                      self.rank, e_last & 7, g1 & 7, crate::net::race_probe_hold_ms());
+            g1
+        } else { g0 };
+        let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
+        let peer = crate::net::exchange_u32s(&mine, 4 + 4)?; // + the 16-byte tail guard
+        self.wp.rec(3, t0, s0);
+        if peer != mine {
+            crate::net::abort_link();
+            anyhow::bail!("TP pack pre-verify FAILED (round {}): this rank R = {r_said} rows, pack hash {h:08x} (combined over every \
+                           segment's rows, slot, position, bonus, sampler and drafts), head passes launched {launched}; peer {:?} \
+                           [tag, R, hash, launched] — device_epoch&7 = {}, xchg gen&7 = {} — ranks chose different packs (row total, \
+                           slots, drafts or speculative head-pass launches); this rank's pack: {}; link aborted before the packed verify",
+                          self.step + 1, peer, e_last & 7, g & 7, crate::lane_pack::describe_pre_words(words));
+        }
+        let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
+        let rr = tp_agree_eq(step, m0, r_said, h);
+        self.wp.rec(4, t0, s0);
+        if let Err(why) = rr {
+            crate::net::abort_link();
+            anyhow::bail!("TP pack pre-verify agree FAILED (round {}, R = {r_said} rows, first segment {m0} rows, pack hash {h:08x}: \
+                           {why}) — ranks chose different packs; this rank's pack: {}; link aborted before the packed verify",
+                          self.step + 1, crate::lane_pack::describe_pre_words(words));
         }
         self.pre_agrees += 1;
         Ok(())
@@ -469,8 +671,10 @@ impl TpSync {
         let (step, world) = (self.step, self.world as usize);
         let h = fnv32(0, words.iter().copied());
         let field = agree_field(step, AGREE_A) as u32;
-        let frame = ls::rnd_frame(&ls::RoundIn { step, field, accept: a.min(255), width: m.min(15), hash: h, epoch, ms,
-                                                 plain_ms, captured });
+        // S-B9-CF-AGREE16: the frame words are whole u32s; the real accept count and width ride them (the
+        // saturation at 255 / at 15 inherited from the pairwise token made 15, 16 and 17 rows one word here too)
+        let frame = ls::rnd_frame(&ls::RoundIn { step, field, accept: a, width: self.width_said(m), hash: h,
+                                                 epoch, ms, plain_ms, captured });
         let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
         let all = crate::net::hub_all(x, &frame, ls::RND_WIRE)
             .map_err(|e| self.hub_fail("round", &format!("at {what} (lockstep step {step}): {e:#}")))?;
@@ -523,12 +727,92 @@ fn agree_field(counter: u64, kind: u64) -> u64 { (counter & 0x3F_FFFF) | (kind <
 /// divergent accept count / emitted-ids hash / boot config would have sailed through every "agree ok"
 /// (only the timeout could fire). The NVFP4 path (batch.rs) always compared. Ok(()) = both ranks
 /// published the identical token; Err = timeout/abort or a mismatch (message says which).
-pub(crate) fn tp_agree_eq(step: u64, accept: u8, k_verify: u8, hash: u32) -> std::result::Result<(), String> {
-    let h_ext = hash ^ ((k_verify as u32 & 0xF) << 27);
-    match crate::net::agree_ext(step, accept, k_verify, hash) {
+pub(crate) fn tp_agree_eq(step: u64, accept: usize, k_verify: usize, hash: u32) -> std::result::Result<(), String> {
+    let (a, k) = tp_agree_fields(accept, k_verify)?;
+    tp_agree_decide(a, k, hash, crate::net::agree_ext(step, a, k, hash))
+}
+
+/// The (accept, width) pair as the pairwise token carries it: accept in a byte, width in the five bits of
+/// `net::agree_word`. S-B9-CF-AGREE16: a value that does not fit is REFUSED (the caller aborts the link),
+/// never saturated — a saturation at 15 here made a 15-row and a 16-row verify one and the same word.
+pub(crate) fn tp_agree_fields(accept: usize, k_verify: usize) -> std::result::Result<(u8, u8), String> {
+    if accept > u8::MAX as usize || k_verify > crate::net::AGREE_WIDTH_MAX {
+        return Err(format!("REFUSED: accept count {accept} / verify width {k_verify} do not fit the lockstep token (accept <= 255, \
+                            width <= {}); refusing instead of sending a value the peer could mistake for another",
+                           crate::net::AGREE_WIDTH_MAX));
+    }
+    Ok((accept as u8, k_verify as u8))
+}
+
+/// The step-go fence's digest of the (control step, event count) pair both ranks hold after the exchange.
+/// S-B9-CF-AGREE16: it was `(hs as u32) ^ ((hn as u32) << 24) ^ 0x60`, where the event count shared bits
+/// 24..31 with the step (`(hs ^ 1 << 24, hn ^ 1)` gave the same word) and an event count of 256 or more
+/// shifted out. An FNV of the two whole words has neither alias, and it is a digest, which is what
+/// `net::agree_word` folds.
+pub(crate) fn go_fence_word(hs: u64, hn: usize) -> u32 {
+    fnv32(0x60, [hs as u32, (hs >> 32) as u32, hn as u32, (hn as u64 >> 32) as u32].into_iter())
+}
+
+/// Boot check (TP=2 only): the pairwise lockstep token names a round's width in five bits, and a shared
+/// plain step is as wide as the busy lanes, so `--max-batch` above 31 could reach a round the token
+/// cannot name. Refuse at boot instead of aborting the link mid-serve at the first such round. World > 2
+/// frames carry whole u32 words and TP=1 has no lockstep: both are unbounded here.
+pub(crate) fn tp_lane_width_fits(world: u32, max_batch: usize) -> std::result::Result<(), String> {
+    if world == 2 && max_batch > crate::net::AGREE_WIDTH_MAX {
+        return Err(format!("--max-batch {max_batch} at TP=2: a plain step shared by more than {} lanes cannot be named in the \
+                            pairwise lockstep token (5-bit verify-width field); use --max-batch <= {}",
+                           crate::net::AGREE_WIDTH_MAX, crate::net::AGREE_WIDTH_MAX));
+    }
+    Ok(())
+}
+
+/// F2 (owner 2026-10-10: "it should output a message and clearly show the cap at 16 lanes"): the EXL3
+/// server serves at most 16 requests at the same time — the PLE prefill kernels cap a plain step at
+/// m <= 16 (a 17th lane used to error every in-flight request and go DEAD under TP), the packed
+/// verify widths are 4..=16, and the old TP=2 rule capped at `AGREE_WIDTH_MAX`. A `--max-batch`
+/// above 16 now BOOTS WITH 16: one plain line at the boot, `velogb10_max_batch` reports 16, the KV
+/// is sized for 16, and the head ships 16 to the TP nodes (the same resolver on the same argv).
+/// Further requests wait in the queue — `--max-waiting` semantics are unchanged.
+pub(crate) const EXL3_MAX_LANES: usize = 16;
+
+/// `--max-batch` as the serve resolves it from an argv: the ONE parser (`build_serve` and the
+/// pre-network refusal below), so the two cannot come to read different defaults.
+pub(crate) fn max_batch_arg(args: &[String]) -> usize {
+    arg(args, "--max-batch").and_then(|s| s.parse().ok()).unwrap_or(8)
+}
+
+/// F2: the resolved lane count and the value the argv asked for. Every consumer of `--max-batch`
+/// (`build_serve`, the pre-network refusal, the boot line and the metrics) reads the resolved half,
+/// so the ranks cannot come to different lane counts.
+pub(crate) fn resolved_max_batch(args: &[String]) -> (usize, usize) {
+    let raw = max_batch_arg(args);
+    (raw.min(EXL3_MAX_LANES), raw)
+}
+
+/// S-B9-CF-AGREE16B (W4): `tp_lane_width_fits` from the argv and the world alone, so it can run BEFORE
+/// any network step. It used to run only inside `build_serve`, after the pack sync (minutes, on a cold
+/// node) and the RDMA attach: a `--max-batch 32` TP=2 launch synced, linked, and was refused then. Call
+/// sites, in boot order: the head before discovery and the pack sync (`run_exl3_tp_serve_head`), the
+/// node before the link (`exl3_tp_node_prelink`, reported to the head), both ranks before the attach
+/// (`run_tp_head_serve` / `run_tp_node_serve`, next to the otel refusal), and `build_serve` as the
+/// backstop for a caller that reaches it another way.
+pub fn tp_lane_width_refusal(args: &[String], world: u32) -> Result<()> {
+    // F2: the 16-lane cap is applied FIRST, so this can no longer refuse anything — 16 always fits
+    // the pairwise agree width (`AGREE_WIDTH_MAX` 31). The function stays as the backstop that keeps
+    // a future caller that bypasses the cap from booting a width the agree token cannot name.
+    let (width, _) = resolved_max_batch(args);
+    tp_lane_width_fits(world, width).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The comparison half of `tp_agree_eq`, pure: `peer` is what `net::agree_ext` returned (None = link
+/// aborted / peer timeout, Some = the peer's (accept, agree_word) for the same step field).
+pub(crate) fn tp_agree_decide(accept: u8, k_verify: u8, hash: u32, peer: Option<(u8, u32)>) -> std::result::Result<(), String> {
+    let word = crate::net::agree_word(k_verify, hash);
+    match peer {
         None => Err("link aborted or peer timeout".into()),
-        Some((pa, ph)) if pa == accept && ph == h_ext => Ok(()),
-        Some((pa, ph)) => Err(format!("MISMATCH: this rank (accept {accept}, hash {h_ext:08x}) vs peer (accept {pa}, hash {ph:08x})")),
+        Some((pa, pw)) if pa == accept && pw == word => Ok(()),
+        Some((pa, pw)) => Err(format!("MISMATCH: this rank (accept {accept}, width {k_verify}, word {word:08x}) vs peer (accept {pa}, \
+                                       width {}, word {pw:08x}) [word = width in bits 27..31 | 27-bit digest]", pw >> 27)),
     }
 }
 
@@ -866,6 +1150,72 @@ struct Wp23Lane {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SpecLanes { Never, Over(usize), Auto }
 
+/// The switch position `step_plain` orders its lanes around: qsa_limit() when the pack has a live
+/// sparse attention and the per-row regime is on; usize::MAX = no switch (no indexer, --qsa-exl3 0
+/// or --qsa-row-regime 0), which makes every order below the identity.
+fn regime_switch(qsa_live: bool, row_regime_on: bool, qsa_limit: usize) -> usize {
+    if qsa_live && row_regime_on { qsa_limit } else { usize::MAX }
+}
+
+/// The scheduler side of the per-row regime (S-B9-REL-QSAREGIME; a free function since
+/// S-B9-REL-SMALLFIXES 9a(iv) so the order is testable without a model): `slots` with the lanes
+/// at/below the switch `lim` first, each class in its given order. `pos_of(slot)` = the lane's
+/// next position.
+fn regime_ordered_slots(slots: &[usize], pos_of: impl Fn(usize) -> usize, lim: usize) -> Vec<usize> {
+    let pos: Vec<usize> = slots.iter().map(|&s| pos_of(s)).collect();
+    crate::exl3_forward::regime_order(&pos, lim).into_iter().map(|i| slots[i]).collect()
+}
+
+/// S-B9-REL-SMALLFIXES 9a(iii): the idle-point line of the lazily captured mixed-step graphs
+/// (None = nothing new since the last line).
+fn mixed_graphs_idle_line(printed: u64, now: u64, lanes: usize) -> Option<String> {
+    (now > printed).then(|| format!("[exl3-serve] mixed-step graphs idle: {printed}->{now} captured since boot (lazy, one per step shape \
+seen, not capped; {lanes} lanes can form {} mixed step shapes per sparse grid bucket and penalty state)",
+                                    crate::exl3_forward::mixed_step_shapes(lanes)))
+}
+
+/// S-B9-REL-SMALLFIXES item 5(a): the statistics a scheduler may report for a finishing stop
+/// token. A greedy row's token is that row's argmax, so its rank must be 1: any other rank means
+/// the logits row read back is not the row that chose the token, and nothing is reported rather
+/// than a number about another row. A sampled row has no such check (any rank is possible).
+fn stop_info_checked(stats: Option<(f64, u32)>, greedy: bool) -> Option<(f64, u32)> {
+    match stats {
+        Some((p, rank)) if p.is_finite() && (!greedy || rank == 1) => Some((p, rank)),
+        _ => None,
+    }
+}
+
+/// SURFACE2 item 4: does this boot speculate at all — the pack has a draft head and neither
+/// `--mtp off` nor the hatch turned it off? The boot lines about the speculative rounds (their lane
+/// order, the shared-step policy, the DDS depth posture, the sampling mode) are printed only then.
+fn spec_live(has_head: bool, off: Option<crate::exl3_forward::MtpOff>) -> bool {
+    has_head && off.is_none()
+}
+
+/// The boot line about the pack's draft head (None = the pack has none). The head is loaded either
+/// way (it is part of the pack); with speculation off the line says it is not used.
+fn head_loaded_line(has_head: bool, off: Option<crate::exl3_forward::MtpOff>) -> Option<String> {
+    if !has_head { return None; }
+    Some(match off {
+        None => "[exl3-serve] M1 pack head loaded (MTP draft head for chain-verify serving)".to_string(),
+        Some(o) => format!("[exl3-serve] M1 pack head loaded (MTP draft head; NOT used on this boot: {})", o.flag()),
+    })
+}
+
+/// The boot line of the MTP posture (None = the pack has no MTP head: nothing to say).
+/// S-B9-REL-SMALLFIXES item 1: `--mtp off` is honoured and says so ('MTP OFF (--mtp off)'); the
+/// two OFF lines keep the `[exl3-serve] MTP chain-verify OFF` prefix the gate scripts match.
+fn mtp_banner(has_head: bool, off: Option<crate::exl3_forward::MtpOff>, mtp_k: usize, draft_conf: f64) -> Option<String> {
+    use crate::exl3_forward::MtpOff;
+    if !has_head { return None; }
+    Some(match off {
+        None => format!("[exl3-serve] MTP chain-verify ON (k={mtp_k}, greedy + sampled lanes, dynamic draft stop {}; --mtp off / --exl3-mtp-k override)",
+                        if draft_conf > 0.0 { format!("at {draft_conf}") } else { "OFF".to_string() }),
+        Some(MtpOff::MtpFlag) => "[exl3-serve] MTP chain-verify OFF: MTP OFF (--mtp off) — plain decoding only, no draft head, no speculative rounds".to_string(),
+        Some(MtpOff::Hatch) => "[exl3-serve] MTP chain-verify OFF (--exl3-no-mtp set — diagnostics hatch)".to_string(),
+    })
+}
+
 /// CF-FCFS `--lane-order`: the order the SERIAL speculative rounds run in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LaneOrder {
@@ -947,18 +1297,54 @@ impl SpecLanes {
 /// n=16 90): the learned `shared_scale` corrects it for the topology / content actually served.
 fn shared_step_prior_ms(n: usize) -> f64 { 31.5 + 3.6 * n as f64 }
 
+/// F4 (S-B9-REL-FINALFIX, from PACK5G finding 1): under `--lane-pack on` the shared arm of the
+/// `use_shared_plain` comparison is priced as `shared_scale * shared_step_prior_ms(n)`, but the
+/// scale is only LEARNED by running shared rounds (`learn_shared_ms`) — and with the scale
+/// unlearned the prior never wins at c=4, so an on-boot rides packed pairs for the whole request
+/// (19/20 PACK5G boots) while the shared step measured FASTER in 3 of the 4 standard cells (only
+/// code/thinking-off pays for pairs). The probe breaks the loop: one shared plain step early,
+/// then periodically, so both arms are priced from measurement and the comparison picks the
+/// cheaper of the two. Cadence counts rounds on the OTHER arm:
+const SHARED_PROBE_FIRST: u32 = 16;  // while the scale has never been learned (boot start)
+const SHARED_PROBE_EVERY: u32 = 128; // afterwards, beside the shared arm's own 1-in-128 serial refresh
+fn shared_probe_due(ctr: u32, scale_unlearned: bool) -> bool {
+    ctr >= if scale_unlearned { SHARED_PROBE_FIRST } else { SHARED_PROBE_EVERY }
+}
+
+/// Generated token ids a request keeps for its `[mtp-stats] toks=` field (--round-trace).
+const FIRST_TOKS: usize = 8;
+
+/// `--round-trace` in the EXL3 server (S-B9-CF-PACK4S): `[mtp-stats]` also prints the request's
+/// seed, its per-round arm trace and its first generated token ids. Diagnostics; no effect on any round.
+fn round_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::opts::var(crate::opt!("round-trace")).is_ok())
+}
+
 impl Lane {
     fn log_stats(&self, slot: usize, reason: &str) {
         if self.st_rounds == 0 && self.st_plain == 0 { return; }
         let r = self.st_rounds.max(1) as f64;
         crate::tel::add_spec(self.st_rounds as u64, self.st_drafted as u64, self.st_accepted as u64);
+        crate::tel::add_mtp_reprobe(self.reprobe.off_events as u64, self.reprobe.reprobes as u64,
+                                    self.reprobe.reprobe_ok as u64);
         self.log_wp23(slot);
+        // S-B9: off_events/reprobes/reprobe_ok APPENDED (existing key order is frozen —
+        // scripts parse it).
+        // S-B9-CF-PACK4S: packed= APPENDED (lane rounds a packed verify served, of `rounds`); with
+        // --round-trace also the request's seed and its per-round arm trace (lane_pack::ArmTrace:
+        // the provenance of each emitted token — the sampled-lane distribution gate reads it).
+        let trace = if round_trace_on() {
+            format!(" seed={} arms={} toks={}", self.seed, self.arms.text(),
+                    self.first_toks.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","))
+        } else { String::new() };
         crate::reprintln!("[mtp-stats] slot={slot} finish={reason} gen={} rounds={} drafted={} accepted={} ({:.1}%) \
-                   tok/round={:.2} ms/round={:.1} plain_steps={} temp={} ctrl={}",
+                   tok/round={:.2} ms/round={:.1} plain_steps={} temp={} ctrl={} off_events={} reprobes={} reprobe_ok={} packed={}{trace}",
                   self.generated, self.st_rounds, self.st_drafted, self.st_accepted,
                   100.0 * self.st_accepted as f64 / self.st_drafted.max(1) as f64,
                   (self.st_accepted as f64 + self.st_rounds as f64) / r, self.st_ms / r,
-                  self.st_plain, self.temperature, self.st_ctrl);
+                  self.st_plain, self.temperature, self.st_ctrl,
+                  self.reprobe.off_events, self.reprobe.reprobes, self.reprobe.reprobe_ok, self.arms.packed);
     }
 
     /// WP02: the lane's client is gone (receiver dropped: disconnect, or a stop-string hit on the
@@ -1010,6 +1396,46 @@ impl Lane {
                   self.generated, self.pos, self.seed, self.temperature, self.top_p, self.top_k,
                   self.min_p, self.pen, self.mtp.is_some(), self.prompt_hash, tail);
     }
+}
+
+/// `--prefill-interleave` value from the command line: absent / empty = 0 (off).
+fn parse_prefill_interleave(v: Option<&str>) -> Result<usize> {
+    match v.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(0),
+        Some(v) => v.parse::<usize>().map_err(|e| anyhow::anyhow!("--prefill-interleave: {e} (decode steps per prefill chunk, 0 = off)")),
+    }
+}
+
+/// The interleave the scheduler runs with, and the boot line that says so (None = flag off, no
+/// line: default boot logs are unchanged). Under TP it is forced to 0 on every rank: a rank-local
+/// step between prefill chunks would break the SPMD lockstep (the head drives every step).
+fn resolve_prefill_interleave(n: usize, tp: bool, chunk: usize) -> (usize, Option<String>) {
+    match (n, tp) {
+        (0, _) => (0, None),
+        (n, true) => (0, Some(format!("[exl3-serve] --prefill-interleave {n} IGNORED under TP (single-box only): \
+                                       every rank runs with interleave 0, the whole prompt prefills before the next step"))),
+        (n, false) => (n, Some(format!("[exl3-serve] prefill interleave ON (--prefill-interleave {n}): up to {n} scheduler step(s) for the \
+                                        lanes already decoding after each non-final prefill chunk (chunk {chunk} tokens); \
+                                        the chunk grid and the joining request's bytes are unchanged, its first token is later"))),
+    }
+}
+
+/// Public issue #24: one lane's (positions used, positions cached) as /metrics reports them.
+/// A running request uses `pos` positions (prompt + generated) and a prefill in flight the rows it
+/// has written (a resumed prefix included); neither reads as cached, because the prefix snapshot is
+/// part of what the request holds. A free lane uses nothing and keeps its snapshot's positions.
+fn kv_lane_occupancy(active_pos: Option<usize>, prefill_pos: Option<usize>, cache_len: Option<usize>) -> (usize, usize) {
+    match active_pos.or(prefill_pos) {
+        Some(p) => (p, 0),
+        None => (0, cache_len.unwrap_or(0)),
+    }
+}
+
+/// Does the hook run after the chunk that ended at `end` of a prefill to `n`? Never after the final
+/// chunk (the seam step and the head prime follow it directly), never for a non-cancellable
+/// internal prefill (`cancellable` false: the WP16 XCHECK's reference run), never under TP.
+fn interleave_point(interleave: usize, tp: bool, cancellable: bool, end: usize, n: usize) -> bool {
+    interleave > 0 && !tp && cancellable && end < n
 }
 
 /// C1 v2: prefill scratch rows — the merged-chunk cap with tail checkpoints on (2C - 1; under TP
@@ -1067,11 +1493,16 @@ impl Exl3Scheduler {
         if self.psc.is_none() {
             self.psc = Some(self.model.prefill_scratch(psc_rows(c, self.tp.is_some()))?);
         }
-        let psc = self.psc.as_mut().unwrap();
         let mut pos = from;
         let n = to.min(prompt.len().saturating_sub(1)); // the seam token is a decode step
+        if tx.is_some() {
+            // issue #24: the request owns its slot from here; a resumed prefix (rows 0..from) counts
+            self.kv_pf = Some((slot, from));
+            self.publish_kv();
+        }
         if pos >= n { return Ok(true); }
         let mut taken: Vec<usize> = Vec::new();
+        let (mut il_points, mut il_steps, mut il_ms) = (0usize, 0usize, 0.0f64);
         // C1 v2 (knob on == realign): merge away the chunk the split / realign would add (psc holds
         // 2C - 1 rows then, see run())
         let absorb = crate::exl3_forward::absorb_rmin();
@@ -1089,6 +1520,8 @@ impl Exl3Scheduler {
                      n - from, if absorb.is_some() { " (absorb-tail)" } else { "" });
         }
         for end in grid {
+            // (re-borrowed per chunk: the interleave hook at the end of the body needs all of self)
+            let psc = self.psc.as_mut().unwrap();
             if pos > from {
                 let mut gone = tx.map_or(false, |t| t.is_closed());
                 // TP-D: the HEAD decides (its client); every rank stops at this same chunk boundary
@@ -1128,9 +1561,29 @@ impl Exl3Scheduler {
                 }
             }
             pos = end;
+            if tx.is_some() {
+                // issue #24: a request's prefill holds rows 0..end of its slot
+                self.kv_pf = Some((slot, end));
+                self.publish_kv();
+            }
+            // --prefill-interleave: this chunk's rows, checkpoint and head-fill carry are complete
+            // (interleave_steps drains the device first), so the lanes that were decoding before
+            // this prompt arrived get their steps now.
+            if interleave_point(self.interleave, self.tp.is_some(), tx.is_some(), end, n) {
+                let t_il = std::time::Instant::now();
+                let ran = self.interleave_steps(slot)?;
+                il_points += usize::from(ran > 0);
+                il_steps += ran;
+                if ran > 0 { il_ms += t_il.elapsed().as_secs_f64() * 1e3; }
+            }
         }
-        // S-A3-f-d Item 2: serve-path prefill telemetry (TTFT's main term).
-        let ms = tp.elapsed().as_secs_f64() * 1e3;
+        if il_steps > 0 {
+            crate::rprintln!("[exl3-serve] prefill-interleave slot={slot}: {il_steps} scheduler step(s) at {il_points} of {} chunk boundaries, \
+                              {il_ms:.1} ms of decode (not counted in the prefill line's ms / tok/s)", nchunks.saturating_sub(1));
+        }
+        // S-A3-f-d Item 2: serve-path prefill telemetry (TTFT's main term). With --prefill-interleave
+        // the decode steps run between the chunks are taken out, so the line stays the prefill's own rate.
+        let ms = tp.elapsed().as_secs_f64() * 1e3 - il_ms;
         let done = n - from;
         crate::rprintln!("[exl3-serve] prefill slot={} n={} (pos {}..{}) in {:.1} ms ({:.0} tok/s, C={})",
                  slot, done, from, n, ms, if ms > 0.0 { done as f64 * 1e3 / ms } else { 0.0 }, c);
@@ -1151,6 +1604,65 @@ impl Exl3Scheduler {
             }
         }
         Ok(true)
+    }
+
+    /// `--prefill-interleave N` (public PR #23): between two prefill chunks of the prompt joining
+    /// `slot`, run up to N scheduler steps for the lanes that are already decoding, so a long
+    /// prompt no longer freezes every running stream for its whole prefill. Returns the steps run.
+    ///
+    /// Why the nested `step()` cannot see or disturb the prefill in flight:
+    /// - `lanes[slot]` is None until `admit` finishes, and `step()` (cancel sweep, re-probe arming,
+    ///   shared-plain choice, fcfs front, every round) only walks the lanes that are Some. Nothing
+    ///   in a step admits a request, so the joiner's slot cannot be handed to anyone else; a lane
+    ///   that finishes or is cancelled inside a step frees a DIFFERENT index (it was Some when this
+    ///   slot was picked) and `run` admits the next waiting request there after this admit returns.
+    /// - the prefill carries its state across chunks in `self.psc` (head-fill carry, WP05 stage,
+    ///   image splice) and in `slot`'s own rows of the model (GDN / conv state, PLE ring, KV and
+    ///   QSA planes, head KV). A step works in `self.sc` and the stepped lanes' slots; it never
+    ///   reads `self.psc`, `self.cache` or `self.wp16` (those are touched by admit / prefill only).
+    /// - `admit` stages the joiner's sampler, penalties and seam step in `self.sc` only AFTER the
+    ///   prefill returns, so nothing a nested step stages there is read by the joiner.
+    /// A failing step fails every live lane (`fail_step`) and the error ends this prefill too.
+    fn interleave_steps(&mut self, slot: usize) -> Result<usize> {
+        anyhow::ensure!(self.lanes[slot].is_none(), "prefill-interleave: slot {slot} already holds a lane");
+        if self.fatal.is_some() || self.lanes.iter().all(|l| l.is_none()) { return Ok(0); }
+        // prefill_chunk ends synced, but a checkpoint taken at this chunk end queued its copies
+        // after that: drain them so the first nested round's measured time (lane EMAs, the cost
+        // guard, the shared-step scale) is the round's own.
+        self.model.dev().synchronize()?;
+        let mut ran = 0usize;
+        // S-B9-CF-PACK4: a prompt is mid-prefill for these steps — the decoding lanes do not pack
+        self.in_prefill = true;
+        for _ in 0..self.interleave {
+            if self.fatal.is_some() || self.lanes.iter().all(|l| l.is_none()) { break; }
+            if let Err(e) = self.step() {
+                self.in_prefill = false;
+                self.fail_step(&e);
+                // The joiner fails too (the PR's choice: after a failed step nothing is admitted on
+                // top of it). Its client sees `{e}` of this error, so the root cause goes in the text.
+                anyhow::bail!("a decode step between prefill chunks failed (--prefill-interleave): {e:#}");
+            }
+            ran += 1;
+        }
+        self.in_prefill = false;
+        if let Some(f) = self.fatal.as_ref() {
+            anyhow::bail!("engine stopped during a prefill-interleave step: {f}");
+        }
+        Ok(ran)
+    }
+
+    /// A failed decode step (from `run`, or from a prefill-interleave step): fail every live lane
+    /// loudly (never emit garbage as if it were text) and mark the engine dead on a sticky CUDA error.
+    fn fail_step(&mut self, e: &anyhow::Error) {
+        eprintln!("[exl3-serve] decode step failed: {e:#}");
+        for s in 0..self.lanes.len() {
+            if let Some(lane) = self.lanes[s].take() {
+                let _ = lane.tx.send(TokEvent::Finish { reason: format!("error: {e}") });
+            }
+        }
+        if sticky_cuda_error(e) {
+            self.fatal = Some(format!("{e:#}"));
+        }
     }
 
     /// Prefill prompt[..plen-1] into `slot`, resuming from a cached prefix when possible, and
@@ -1320,14 +1832,18 @@ impl Exl3Scheduler {
     /// that ships the head's (ms, plain ms, captured) — returned on EVERY rank, so every timing-
     /// derived decision downstream is the head's; (3) with `ident` on, the digests of the logits
     /// rows 0..m, the residual and the taps window are compared across ranks (G-T1-b graphed).
+    ///
+    /// S-B9-CF-PACK5: `digest_pack` = the round's rows live in the PACKED scratch (a packed verify):
+    /// the `--exl3-tp-ident` digests then read it, not the served scratch (whose argmax / logits are
+    /// only `--max-batch`-wide: a 16-row pack indexed past them).
     fn tp_round(&mut self, what: &str, a: usize, m: usize, words: &[u32], ms: f64, plain_ms: f64,
-                captured: bool) -> Result<(f64, f64, bool)> {
+                captured: bool, digest_pack: bool) -> Result<(f64, f64, bool)> {
         let Some(t) = self.tp.as_mut() else { return Ok((ms, plain_ms, captured)) };
         if t.world > 2 {
             // TP-4D: ONE merged head-hub op (tp_lockstep::RND) instead of agree / exchange / agree
             let mut x = crate::net::link_hub(t.deadline_ms)?;
             let epoch = crate::net::traced_device_epoch();
-            let (model, sc) = (&self.model, &self.sc);
+            let (model, sc) = (&self.model, if digest_pack { self.scp.as_ref().unwrap_or(&self.sc) } else { &self.sc });
             return t.round_hub(&mut x, what, a, m, words, ms, plain_ms, captured, epoch, |m| model.tp_ident_digests(sc, m));
         }
         t.step += 1;
@@ -1337,7 +1853,7 @@ impl Exl3Scheduler {
         // path epoch payload of it has been read on both sides (the exchange below reuses ring slot
         // memory: its send buffer is send slot 0, its receive lands in recv slot gen & 7).
         let (t0, s0) = (std::time::Instant::now(), crate::net::wait_sleeps());
-        let r = tp_agree_eq(agree_field(step, AGREE_A), a.min(255) as u8, m.min(15) as u8, h);
+        let r = tp_agree_eq(agree_field(step, AGREE_A), a, t.width_said(m), h);
         t.wp.rec(0, t0, s0);
         t.wp.rounds += 1;
         if let Err(why) = r {
@@ -1345,7 +1861,10 @@ impl Exl3Scheduler {
             anyhow::bail!("TP agree() FAILED at {what} (lockstep step {step}, accept {a}, width {m}, hash {h:08x}): {why} — \
                            ranks diverged or the link aborted");
         }
-        let digests = if ident { self.model.tp_ident_digests(&self.sc, m)? } else { Vec::new() };
+        let digests = if ident {
+            let dsc = if digest_pack { self.scp.as_ref().unwrap_or(&self.sc) } else { &self.sc };
+            self.model.tp_ident_digests(dsc, m)?
+        } else { Vec::new() };
         let tag = 0xC0DE_0000u32 | (step as u32 & 0xFFFF);
         let (mb, pb) = (ms.to_bits(), plain_ms.to_bits());
         let mut mine = vec![tag, mb as u32, (mb >> 32) as u32, pb as u32, (pb >> 32) as u32, captured as u32,
@@ -1394,6 +1913,29 @@ impl Exl3Scheduler {
     /// default). API-parity G2: sampled lanes speculate too (device-sampled verify rows).
     /// Lanes whose request turned MTP off (G1) batch through the plain decode path.
     fn step(&mut self) -> Result<()> {
+        let before = self.steps;
+        let r = self.step_rounds();
+        // H3: round COMPLETE — the age gauge measures from here. Every arm of `step_rounds` ends
+        // here (it used to be written on the rr arm only: a shared plain step and an fcfs step
+        // left velogb10_scheduler_last_step_age_seconds growing while busy read 1).
+        if r.is_ok() && self.steps != before { crate::metrics::sched_touch(); }
+        self.publish_kv(); // issue #24: lane positions after this step (finished lanes read 0)
+        r
+    }
+
+    /// Public issue #24: publish every lane's KV occupancy to /metrics — the positions a running
+    /// request holds (`Lane.pos`: prompt + generated; the prefill in flight: the rows written so
+    /// far) and, for a free lane, the prompt positions its prefix-cache snapshot keeps. Host-only:
+    /// a few relaxed loads/stores per lane, once per scheduler step / prefill chunk / admit.
+    fn publish_kv(&self) {
+        let pf = self.kv_pf;
+        crate::metrics::kv_publish(self.lanes.iter().zip(self.cache.iter()).enumerate()
+            .map(|(s, (lane, cache))| kv_lane_occupancy(lane.as_ref().map(|l| l.pos), pf.filter(|p| p.0 == s).map(|p| p.1),
+                                                        cache.as_ref().map(|c| c.len()))));
+    }
+
+    /// The rounds of one `step` (every arm may return early; `step` does the per-step publication).
+    fn step_rounds(&mut self) -> Result<()> {
         crate::metrics::sched_step(); // v0.7.3 gauge: rounds + busy
         // WP02 cancel sweep (the NVFP4 decode_step sweep, batch.rs): a lane whose client is gone
         // (disconnect, or the HTTP side dropped the receiver on a stop-string hit) frees its slot
@@ -1430,11 +1972,42 @@ impl Exl3Scheduler {
         crate::tel::note_step();
         let mtp_on = self.model.mtp.is_some()
             && !crate::exl3_forward::mtp_disabled_by_opt();
+        // S-B9-REL-MTPREPROBE: arm due re-probes BEFORE dispatch (pure lane state —
+        // plain-step counts and agreed HEAD ms inputs — so every TP rank arms the same
+        // lanes; lockstep holds through the transition). The seam is exactly a control
+        // round's post-step state: the lane's plain steps kept its head row primed and
+        // its tap snapshotted (step_plain), so Some(0) arms it cleanly.
+        if mtp_on && self.reprobe_on {
+            let mut armed: Vec<(usize, usize, usize)> = Vec::new(); // (slot, plain steps waited, off event)
+            for &s in &slots {
+                let due = self.lanes[s].as_ref()
+                    .map_or(false, |l| l.mtp.is_none() && l.reprobe.probe_due(&self.reprobe_cfg));
+                if due {
+                    let (steps, ev) = {
+                        let l = self.lanes[s].as_ref().unwrap();
+                        (l.reprobe.plain_steps, l.reprobe.off_events)
+                    };
+                    let l = self.lanes[s].as_mut().unwrap();
+                    l.mtp = Some(0);
+                    l.ema_ms = 0.0;
+                    l.ema_tok = 0.0;
+                    l.ema_n = 0;
+                    l.reprobe.armed_for_probe();
+                    armed.push((s, steps, ev));
+                }
+            }
+            for &(s, steps, ev) in &armed {
+                crate::rprintln!("[exl3-serve] MTP re-probe (slot {s}): back ON after {steps} plain steps \
+(off event {ev}; probe window {} rounds, a {:.0}% sustained loss turns it off again)",
+                           self.reprobe_cfg.probe_window, 100.0 * self.reprobe_cfg.margin);
+            }
+        }
         // CF-P1e load-adaptive batching: past `--spec-lanes-max` busy lanes, serial speculative rounds stop
         // scaling (one lane per round), so every busy lane shares one batched plain step instead; the
         // lanes' MTP heads stay in sync (see step_plain's `sync_head`), so speculation resumes when load drops.
         if mtp_on && self.use_shared_plain(&slots) {
             self.shared_streak += 1;
+            self.shared_probe_ctr = 0; // a shared round ran: the scale just learned, no probe owed
             // Stale-estimate refresh: lanes' speculative-speed EMAs freeze while they ride shared steps, so every
             // 128th shared round one lane (rotating) runs a serial speculative round instead; the others skip
             // this iteration. ~0.5% of rounds; keeps the cost-based choice tracking the content.
@@ -1444,9 +2017,39 @@ impl Exl3Scheduler {
                     return self.step_mtp(s);
                 }
             }
+            crate::metrics::lane_pack_round(2); // arm = shared_plain
             return self.step_plain(&slots, true);
         }
         self.shared_streak = 0;
+        // S-B9-REL-FINALFIX F4: the shared-cost probe (see `shared_probe_due`). Only under
+        // `--lane-pack on` + the Auto policy at >=4 busy lanes: the flag-off arm (G2 byte
+        // identity) and the two-lane packed win (PACK5G c=2) never see it, and three lanes
+        // measured "nothing at three". The probe round is exactly what the shared arm runs
+        // (`step_plain(&slots, true)`, heads kept in sync), so every busy lane advances one
+        // token and `learn_shared_ms` seeds/refreshes `shared_scale`; from the next round the
+        // comparison above picks the cheaper arm by measurement. Pure lane-state decision
+        // (counter, scale and policy are lockstep-adopted or rank-identical), so both TP ranks
+        // take it in the same step, like the re-probe arming above.
+        if mtp_on && self.lane_pack.on() && self.spec_policy == SpecLanes::Auto && slots.len() >= 4
+            && shared_probe_due(self.shared_probe_ctr, self.shared_scale == 1.0) {
+            self.shared_probe_ctr = 0;
+            if self.policy_logs < 64 {
+                self.policy_logs += 1;
+                crate::reprintln!("[exl3-serve] spec-lanes auto: shared-step probe with {} busy lanes \
+                           (one shared plain step; the arm pick then prices both arms by measurement)", slots.len());
+            }
+            crate::metrics::lane_pack_round(2); // arm = shared_plain: this round IS one
+            return self.step_plain(&slots, true);
+        }
+        self.shared_probe_ctr = self.shared_probe_ctr.saturating_add(1);
+        // S-B9-CF-PACK4 `--lane-pack on`: two packable busy lanes share ONE packed speculative
+        // verify. `pack_plan` is None with the flag off or fewer than two busy lanes, so both of
+        // those take the loops below untouched (off == master; a lone request never packs).
+        if mtp_on {
+            if let Some(plan) = self.pack_plan(&slots) {
+                return self.step_packed(&slots, plan);
+            }
+        }
         // CF-FCFS: the fcfs arm steps ONE lane (the front) and leaves the rest untouched this
         // scheduler step; the MTP-off lanes still batch together exactly as below. rr (the default)
         // runs the original loop, unchanged and in slot order.
@@ -1519,8 +2122,330 @@ impl Exl3Scheduler {
         if !plain.is_empty() {
             self.step_plain(&plain, false)?;
         }
-        crate::metrics::sched_touch(); // H3: round COMPLETE — the age gauge measures from here
         Ok(())
+    }
+
+    /// The depth of a speculative round for a lane at position `p` with `remaining` tokens of
+    /// budget: (after the end-of-window and remaining-budget clamps, after the sparse-switch
+    /// clamp as well). The second is the round's depth; first > second = the round is clamped
+    /// at the switch. One definition for `step_mtp` and the packed arm's plan.
+    fn round_depth(&self, p: usize, remaining: usize) -> (usize, usize) {
+        let mut k_eff = self.mtp_k.min(self.model.max_pos().saturating_sub(p + 2));
+        if crate::exl3_forward::a_flags().rem_clamp {
+            k_eff = k_eff.min(remaining.saturating_sub(1));
+        }
+        (k_eff, self.model.regime_depth(p, k_eff))
+    }
+
+    /// S-B9-CF-PACK4: this step's packing (`lane_pack::plan`), or None = the flag is off or
+    /// fewer than two lanes are busy, and the caller runs master's loops untouched. Every input
+    /// is lane state plus the rotation counter (which advances once per planned step).
+    fn pack_plan(&mut self, slots: &[usize]) -> Option<crate::lane_pack::Plan> {
+        use crate::lane_pack::{lane_block, LaneFacts, LaneView, Skip};
+        if !self.lane_pack.on() || slots.len() < 2 { return None; }
+        let views: Vec<LaneView> = slots.iter().map(|&s| {
+            let l = self.lanes[s].as_ref().unwrap();
+            let (k_pre, kd_reg) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated));
+            let facts = LaneFacts {
+                mtp_armed: l.mtp.is_some(),
+                force_control: l.force_control,
+                probing: l.reprobe.phase == crate::mtp_reprobe::Phase::Probing,
+                sampled: l.samp_rows(1)[0].is_some(),
+                // PACK4S: sampled lanes pack (real-q and match rule); only the lone-verify
+                // sampler dump (--wp24-dump records the lone round's rows) keeps them out; and
+                // (PACK5) a topology whose packed sampled tail is not gated (TP=2)
+                sampled_lone: crate::wp24::dump_on() || !self.pack_sampled,
+                penalized: l.pen.is_some(),
+                image: l.img,
+                depth: 0, // set by lane_view from kd_reg (capped at PACK_DEPTH_MAX: PACK4-REVIEW A4)
+            };
+            // The verify's regime is its LAST row's (p + w for the w <= kd drafts the DDS keeps).
+            // With the per-row regime on, a round never straddles the switch, so every w gives
+            // the regime of p + kd; with --qsa-row-regime 0 a straddling round's regime depends
+            // on w, which is only known after drafting: such a lane does not pack (and the boot
+            // refuses that posture, PACK4-REVIEW B3). `lane_view` is the pure, unit-tested rule.
+            crate::lane_pack::lane_view(s, facts, l.pos, k_pre, kd_reg, self.in_prefill, self.pack_ready,
+                                        &|p| self.model.qsa_live(p))
+        }).collect();
+        let plan = crate::lane_pack::plan(self.lane_pack, &views, self.pack_rot);
+        if plan.is_some() { self.pack_rot += 1; }
+        plan
+    }
+
+    /// One lane round ran outside a pack: count it, and log the first few (64 lines in all, at
+    /// most 8 per reason so one common reason cannot use the whole budget).
+    fn note_skip(&mut self, s: usize, why: crate::lane_pack::Skip) {
+        crate::metrics::lane_pack_skip(why.index());
+        if self.pack_logs < 64 && crate::metrics::lane_pack_skips(why.index()) <= 8 {
+            self.pack_logs += 1;
+            crate::reprintln!("[exl3-serve] lane-pack skip: {} (slot {s}; line {}/64, every skip is counted: /metrics \
+velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, why.label());
+        }
+    }
+
+    /// S-B9-CF-PACK4: one scheduler step under `--lane-pack on` with at least two busy lanes.
+    /// Lanes are visited in slot order, as in the serial loop: a lane that is the first slot of
+    /// a planned pair runs the packed round with its partner; every other lane runs exactly
+    /// what the serial loop runs for it (its lone speculative round, or the plain batch for
+    /// MTP-off lanes), with the reason it stayed out of a pack counted.
+    fn step_packed(&mut self, slots: &[usize], plan: crate::lane_pack::Plan) -> Result<()> {
+        let mut plain: Vec<usize> = Vec::new();
+        for &s in slots {
+            match plan.pair_of(s) {
+                Some([a, b]) => {
+                    if s == a { // b ran with a (slots ascend, a < b)
+                        if let Err(e) = self.step_pair(a, b) {
+                            // PACK4-REVIEW A3: an error out of the PACKED part of the round leaves
+                            // the arm off for the rest of the boot (the caller still fails every
+                            // live lane, as for any decode-step error); the control-cadence
+                            // fallback's serial rounds are the lone path's own and do not.
+                            if std::mem::take(&mut self.pack_stats.in_round) { self.pack_disable(a, b, &e); }
+                            return Err(e);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(why) = plan.skip_of(s) { self.note_skip(s, why); }
+                    if self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some()) {
+                        self.step_mtp(s)?;
+                    } else if self.lanes[s].is_some() {
+                        plain.push(s);
+                    }
+                }
+            }
+        }
+        if !plain.is_empty() {
+            self.step_plain(&plain, false)?;
+        }
+        // H3 (round COMPLETE): written by `step`, the wrapper, for every arm of `step_rounds` (this one included)
+        Ok(())
+    }
+
+    /// S-B9-CF-PACK4: ONE packed speculative round for the lanes in slots `sa` < `sb` (design
+    /// 3.2): each request drafts on the served scratch with the lone round's own draft half;
+    /// ONE packed verify (graph replay on the packed scratch) accepts and commits per segment;
+    /// then, per request, the head re-prime, the lone round's bookkeeping (`round_account`, fed
+    /// the request's SHARE of the round time) and its emit loop (`round_emit`). Both lanes are
+    /// unpenalized, MTP-armed, on one side of the sparse switch, with depth >= 1.
+    /// S-B9-CF-PACK4S: each lane is greedy or sampled (real-q under `--spec-sampling ratio`,
+    /// else the match rule), in any combination. A lane drafts under ITS OWN sampler staging,
+    /// exactly as its lone round stages it; a real-q lane's draft lists go to its row offset
+    /// of the packed scratch before the next lane drafts; the verify stages one sampler block
+    /// per row and the lane's counters advance as in its lone round.
+    fn step_pair(&mut self, sa: usize, sb: usize) -> Result<()> {
+        use crate::lane_pack::{ctrl_period, lane_share_ms, pair_owes_control, PostLane, PreSeg, SegSamp, Skip};
+        let k = self.mtp_k;
+        let af = crate::exl3_forward::a_flags();
+        // (slot, bonus token, position, tap row, depth, cost) of each lane, before the round
+        let pre: Vec<(usize, i32, usize, usize, usize, f64)> = [sa, sb].iter().map(|&s| {
+            let l = self.lanes[s].as_ref().unwrap();
+            let (_, kd) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated));
+            let kd = kd.min(crate::lane_pack::PACK_DEPTH_MAX); // PACK4-REVIEW A4: the plan's own depth
+            (s, l.last_tok as i32, l.pos, l.mtp.unwrap(), kd,
+             if l.ema_tok > 0.0 { l.ema_ms / l.ema_tok } else { 0.0 })
+        }).collect();
+        // The control cadence is the serial arm's, count for count: the pair would consume the
+        // counter values ctrl_round + 1 and + 2; if either is a control round for its lane, the
+        // two lanes run serial this step (the control round itself is step_mtp's).
+        let (per_a, per_b) = (ctrl_period(af.ctrl == 0, self.ema_plain, pre[0].5), ctrl_period(af.ctrl == 0, self.ema_plain, pre[1].5));
+        if af.ctrl != 3 && pair_owes_control(self.ctrl_round, per_a, per_b) {
+            self.note_skip(sa, Skip::Control);
+            self.note_skip(sb, Skip::Control);
+            self.step_mtp(sa)?;
+            return self.step_mtp(sb);
+        }
+        self.pack_stats.in_round = true; // PACK4-REVIEW A3: cleared when the round completes
+        let xcheck = crate::exl3_forward::a_xcheck_on();
+        if xcheck {
+            for &(s, _, _, tap_row, _, _) in &pre { self.model.tap_xcheck_verify(&self.sc, s, tap_row)?; }
+        }
+        self.ctrl_round += 2;
+        let head = self.model.mtp.as_ref().unwrap();
+        let t0 = std::time::Instant::now();
+        let g0 = self.model.graph_count(); // a round that captures a graph is not cost-fit
+        // 1. draft: per request, sequential — the lone round's draft half, under the lone
+        // round's own staging of the served scratch (which may still carry another lane's):
+        // the lane's sampler rows and, for a real-q lane, its draft sampler (the draft tail and
+        // the pass-graph keys read these), and no penalties (a penalized lane does not pack).
+        let dds = self.draft_conf > 0.0;
+        let mut drafts: Vec<crate::exl3_forward::PackDraft> = Vec::with_capacity(2);
+        let mut at = 0usize; // the next segment's first row in the packed verify
+        for &(s, b, p, tap_row, kd, _) in &pre {
+            let (rows, rq) = (self.lanes[s].as_ref().unwrap().samp_rows(k + 1), self.rq_stage(s));
+            let seg = SegSamp { samp: rows[0], ratio: rq.map_or(false, |r| r.mode == 2) };
+            self.model.set_spec_sampling(&mut self.sc, &rows, rq)?;
+            self.model.set_penalties(&mut self.sc, &vec![None; k + 1])?;
+            let d = if dds {
+                let target = {
+                    let lane = self.lanes[s].as_mut().unwrap();
+                    let t = wp23_target(self.draft_conf, wp23_guard_on(k), lane.mtp_rounds,
+                                        lane.wp23.fit.slope(), lane.ema_tok, lane.ema_ms);
+                    lane.wp23.target = t;
+                    t
+                };
+                let cal = &self.cal;
+                let mut reach = 1.0f64;
+                let mut keep = |i: usize, c: f32| { reach *= cal.estimate_at(i, c); reach >= target };
+                self.model.pack_draft(&mut self.sc, head, s, kd, b, p, tap_row, Some(&mut keep), seg, rq)?
+            } else {
+                // --draft-confidence 0: the fixed-depth chain of the round's depth (the lone mtp_round's)
+                self.model.pack_draft(&mut self.sc, head, s, kd, b, p, tap_row, None, seg, rq)?
+            };
+            // the real-q list hand-off, issued BEFORE the next lane drafts: both chains write
+            // the served list rows 0..w (no-op for a greedy or match-rule lane)
+            let scp = self.scp.as_mut().context("lane-pack: the packed scratch is missing")?;
+            self.model.pack_list_handoff(&self.sc, scp, at, &d)?;
+            at += d.drafts.len() + 1;
+            drafts.push(d);
+        }
+        // S-B9-CF-PACK5 (TP): the pack's ONE pre-verify lockstep point — after BOTH lanes drafted,
+        // before the packed verify launches (the verify's R-keyed barrier sequence needs every rank
+        // to have built the same pack). The pack was decided by `pack_plan` from replicated lane
+        // state, so a divergence here is a bug (or a fault drill), never a legitimate difference.
+        // `--exl3-tp-preverify=0` (diagnostic) skips it, as it skips the lone round's.
+        let tpre0 = std::time::Instant::now();
+        if self.tp.is_some() && tp_preverify_on() {
+            self.model.pack_drain_wasted(&drafts)?;
+            let segs = [PreSeg::of(drafts[0].slot, drafts[0].p, drafts[0].b, &drafts[0].drafts, &drafts[0].samp, drafts[0].launched, drafts[0].wasted),
+                        PreSeg::of(drafts[1].slot, drafts[1].p, drafts[1].b, &drafts[1].drafts, &drafts[1].samp, drafts[1].launched, drafts[1].wasted)];
+            let words = crate::lane_pack::pre_words(&segs);
+            let r = crate::lane_pack::pack_rows_total(&segs);
+            let launched = drafts[0].launched + drafts[1].launched;
+            let t = self.tp.as_mut().context("lane-pack: TP state missing")?;
+            t.pre_verify_pack(r, segs[0].drafts.len() + 1, &words, launched)?;
+            self.pack_stats.ms_pre += tpre0.elapsed().as_secs_f64() * 1e3;
+        }
+        // S-B9-CF-PACK5: the decision trace of a packed round, on EVERY rank (head and node print the
+        // same line: slots, rows, the combined pack hash, head passes, wasted passes), so a divergence
+        // is a `diff` of two logs. The first 16 rounds, then every 4096th.
+        {
+            let n = self.pack_stats.rounds + 1;
+            if n <= 16 || n % 4096 == 0 {
+                let segs = [PreSeg::of(drafts[0].slot, drafts[0].p, drafts[0].b, &drafts[0].drafts, &drafts[0].samp, drafts[0].launched, drafts[0].wasted),
+                            PreSeg::of(drafts[1].slot, drafts[1].p, drafts[1].b, &drafts[1].drafts, &drafts[1].samp, drafts[1].launched, drafts[1].wasted)];
+                let h = fnv32(0x5EED, crate::lane_pack::pre_words(&segs).iter().map(|&d| d as u32));
+                crate::rprintln!("[exl3-serve] lane-pack: round #{n}{}: slots {}+{} rows {}+{}={} pack hash {h:08x} head passes {}+{} wasted {}+{}",
+                                 self.tp.as_ref().map_or(String::new(), |t| format!(" (TP rank {})", t.rank)),
+                                 drafts[0].slot, drafts[1].slot, drafts[0].drafts.len() + 1, drafts[1].drafts.len() + 1,
+                                 crate::lane_pack::pack_rows_total(&segs), drafts[0].launched, drafts[1].launched,
+                                 drafts[0].wasted as u8, drafts[1].wasted as u8);
+            }
+        }
+        let t1 = std::time::Instant::now();
+        // 2. ONE packed verify: stage, replay, taps into the served windows, one readback
+        let scp = self.scp.as_mut().context("lane-pack: the packed scratch is missing")?;
+        let (outs, pvm) = self.model.pack_verify(&mut self.sc, scp, &drafts[0], &drafts[1])?;
+        let t2 = std::time::Instant::now();
+        // 3. per request: the head re-prime from the taps the verify left in its window
+        for j in 0..2 {
+            self.model.pack_finish(&mut self.sc, head, &drafts[j], &outs[j])?;
+        }
+        let t3 = std::time::Instant::now();
+        let captured_local = self.model.graph_count() != g0;
+        let ms_of = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        // (--wp24-xcheck's host re-derivation is not round cost: the lone round's `diag_ms` rule)
+        let ms_local = (ms_of(t0, t3) - pvm.diag).max(0.0);
+        // S-B9-CF-PACK5 (TP): the packed round's POST-verify lockstep point, `tp_round` as the lone
+        // round runs it: agree the pair's outcome (per lane the accept count, rows, emitted ids,
+        // drafts and draft confidences; the total row count R as the width) and TAKE THE HEAD's
+        // round ms and capture flag. `step_pair` fed its LOCAL clock to the cost model before; under
+        // TP that would let the EMAs, the DDS fit and the section 6 control diverge between ranks.
+        let tpost0 = std::time::Instant::now();
+        let (ms_round, _plain_ms, captured) = if self.tp.is_some() {
+            let lanes: Vec<PostLane> = (0..2).map(|j| PostLane {
+                accepted: outs[j].a, rows: drafts[j].drafts.len() + 1,
+                emitted: &outs[j].emitted, drafts: &outs[j].drafts, confs: &drafts[j].confs }).collect();
+            let w = crate::lane_pack::post_words(&lanes);
+            let r = lanes.iter().map(|l| l.rows).sum::<usize>();
+            self.tp_round("pack-round", outs[0].a + outs[1].a, r, &w, ms_local, 0.0, captured_local, true)?
+        } else {
+            (ms_local, 0.0, captured_local)
+        };
+        if self.tp.is_some() { self.pack_stats.ms_post += tpost0.elapsed().as_secs_f64() * 1e3; }
+        let ms_lane = lane_share_ms(ms_round, 2);
+        crate::metrics::lane_pack_round(0); // arm = packed
+        {
+            let st = &mut self.pack_stats;
+            st.rq_rounds += drafts.iter().any(|d| d.samp.ratio) as u64;
+            for d in &drafts {
+                let kind = if d.samp.samp.is_none() { 2 } else if d.samp.ratio { 0 } else { 1 };
+                crate::metrics::lane_pack_lane_round(kind);
+                match kind { 0 => st.lanes_rq += 1, 1 => st.lanes_match += 1, _ => st.lanes_greedy += 1 }
+            }
+            st.rounds += 1;
+            st.rows += (drafts[0].drafts.len() + drafts[1].drafts.len() + 2) as u64;
+            st.toks += (outs[0].a + outs[1].a + 2) as u64;
+            st.ms_draft += ms_of(t0, t1);
+            st.ms_verify += ms_of(t1, t2);
+            st.ms_finish += ms_of(t2, t3);
+            st.ms_stage += pvm.stage;
+            st.ms_graph += pvm.graph;
+            st.ms_read += pvm.read;
+            let r = (drafts[0].drafts.len() + drafts[1].drafts.len() + 2).min(16);
+            st.by_r[r].0 += 1;
+            st.by_r[r].1 += pvm.graph;
+            st.by_r[r].2 += (outs[0].a + outs[1].a + 2) as u64;
+        }
+        // every verified position labels the calibrator (the lone round's rule, per request;
+        // a fixed-depth chain has no confidences and labels nothing, as in the lone mtp_round)
+        for j in 0..2 {
+            for (i, &c) in drafts[j].confs.iter().enumerate() {
+                if i < outs[j].a { self.cal.add_label(i, c, true); } else { self.cal.add_label(i, c, false); break; }
+            }
+            if dds { self.cal.decay_step(); }
+        }
+        // 4. per request: the serial arm's bookkeeping and emit loop. A lane that finishes here
+        // (stop / length / loop / a gone client) frees its slot; its partner's round is complete
+        // on the device and in `outs`, so it is accounted and emitted regardless.
+        let row0 = [0usize, drafts[0].drafts.len() + 1];
+        for j in 0..2 {
+            let s = pre[j].0;
+            // the lane's real-q flag: ctr advances by k + 1 and (real-q) dctr by k, as in its lone round
+            self.round_account(s, &outs[j], ms_lane, 0.0, captured, false, false, drafts[j].samp.ratio, xcheck, true)?;
+            self.round_emit(s, &outs[j], Some(row0[j]))?;
+        }
+        self.pack_stats.in_round = false;
+        Ok(())
+    }
+
+    /// PACK4-REVIEW A3: a packed round failed. The caller fails every live lane (a decode-step error
+    /// always does: after an arbitrary error mid-round the shared staging — the pinned stage's
+    /// in-flight copies, `sc.rp.pending`, the speculative-pass state — is not proven clean, and
+    /// only the pair's own state could be spared, which this does not attempt). Without this the
+    /// arm stayed on and a deterministic failure repeated for every later concurrent pair until
+    /// a restart. Now the server degrades to the serial arm for the rest of the boot: one loud
+    /// line, `velogb10_lane_pack_disabled 1`, and every later round is master's.
+    fn pack_disable(&mut self, a: usize, b: usize, why: &anyhow::Error) {
+        if !self.lane_pack.on() { return; }
+        self.lane_pack = crate::lane_pack::LanePack::Off;
+        crate::metrics::lane_pack_disabled();
+        crate::reprintln!("[exl3-serve] LANE-PACK DISABLED for the rest of this boot: the packed round of slots {a} + {b} failed ({why:#}); \
+every busy lane of this step fails with it, and every later round runs the serial arm (--lane-pack off semantics; \
+/metrics velogb10_lane_pack_disabled 1). Restart the server to re-enable packing");
+    }
+
+    /// S-B9-CF-PACK4: the idle-point line of the packed arm (None = nothing new since the last).
+    fn pack_idle_line(&mut self) -> Option<String> {
+        let st = self.pack_stats;
+        if st.rounds == st.printed { return None; }
+        self.pack_stats.printed = st.rounds;
+        let curve: Vec<String> = st.by_r.iter().enumerate().filter(|(_, c)| c.0 > 0)
+            .map(|(r, c)| format!("R{r}:{}x {:.1}ms {:.2}tok", c.0, c.1 / c.0 as f64, c.2 as f64 / c.0 as f64)).collect();
+        crate::rprintln!("[exl3-serve] lane-pack cost by width (rounds, graph-and-sync ms, tokens per round): {}", curve.join(" | "));
+        let n = st.rounds.max(1) as f64;
+        let skips: Vec<String> = crate::lane_pack::Skip::ALL.iter()
+            .map(|w| (w.label(), crate::metrics::lane_pack_skips(w.index())))
+            .filter(|(_, c)| *c > 0).map(|(l, c)| format!("{l} {c}")).collect();
+        Some(format!("[exl3-serve] lane-pack idle{}: {} packed rounds since boot ({} on the real-q family; lane rounds in packs: {} real-q sampled, {} match-rule sampled, {} greedy; \
+{:.2} rows and {:.2} tokens per packed round; \
+host ms per round: drafts {:.2} + verify {:.2} (staging {:.2} + graph and sync {:.2} + readback {:.2}) + re-prime enqueue {:.2}{}); rounds by arm: packed {} serial {} shared_plain {}; \
+lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| format!(" (TP rank {})", t.rank)),
+                     st.rounds, st.rq_rounds, st.lanes_rq, st.lanes_match, st.lanes_greedy, st.rows as f64 / n, st.toks as f64 / n,
+                     st.ms_draft / n, st.ms_verify / n, st.ms_stage / n, st.ms_graph / n, st.ms_read / n, st.ms_finish / n,
+                     if self.tp.is_some() { format!("; TP lockstep: pre-verify {:.2} ms (inside the drafts figure) + post-verify tp_round {:.2} ms (after the re-prime enqueue: NOT in the figures above) per round",
+                                                    st.ms_pre / n, st.ms_post / n) } else { String::new() },
+                     crate::metrics::lane_pack_rounds(0), crate::metrics::lane_pack_rounds(1), crate::metrics::lane_pack_rounds(2),
+                     if skips.is_empty() { "none".to_string() } else { skips.join(", ") }))
     }
 
     /// CF-P1e: do the busy lanes share one plain batched step this round (true) or run serial speculative rounds?
@@ -1578,6 +2503,7 @@ impl Exl3Scheduler {
     /// every 128th round runs PLAIN as the control and the MTP path auto-disables
     /// (loudly) if its per-token cost loses to plain.
     fn step_mtp(&mut self, s: usize) -> Result<()> {
+        crate::metrics::lane_pack_round(1); // arm = serial (a lone speculative lane round)
         let k = self.mtp_k;
         let af = crate::exl3_forward::a_flags();
         let head = self.model.mtp.as_ref().unwrap();
@@ -1599,17 +2525,36 @@ impl Exl3Scheduler {
         // written row's pooled-key block inside floor(max_pos/ratio). The remaining-budget half
         // drafts no token the request cannot emit (--a-remclamp=0 = off). k_eff == 0 -> a plain
         // step (with the budget clamp that is the request's last token).
-        let mut k_eff = k.min(self.model.max_pos().saturating_sub(p + 2));
-        if af.rem_clamp {
-            k_eff = k_eff.min(remaining.saturating_sub(1));
+        // (S-B9-CF-PACK4: the two clamps and the regime clamp below are `round_depth` — one
+        // definition for this round and the packed arm's plan.)
+        let (mut k_eff, kd) = self.round_depth(p, remaining);
+        // S-B9-REL-QSAREGIME: a verify (and its draft chain) runs ONE attention regime, chosen from
+        // its last row, so a round that straddles the sparse switch would put its rows at/below the
+        // switch on the sparse kernels — not the bits a plain decode of those positions has (AGENTS
+        // 2.4: column 0 of a verify is the decode's). Like the two clamps above, the round stops at
+        // the switch: rows p..=qsa_limit only; at p == qsa_limit that is k_eff 0, a plain step. A
+        // few short rounds once per request; a function of p alone (lockstep state under TP).
+        {
+            if kd < k_eff {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::rprintln!("[exl3-serve] per-row attention regime: a speculative round at position {p} stops at the \
+sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle it)"));
+            }
+            k_eff = kd;
         }
+        // S-B9-REL-MTPREPROBE: a pending confirm forces ONE control round now (a fresh
+        // plain sample at the CURRENT context) before an off may fire.
+        let force_ctrl = {
+            let l = self.lanes[s].as_mut().unwrap();
+            std::mem::take(&mut l.force_control)
+        };
         self.ctrl_round += 1;
         // WP03 cadence: 1/1024 while this request's MTP cost is clearly below plain (< 0.8x), else
         // 1/128. ema_plain stays context-local: it is refreshed only by control rounds at the
         // current context, never by a boot-time plain cost (under-priced at long context).
-        let period = if af.ctrl == 0 && self.ema_plain > 0.0 && lane_cost > 0.0
-            && lane_cost < 0.8 * self.ema_plain { 1024 } else { 128 };
-        let control = self.ctrl_round % period == 0;
+        let period = crate::lane_pack::ctrl_period(af.ctrl == 0, self.ema_plain, lane_cost);
+        // (--a-ctrl off, gate diagnostics: no cadence control; see exl3_forward::AFlags)
+        let control = (af.ctrl != 3 && self.ctrl_round % period == 0) || force_ctrl;
         let plain_step = control || k_eff == 0;
         // G2: stage this lane's sampler rows (verify rows 0..k, or row 0 of a plain step).
         // WP24: a sampled lane under --spec-sampling ratio stages real-q rows + the draft sampler
@@ -1694,16 +2639,33 @@ impl Exl3Scheduler {
             w.extend(out.drafts.iter().map(|&x| x as u32));
             w.extend(confs.iter().map(|c| c.to_bits()));
             let m = if plain_step { 1 } else { out.drafts.len() + 1 };
-            self.tp_round(if plain_step { "plain-round" } else { "mtp-round" }, out.a, m, &w, ms, plain_ms, captured_local)?
+            self.tp_round(if plain_step { "plain-round" } else { "mtp-round" }, out.a, m, &w, ms, plain_ms, captured_local, false)?
         } else {
             (ms, plain_ms, captured_local)
         };
+        // S-B9-CF-PACK4: the round's bookkeeping and its emit loop are `round_account` /
+        // `round_emit` (moved there unchanged, in order) so the packed arm runs the same code
+        // per request.
+        self.round_account(s, &out, ms, plain_ms, captured, control, plain_step, rq_ratio, xcheck, false)?;
+        self.round_emit(s, &out, None)
+    }
+
+    /// One lane's round bookkeeping, exactly as the serial arm does it after its lockstep point:
+    /// the tap cross-check record, the sampler counters, the per-request profitability control
+    /// (cost EMAs, re-probe policy, control samples) and the WP23 width counts + cost fit.
+    /// `ms` = this lane's round time (a packed round passes its SHARE, lane_pack::lane_share_ms).
+    /// `packed` = a packed verify served the round (the request's arm trace records it).
+    #[allow(clippy::too_many_arguments)]
+    fn round_account(&mut self, s: usize, out: &crate::exl3_forward::MtpRoundOut, ms: f64, plain_ms: f64,
+                     captured: bool, control: bool, plain_step: bool, rq_ratio: bool, xcheck: bool, packed: bool) -> Result<()> {
+        let k = self.mtp_k;
         if xcheck {
             self.model.tap_xcheck_record(&self.sc, s, out.tap_row)?;
         }
         // G2: advance the lane's sampler counter past every row this round consumed.
         {
             let lane = self.lanes[s].as_mut().unwrap();
+            lane.arms.push(if packed { 'P' } else if control { 'c' } else if plain_step { 'p' } else { 'S' }, out.emitted.len());
             lane.ctr = lane.ctr.wrapping_add(if plain_step { 1 } else { (k + 1) as u32 });
             // WP24: past every draft counter this round could use (passes 0..k_eff-1 incl. a
             // HOST speculative pass the DDS then stopped before; k_eff <= k)
@@ -1738,36 +2700,97 @@ impl Exl3Scheduler {
             self.ema_plain = if self.ema_plain <= 0.0 { plain_ms } else {
                 0.875 * self.ema_plain + 0.125 * plain_ms
             };
-            if let Some(lane) = self.lanes[s].as_mut() { lane.st_ctrl += 1; }
+            if let Some(lane) = self.lanes[s].as_mut() {
+                lane.st_ctrl += 1;
+                // S-B9: a pending confirm collects this fresh sample (current context)
+                if lane.reprobe.confirm_pending {
+                    lane.reprobe.confirm_sample(plain_ms);
+                }
+            }
         } else if plain_step {
             // WP02: the window/budget-clamped last step (k_eff == 0) — a plain step, not a round
             if let Some(lane) = self.lanes[s].as_mut() { lane.st_plain += 1; }
         } else {
             let ema_plain = self.ema_plain;
+            let reprobe_on = self.reprobe_on;
+            let cfg = self.reprobe_cfg;
+            // legacy mode keeps today's estimator weight so --mtp-reprobe=off is exact
+            let ema_w = if reprobe_on { cfg.ema_w } else { 1.0 / 16.0 };
             let lane = self.lanes[s].as_mut().unwrap();
             lane.mtp_rounds += 1;
             lane.st_rounds += 1;
             lane.st_drafted += out.drafts.len();
             lane.st_accepted += out.a;
             lane.st_ms += ms;
-            // the first rounds of a slot can include graph capture; keep them out of the cost
-            if lane.mtp_rounds > 4 {
+            // The first `warmup` rounds of a slot can include graph capture; keep them
+            // out of the cost. --mtp-reprobe=off keeps the exact legacy estimator
+            // (one-round seed + 1/16 EMA, hardcoded 4-round guard: bit-for-bit the
+            // pre-branch behaviour). The re-probe policy blends via
+            // mtp_reprobe::blend_cost_ema (W1.1): a RUNNING MEAN over the first 64
+            // post-reset rounds and capture rounds excluded entirely — one
+            // capture-poisoned or 1-token round must not steer a probe verdict
+            // (at 1/64 a seed still carries 0.79-0.62 of itself at rounds 16-31).
+            if reprobe_on {
+                if lane.mtp_rounds > cfg.warmup {
+                    crate::mtp_reprobe::blend_cost_ema(
+                        &mut lane.ema_ms, &mut lane.ema_tok, &mut lane.ema_n,
+                        ms, toks, captured, (cfg.ema_w.recip()) as usize, cfg.ema_w);
+                }
+            } else if lane.mtp_rounds > 4 {
                 if lane.ema_tok <= 0.0 {
                     lane.ema_ms = ms;
                     lane.ema_tok = toks;
                 } else {
-                    lane.ema_ms = 0.9375 * lane.ema_ms + 0.0625 * ms;
-                    lane.ema_tok = 0.9375 * lane.ema_tok + 0.0625 * toks;
+                    lane.ema_ms = (1.0 - ema_w) * lane.ema_ms + ema_w * ms;
+                    lane.ema_tok = (1.0 - ema_w) * lane.ema_tok + ema_w * toks;
                 }
             }
             let cost = if lane.ema_tok > 0.0 { lane.ema_ms / lane.ema_tok } else { 0.0 };
-            if lane.mtp_rounds >= 64 && ema_plain > 0.0 && cost > ema_plain * 1.02 {
-                crate::reprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
+            if !reprobe_on {
+                // --mtp-reprobe=off: the previous one-way rule, exactly (2% margin, no confirm,
+                // no re-arm — the frozen pre-fix behaviour for A/B and for users who want it).
+                if lane.mtp_rounds >= 64 && ema_plain > 0.0 && cost > ema_plain * 1.02 {
+                    crate::reprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
                            {:.2} tok/round) vs plain {:.2} after {} rounds (AGENTS §6, per-request)",
                            cost, lane.ema_ms, lane.ema_tok, ema_plain, lane.mtp_rounds);
-                // the lane is at a clean seam (round committed, last_tok unconsumed at
-                // lane.pos — the same state a control round leaves), so plain can take over.
-                lane.mtp = None;
+                    // the lane is at a clean seam (round committed, last_tok unconsumed at
+                    // lane.pos — the same state a control round leaves), so plain can take over.
+                    lane.mtp = None;
+                }
+            } else {
+                // S-B9-REL-MTPREPROBE: the §6 decision is the pure policy's (margin 10%, a
+                // 1/64-round window that spans local troughs, and a plain baseline that must
+                // survive a fresh confirm at the CURRENT context — see src/mtp_reprobe.rs).
+                // The round left the lane at a clean seam (last_tok unconsumed at lane.pos,
+                // the round's tap saved in out.tap_row), so an off can prime from here.
+                use crate::mtp_reprobe::RoundVerdict as RV;
+                let plain_ref = lane.reprobe.plain_reference(ema_plain);
+                match lane.reprobe.observe_round(cost, ema_plain, &cfg) {
+                    RV::Continue => {}
+                    RV::ConfirmControl => {
+                        // crossed the margin: demand ONE fresh plain sample before deciding
+                        lane.force_control = true;
+                    }
+                    RV::Off => {
+                        crate::reprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
+{:.2} tok/round) vs plain {:.2} after {} rounds (AGENTS §6; re-probe in {} plain steps)",
+                                   cost, lane.ema_ms, lane.ema_tok, plain_ref, lane.mtp_rounds, cfg.backoff_base);
+                        lane.mtp = None;
+                        lane.reprobe.went_off(out.tap_row, false, &cfg);
+                    }
+                    RV::ProbeFailed => {
+                        let next_b = (lane.reprobe.backoff.saturating_mul(2)).min(cfg.backoff_cap).max(cfg.backoff_base);
+                        crate::reprintln!("[exl3-serve] MTP re-probe FAILED (slot {s}): {:.2} ms/tok vs plain {:.2} after {} \
+probe rounds; off again (next probe in {next_b} plain steps)", cost, plain_ref, lane.reprobe.probe_rounds);
+                        lane.mtp = None;
+                        lane.reprobe.went_off(out.tap_row, true, &cfg);
+                    }
+                    RV::ProbeSucceeded => {
+                        crate::reprintln!("[exl3-serve] MTP re-probe OK (slot {s}): stayed on {} probe rounds at {:.2} \
+ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, cfg.backoff_base);
+                        lane.reprobe.probe_ok(&cfg);
+                    }
+                }
             }
         }
         // WP23: rounds by verified draft width, and the cost fit (ms on drafts) — MTP rounds of a
@@ -1783,9 +2806,15 @@ impl Exl3Scheduler {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Emit one round's tokens for the lane in slot `s` (stop at EOS / max_new / a loop / a gone
+    /// client mid-list; a finishing lane frees its slot). `packed_row0` = Some(the lane's first
+    /// row in the packed verify) when the round's logits rows live in the packed scratch.
+    fn round_emit(&mut self, s: usize, out: &crate::exl3_forward::MtpRoundOut, packed_row0: Option<usize>) -> Result<()> {
         // ---- emit the round's tokens (stop at EOS / max_new mid-list)
-        for &t32 in out.emitted.iter() {
+        for (j, &t32) in out.emitted.iter().enumerate() {
             let t = t32 as u32;
             let (finish, reason, generated) = {
                 let lane = self.lanes[s].as_mut().unwrap();
@@ -1793,6 +2822,7 @@ impl Exl3Scheduler {
                 lane.pos += 1;
                 lane.generated += 1;
                 lane.history.push(t);
+                if lane.first_toks.len() < FIRST_TOKS { lane.first_toks.push(t); }
                 let fin = lane.generated >= lane.max_new
                     || (self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new);
                 let rsn = if lane.generated >= lane.max_new { "length" }
@@ -1819,6 +2849,10 @@ impl Exl3Scheduler {
                 return Ok(());
             }
             if finish {
+                self.publish_kv(); // issue #24: the lane's final position (the peaks include the round that ends the request)
+                // item 5(a): emitted[j] is the choice of the round's logits row j (verify row j, or
+                // row 0 of a plain step) — still in sc.logits: the re-prime after a verify is KV-only
+                if reason == "stop" { self.send_stop_info(s, packed_row0.map_or(j, |r0| r0 + j), t, packed_row0.is_some()); }
                 if let Some(lane) = self.lanes[s].take() {
                     if reason == "loop_detected" { lane.log_loop(s, &self.tok); }
                     lane.log_stats(s, &reason);
@@ -1841,6 +2875,35 @@ impl Exl3Scheduler {
         Ok(())
     }
 
+    /// S-B9-REL-SMALLFIXES item 5(a): the lane in slot `s` is finishing on the stop token `tok`,
+    /// the choice of logits row `row` of the step that just ran. Reads that ONE row back and sends
+    /// the token's probability and rank ahead of the Finish (`stop_p` / `stop_rank` of the HTTP
+    /// side's `[gen]` line). Cost: one host readback of vocab f16 values plus one host pass over
+    /// them, on a request's FINISHING step and only when it ends on a stop token; no step of a
+    /// running request pays anything. TP=1 only: under TP the greedy head is vocab-parallel and no
+    /// rank holds a full logits row (the line says `na`). A greedy row checks itself — its token
+    /// must be the row's top logit (`stop_info_checked`); if it is not, the row read is not the row
+    /// that chose the token, nothing is sent and one line per boot says so.
+    fn send_stop_info(&self, s: usize, row: usize, tok: u32, packed: bool) {
+        if self.tp.is_some() { return; }
+        let Some(lane) = self.lanes[s].as_ref() else { return };
+        let samp = crate::exl3_forward::SampParams::sampled(lane.temperature, lane.top_p, lane.top_k, lane.min_p, 0, 0);
+        // S-B9-CF-PACK4: a packed round's logits rows are in the packed scratch (row = row0 + j)
+        let sc = match (packed, self.scp.as_ref()) { (true, Some(scp)) => scp, _ => &self.sc };
+        let stats = match self.model.logits_row(sc, row) {
+            Ok(r) => crate::exl3_forward::stop_token_stats(&r, tok as usize, samp.as_ref()),
+            Err(_) => None,
+        };
+        match stop_info_checked(stats, samp.is_none()) {
+            Some((p, rank)) => { let _ = lane.tx.send(TokEvent::StopInfo { p: p as f32, rank, sampled: samp.is_some() }); }
+            None => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::rprintln!("[exl3-serve] stop_p unavailable for a request (slot {s}, logits row {row}, token {tok}, {:?}): \
+the [gen] line says stop_p=na", stats));
+            }
+        }
+    }
+
     /// Plain batched decode for the given slots (the pre-f-d step() body).
     /// CF-P1e: fold a measured shared-round time (ms, lockstep-adopted under TP) into the model's learned scale.
     /// The first rounds of a width can include a graph capture, so an outlier above 3x the model is ignored.
@@ -1851,20 +2914,56 @@ impl Exl3Scheduler {
         self.shared_scale = if self.shared_streak <= 1 && self.shared_scale == 1.0 { r } else { 0.9 * self.shared_scale + 0.1 * r };
     }
 
+    /// S-B9-REL-QSAREGIME: `slots` with the lanes at/below the sparse switch first (see step_plain).
+    fn regime_ordered(&self, slots: &[usize]) -> Vec<usize> {
+        let lim = regime_switch(self.model.qsa_live(usize::MAX), crate::exl3_forward::row_regime_on(), self.model.qsa_limit());
+        regime_ordered_slots(slots, |s| self.lanes[s].as_ref().map_or(0, |l| l.pos), lim)
+    }
+
     /// `sync_head` (CF-P1e): the lanes are MTP-capable but this round is a shared plain step — keep each lane's draft
     /// head exactly as a control round does (write the head's row p KV-only from the lane's saved tap BEFORE the
     /// step; snapshot the step's tap row into the lane's window AFTER it), so its next speculative round is valid.
     fn step_plain(&mut self, slots: &[usize], sync_head: bool) -> Result<()> {
-        if sync_head {
+        // S-B9-REL-QSAREGIME: lanes at/below the sparse-attention switch first (stable; the identity
+        // unless the lanes straddle the switch), so forward_step keeps their rows on the dense
+        // kernels when a longer lane shares the step — a lane's bits must not depend on its
+        // neighbours. Everything below indexes rows through this one list. Under TP every rank
+        // orders from the same lockstep positions.
+        let ordered = self.regime_ordered(slots);
+        let slots: &[usize] = &ordered;
+        // S-B9-REL-MTPREPROBE: an MTP-off lane under the re-probe policy keeps the SAME
+        // head sync an armed lane gets — prime its row p from the saved tap BEFORE the step
+        // (the 1-layer head row a control round would write) and snapshot the step's tap
+        // AFTER it — so its head KV stays contiguous and its re-arm is exactly a
+        // control-round seam. --mtp-reprobe=off primes only when sync_head, as before.
+        let reprobe_primes = self.reprobe_on && self.model.mtp.is_some();
+        if sync_head || reprobe_primes {
             let model = self.model.clone();
             if let Some(head) = model.mtp.as_ref() {
                 for &s in slots {
                     let (b, p, tr) = { let l = self.lanes[s].as_ref().unwrap(); (l.last_tok as i32, l.pos, l.mtp) };
+                    let tr = tr.or({
+                        // an off rearmable lane: its saved tap row (0 once a primed step snapshotted)
+                        let l = self.lanes[s].as_ref().unwrap();
+                        if l.reprobe.keep_primed() { Some(l.reprobe.prime_tap_row) } else { None }
+                    });
                     if let Some(tap_row) = tr {
                         model.mtp_plain_prime(&mut self.sc, head, s, b, p, tap_row)?;
                     }
                 }
             }
+        }
+        // S-B9-REL-MTPREPROBE2 W1.3: when this shared step is exactly one slot and that
+        // lane is an off re-probe lane, its plain sample must time the STEP ALONE — the
+        // same discipline as a control round (prime, synchronize, then time). Without
+        // the sync the async mtp_plain_prime's head GPU time lands inside the sample
+        // (stream-ordered before forward_step's readback), inflating off_plain_ema and
+        // biasing the policy toward staying ON. Multi-lane shared steps keep the CF-P1e
+        // costing (primes + step): their number feeds the shared estimate, not the policy.
+        let solo_off_sample = self.reprobe_on && slots.len() == 1
+            && self.lanes[slots[0]].as_ref().map_or(false, |l| l.reprobe.keep_primed());
+        if (sync_head || reprobe_primes) && solo_off_sample {
+            self.model.dev().synchronize()?;
         }
         let t_round = std::time::Instant::now();   // CF-P1e: the shared round's cost = head primes + the step
         let toks: Vec<i32> = slots.iter()
@@ -1884,22 +2983,61 @@ impl Exl3Scheduler {
             .collect();
         self.model.set_penalties(&mut self.sc, &pens)?;
         let ids = self.model.forward_step(&mut self.sc, &toks, &poss, slots, None)?;
+        // S-B9: one agreed ms for the step (the HEAD's under TP — a rank-local clock must
+        // never drive a decision), reused by the shared estimate and the off-lane sampler.
+        let own_ms = t_round.elapsed().as_secs_f64() * 1e3;
+        let plain_ms_head;
         if self.tp.is_some() {
             // TP-C: lockstep on the batched plain step's emitted ids (no wall-clock decision here)
             let w: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
-            let own = t_round.elapsed().as_secs_f64() * 1e3;
-            let (ms, _, _) = self.tp_round("plain-step", 0, slots.len(), &w, own, 0.0, false)?;
+            let (ms, _, _) = self.tp_round("plain-step", 0, slots.len(), &w, own_ms, 0.0, false, false)?;
             if sync_head { self.learn_shared_ms(slots.len(), ms); }
-        } else if sync_head {
-            self.learn_shared_ms(slots.len(), t_round.elapsed().as_secs_f64() * 1e3);
+            plain_ms_head = ms;
+        } else {
+            if sync_head { self.learn_shared_ms(slots.len(), own_ms); }
+            plain_ms_head = own_ms;
         }
         if let Some(g) = self.gate.as_mut() { g.plain += slots.len() as u64; }
-        if sync_head {
+        if sync_head || self.reprobe_on {
             let model = self.model.clone();
+            // S-B9-REL-MTPREPROBE2 W1.5: --a-xcheck must see these plain-step snapshots
+            // too (a control round records its row the same way) — without the record
+            // the FIRST speculative round after a re-arm verifies against the lane's
+            // last RECORDED (verify-era) row and logs a false "clobbered" line.
+            let xcheck = crate::exl3_forward::a_xcheck_on();
             for (j, &s) in slots.iter().enumerate() {
                 if self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some()) {
                     model.tap_snapshot_row(&mut self.sc, s, j)?;
+                    if xcheck {
+                        if let Err(e) = model.tap_xcheck_record(&self.sc, s, 0) {
+                            eprintln!("[a-xcheck] record failed: {e:#}");
+                        }
+                    }
                     self.lanes[s].as_mut().unwrap().mtp = Some(0);
+                } else if self.reprobe_on && self.lanes[s].as_ref().map_or(false, |l| l.reprobe.keep_primed()) {
+                    // S-B9: keep the off lane's tap fresh (row 0) so its next head prime is valid
+                    model.tap_snapshot_row(&mut self.sc, s, j)?;
+                    if xcheck {
+                        if let Err(e) = model.tap_xcheck_record(&self.sc, s, 0) {
+                            eprintln!("[a-xcheck] record failed: {e:#}");
+                        }
+                    }
+                    self.lanes[s].as_mut().unwrap().reprobe.prime_tap_row = 0;
+                }
+            }
+            // S-B9: off lanes' plain steps count toward the re-probe backoff. A lane ALONE
+            // in this batch also yields an exact per-token plain cost at the CURRENT
+            // context (the engine's ema_plain can be stale-low: plain grows with context)
+            // — it raises the probe's plain reference, so probes cannot fail on a stale
+            // baseline.
+            if self.reprobe_on {
+                for &s in slots {
+                    let off = self.lanes[s].as_ref()
+                        .map_or(false, |l| l.mtp.is_none() && l.reprobe.keep_primed());
+                    if off {
+                        let sample = if slots.len() == 1 && plain_ms_head > 0.0 { plain_ms_head } else { 0.0 };
+                        self.lanes[s].as_mut().unwrap().reprobe.observe_plain(sample, &self.reprobe_cfg);
+                    }
                 }
             }
         }
@@ -1910,6 +3048,8 @@ impl Exl3Scheduler {
                 let next = ids[j] as u32;
                 lane.ctr = lane.ctr.wrapping_add(1);
                 lane.st_plain += 1;
+                lane.arms.push('p', 1);
+                if lane.first_toks.len() < FIRST_TOKS { lane.first_toks.push(next); }
                 lane.last_tok = next;
                 lane.pos += 1;
                 lane.generated += 1;
@@ -1930,6 +3070,9 @@ impl Exl3Scheduler {
                 }
             };
             let tp_on = self.tp.is_some();
+            // item 5(a): ids[j] is the choice of the step's logits row j
+            if finish && reason == "stop" { self.send_stop_info(s, j, t, false); }
+            if finish { self.publish_kv(); } // issue #24: the lane's final position (the peaks include the round that ends the request)
             let lane = self.lanes[s].as_mut().unwrap();
             // TP-D: under TP a failed send is not a cancel here (the head's next sweep ships it)
             if lane.tx.send(TokEvent::Tok(t)).is_err() && !tp_on {
@@ -1962,6 +3105,7 @@ impl Exl3Scheduler {
         // empty HTTP 200. A client that hangs up while queued is dropped before admission.
         let mut waiting: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
         let mut rots_printed = 0usize;
+        let mut mixed_printed = 0u64;
         loop {
             if self.fatal.is_some() {
                 return self.die(waiting, rx);
@@ -1973,6 +3117,13 @@ impl Exl3Scheduler {
                     crate::rprintln!("[exl3-serve] lane-order fcfs idle: {rots_printed}->{} total rotations", self.fcfs_rots);
                     rots_printed = self.fcfs_rots;
                 }
+                // 9a(iii): the lazily captured mixed-step graphs, whenever their number grew
+                if let Some(line) = mixed_graphs_idle_line(mixed_printed, crate::metrics::mixed_step_graphs(), self.width) {
+                    crate::rprintln!("{line}");
+                    mixed_printed = crate::metrics::mixed_step_graphs();
+                }
+                self.publish_kv(); // issue #24: the idle value (lanes freed outside a step included)
+                if let Some(line) = self.pack_idle_line() { crate::rprintln!("{line}"); } // S-B9-CF-PACK4
                 crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                 match rx.blocking_recv() {
                     Some(req) => waiting.push_back(req),
@@ -1996,16 +3147,7 @@ impl Exl3Scheduler {
                 continue;
             }
             if let Err(e) = self.step() {
-                eprintln!("[exl3-serve] decode step failed: {e:#}");
-                // Fail every live lane loudly — never emit garbage as if it were text.
-                for s in 0..self.lanes.len() {
-                    if let Some(lane) = self.lanes[s].take() {
-                        let _ = lane.tx.send(TokEvent::Finish { reason: format!("error: {e}") });
-                    }
-                }
-                if sticky_cuda_error(&e) {
-                    self.fatal = Some(format!("{e:#}"));
-                }
+                self.fail_step(&e);
             }
         }
     }
@@ -2025,6 +3167,7 @@ impl Exl3Scheduler {
                 let _ = lane.tx.send(TokEvent::Finish { reason: reason.clone() });
             }
         }
+        self.publish_kv(); // issue #24: a dead engine holds no request
         while let Ok(req) = rx.try_recv() {
             waiting.push_back(req);
         }
@@ -2088,6 +3231,14 @@ impl Exl3Scheduler {
     }
 
     fn admit(&mut self, req: BatchRequest) {
+        self.admit_req(req);
+        // issue #24: the prefill (if any) is over — the lane now carries its own position, or the
+        // admit failed / was cancelled and the slot is free again.
+        self.kv_pf = None;
+        self.publish_kv();
+    }
+
+    fn admit_req(&mut self, req: BatchRequest) {
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
         // then a lane with no snapshot, then any free lane.
@@ -2225,6 +3376,10 @@ impl Exl3Scheduler {
                 return;
             }
         };
+        // issue #24: the seam step wrote row plen - 1 — the request holds its whole prompt now (a
+        // request that ends at its first token never becomes a lane; its context still counts in the peak)
+        self.kv_pf = Some((free, plen));
+        self.publish_kv();
         if self.tp.is_some() {
             // TP-C: lockstep on the seam step (the request's first token)
             // TP-D: + the slot, the prefix-cache / WP16-C1 resume points and the checkpoint store's
@@ -2239,7 +3394,7 @@ impl Exl3Scheduler {
                 w.extend([st.live() as u32, st.n_alloc as u32,
                           fnv32(0, st.positions(free).iter().map(|&x| x as u32))]);
             }
-            if let Err(e) = self.tp_round("seam", 0, 1, &w, 0.0, 0.0, false) {
+            if let Err(e) = self.tp_round("seam", 0, 1, &w, 0.0, 0.0, false, false) {
                 crate::reprintln!("[exl3-serve] TP seam lockstep failed (slot {free}): {e:#}");
                 let _ = req.tx.send(TokEvent::Finish { reason: format!("error: TP lockstep failed: {e}") });
                 self.fatal = Some(format!("{e:#}"));
@@ -2293,6 +3448,7 @@ impl Exl3Scheduler {
         let mut loop_det = self.loop_cfg
             .map(|(w, r)| crate::loop_detect::LoopDetector::for_stop_on_loop(w, r));
         if let Some(d) = loop_det.as_mut() { d.feed(last); }
+        let is_img = !req.image_spans.is_empty(); // S-B9-CF-PACK4: an image lane never packs (v1)
         let admit_seq = self.admit_ctr;   // CF-FCFS: FCFS order; the same on every TP rank
         self.admit_ctr += 1;
         self.lanes[free] = Some(Lane {
@@ -2316,6 +3472,7 @@ impl Exl3Scheduler {
             gate_first: true,
             ema_ms: 0.0,
             ema_tok: 0.0,
+            ema_n: 0,
             mtp_rounds: 0,
             // TP-I #7: a TP lane's cost prior is the TP=2 one (dds_prior; TP=1 = 6.0 unchanged)
             wp23: Wp23Lane { fit: CostFit::with_prior(dds_prior_w(self.tp_world())), ..Default::default() },
@@ -2325,9 +3482,14 @@ impl Exl3Scheduler {
             st_ms: 0.0,
             st_plain: 0,
             st_ctrl: 0,
+            arms: Default::default(),
+            first_toks: vec![last],
+            reprobe: crate::mtp_reprobe::ReProbe::new(&self.reprobe_cfg),
+            force_control: false,
             mtp,
             admit_seq,
             fcfs_credit: 0,
+            img: is_img,
             tx: req.tx,
         });
     }
@@ -2358,6 +3520,9 @@ impl Exl3Scheduler {
     /// TP-D: when the engine goes idle, one line of lockstep counters (the session's agree receipts).
     fn tp_log_idle(&mut self, step_no: u64) {
         if self.lanes.iter().all(|l| l.is_none()) {
+            // S-B9-CF-PACK5: the packed arm's counters on the node too (its mirror loop never reaches
+            // the head's idle-point line); printed once per change, so the head's own call is a no-op
+            if let Some(line) = self.pack_idle_line() { crate::rprintln!("{line}"); }
             if let Some(t) = self.tp.as_mut() {
                 crate::rprintln!("[tp-serve] rank {} idle after control step {step_no}: lockstep agrees {} ok, pre-verify agrees {} ok{}",
                          t.rank, t.agrees, t.pre_agrees,
@@ -2408,6 +3573,7 @@ impl Exl3Scheduler {
                 let _ = lane.tx.send(TokEvent::Finish { reason: reason.clone() });
             }
         }
+        self.publish_kv(); // issue #24: a dead engine holds no request
         if let Some(rx) = rx {
             while let Ok(req) = rx.try_recv() { waiting.push_back(req); }
         }
@@ -2435,6 +3601,7 @@ impl Exl3Scheduler {
         let mut waiting: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
         let mut step_no: u64 = 0;
         let mut rots_printed = 0usize;
+        let mut mixed_printed = 0u64;
         let fast_ctl = crate::opts::var(crate::opt!("exl3-tp-fastctl")).map_or(true, |v| v != "0");
         println!("[exl3-serve] TP control: {}", if fast_ctl { "step-go over RDMA while live, TCP Step only with events (TP-E)" }
                  else { "TCP Step every step (--exl3-tp-fastctl=0)" });
@@ -2445,6 +3612,13 @@ impl Exl3Scheduler {
                     crate::rprintln!("[exl3-serve] lane-order fcfs idle: {rots_printed}->{} total rotations", self.fcfs_rots);
                     rots_printed = self.fcfs_rots;
                 }
+                // 9a(iii): the lazily captured mixed-step graphs, whenever their number grew
+                if let Some(line) = mixed_graphs_idle_line(mixed_printed, crate::metrics::mixed_step_graphs(), self.width) {
+                    crate::rprintln!("{line}");
+                    mixed_printed = crate::metrics::mixed_step_graphs();
+                }
+                self.publish_kv(); // issue #24: the idle value (lanes freed outside a step included)
+                if let Some(line) = self.pack_idle_line() { crate::rprintln!("{line}"); } // S-B9-CF-PACK4
                 crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                 match rx.blocking_recv() {
                     Some(req) => waiting.push_back(req),
@@ -2598,6 +3772,22 @@ impl Exl3Scheduler {
                 ServingMsg::Step(se) => {
                     anyhow::ensure!(se.step == step_no + 1, "TP mirror: head step {} after local step {step_no}", se.step);
                     step_no = se.step;
+                    // PR #17 (ported): read ALL binary image payloads right after the Step frame,
+                    // in admit order, BEFORE any admit()/prefill runs — prefill multiplexes
+                    // HeadFlag traffic on the same control stream, so a payload still unread when
+                    // the first admit runs could interleave with HeadFlag frames (stream desync /
+                    // digest mismatch with 2+ images admitted in one Step). Digest checks unchanged.
+                    // S-B9-REL-PRPORT3 (review R9): the pre-read lives in
+                    // read_step_image_payloads (unit-tested); admit-order specs, then read.
+                    let specs: Vec<(u64, u64)> = se.events.iter().filter_map(|ev| match ev {
+                        TpEvent::Admit(w) => Some((w.image_bytes as u64, w.image_digest as u64)),
+                        _ => None,
+                    }).collect();
+                    let payloads = {
+                        let t = self.tp.as_mut().context("mirror without TP state")?;
+                        read_step_image_payloads(&mut t.ctl[0], step_no, &specs)?
+                    };
+                    let mut payload_iter = payloads.into_iter();
                     for ev in se.events {
                         match ev {
                             TpEvent::Cancel { lane } => {
@@ -2608,20 +3798,11 @@ impl Exl3Scheduler {
                             TpEvent::Admit(w) => {
                                 let (tx, _rx, _bl) = crate::server::tok_channel(); // mirror dummy; LR-5 gated off under TP
                                 let min_p = w.min_p;
-                                let (ib, idg) = (w.image_bytes, w.image_digest);
                                 let mut req = w.into_request(tx);
                                 req.min_p = min_p;
-                                if ib > 0 {
-                                    // VIS-4: this admit's image rows follow the Step frame (binary channel)
-                                    use std::io::Read;
-                                    let mut buf = vec![0u8; ib as usize];
-                                    let t = self.tp.as_mut().context("mirror without TP state")?;
-                                    t.ctl[0].read_exact(&mut buf).context("TP node: image payload read")?;
-                                    anyhow::ensure!(crate::tp_serve::fnv64(&buf) == idg,
-                                                    "TP node: image payload digest mismatch (step {step_no})");
-                                    req.image_embeds = Some(buf.chunks_exact(2)
-                                        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect());
-                                }
+                                // PR #17: this admit's image rows were already read (in admit
+                                // order) right after the Step frame — see payloads above.
+                                req.image_embeds = payload_iter.next().flatten();
                                 admitted += 1;
                                 self.admit(req);
                             }
@@ -2766,6 +3947,28 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
     // keeps the pre-registry hash.
     let spmd = crate::opts::spmd_digest();
     if let Some(d) = spmd { w.extend([0x4F50_5453, d]); }
+    // S-B9-CF-PACK5: with --lane-pack on, the resolved mode, whether sampled lanes may pack here and
+    // THE PACKED GRAPH SET (count + digest of the (family, regime, width) presence table). `pack_plan`
+    // reads `pack_ready`, derived from rank-local graph presence: a rank whose set differed (the
+    // CF-P1e TP=2 --max-batch 16 death was a decision reading rank-local graph state) now refuses to
+    // boot here instead of planning a pack its peer cannot replay. Pushed only when the arm is on,
+    // so a --lane-pack off boot adds nothing to the hash.
+    if s.lane_pack.on() {
+        if let Some(scp) = s.scp.as_ref() {
+            let (n, d, _) = s.model.pack_graph_set(scp, &crate::lane_pack::fams(s.spec_ratio, s.pack_sampled));
+            w.extend([0x504B_0001, 1, s.pack_sampled as u32, n as u32, d, s.pack_ready[0] as u32, s.pack_ready[1] as u32]);
+        }
+    }
+    // F1/F10: when the RESOLVED mode is on (the default: no flag needs to be typed), hash the fallback decision
+    // (active or not, and why) — a rank that packs while its peer fell back would misstate what is served. Every
+    // reason comes from shipped options and model facts and the mode itself from the registry (the head's typed
+    // value ships in the snapshot, the row's default is the same constant in one binary), so both ranks hash the
+    // same words; a --lane-pack off boot records nothing.
+    if let Some(why) = crate::lane_pack::boot_pack_word() {
+        let mut d = 0x811c9dc5u32;
+        for b in why.bytes() { d = (d ^ b as u32).wrapping_mul(0x01000193); }
+        w.extend([0x5F50_4B46, why.is_empty() as u32, d]);
+    }
     w.extend(s.eos.iter().copied());
     w.extend(tune.bytes().map(|b| b as u32));
     let h = fnv32(0xB007, w.iter().copied());
@@ -2814,6 +4017,12 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
     if let Some(cfg) = crate::otel::config_from_args(|f| arg(args, &format!("--{f}")).map(|s| s.to_string())) {
         if let Err(e) = cfg.hostport() { anyhow::bail!("[otel] {e}"); }
     }
+    tp_lane_width_refusal(args, ctx.world as u32)?;   // W4: before the attach (the head's main refused it before the sync)
+    // S-B9-CF-PACK5: --lane-pack runs at TP=1, TP=2 and TP=4; a TYPED `--lane-pack on` at a larger world is refused
+    // here BEFORE the attach (PACK4-REVIEW B1: and before this, in main.rs, by xtp::world_gt2_flag_refusals,
+    // ahead of the discovery). F10: `parse(None)` is the raw-argv meaning (off), so a defaulted-on boot is never
+    // refused here; build_serve turns it into a fallback line.
+    crate::lane_pack::tp_refusal(crate::lane_pack::LanePack::parse(arg(args, "--lane-pack"))?, ctx.world as u32)?;
     let attach = tp_attach(ctx)?;
     let mut parts = build_serve(args, model_dir, Some(attach))?;
     tp_ident_knob(&mut parts.sched);
@@ -2844,9 +4053,11 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
             let graphs = if crate::opts::var(crate::opt!("exl3-no-graph")).is_ok()
                 || crate::opts::var(crate::opt!("mtp-dump")).map_or(false, |v| !v.is_empty()) { "OFF (--exl3-no-graph / --mtp-dump)" }
                 else if arg(args, "--graph-precapture") == Some("off") { "ON (lazy capture: --graph-precapture off)" }
-                else { "ON (precaptured at boot)" };
+                else { "ON (the greedy, unpenalized shapes are precaptured at boot; sampled and penalized shapes are captured during traffic)" };
             let mtp = if mtp_on { format!("ON k={}", s.mtp_k) }
-                else if s.model.mtp.is_some() { "OFF (--exl3-no-mtp)".to_string() } else { "OFF (pack has no MTP head)".to_string() };
+                else if s.model.mtp.is_some() {
+                    format!("OFF ({})", crate::exl3_forward::mtp_off_by_opt().map_or("--exl3-no-mtp", |o| o.flag()))
+                } else { "OFF (pack has no MTP head)".to_string() };
             let dds = if mtp_on && s.draft_conf > 0.0 { format!("ON at {}", s.draft_conf) } else { "OFF".to_string() };
             let dec = xtp::dec_xport_mode() == 1;
             println!("[exl3-serve] TP={world} serving: head-authoritative Step/Cancel/Admit(seed) + HeadFlag, hub lockstep agree per \
@@ -2863,13 +4074,13 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
                      if xtp::vp_head_on() && dec { "ON" } else { "OFF (--tp-vp-head off / --tp-dec-xport 0)" },
                      if xtp::vp_head_on() && dec && xtp::vp_sampled_on() { "ON (vocab-parallel all-gather, TP-4H2)" }
                          else { "REPLICATED head (--tp-vp-sampled off / --tp-vp-head off / --tp-dec-xport 0)" },
-                     if mtp_on && xtp::dh_shard_on() && dec { "ON" } else { "OFF (no MTP head / --tp-dh-shard off / --tp-dec-xport 0)" },
+                     if mtp_on && xtp::dh_shard_on() && dec { "ON (shown for the greedy, unpenalized requests)" } else { "OFF (no MTP head / --tp-dh-shard off / --tp-dec-xport 0)" },
                      if dec { format!("folded K1 + multi-block K2, {} exchange(s) per reduce{}, receive cpu_done only",
                                       if xtp::tp_reduce_single_for(world) { 1 } else { (world as u32).trailing_zeros() },
                                       if xtp::tp_reduce_single_for(world) { " (--tp-reduce single: ONE all-peers stage, the world-4 default)" } else { "" }) }
                          else { "serial K1/K2 + cvt (--tp-dec-xport 0)".to_string() },
                      match xtp::prefill_xport_mode() { 0 => "serial rounds-aware K1/K2", 1 => "single-rail pipelined (hardware-unproven at world > 2)", _ => "dual-rail pipelined (hardware-unproven at world > 2)" },
-                     if xtp::pf_overlap_rows() == 0 { "OFF" } else { "INERT" },
+                     if xtp::pf_overlap_rows() == 0 { "OFF" } else { "ON (the hooks ride the TP-4E round-aware program: a landed row range is consumed only after its last round's K2m; fold is refused at world > 2)" },
                      if !xtp::seq_parallel_on() { "OFF" }
                          else if world == 4 { "ON (TP-4S quarter rows: recursive-halving reduce-scatter + recursive-doubling all-gather; hardware-unproven until PLAN/TP-4S_GATES.md rungs 1-2 pass)" }
                          else { "INERT" },
@@ -2897,6 +4108,11 @@ pub fn run_tp_node_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
     if let Some(cfg) = crate::otel::config_from_args(|f| arg(args, &format!("--{f}")).map(|s| s.to_string())) {
         if let Err(e) = cfg.hostport() { anyhow::bail!("[otel] {e}"); }
     }
+    tp_lane_width_refusal(args, node_world as u32)?;   // W4: before the attach (the prelink refused it before the link)
+    // S-B9-CF-PACK5: --lane-pack runs at TP=1, TP=2 and TP=4; a TYPED `--lane-pack on` at a larger world is refused
+    // here BEFORE the attach (and before the link, in the prelink, by xtp::world_gt2_flag_refusals: PACK4-REVIEW
+    // B1); a defaulted-on boot is handled by build_serve's fallback (F10).
+    crate::lane_pack::tp_refusal(crate::lane_pack::LanePack::parse(arg(args, "--lane-pack"))?, node_world as u32)?;
     let boot = (|| -> Result<(Exl3Scheduler, Option<Vec<usize>>)> {
         let attach = tp_attach(ctx)?;
         let parts = build_serve(args, model_dir, Some(attach))?;
@@ -2942,13 +4158,24 @@ pub fn parse_spec_sampling(args: &[String]) -> Result<(bool, Option<f32>)> {
             Some(t)
         }
     };
-    if spec_ratio || draft_temp.is_some() {
+    // (SURFACE2 item 4: nothing is drafted with speculation switched off, so the mode is not announced)
+    if (spec_ratio || draft_temp.is_some()) && !crate::exl3_forward::mtp_disabled_by_opt() {
         println!("[exl3-serve] spec sampling: {} (draft temperature {}){}",
                  if spec_ratio { "ratio (real-q: sampled drafts on the full draft-slice head — on DHEAD when the DHEAD-RQ line says so, accept min(1, p/q'))" } else { "match" },
                  draft_temp.map_or("= request temperature".to_string(), |t| t.to_string()),
                  if !spec_ratio && draft_temp.is_some() { " — --draft-temperature only applies with --spec-sampling ratio" } else { "" });
     }
     Ok((spec_ratio, draft_temp))
+}
+
+/// Is the `--vision-fail-gemm` drill armed? Read through the option registry, as the NVFP4 server
+/// does (`src/main.rs`). S-B9-REL-VISIONFIX H2: this path read it with `arg(args, ..).is_some()`,
+/// the VALUE reader, which answers "is there a token after the flag": a bare flag at the END of
+/// the command line was silently not armed (and `--print-config` still showed it as set), while a
+/// flag followed by anything at all, `=0` included, was. The registry parses a `Ty::Flag` by
+/// presence, wherever it stands.
+fn vision_fail_gemm_armed() -> bool {
+    crate::opts::on(crate::opt!("vision-fail-gemm"))
 }
 
 /// CF-P1d pre-load fit check: the parts of a serving footprint, in bytes (estimates; see `fit_plan`).
@@ -3000,6 +4227,170 @@ fn suggest(p: FitParts, lanes: usize, avail: u64, max_pos: usize) -> String {
         out += " The model alone leaves too little memory on one box: run it over two boxes (--tp 2).";
     }
     out
+}
+
+/// Which limit trimmed a `--max-seq-len` request (public PR #21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CtxLimit {
+    /// The model's trained window (`max_position_embeddings`) times the rope extension factor.
+    Rope,
+    /// The launch-argument bit-packings: `max_pos` rides in 20 bits (`exl3_forward::MAX_POS_PACKED`).
+    Packing,
+}
+
+/// The rope extension factor of the EXL3 forward. It computes plain RoPE per step, with no YaRN (the
+/// `--rope-yarn-factor` option reaches only the NVFP4 `GpuModel` tables), so the trained window is
+/// the rope ceiling. A YaRN port for EXL3 passes its factor to `clamp_ctx` instead of this constant.
+pub const EXL3_ROPE_FACTOR: f64 = 1.0;
+
+/// The widest `--max-seq-len` the EXL3 packings carry: `max_pos = max_seq_len + decode_headroom`
+/// must stay below `MAX_POS_PACKED`.
+pub fn packable_max_seq_len() -> usize {
+    (crate::exl3_forward::MAX_POS_PACKED - 1).saturating_sub(crate::batch::decode_headroom(false))
+}
+
+/// The context a `--max-seq-len` request may use, and the limit that trimmed it (None = honoured as
+/// asked). `native` is the pack's trained window when its config could be read; the packing ceiling
+/// is a constant and applies either way, so an unreadable config never disables the guard.
+pub fn clamp_ctx(max_seq_len: usize, native: Option<usize>, rope_factor: f64) -> (usize, Option<CtxLimit>) {
+    let pack_eff = packable_max_seq_len();
+    let (eff, why) = match native {
+        Some(n) => {
+            let rope_eff = ((n as f64) * rope_factor.max(1.0)).ceil() as usize;
+            (rope_eff.min(pack_eff), if pack_eff < rope_eff { CtxLimit::Packing } else { CtxLimit::Rope })
+        }
+        None => (pack_eff, CtxLimit::Packing),
+    };
+    if max_seq_len > eff { (eff, Some(why)) } else { (max_seq_len, None) }
+}
+
+/// The pack's trained window from its config.json (`text_config` when nested), as `fit_parts` reads it.
+fn native_window(model_dir: &str) -> Option<usize> {
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(std::path::Path::new(model_dir).join("config.json")).ok()?).ok()?;
+    let t = cfg.get("text_config").unwrap_or(&cfg);
+    t.get("max_position_embeddings").and_then(|v| v.as_u64()).map(|v| v as usize)
+}
+
+/// One line naming the limit that trimmed `asked` to `eff` (pure: the text is unit-tested).
+fn clamp_ctx_message(asked: usize, eff: usize, why: CtxLimit, native: Option<usize>, rope_factor: f64) -> String {
+    let limit = match why {
+        CtxLimit::Rope if rope_factor > 1.0 =>
+            format!("the model's trained window {} x rope factor {rope_factor}", native.unwrap_or(0)),
+        CtxLimit::Rope => format!("the model's trained window {} (max_position_embeddings)", native.unwrap_or(0)),
+        CtxLimit::Packing => format!("the launch-argument bit-packings (max_pos must stay below {} = 2^20)",
+                                     crate::exl3_forward::MAX_POS_PACKED),
+    };
+    format!("[warn] --max-seq-len {asked} exceeds {limit} - clamping to {eff}.")
+}
+
+/// The context this EXL3 serve honours for `model_dir`: `--max-seq-len` trimmed to the rope and
+/// packing ceilings, with one log line naming the limit when it was trimmed. Every rank of a TP serve
+/// resolves it from the same argv and the same pack config (`build_serve`), and the head ships the
+/// trimmed value in `TpConfig.max_seq_len`.
+pub fn clamp_max_seq_len(model_dir: &str, max_seq_len: usize) -> usize {
+    let (eff, msg) = resolve_max_seq_len(model_dir, max_seq_len);
+    if let Some(m) = msg { crate::rprintln!("{m}"); }
+    eff
+}
+
+/// `clamp_max_seq_len` without the log line: (window, the line to print when it was trimmed).
+pub fn resolve_max_seq_len(model_dir: &str, max_seq_len: usize) -> (usize, Option<String>) {
+    let native = native_window(model_dir);
+    let (eff, why) = clamp_ctx(max_seq_len, native, EXL3_ROPE_FACTOR);
+    (eff, why.map(|w| clamp_ctx_message(max_seq_len, eff, w, native, EXL3_ROPE_FACTOR)))
+}
+
+#[cfg(test)]
+mod ctx_clamp_tests {
+    use super::*;
+
+    const W: usize = 262_144; // the Qwen3.8 family's trained window
+
+    /// Without a rope extension the context stops at the model's trained window.
+    #[test]
+    fn the_context_stops_at_the_trained_window() {
+        assert_eq!(clamp_ctx(300_000, Some(W), 1.0), (W, Some(CtxLimit::Rope)));
+        assert_eq!(clamp_ctx(W + 1, Some(W), 1.0), (W, Some(CtxLimit::Rope)));
+        assert_eq!(clamp_ctx(W, Some(W), 1.0), (W, None));
+        assert_eq!(clamp_ctx(32_768, Some(W), 1.0), (32_768, None));
+    }
+
+    /// A rope factor raises the ceiling until the packings stop it: max_pos = max_seq_len + headroom
+    /// must stay below 2^20.
+    #[test]
+    fn a_rope_factor_raises_the_ceiling_to_the_packing_limit() {
+        let top = packable_max_seq_len();
+        assert_eq!(top + crate::batch::decode_headroom(false), crate::exl3_forward::MAX_POS_PACKED - 1);
+        assert_eq!(clamp_ctx(600_000, Some(W), 2.0), (2 * W, Some(CtxLimit::Rope)));
+        assert_eq!(clamp_ctx(1_048_576, Some(W), 4.0), (top, Some(CtxLimit::Packing)));
+        assert_eq!(clamp_ctx(top, Some(W), 4.0), (top, None));
+        // a factor below 1 never shrinks the trained window
+        assert_eq!(clamp_ctx(W, Some(W), 0.5), (W, None));
+    }
+
+    /// An unreadable config must not disable the guard: the packing ceiling still applies.
+    #[test]
+    fn an_unknown_window_still_gets_the_packing_ceiling() {
+        let top = packable_max_seq_len();
+        assert_eq!(clamp_ctx(usize::MAX, None, 1.0), (top, Some(CtxLimit::Packing)));
+        assert_eq!(clamp_ctx(W, None, 1.0), (W, None));
+    }
+
+    /// Whatever is asked, the window the clamp returns loads: `FwdModel::load_tp` accepts its max_pos.
+    #[test]
+    fn every_clamped_window_passes_the_loader_guard() {
+        for native in [None, Some(4096), Some(W), Some(1 << 20), Some(1 << 24)] {
+            for f in [1.0, 2.0, 4.0, 64.0] {
+                for asked in [1usize, 4096, W, W + 3, 524_288, 1_048_574, 1_048_575, 1 << 20, 1 << 30] {
+                    let (eff, _) = clamp_ctx(asked, native, f);
+                    assert!(eff <= asked);
+                    let max_pos = eff + crate::batch::decode_headroom(false);
+                    assert!(crate::exl3_forward::check_max_pos_packable(max_pos).is_ok(), "{asked} {native:?} x{f} -> {eff}");
+                }
+            }
+        }
+    }
+
+    /// The log line names the limit that applied (and only mentions a rope factor when one is set).
+    #[test]
+    fn the_message_names_the_limit() {
+        let m = clamp_ctx_message(300_000, W, CtxLimit::Rope, Some(W), 1.0);
+        assert_eq!(m, "[warn] --max-seq-len 300000 exceeds the model's trained window 262144 (max_position_embeddings) - clamping to 262144.");
+        let m = clamp_ctx_message(600_000, 2 * W, CtxLimit::Rope, Some(W), 2.0);
+        assert!(m.contains("trained window 262144 x rope factor 2") && m.ends_with("clamping to 524288."), "{m}");
+        let m = clamp_ctx_message(2_000_000, 1_048_574, CtxLimit::Packing, None, 1.0);
+        assert!(m.contains("bit-packings (max_pos must stay below 1048576 = 2^20)") && m.ends_with("clamping to 1048574."), "{m}");
+    }
+
+    /// Wiring pin: the serve builder and the TP head resolve --max-seq-len through the clamp (the
+    /// served path itself is the GPU gate: a 524288 boot loads at 262145 on every rank).
+    #[test]
+    fn the_serve_and_the_tp_head_go_through_the_clamp() {
+        let code = |src: &str| src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let serve = code(include_str!("exl3_serve.rs"));
+        let needle = ["let max_seq_len: usize = clamp_max_seq_len(model_dir, ", "arg(args, \"--max-seq-len\")"].concat();
+        assert_eq!(serve.matches(&needle).count(), 1, "build_serve");
+        let main = code(include_str!("main.rs"));
+        let needle = ["tpc.max_seq_len = gb10_inference::exl3_serve::", "resolve_max_seq_len("].concat();
+        assert_eq!(main.matches(&needle).count(), 1, "run_exl3_tp_serve_head");
+    }
+
+    /// The trained window is read from the pack's config.json, flat or nested under text_config.
+    #[test]
+    fn the_trained_window_is_read_from_the_pack_config() {
+        let dir = std::env::temp_dir().join(format!("gb10_ctx_clamp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert_eq!(native_window(d), None, "no config.json");
+        std::fs::write(dir.join("config.json"), r#"{"max_position_embeddings": 262144}"#).unwrap();
+        assert_eq!(native_window(d), Some(W));
+        std::fs::write(dir.join("config.json"), r#"{"text_config": {"max_position_embeddings": 131072}, "max_position_embeddings": 7}"#).unwrap();
+        assert_eq!(native_window(d), Some(131_072));
+        assert_eq!(clamp_max_seq_len(d, 200_000), 131_072);
+        assert_eq!(clamp_max_seq_len(d, 65_536), 65_536);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Estimate the footprint of an EXL3 pack from its files and config (no GPU, no weight reads).
@@ -3100,9 +4491,39 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     if let Some(cfg) = &otel_cfg {
         if let Err(e) = cfg.hostport() { eprintln!("[otel] {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 1); } // H7
     }
+    // S-B9-CF-PACK4: --lane-pack, parsed before the model load. F10 (owner 2026-10-12): the registry default is
+    // ON, so the mode is resolved from the TYPED value (this head's argv; the node re-parses the head's argv) and
+    // otherwise from the registry row: both ranks of one binary resolve the same mode with no flag typed.
+    // Only a TYPED `--lane-pack on` above the largest world is refused (as before); a defaulted-on boot that
+    // cannot pack, for that or any other reason, falls back with one line (AGENTS 1b-bis item 8).
+    let lane_pack_typed = arg(args, "--lane-pack");
+    let mut lane_pack = match lane_pack_typed {
+        Some(v) => crate::lane_pack::LanePack::parse(Some(v))?,
+        None => crate::lane_pack::LanePack::from_opts()?,
+    };
+    if lane_pack_typed.is_some() { crate::lane_pack::tp_refusal(lane_pack, tp_world)?; }
     let port: u16 = arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8000);
-    let max_seq_len: usize = arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let width: usize = arg(args, "--max-batch").and_then(|s| s.parse().ok()).unwrap_or(8);
+    // Public PR #21: trim --max-seq-len to what the engine can address (the trained window, then the
+    // 20-bit packings) and say which limit applied; an unclamped wider window used to boot.
+    let max_seq_len: usize = clamp_max_seq_len(model_dir, arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
+    // F2 (owner 2026-10-10): at most 16 requests are served at once; a larger --max-batch boots
+    // with 16 and further requests wait in the queue (--max-waiting semantics unchanged).
+    let (width, raw_width) = resolved_max_batch(args);
+    crate::metrics::set_max_batch_requested(raw_width);
+    if raw_width > width {
+        crate::reprintln!("[exl3-serve] --max-batch {raw_width}: this server serves at most {EXL3_MAX_LANES} \
+                           requests at the same time; using {width}; further requests wait in the queue");
+    }
+    // (backstop: the TP entry points resolve the same cap before any network step,
+    // `tp_lane_width_refusal`; 16 always fits the pairwise agree width)
+    tp_lane_width_fits(tp_world, width).map_err(|e| anyhow::anyhow!(e))?;
+    // S-B9-CF-AGREE16B (W3): at TP=1 there is no TpSync to say what a lockstep drill flag does: say it here
+    if tp_rank.is_none() {
+        for l in crate::net::drill_plan(crate::opts::get(crate::opt!("tp-agree-drill")).as_deref(),
+                                        crate::opts::get(crate::opt!("tp-width-drill")).as_deref(), true, None).lines {
+            crate::reprintln!("{l}");
+        }
+    }
     let max_pos = max_seq_len + crate::batch::decode_headroom(false);
     // --prefix-cache on|off (default on, as the NVFP4 server): per-slot recurrent-state snapshots
     // at the message boundary so a multi-turn re-send prefills only its new suffix.
@@ -3134,6 +4555,26 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     anyhow::ensure!(kv_fmt != crate::exl3_forward::KV_Q4X,
                     "[kv-cache]=q4x is the WP25 probe's deliberately broken control; it is never served");
     let kv_name = crate::exl3_forward::kv_fmt_name(kv_fmt);
+    // PACK4-REVIEW B3, now F1 (owner 2026-10-10: "support things properly or gracefully fall back"):
+    // the postures --lane-pack on was never gated under no longer REFUSE the boot. The reasons are
+    // collected here — before the model load, so nothing packed is ever built for a boot that will
+    // not pack — and the boot decides just before the packed scratch: ONE plain line, packed rounds
+    // OFF for this boot, and the decision rides /metrics and the TP boot agree (a rank-local
+    // difference still dies loudly there).
+    let mut pack_blockers: Vec<String> = Vec::new();
+    if lane_pack.on() && tp_world > crate::lane_pack::LANE_PACK_MAX_WORLD {
+        pack_blockers.push(format!("TP={tp_world}: the packed arm has a lockstep frame for at most {} machines",
+                                   crate::lane_pack::LANE_PACK_MAX_WORLD));
+    }
+    if lane_pack.on() {
+        pack_blockers.extend(crate::lane_pack::posture_fallbacks(&crate::lane_pack::Posture {
+            kv: kv_name,
+            mtp_k: crate::exl3_forward::mtp_depth_default(),
+            row_regime: crate::exl3_forward::row_regime_on(),
+            a_ctrl_old: crate::exl3_forward::a_flags().ctrl == 2,
+            fcfs: LaneOrder::parse(arg(args, "--lane-order").map(str::trim).filter(|v| !v.is_empty()))? == LaneOrder::Fcfs,
+        }));
+    }
     // --reasoning-effort / --thinking: the server-wide thinking defaults, as on the NVFP4 server.
     // Unset = the model's own chat template decides (Qwen3.8: thinking on at xhigh, the model
     // card's default). A request's reasoning_effort / chat_template_kwargs.enable_thinking wins.
@@ -3200,8 +4641,12 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     }
     println!("[exl3-serve] {who}: loading EXL3 pack {model_dir} (width {width}, max_pos {max_pos}, kv-cache {kv_name})");
     let model = FwdModel::load_tp(model_dir, width, max_pos, tp)?;
-    if model.mtp.is_some() {
-        println!("[exl3-serve] M1 pack head loaded (MTP draft head for chain-verify serving)");
+    // SURFACE2 item 4: the boot lines that describe HOW this server speculates print only when it
+    // does. With --mtp off (or the hatch) the WP23 DDS line, the lane-order line, the shared-step
+    // line and the spec-sampling line described rounds that never run.
+    let spec_live = spec_live(model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt());
+    if let Some(line) = head_loaded_line(model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt()) {
+        println!("{line}");
     }
     let tok = QwenTokenizer::from_file(&format!("{}/tokenizer.json", model_dir.trim_end_matches('/')))?;
     // Stop tokens = the §3 union: generation_config eos (int or list) + tokenizer/config eos.
@@ -3272,11 +4717,18 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     println!("[exl3-serve] loop detector {} ; penalty window {pen_range} + {pen_range} tokens \
               (defaults rep {default_rep_penalty} presence {default_presence_penalty} frequency {default_frequency_penalty})",
              match loop_cfg { Some((w, r)) => format!("ON (window {w}, min reps {r})"), None => "OFF".into() });
+    // S-B9-REL-INTEG (AGENTS 1b-bis): a penalized request never joins a packed verify, and a request that sends no
+    // penalty field INHERITS these server defaults. Say so at boot, where the operator chose the flags.
+    if lane_pack.on() {
+        if let Some(w) = lane_pack_penalty_warning(default_rep_penalty, default_presence_penalty, default_frequency_penalty) {
+            crate::rprintln!("{w}");
+        }
+    }
     let tok = Arc::new(tok);
     // BUG-5 FIX (width half): mtp_round verifies at m=k+1 rows — the scratch must
     // hold the verify width even when the lane count is 1 (w1 serve panicked on
     // sc.slots[2] with a 2-element buffer). Model width (state slots) stays = lanes.
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1))?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1), model.max_pos())?;
     // S-A3-f-b: chunked prefill width (CLI --prefill-chunk; user-facing knob).
     // S-A3-f-d Item 2: default 512 -> 2048 — the matched-C table (7838 toks,
     // fixed flash256 kernel) shows 112 tok/s @ C=512 vs 234 @ C=2048 (the KV
@@ -3321,6 +4773,102 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     } else {
         println!("[exl3-serve] graph precapture OFF (--graph-precapture off): decode graphs capture lazily");
     }
+    // S-B9-CF-PACK4 `--lane-pack on`: the packed verify's own 16-row scratch and its graph family
+    // (every exact width R = 4..16, each reachable regime), captured NOW — the served arm never
+    // captures a packed graph while serving. With the flag off nothing here runs: no scratch,
+    // no graph, and every device byte is master's (the host still prints one boot line and renders
+    // the lane-pack /metrics series, all zero).
+    // F1 (owner 2026-10-10): `--lane-pack on` never refuses a boot. Every reason it cannot pack on
+    // this boot has been collected into `pack_blockers` (the posture fallbacks, `--max-batch 1`,
+    // `--graph-precapture off`) plus `pack_supported`'s kernel/model postures here. A blocked boot
+    // flips the flag OFF before anything packed runs — no packed scratch, no packed graph, the
+    // served path is master's bit for bit — prints ONE plain line, and records the decision for
+    // /metrics and the TP boot agree.
+    if lane_pack.on() {
+        if width < 2 {
+            pack_blockers.push(format!("--max-batch {width}: a pack steps two requests per round (needs --max-batch >= 2)"));
+        }
+        if !precapture {
+            pack_blockers.push("--graph-precapture off: the packed graphs are captured at boot, never while serving".to_string());
+        }
+        if let Err(e) = model.pack_supported() {
+            pack_blockers.push(e.to_string());
+        }
+        if !pack_blockers.is_empty() {
+            let why = pack_blockers.join("; ");
+            crate::rprintln!("[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: {why}; requests are served without packed rounds (--lane-pack off silences this line)");
+            crate::lane_pack::record_boot_pack(Some(why.clone()));
+            lane_pack = crate::lane_pack::LanePack::Off;
+        }
+    }
+    // F10: building the packed scratch and its graph family is the only allocation the default adds to a boot. It
+    // must never abort one: any failure here (device memory, a capture) is a FALLBACK reason, the half-built
+    // scratch is dropped, and the decision is recorded AFTER the build (the TP boot agree hashes it).
+    let (scp, pack_ready, pack_sampled) = if lane_pack.on() {
+        // Do sampled lanes pack on this boot? TP=1: yes (PACK4S). Under TP: `--lane-pack-sampled-tp`
+        // (default on; off = a sampled lane runs its own lone round, counted `skip sampled`).
+        let sampled_ok = tp_rank.is_none() || pack_sampled_under_tp();
+        let fams = crate::lane_pack::fams(spec_ratio, sampled_ok);
+        let free = || cudarc::driver::result::mem_get_info().map(|x| x.0).unwrap_or(0) as f64;
+        let f0 = free();
+        let built = crate::lane_pack::build_or_fall_back(|| {
+            let mut scp = model.pack_scratch()?;
+            model.dev().synchronize()?;
+            let f1 = free();
+            // S-B9-CF-PACK4S: under --spec-sampling ratio (the default) a sampled lane's verify rows
+            // are real-q rows, so the boot also holds the rq family (the same widths and regimes);
+            // under the match rule the greedy family serves sampled rows at TP=1 (a family of its own
+            // under TP: a different verify tail).
+            let tcap = std::time::Instant::now();
+            let (n, graph_mb, note) = model.pack_precapture(&mut scp, &fams)?;
+            let cap_s = tcap.elapsed().as_secs_f64();
+            let fam_ready = |sparse: bool| fams.iter().all(|&f| model.pack_family_ready(&scp, sparse, f));
+            let ready = [fam_ready(false), fam_ready(true)];
+            anyhow::ensure!(ready[0], "the dense packed graph family is incomplete after the boot capture");
+            Ok((scp, ready, n, graph_mb, note, cap_s, f1))
+        });
+        match built {
+            Err(why) => {
+                crate::rprintln!("[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: {why}; requests are served without packed rounds (--lane-pack off silences this line)");
+                crate::lane_pack::record_boot_pack(Some(why));
+                lane_pack = crate::lane_pack::LanePack::Off;
+                (None, [false, false], false)
+            }
+            Ok((scp, ready, n, graph_mb, note, cap_s, f1)) => {
+                crate::lane_pack::record_boot_pack(Some(String::new()));
+                if tp_rank.is_some() {
+                    crate::rprintln!("[exl3-serve] lane-pack under TP: sampled requests {} (--lane-pack-sampled-tp {})",
+                                     if sampled_ok { "JOIN packed rounds (the pack ran them at TP=2 on one pair, 2026-10-10; TP=4 was exercised by hand, no gate chain)" } else { "run alone; only greedy requests pack" },
+                                     if sampled_ok { "on" } else { "off" });
+                }
+                let f2 = free();
+                let fam_names: Vec<&str> = fams.iter().map(|f| f.label()).collect();
+                crate::rprintln!("[exl3-serve] lane-pack ON (the default; --lane-pack off turns it off){}: two requests share ONE packed speculative verify per round \
+(three busy = one pair + one rotating lone round); {}; penalized requests and requests with images do not; \
+draft chain: {}; packed scratch {:.0} MB + {n} packed verify graphs captured in {cap_s:.2} s, {graph_mb:+.0} MB \
+(exact widths R = {}..{}, families: {}; {note}), {:.2} GiB of device memory in all (the graph delta is cuMemGetInfo-noisy; \
+the free memory that matters is the 'after the boot' figure of the PLE line below)",
+                         if tp_rank.is_some() { format!(" at TP={tp_world} rank {}", tp_rank.unwrap_or(0)) } else { String::new() },
+                         if !sampled_ok { "GREEDY requests pack; SAMPLED requests run their own lone round (the sampled tail of a packed verify is not gated under TP)".to_string() }
+                         else if crate::wp24::dump_on() { "greedy and sampled requests pack, in any combination (--wp24-dump is set: sampled requests stay on the lone path)".to_string() }
+                         else if spec_ratio { "greedy and SAMPLED requests pack, in any combination (sampled rows verify by the real-q ratio rule, per-row sampler blocks)".to_string() }
+                         else { "greedy and SAMPLED requests pack, in any combination (sampled rows verify by the match rule, per-row sampler blocks)".to_string() },
+                         if draft_conf > 0.0 { "dynamic draft stop" } else { "FIXED depth (--draft-confidence 0)" },
+                         (f0 - f1) / 1e6, crate::lane_pack::PACK_WIDTHS.start(), crate::lane_pack::PACK_WIDTHS.end(),
+                         fam_names.join(" + "), (f0 - f2) / (1u64 << 30) as f64);
+                // S-B9-CF-PACK5: the packed graph set, named on EVERY rank (head and node print this line);
+                // the TP boot agree compares its count and digest (a rank holding a different set refuses
+                // to boot instead of letting `pack_plan` decide rank-locally)
+                let (gn, gh, gdesc) = model.pack_graph_set(&scp, &fams);
+                crate::rprintln!("[exl3-serve] lane-pack packed graph set{}: {gn} graphs [{gdesc}] digest {gh:08x}; dense ready {}, sparse ready {}",
+                         if tp_rank.is_some() { format!(" (TP={tp_world} rank {})", tp_rank.unwrap_or(0)) } else { String::new() },
+                         ready[0], ready[1]);
+                (Some(scp), ready, sampled_ok)
+            }
+        }
+    } else {
+        (None, [false, false], false)
+    };
     // PFX1 (e): after the boot captures — the cuBLASLt plans of every prefill tail length are
     // built in the background (host-only work; requests are served meanwhile, lazily as before).
     let _ = model.lt_prewarm_start();
@@ -3382,7 +4930,8 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // VIS-4: the head (TP=1, or rank 0) runs the tower; a node only needs the mrope section (it splices
     // the rows the head ships).
     let (vision_tower, vision_gpu, mrope_section) = if tp_rank.map_or(true, |r| r == 0) {
-        vision_boot(model_dir)
+        // PR #16 drill flag: --vision-fail-gemm (one-shot GEMM fault; see vision_gemm_drill).
+        vision_boot(model_dir, vision_fail_gemm_armed())
     } else {
         let sec = mrope_section_of(model_dir);
         println!("[exl3-serve] vision (node): mrope section {sec:?}; image rows arrive from the head");
@@ -3404,25 +4953,42 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         Some(v) => v.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("--lane-quantum: {e}"))?,
     };
     anyhow::ensure!(lane_quantum > 0, "--lane-quantum must be > 0");
-    if width > 1 && model.mtp.is_some() {
+    anyhow::ensure!(!(lane_pack.on() && lane_order == LaneOrder::Fcfs),
+                    "--lane-pack on needs --lane-order rr: fcfs steps ONE lane per scheduler step, a pack steps two");
+    // --prefill-interleave N (public PR #23; default 0 = off = no code path change). Every TP rank
+    // parses the same argv and resolves 0, so the node needs nothing and the lockstep is untouched.
+    let (interleave, il_line) = resolve_prefill_interleave(
+        parse_prefill_interleave(arg(args, "--prefill-interleave"))?, tp_rank.is_some(), chunk);
+    if let Some(line) = il_line { crate::rprintln!("{line}"); }
+    if width > 1 && spec_live {
         println!("[exl3-serve] load-adaptive batching (--spec-lanes-max): {} (--max-batch {width})", match spec_policy {
             SpecLanes::Auto => "auto — each round picks serial speculation or ONE shared plain step by estimated aggregate tokens/s".to_string(),
             SpecLanes::Over(k) => format!("one shared plain step with more than {k} busy lanes, serial speculation otherwise"),
             SpecLanes::Never => "off — always serial speculative rounds".to_string(),
         });
     }
+    // S-B9-REL-MTPREPROBE: --mtp-reprobe=off restores the previous one-way behaviour;
+    // --mtp-reprobe-drill shrinks the schedule for identity/stress runs.
+    let reprobe_on = crate::opts::var(crate::opt!("mtp-reprobe")).map_or(true, |v| v != "off");
+    let reprobe_cfg = if crate::opts::var(crate::opt!("mtp-reprobe-drill")).is_ok() {
+        crate::mtp_reprobe::ReProbeCfg::drill()
+    } else {
+        crate::mtp_reprobe::ReProbeCfg::default()
+    };
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
-        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
+        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave, psc: Some(psc0),
         mtp_k, spec_policy, lane_order, lane_quantum, admit_ctr: 0, fcfs_rots: 0,
-        shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        lane_pack, scp, pack_ready, pack_sampled, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(),
+        reprobe_on, reprobe_cfg,
+        shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on, cache: (0..width).map(|_| None).collect(),
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
         tp: tp_rank.map(|r| TpSync::new(r, tp_world as i32)),
-        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), mrope_section, vis_seam: None,
+        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), mrope_section, vis_seam: None, kv_pf: None,
     };
-    if width > 1 && model.mtp.is_some() {
+    if width > 1 && spec_live {
         println!("[exl3-serve] serial lane order (--lane-order): {}{}", lane_order.name(),
                  if lane_order == LaneOrder::Fcfs {
                      format!(" — run to completion, one lane at a time, FCFS by admission order, \
@@ -3430,18 +4996,17 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
                  } else {
                      " — every busy lane one round per scheduler step, in slot order (unchanged)".to_string()
                  });
+        // after the lane-order line: `speculation_boot_lines_follow_the_switch` pins that line directly behind its guard
+        crate::rprintln!("[exl3-serve] packed speculative verify (--lane-pack): {}", lane_pack.name());
     }
     println!("[exl3-serve] liveness: sticky CUDA error / scheduler thread crash -> {}",
              if exit_on_fatal { "exit 70 (--exit-on-fatal, default)" } else { "engine DEAD, /health 503 (--exit-on-fatal off)" });
     println!("[exl3-serve] prefill chunk width = {chunk} tokens/sweep (wide-M)");
-    if model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() {
-        println!("[exl3-serve] MTP chain-verify ON (k={mtp_k}, greedy + sampled lanes, dynamic draft stop {}; --exl3-no-mtp / --exl3-mtp-k override)",
-                 if draft_conf > 0.0 { format!("at {draft_conf}") } else { "OFF".to_string() });
-    } else if model.mtp.is_some() {
-        println!("[exl3-serve] MTP chain-verify OFF (--exl3-no-mtp set — diagnostics hatch)");
+    if let Some(line) = mtp_banner(model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt(), mtp_k, draft_conf) {
+        println!("{line}");
     }
     // WP23: depth 6/7 posture (both parts default on iff k > 5; --exl3-mtp-k=5 = the K5 build).
-    if model.mtp.is_some() && draft_conf > 0.0 {
+    if spec_live && draft_conf > 0.0 {
         println!("[exl3-serve] WP23 DDS: depth ceiling k={mtp_k} (max {}), depth-keyed bins {}, cost guard {} \
                   (target = max({draft_conf}, clamp(c_hat*tok/ms, 0.15, 0.8)) after 16 rounds, c_hat seeded 6.0 ms/draft; \
                   --exl3-dds-depth-bins / --exl3-dds-guard = 0|1 force)",
@@ -3457,6 +5022,9 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     let model_name = crate::server::resolve_model_name(
         arg(args, "--model-name"), arg(args, "--served-model-name"), model_dir);
     crate::metrics::set_max_batch(width);
+    // Public issue #24: the KV occupancy gauges — `width` lanes of the SERVED window (after the
+    // clamp above). The model load registered the byte counts.
+    crate::metrics::kv_pool_init(width, max_seq_len);
     // v0.7.3 ("tel"): the sink lives ONLY where the HTTP API lives — TP=1, or TP rank 0
     // (the head). A node never builds one: it has no HTTP hooks to fill the ring and no
     // sender to drain it, so under TP only the head emits. `--otel-model-id` /
@@ -3474,7 +5042,9 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         tokenizer: tok,
         model_name: model_name.clone(),
         // No output cap in the request = generate until a stop token or the end of the context
-        // window (the vLLM contract; was a silent 1024). --max-tokens N sets a server-wide cap.
+        // window (the vLLM contract; was a silent 1024). --max-tokens N is the DEFAULT for a chat
+        // request that omits max_tokens, not a cap: server.rs takes
+        // `req.max_tokens.unwrap_or(default_max_tokens)` and clamps only to the context room.
         default_max_tokens: arg(args, "--max-tokens").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX),
         default_rep_penalty,
         default_presence_penalty,
@@ -3511,9 +5081,16 @@ fn mrope_section_of(model_dir: &str) -> Option<[usize; 3]> {
 /// VIS-2: load the vision tower for the EXL3 server (CPU weights + the f32 GPU tower) and the text
 /// config's interleaved mrope_section. Any failure = text-only with a printed reason.
 #[allow(clippy::type_complexity)]
-fn vision_boot(model_dir: &str) -> (Option<Arc<crate::vision_tower::VisualTower>>,
+fn vision_boot(model_dir: &str, fail_first_gemm: bool) -> (Option<Arc<crate::vision_tower::VisualTower>>,
                                     Option<Arc<std::sync::Mutex<crate::vision_gpu::GpuVisualTower>>>,
                                     Option<[usize; 3]>) {
+    // S-B9-REL-VISIONFIX2 (review M3): `--vision-cpu` is a registry flag, but only the NVFP4 server honours it.
+    // This server always builds the GPU tower (the CPU tower runs only as the fallback after a GPU failure):
+    // say so instead of ignoring the flag silently.
+    if crate::opts::on(crate::opt!("vision-cpu")) {
+        crate::rprintln!("[exl3-serve] vision: --vision-cpu is honoured by the NVFP4 server only; this server always builds the GPU tower \
+(the CPU tower serves only after a GPU-tower failure)");
+    }
     match crate::vision_tower::vision_geometry(model_dir) {
         Ok(Some(_)) => {}
         Ok(None) => return (None, None, None),
@@ -3529,7 +5106,7 @@ fn vision_boot(model_dir: &str) -> (Option<Arc<crate::vision_tower::VisualTower>
         Err(e) => { println!("[exl3-serve] vision: tower load failed ({e:#}) — text-only"); return (None, None, None); }
     };
     let gpu = match cudarc::driver::CudaDevice::new(0).map_err(anyhow::Error::from)
-        .and_then(|d| crate::vision_gpu::GpuVisualTower::new(d, &tower)) {
+        .and_then(|d| crate::vision_gpu::GpuVisualTower::new_with_drill(d, &tower, fail_first_gemm)) {
         Ok(g) => g,
         Err(e) => { println!("[exl3-serve] vision: GPU tower unavailable ({e:#}) — text-only"); return (None, None, None); }
     };
@@ -3709,6 +5286,7 @@ fn wp24_gate_arm(sched: &mut Exl3Scheduler, arm: GateArm, prompt: &[u32], t: f32
                     TokEvent::Finish { reason: r } => reason = Some(r),
                     // #8.2: admission telemetry — no action for a gate drain.
                     TokEvent::Admitted { .. } => {}
+                    TokEvent::StopInfo { .. } => {}
                 }
             }
             anyhow::ensure!(reason.as_deref() == Some("length") && toks.len() == positions,
@@ -3764,7 +5342,9 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
         anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
-    anyhow::ensure!(!crate::exl3_forward::mtp_disabled_by_opt(), "WP24 gate: --exl3-no-mtp is set — the MTP arms need the head");
+    if let Some(off) = crate::exl3_forward::mtp_off_by_opt() {
+        anyhow::bail!("WP24 gate: {} is set — the MTP arms need the head", off.flag());
+    }
     let max_pos = max_seq_len + crate::batch::decode_headroom(false);
     println!("WP24 served gate: loading {model_dir} (width {width}, max_pos {max_pos}, kv-cache {})",
              crate::exl3_forward::kv_fmt_name(crate::exl3_forward::kv_fmt_from_opts()));
@@ -3781,19 +5361,28 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     let mtp_k = crate::exl3_forward::mtp_depth_default();
     anyhow::ensure!(prompt.len() >= 2 && prompt.len() + positions + mtp_k + 4 < model.max_pos(),
                     "WP24 gate: prompt of {} tokens does not fit the window", prompt.len());
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1))?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1), model.max_pos())?;
     let chunk = 2048usize;
     let psc0 = model.prefill_scratch(chunk)?;
     model.precapture_decode_graphs(&mut sc, width, mtp_k, draft_conf > 0.0)?;
     let tok = Arc::new(tok);
+    // S-B9-REL-MTPREPROBE policy flags (bench/probe paths construct the same scheduler).
+    let reprobe_on = crate::opts::var(crate::opt!("mtp-reprobe")).map_or(true, |v| v != "off");
+    let reprobe_cfg = if crate::opts::var(crate::opt!("mtp-reprobe-drill")).is_ok() {
+        crate::mtp_reprobe::ReProbeCfg::drill()
+    } else {
+        crate::mtp_reprobe::ReProbeCfg::default()
+    };
     let mut sched = Exl3Scheduler {
         model: model.clone(), sc, width,
-        lanes: (0..width).map(|_| None).collect(), eos, chunk, psc: Some(psc0),
-        mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        lanes: (0..width).map(|_| None).collect(), eos, chunk, interleave: 0, psc: Some(psc0),
+        mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0,
+        lane_pack: crate::lane_pack::LanePack::Off, scp: None, pack_ready: [false, false], pack_sampled: false, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(),
+        reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: None, pen_range: 1024, spec_ratio: false, draft_temp, gate: None, tok: tok.clone(), tp: None,
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None,
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None, kv_pf: None,
     };
     let quick = args.iter().any(|a| a == "--quick");
     wp24_gate_conditions(&mut sched, &prompt, &text, trials, positions, n_seeds, top_k, draft_conf, draft_temp, quick)
@@ -4138,6 +5727,7 @@ fn spec_arm(sched: &mut Exl3Scheduler, arm: SpecArm, prompt: &[u32], gen: usize)
             TokEvent::Finish { reason: r } => reason = r,
             // #8.2: admission telemetry — no action for a spec gate drain.
             TokEvent::Admitted { .. } => {}
+            TokEvent::StopInfo { .. } => {}
         }
     }
     anyhow::ensure!(!reason.starts_with("error"), "spec: {} request failed: {reason}", arm.name());
@@ -4230,19 +5820,28 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let eos = tok.stop_token_ids(cfg_eos);
     let mtp_k = crate::exl3_forward::mtp_depth_default();
     let width = o.width;
-    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1))?;
+    let mut sc = FwdModel::scratch(model.dev(), &model.cfg, width.max(mtp_k + 1), model.max_pos())?;
     let chunk = 2048usize;
     let psc0 = model.prefill_scratch(chunk)?;
     model.precapture_decode_graphs(&mut sc, width, mtp_k, true)?;
     let tok = Arc::new(tok);
+    // S-B9-REL-MTPREPROBE policy flags (bench/probe paths construct the same scheduler).
+    let reprobe_on = crate::opts::var(crate::opt!("mtp-reprobe")).map_or(true, |v| v != "off");
+    let reprobe_cfg = if crate::opts::var(crate::opt!("mtp-reprobe-drill")).is_ok() {
+        crate::mtp_reprobe::ReProbeCfg::drill()
+    } else {
+        crate::mtp_reprobe::ReProbeCfg::default()
+    };
     let mut sched = Exl3Scheduler {
         model: model.clone(), sc, width,
-        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, psc: Some(psc0),
-        mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0, shared_scale: 1.0, shared_last: false, shared_streak: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
+        lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave: 0, psc: Some(psc0),
+        mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0,
+        lane_pack: crate::lane_pack::LanePack::Off, scp: None, pack_ready: [false, false], pack_sampled: false, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(),
+        reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: Some((300, 3)), pen_range: 1024, spec_ratio: true, draft_temp: None, gate: None, tok: tok.clone(),
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None,
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None, kv_pf: None,
         tp: if tp_on { Some(TpSync::new(rank, world)) } else { None },
     };
     let mut arms = vec![SpecArm::Plain];
@@ -4445,6 +6044,155 @@ mod tp_hub_tests {
             for (r, o) in out.iter().enumerate() {
                 let e = o.as_ref().expect_err(&format!("{what}: rank {r} must fail on a divergent rank {r_bad}"));
                 assert!(e.contains("pre-verify") && e.contains(&format!("rank {r_bad}")), "{what} rank {r}: {e}");
+            }
+        }
+        // S-B9-CF-AGREE16: the widths a packed verify would reach (today's pre-verify sees at most 7 drafts).
+        // One rank drafted for a 15-row verify, the others for a 16-row one (and 16 vs 17, 15 vs 17): the SAME
+        // drafts hash on every rank, so the width word alone must fail the op, on every rank, before the verify
+        // launches. (This frame always carried the whole width: the case pins it, it was not red on master.)
+        let drafts: Vec<i32> = (0..16).collect();
+        for (w_most, w_bad, r_bad) in [(16usize, 15usize, 1usize), (15, 16, 2), (17, 16, 3), (16, 17, 1), (17, 15, 2)] {
+            let net = Net::new(W, true);
+            let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+                let mut t = sync(r);
+                t.pre_verify_hub(hub, if r == r_bad { w_bad } else { w_most }, &drafts, 3).map_err(|e| format!("{e:#}"))
+            });
+            for (r, o) in out.iter().enumerate() {
+                let e = o.as_ref().expect_err(&format!("width {w_most} vs {w_bad}: rank {r} must fail"));
+                assert!(e.contains("pre-verify") && e.contains(&format!("rank {r_bad} width")), "{w_most} vs {w_bad}, rank {r}: {e}");
+            }
+        }
+        for w in [15usize, 16, 17] {
+            let net = Net::new(W, true);
+            let ok = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| sync(r).pre_verify_hub(hub, w, &drafts, 3).is_ok());
+            assert!(ok.iter().all(|&g| g), "every rank at width {w} must agree: {ok:?}");
+        }
+    }
+
+    /// S-B9-CF-PACK5, the fault drill at unit scale (fake hub transport, every rank a thread): the
+    /// PACKED round's pre-verify frame. The words are `lane_pack::pre_words` of a two-lane pack; R is
+    /// the explicit row total. One rank disagreeing about the pack (a different draft in either lane,
+    /// the same words split differently, another slot, another position) or about R must fail EVERY
+    /// rank at this exchange, before any packed verify could launch, with the combined-hash message
+    /// naming the offending rank; identical packs pass. (The world-2 path is the same words through
+    /// `exchange_u32s` + `tp_agree_eq`, which needs the real link: the live drill covers it.)
+    #[test]
+    fn the_pack_pre_verify_catches_every_disagreement_about_the_pack_before_the_verify() {
+        use crate::lane_pack::{pack_rows_total, pre_words, PreSeg};
+        let (d0, d1) = ([11, 12, 13], [21, 22]);
+        let mk = |slot1: usize, pos1: usize, e1: [i32; 2]| -> (usize, Vec<i32>) {
+            let segs = [PreSeg::greedy(1, 100, 7, &d0), PreSeg::greedy(slot1, pos1, 8, &e1)];
+            (pack_rows_total(&segs), pre_words(&segs))
+        };
+        let base = mk(2, 200, d1);
+        let net = Net::new(W, true);
+        let ok = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = sync(r);
+            let res = t.pre_verify_hub(hub, base.0, &base.1, 5);
+            (res.is_ok(), t.pre_agrees)
+        });
+        assert!(ok.iter().all(|&(good, n)| good && n == 1), "{ok:?}");
+        assert_eq!(base.0, 7);
+        for (what, r_bad, other) in [("a draft of lane 1", 3usize, mk(2, 200, [21, 23])), ("lane 1's slot", 1, mk(3, 200, d1)),
+                                     ("lane 1's position", 2, mk(2, 201, d1))] {
+            let net = Net::new(W, true);
+            let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+                let mut t = sync(r);
+                let (rows, words) = if r == r_bad { (other.0, &other.1) } else { (base.0, &base.1) };
+                t.pre_verify_hub(hub, rows, words, 5).map_err(|e| format!("{e:#}"))
+            });
+            for (r, o) in out.iter().enumerate() {
+                let e = o.as_ref().expect_err(&format!("{what}: rank {r} must fail on a divergent rank {r_bad}"));
+                assert!(e.contains("pre-verify") && e.contains(&format!("rank {r_bad}")) && e.contains("link aborted before the verify"),
+                        "{what} rank {r}: {e}");
+            }
+        }
+        // the row total alone: SAME words, one rank believes R is one row wider (a 15- vs 16-row pack)
+        for (r_most, r_bad, who) in [(15usize, 16usize, 2usize), (16, 15, 1)] {
+            let net = Net::new(W, true);
+            let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+                let mut t = sync(r);
+                t.pre_verify_hub(hub, if r == who { r_bad } else { r_most }, &base.1, 5).map_err(|e| format!("{e:#}"))
+            });
+            for (r, o) in out.iter().enumerate() {
+                let e = o.as_ref().expect_err(&format!("R {r_most} vs {r_bad}: rank {r} must fail"));
+                assert!(e.contains(&format!("rank {who} width")), "R {r_most} vs {r_bad}, rank {r}: {e}");
+            }
+        }
+    }
+
+    /// S-B9-CF-AGREE16: the post-verify round of the world > 2 lockstep. `words` (emitted ids, drafts,
+    /// confidences) are the same on every rank here, so the hash is equal and ONLY the width (then only the
+    /// accept count) tells the ranks apart: every unequal pair in 0..=17 must fail every rank and name the
+    /// offender; every equal pair must pass.
+    #[test]
+    fn round_hub_tells_every_width_and_accept_count_apart_0_to_17() {
+        let words = [11u32, 22, 33];
+        let run = |a_most: usize, a_bad: usize, m_most: usize, m_bad: usize| -> Vec<std::result::Result<(), String>> {
+            let net = Net::new(W, true);
+            run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+                let mut t = sync(r);
+                let (a, m) = if r == 1 { (a_bad, m_bad) } else { (a_most, m_most) };
+                t.round_hub(hub, "verify", a, m, &words, 1.0, 1.0, false, 0, |_| Ok(vec![])).map(|_| ()).map_err(|e| format!("{e:#}"))
+            })
+        };
+        let mut silent: Vec<String> = Vec::new();
+        for m_most in 0..=17usize {
+            for m_bad in 0..=17usize {
+                let out = run(3, 3, m_most, m_bad);
+                if m_most == m_bad {
+                    assert!(out.iter().all(|o| o.is_ok()), "width {m_most} on every rank must agree: {out:?}");
+                } else if out.iter().any(|o| o.is_ok()) {
+                    silent.push(format!("width {m_most} vs {m_bad}"));
+                } else {
+                    for (r, o) in out.iter().enumerate() {
+                        let e = o.as_ref().unwrap_err();
+                        assert!(e.contains("rank 1 verify width"), "width {m_most} vs {m_bad}, rank {r}: {e}");
+                    }
+                }
+            }
+        }
+        for a_most in 0..=17usize {
+            for a_bad in 0..=17usize {
+                let out = run(a_most, a_bad, 17, 17);
+                if a_most == a_bad {
+                    assert!(out.iter().all(|o| o.is_ok()), "accept {a_most} on every rank must agree: {out:?}");
+                } else if out.iter().any(|o| o.is_ok()) {
+                    silent.push(format!("accept {a_most} vs {a_bad}"));
+                } else {
+                    for (r, o) in out.iter().enumerate() {
+                        let e = o.as_ref().unwrap_err();
+                        assert!(e.contains("rank 1 accept count"), "accept {a_most} vs {a_bad}, rank {r}: {e}");
+                    }
+                }
+            }
+        }
+        assert!(silent.is_empty(), "{} unequal pairs passed the round in silence: {silent:?}", silent.len());
+        // beyond a byte: the frame words are whole u32s, so 255 vs 256 accepted ids are told apart as well
+        assert!(run(255, 256, 17, 17).iter().all(|o| o.is_err()), "accept 255 vs 256 must fail the round");
+        assert!(run(3, 3, 31, 32).iter().all(|o| o.is_err()), "width 31 vs 32 must fail the round");
+    }
+
+    /// S-B9-CF-AGREE16, the fault drill at unit scale: every rank runs a 16-row round, ONE rank carries
+    /// `--tp-width-drill 16` (the flag's name since AGREE16B) and therefore REPORTS 15 - rank. The guard
+    /// must fail the round on every rank.
+    #[test]
+    fn the_width_drill_on_one_rank_fails_a_16_row_round_on_every_rank() {
+        for drill_rank in [0usize, 2] {
+            let net = Net::new(W, true);
+            let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+                let mut t = sync(r);
+                if r == drill_rank { t.drill_width = Some(16); }
+                // a 5-row round first: the drill leaves every width but its own alone
+                let first = t.round_hub(hub, "verify", 2, 5, &[1, 2], 1.0, 1.0, false, 0, |_| Ok(vec![])).map(|_| ()).map_err(|e| format!("{e:#}"));
+                let second = t.round_hub(hub, "verify", 2, 16, &[1, 2], 1.0, 1.0, false, 0, |_| Ok(vec![])).map(|_| ()).map_err(|e| format!("{e:#}"));
+                (first, second, t.drill_hits)
+            });
+            for (r, (first, second, hits)) in out.iter().enumerate() {
+                assert!(first.is_ok(), "rank {r}: the 5-row round is not the drill's width: {first:?}");
+                let e = second.as_ref().expect_err(&format!("rank {r}: rank {drill_rank} reported 15 for a 16-row round — the round must fail"));
+                assert!(e.contains("verify width"), "rank {r}: {e}");
+                assert_eq!(*hits, (r == drill_rank) as u64, "rank {r}");
             }
         }
     }
@@ -4759,8 +6507,121 @@ mod spec_lanes_tests {
             assert!((p - ms).abs() / ms < 0.05, "n={n}: {p} vs {ms}");
         }
     }
+
+    /// F4: the shared-cost probe fires EARLY while the scale has never been learned (the wrong
+    /// arm must not own a quarter of a ~250-round request) and at the 1-in-128 cadence afterwards,
+    /// mirroring the shared arm's own stale-estimate refresh.
+    #[test]
+    fn the_shared_probe_fires_early_then_every_128() {
+        assert_eq!(super::SHARED_PROBE_FIRST, 16);
+        assert_eq!(super::SHARED_PROBE_EVERY, 128);
+        let due = super::shared_probe_due;
+        assert!(!due(0, true) && !due(15, true), "not before 16 rounds on the other arm");
+        assert!(due(16, true) && due(17, true), "due at 16 while the scale is unlearned");
+        assert!(!due(15, false) && !due(127, false), "learned scale: 1-in-128 cadence");
+        assert!(due(128, false) && due(1000, false));
+    }
+
+    /// F4: the probe sits between the shared arm's return and `pack_plan`, gated on
+    /// `--lane-pack on` + the Auto policy + >=4 busy lanes, and runs the shared arm's own step
+    /// (not a new path). Flag-off boots (G2 byte identity), `Never`/`Over` policies, and
+    /// two-lane packed rounds (the PACK5G c=2 win, G4/G7 identity) never reach it.
+    #[test]
+    fn the_shared_probe_is_flag_on_auto_four_lanes_and_before_pack_plan() {
+        let src = include_str!("exl3_serve.rs");
+        let arm = src.find("if mtp_on && self.use_shared_plain(&slots) {").expect("shared arm in step()");
+        let step = &src[arm..];
+        let probe = step.find("shared_probe_due(self.shared_probe_ctr").expect("probe call in step()");
+        let pack = step.find("if let Some(plan) = self.pack_plan(&slots)").expect("pack_plan in step()");
+        assert!(probe < pack, "the probe must preempt pack_plan when due");
+        let gate = &step[..probe];
+        assert!(gate.contains("self.lane_pack.on() && self.spec_policy == SpecLanes::Auto && slots.len() >= 4"),
+                "the gate names the flag, the policy and the four lanes");
+        let probe_block = &step[probe..pack];
+        assert!(probe_block.contains("crate::metrics::lane_pack_round(2)"),
+                "the probe counts itself as a shared_plain round on /metrics");
+        assert!(probe_block.contains(&["return self.", "step_plain(&slots, true);"].concat()),
+                "the probe runs the shared arm's own step");
+        assert!(gate.contains("self.shared_streak = 0;"),
+                "the probe sits after the streak reset (so learn_shared_ms can seed at streak 0)");
+    }
 }
 
+
+#[cfg(test)]
+mod prefill_interleave_tests {
+    use super::*;
+
+    #[test]
+    fn the_flag_parses_to_zero_when_absent_and_refuses_garbage() {
+        assert_eq!(parse_prefill_interleave(None).unwrap(), 0);
+        assert_eq!(parse_prefill_interleave(Some("")).unwrap(), 0);
+        assert_eq!(parse_prefill_interleave(Some(" 2 ")).unwrap(), 2);
+        assert_eq!(parse_prefill_interleave(Some("0")).unwrap(), 0);
+        for bad in ["on", "-1", "1.5"] {
+            let e = parse_prefill_interleave(Some(bad)).unwrap_err().to_string();
+            assert!(e.starts_with("--prefill-interleave:"), "{e}");
+        }
+        let a: Vec<String> = ["--prefill-interleave=3", "--port", "9000"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_prefill_interleave(arg(&a, "--prefill-interleave")).unwrap(), 3);
+    }
+
+    /// Off is silent (default boot logs unchanged); on says so; under TP it is forced to 0 on every
+    /// rank and the line says it is ignored.
+    #[test]
+    fn the_resolved_value_is_zero_under_tp_and_the_boot_line_says_so() {
+        assert_eq!(resolve_prefill_interleave(0, false, 4095), (0, None));
+        assert_eq!(resolve_prefill_interleave(0, true, 4095), (0, None));
+        let (n, line) = resolve_prefill_interleave(2, false, 1024);
+        assert_eq!(n, 2);
+        let line = line.unwrap();
+        assert!(line.starts_with("[exl3-serve] prefill interleave ON (--prefill-interleave 2)") && line.contains("chunk 1024 tokens"), "{line}");
+        let (n, line) = resolve_prefill_interleave(2, true, 1024);
+        assert_eq!(n, 0);
+        assert!(line.unwrap().contains("--prefill-interleave 2 IGNORED under TP"));
+    }
+
+    /// The hook never runs after the final chunk (the seam step follows it), for a non-cancellable
+    /// internal prefill, under TP, or with the flag off.
+    #[test]
+    fn the_hook_runs_only_between_chunks_of_a_cancellable_single_box_prefill() {
+        assert!(interleave_point(1, false, true, 1024, 20_000));
+        assert!(interleave_point(4, false, true, 19_999, 20_000));
+        assert!(!interleave_point(1, false, true, 20_000, 20_000), "final chunk");
+        assert!(!interleave_point(0, false, true, 1024, 20_000), "flag off");
+        assert!(!interleave_point(1, true, true, 1024, 20_000), "TP");
+        assert!(!interleave_point(1, false, false, 1024, 20_000), "WP16 XCHECK reference prefill");
+    }
+
+    /// Every served grid ends exactly at `n`, whatever its options (realign, tail split, absorb-tail),
+    /// so no hook follows the last chunk and every earlier boundary is a hook point. (A property of
+    /// `plan_grid` that the hook predicate relies on; the hook itself is covered by the GPU gate.)
+    #[test]
+    fn interleave_points_are_the_grid_minus_its_last_chunk() {
+        use crate::exl3_forward::plan_grid;
+        for (from, n, c, realign, tail, absorb) in [
+            (0usize, 20_000usize, 1024usize, false, None, None),
+            (0, 20_000, 4095, true, Some(19_900), Some(16)),
+            (3_000, 20_000, 1024, true, Some(19_000), Some(16)),
+            (0, 900, 1024, false, None, None),
+            (0, 4095, 4095, true, None, Some(16)),
+        ] {
+            let grid = plan_grid(from, n, c, realign, tail, psc_rows(c, false), absorb, true);
+            assert_eq!(grid.last().copied(), Some(n), "the grid ends at n");
+            let points = grid.iter().filter(|&&e| interleave_point(1, false, true, e, n)).count();
+            assert_eq!(points, grid.len() - 1, "grid {grid:?}");
+        }
+    }
+
+    /// The registry row: a plain integer flag, no environment variable, default off.
+    #[test]
+    fn the_flag_is_registered_without_an_environment_variable() {
+        let o = crate::opt!("prefill-interleave").def();
+        assert_eq!((o.flag, o.env, o.def), ("prefill-interleave", "", "0"));
+        assert!(matches!(o.ty, crate::opts::Ty::Int));
+        assert_eq!(o.scope, crate::opts::Scope::Spmd);
+    }
+}
 
 #[cfg(test)]
 /// S1 (REL_V0_7_3 review): both spellings of every flag EXL3 reads with `arg()` must work.
@@ -4772,7 +6633,7 @@ mod s1_eq_aware_arg_tests {
     const FLAGS: &[&str] = &[
         "--lane-order", "--lane-quantum", "--model-name", "--served-model-name",
         "--otel-endpoint", "--otel-model-id", "--otel-topology",
-        "--port", "--max-seq-len", "--max-batch", "--prefix-cache", "--prefill-chunk",
+        "--port", "--max-seq-len", "--max-batch", "--prefix-cache", "--prefill-chunk", "--prefill-interleave",
         "--kv-cache", "--ple-ram", "--reasoning-effort", "--thinking", "--cpu-affinity",
         "--tune-table", "--tune-draft", "--tune-profile", "--draft-confidence",
         "--draft-temperature", "--spec-sampling", "--host",
@@ -4814,5 +6675,1425 @@ mod s1_eq_aware_arg_tests {
         assert_eq!(arg(&a, "--model-name").as_deref(), Some("Qwen/Qwen3.8-Flash-Next"));
         let a = owned(&["--model-name", "Qwen/Qwen3.8-Flash-Next"]);
         assert_eq!(arg(&a, "--model-name").as_deref(), Some("Qwen/Qwen3.8-Flash-Next"));
+    }
+}
+
+/// S-B9-REL-PRPORT3 (review R9): the PR #17 image-payload pre-read, extracted so the
+/// admit-order alignment and the error paths are unit-testable. Reads every image-bearing
+/// Admit's payload (in admit order) from the control stream BEFORE any admit() runs —
+/// prefill multiplexes HeadFlag frames on the same stream, so a payload still unread when
+/// the first admit runs could interleave with them (the stream desync / digest mismatch
+/// master could hit with 2+ images admitted in one Step). Digest verified per payload;
+/// little-endian f16 rows decoded to f32.
+pub(crate) fn read_step_image_payloads<R: std::io::Read>(
+    r: &mut R,
+    step_no: u64,
+    specs: &[(u64, u64)],
+) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
+    use std::io::Read;
+    let mut payloads: Vec<Option<Vec<f32>>> = Vec::new();
+    for &(ib, idg) in specs {
+        if ib > 0 {
+            let mut buf = vec![0u8; ib as usize];
+            r.read_exact(&mut buf).context("TP node: image payload read")?;
+            anyhow::ensure!(crate::tp_serve::fnv64(&buf) == idg,
+                            "TP node: image payload digest mismatch (step {step_no})");
+            payloads.push(Some(buf.chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect()));
+        } else {
+            payloads.push(None);
+        }
+    }
+    Ok(payloads)
+}
+
+#[cfg(test)]
+mod step_image_payload_tests {
+    //! S-B9-REL-PRPORT3 (review R9): the admit-order alignment and error paths of the
+    //! PR #17 payload pre-read.
+    use super::*;
+
+    fn f16bytes(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn spec(vals: &[f32]) -> (u64, u64) {
+        let b = f16bytes(vals);
+        (b.len() as u64, crate::tp_serve::fnv64(&b))
+    }
+
+    #[test]
+    fn mixed_admits_stay_aligned_in_admit_order() {
+        let a = spec(&[1.5, 2.5]);
+        let b = spec(&[-0.5, 4.0]);
+        let specs = [a, (0, 0), b]; // image, text, image — the text Admit must not shift rows
+        let mut stream = std::io::Cursor::new([f16bytes(&[1.5, 2.5]), f16bytes(&[-0.5, 4.0])].concat());
+        let out = read_step_image_payloads(&mut stream, 7, &specs).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].as_ref().unwrap(), &[1.5, 2.5]);
+        assert!(out[1].is_none(), "a text Admit stays aligned (None), never shifts the next image");
+        assert_eq!(out[2].as_ref().unwrap(), &[-0.5, 4.0]);
+    }
+
+    #[test]
+    fn short_read_errors() {
+        let a = spec(&[1.0, 2.0]);
+        let mut stream = std::io::Cursor::new(vec![0u8; 2]); // 2 of 4 bytes
+        let err = read_step_image_payloads(&mut stream, 9, &[a]).unwrap_err();
+        assert!(format!("{err:#}").contains("image payload read"), "got: {err:#}");
+    }
+
+    #[test]
+    fn digest_mismatch_errors() {
+        let a = spec(&[1.0, 2.0]);
+        let mut stream = std::io::Cursor::new(f16bytes(&[9.0, 9.0])); // right length, wrong bytes
+        let err = read_step_image_payloads(&mut stream, 9, &[a]).unwrap_err();
+        assert!(format!("{err:#}").contains("digest mismatch"), "got: {err:#}");
+    }
+}
+
+/// S-B9-REL-SMALLFIXES item 1 (owner 2026-10-08): `--mtp off` is honoured by the EXL3 server.
+/// Before, `--mtp` was documented in `--help` and ignored here: the banner stayed 'MTP chain-verify
+/// ON' and the only working switch was the diagnostics hatch `--exl3-no-mtp`.
+#[cfg(test)]
+mod mtp_switch_tests {
+    use super::*;
+    use crate::exl3_forward::{mtp_disabled_by_opt, mtp_off_by_opt, mtp_off_of, MtpOff};
+    use crate::opts::{Cat, Scope, Ty};
+
+    /// The registry tests share one process-global store: serialize the ones that write `mtp`.
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_decision_function() {
+        // not passed / auto / on (and the NVFP4 server's older spellings of on) = speculation ON
+        for v in [None, Some("auto"), Some("on"), Some("1"), Some("true")] {
+            assert_eq!(mtp_off_of(v, false), None, "--mtp {v:?} must leave the head on");
+        }
+        // off (and its older spellings) = OFF, attributed to --mtp
+        for v in ["off", "0", "false"] {
+            assert_eq!(mtp_off_of(Some(v), false), Some(MtpOff::MtpFlag), "--mtp {v}");
+        }
+        // the hatch keeps working, alone and next to any --mtp value (it names itself)
+        for v in [None, Some("auto"), Some("on"), Some("off")] {
+            assert_eq!(mtp_off_of(v, true), Some(MtpOff::Hatch), "--exl3-no-mtp with --mtp {v:?}");
+        }
+        assert_eq!(MtpOff::MtpFlag.flag(), "--mtp off");
+        assert_eq!(MtpOff::Hatch.flag(), "--exl3-no-mtp");
+    }
+
+    #[test]
+    fn mtp_is_a_registered_spmd_option() {
+        let id = crate::opts::lookup("mtp").expect("--mtp must be in the registry");
+        let o = id.def();
+        assert_eq!(o.env, "", "a new option has no environment variable");
+        assert_eq!(o.scope, Scope::Spmd, "--mtp must ride TpConfig to the nodes and enter the boot digest");
+        assert_eq!(o.cat, Cat::Spec);
+        assert_eq!(o.def, "auto");
+        match o.ty {
+            Ty::Choice(l) => for v in ["auto", "on", "off"] { assert!(l.contains(&v), "--mtp {v}"); },
+            other => panic!("--mtp must be a Choice (validated at startup), got {other:?}"),
+        }
+        assert!(o.help.contains("MTP OFF (--mtp off)"), "the help names the banner: {}", o.help);
+        // the hatch stays registered and Spmd
+        let h = crate::opts::lookup("exl3-no-mtp").expect("--exl3-no-mtp stays");
+        assert_eq!(h.def().scope, Scope::Spmd);
+    }
+
+    /// The real parser into the real store, read back by the gate every EXL3 site uses.
+    #[test]
+    fn the_command_line_reaches_the_gate() {
+        let _g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let (mtp, hatch) = (crate::opt!("mtp"), crate::opt!("exl3-no-mtp"));
+        let args = |a: &[&str]| -> Vec<String> { a.iter().map(|s| s.to_string()).collect() };
+        let reset = || { crate::opts::test_set(mtp, None); crate::opts::test_set(hatch, None); };
+        reset();
+        assert!(!mtp_disabled_by_opt(), "a default boot speculates");
+        for off in [&["--mtp", "off"][..], &["--mtp=off"][..]] {
+            reset();
+            crate::opts::parse_cli(&args(off)).unwrap();
+            assert_eq!(mtp_off_by_opt(), Some(MtpOff::MtpFlag), "{off:?}");
+            assert!(mtp_disabled_by_opt(), "{off:?} must turn the head off");
+        }
+        for on in [&["--mtp", "on"][..], &["--mtp=auto"][..], &["--mtp", "auto"][..]] {
+            reset();
+            crate::opts::parse_cli(&args(on)).unwrap();
+            assert_eq!(mtp_off_by_opt(), None, "{on:?} is unchanged: the head runs");
+        }
+        reset();
+        crate::opts::parse_cli(&args(&["--exl3-no-mtp"])).unwrap();
+        assert_eq!(mtp_off_by_opt(), Some(MtpOff::Hatch));
+        // an invalid value is refused by the startup parse, with the accepted spellings in the message
+        reset();
+        let e = crate::opts::parse_cli(&args(&["--mtp", "maybe"])).unwrap_err();
+        assert!(e.contains("--mtp takes auto|on|off") && e.contains("'maybe'"), "{e}");
+        assert!(crate::opts::parse_cli(&args(&["--mtp"])).is_err(), "a bare --mtp needs a value");
+        // TP: the head's value is what a node installs (and an unset head clears a node's own)
+        reset();
+        crate::opts::parse_cli(&args(&["--mtp", "off"])).unwrap();
+        let shipped = crate::opts::snapshot();
+        assert!(shipped.contains(&("mtp".to_string(), "off".to_string())), "--mtp off must be in the TpConfig snapshot: {shipped:?}");
+        assert!(crate::opts::spmd_digest().is_some(), "and in the boot agree digest");
+        reset();
+        let mine: Vec<(String, String)> = shipped.into_iter().filter(|(k, _)| k == "mtp").collect();
+        // (install only this row: a full install_head would clear options other tests hold)
+        crate::opts::test_set(mtp, mine.first().map(|(_, v)| v.as_str()));
+        assert!(mtp_disabled_by_opt(), "a node with the head's --mtp off has its head off");
+        reset();
+    }
+
+    /// SURFACE2 item 4: with speculation off, no boot line describes speculative rounds (the WP23
+    /// DDS line still printed under `--mtp off`), and the head line says the head is not used.
+    #[test]
+    fn speculation_boot_lines_follow_the_switch() {
+        assert!(spec_live(true, None));
+        assert!(!spec_live(true, Some(MtpOff::MtpFlag)) && !spec_live(true, Some(MtpOff::Hatch)));
+        assert!(!spec_live(false, None), "a pack without a draft head never speculates");
+        assert_eq!(head_loaded_line(false, None), None);
+        assert_eq!(head_loaded_line(true, None).unwrap(),
+                   "[exl3-serve] M1 pack head loaded (MTP draft head for chain-verify serving)", "the default line is unchanged");
+        let off = head_loaded_line(true, Some(MtpOff::MtpFlag)).unwrap();
+        assert!(off.starts_with("[exl3-serve] M1 pack head loaded") && off.contains("NOT used on this boot: --mtp off"), "{off}");
+        assert!(head_loaded_line(true, Some(MtpOff::Hatch)).unwrap().contains("NOT used on this boot: --exl3-no-mtp"));
+        // source pin (the boot needs a GPU): the line before each of these prints is its guard
+        let src = include_str!("exl3_serve.rs");
+        for (line, guard) in [("WP23 DDS: depth ceiling", "if spec_live && draft_conf > 0.0 {"),
+                              ("load-adaptive batching (--spec-lanes-max)", "if width > 1 && spec_live {"),
+                              ("serial lane order (--lane-order)", "if width > 1 && spec_live {"),
+                              ("spec sampling: {} (draft temperature", "&& !crate::exl3_forward::mtp_disabled_by_opt() {")] {
+            let print = ["println!(\"[exl3-serve] ", line].concat();
+            assert_eq!(src.matches(print.as_str()).count(), 1, "one `{line}` boot line");
+            let before = &src[..src.find(print.as_str()).unwrap()];
+            let guard_line = before.lines().rev().nth(1).unwrap();
+            assert!(guard_line.trim_end().ends_with(guard), "`{line}` must sit behind `{guard}`, found `{}`", guard_line.trim());
+        }
+    }
+
+    #[test]
+    fn the_boot_banner() {
+        assert_eq!(mtp_banner(false, None, 5, 0.4), None, "no MTP head in the pack: no line");
+        assert_eq!(mtp_banner(false, Some(MtpOff::MtpFlag), 5, 0.4), None);
+        let on = mtp_banner(true, None, 5, 0.4).unwrap();
+        assert!(on.starts_with("[exl3-serve] MTP chain-verify ON (k=5,") && on.contains("dynamic draft stop at 0.4"), "{on}");
+        assert!(on.contains("--mtp off"), "the ON line names the switch that turns it off: {on}");
+        let off = mtp_banner(true, Some(MtpOff::MtpFlag), 5, 0.4).unwrap();
+        assert!(off.contains("MTP OFF (--mtp off)"), "{off}");
+        assert!(!off.contains("chain-verify ON"), "{off}");
+        let hatch = mtp_banner(true, Some(MtpOff::Hatch), 5, 0.4).unwrap();
+        assert_eq!(hatch, "[exl3-serve] MTP chain-verify OFF (--exl3-no-mtp set — diagnostics hatch)", "unchanged line");
+        // both OFF lines keep the prefix the gate scripts match (scripts/i18d_chain.sh MOFF)
+        for l in [&off, &hatch] { assert!(l.starts_with("[exl3-serve] MTP chain-verify OFF"), "{l}"); }
+    }
+}
+
+/// S-B9-REL-SMALLFIXES item 5(a): the scheduler's side of `stop_p` / `stop_rank`.
+#[cfg(test)]
+mod stop_info_tests {
+    use super::*;
+    use crate::exl3_forward::{stop_token_stats, SampParams};
+
+    fn row(logits: &[f32]) -> Vec<u16> { logits.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect() }
+    fn near(a: f64, b: f64) -> bool { (a - b).abs() < 2e-3 } // f16 logits: three decimals
+    fn samp_opt(t: f32, top_p: f32, top_k: usize, min_p: f32) -> Option<SampParams> {
+        SampParams::sampled(t, top_p, top_k, min_p, 0, 0)
+    }
+
+    /// The S-B9-REL-SMALLFIXES computation, kept verbatim as the reference `stop_token_stats` must
+    /// reproduce BIT FOR BIT (SURFACE2 item 2 replaced its full sort and its per-token exp calls).
+    fn stop_token_stats_reference(row: &[u16], tok: usize, samp: Option<&SampParams>) -> Option<(f64, u32)> {
+        let lg = |b: u16| half::f16::from_bits(b).to_f32() as f64;
+        let xt = lg(*row.get(tok)?);
+        let (mut lmax, mut rank) = (f64::NEG_INFINITY, 1u32);
+        for &b in row {
+            let x = lg(b);
+            if x > lmax { lmax = x; }
+            if x > xt { rank += 1; }
+        }
+        if !xt.is_finite() || !lmax.is_finite() { return None; }
+        let Some(s) = samp else {
+            let z: f64 = row.iter().map(|&b| (lg(b) - lmax).exp()).filter(|w| w.is_finite()).sum();
+            return Some(((xt - lmax).exp() / z, rank));
+        };
+        let t = (s.temperature as f64).max(1e-6);
+        let w = |x: f64| ((x - lmax) / t).exp();
+        let tau = if s.top_k > 0 && (s.top_k as usize) < row.len() {
+            let mut xs: Vec<f64> = row.iter().map(|&b| lg(b)).filter(|x| !x.is_nan()).collect();
+            let k = (s.top_k as usize - 1).min(xs.len() - 1);
+            *xs.select_nth_unstable_by(k, |a, b| b.total_cmp(a)).1
+        } else {
+            f64::NEG_INFINITY
+        };
+        let mfloor = if s.min_p > 0.0 { lmax + t * (s.min_p as f64).ln() } else { f64::NEG_INFINITY };
+        let mut cand: Vec<f64> = row.iter().map(|&b| lg(b)).filter(|&x| x >= tau && x >= mfloor).collect();
+        let mass: f64 = cand.iter().map(|&x| w(x)).sum();
+        let mut theta = f64::NEG_INFINITY;
+        if s.top_p < 1.0 && mass > 0.0 {
+            cand.sort_unstable_by(|a, b| b.total_cmp(a));
+            let (target, mut cum, mut i) = (s.top_p as f64 * mass, 0.0f64, 0usize);
+            while i < cand.len() {
+                let x = cand[i];
+                while i < cand.len() && cand[i] == x { cum += w(x); i += 1; }
+                theta = x;
+                if cum >= target { break; }
+            }
+        }
+        if !(xt >= tau && xt >= mfloor && xt >= theta) { return Some((0.0, rank)); }
+        let z: f64 = cand.iter().filter(|&&x| x >= theta).map(|&x| w(x)).sum();
+        Some((w(xt) / z, rank))
+    }
+
+    #[test]
+    fn a_greedy_row_reports_the_models_probability_and_rank() {
+        let r = row(&[1.0, 2.0, 3.0, 0.0]);
+        let z = (1f64.exp() + 2f64.exp() + 3f64.exp() + 1.0);
+        let (p, rank) = stop_token_stats(&r, 2, None).unwrap();
+        assert!(near(p, 3f64.exp() / z) && rank == 1, "{p} {rank}");
+        let (p, rank) = stop_token_stats(&r, 3, None).unwrap();
+        assert!(near(p, 1.0 / z) && rank == 4, "{p} {rank}");
+        // ties share the better rank (rank = 1 + the number of STRICTLY greater logits)
+        let t = row(&[5.0, 5.0, 1.0]);
+        assert_eq!(stop_token_stats(&t, 0, None).unwrap().1, 1);
+        assert_eq!(stop_token_stats(&t, 1, None).unwrap().1, 1);
+        assert_eq!(stop_token_stats(&t, 2, None).unwrap().1, 3);
+        // out of range, or a masked token
+        assert_eq!(stop_token_stats(&r, 4, None), None);
+        assert_eq!(stop_token_stats(&row(&[1.0, f32::NEG_INFINITY]), 1, None), None);
+    }
+
+    #[test]
+    fn a_sampled_row_reports_the_probability_in_the_law_the_sampler_draws_from() {
+        let samp = |t: f32, top_p: f32, top_k: usize, min_p: f32| SampParams::sampled(t, top_p, top_k, min_p, 7, 0).unwrap();
+        // temperature only: softmax(l / T)
+        let r = row(&[0.0, 1.0, 2.0]);
+        let s = samp(0.5, 1.0, 0, 0.0);
+        let z = 0f64.exp() + 2f64.exp() + 4f64.exp();
+        let (p, rank) = stop_token_stats(&r, 1, Some(&s)).unwrap();
+        assert!(near(p, 2f64.exp() / z) && rank == 2, "{p} {rank}");
+        // top-k = 2 over [3, 2, 1, 0]: the third token is truncated away (p = 0), its rank stays 3
+        let r = row(&[3.0, 2.0, 1.0, 0.0]);
+        let s = samp(1.0, 1.0, 2, 0.0);
+        let (p, rank) = stop_token_stats(&r, 1, Some(&s)).unwrap();
+        assert!(near(p, 2f64.exp() / (3f64.exp() + 2f64.exp())) && rank == 2, "{p} {rank}");
+        assert_eq!(stop_token_stats(&r, 2, Some(&s)).unwrap(), (0.0, 3));
+        // top-k keeps every tie of the k-th largest (the kernel's rule)
+        let r = row(&[3.0, 2.0, 2.0, 0.0]);
+        let (p, _) = stop_token_stats(&r, 2, Some(&s)).unwrap();
+        assert!(near(p, 2f64.exp() / (3f64.exp() + 2.0 * 2f64.exp())), "{p}");
+        // top-p 0.7 over probabilities .5 / .3 / .2: the prefix .5 + .3 reaches it; .2 is cut
+        let r = row(&[0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()]);
+        let s = samp(1.0, 0.7, 0, 0.0);
+        let (p, rank) = stop_token_stats(&r, 1, Some(&s)).unwrap();
+        assert!(near(p, 0.3 / 0.8) && rank == 2, "{p} {rank}");
+        assert_eq!(stop_token_stats(&r, 2, Some(&s)).unwrap(), (0.0, 3));
+        // min_p 0.2 over .6 / .3 / .1: the floor is 0.2 * 0.6 = 0.12, so .1 is cut
+        let r = row(&[0.6f32.ln(), 0.3f32.ln(), 0.1f32.ln()]);
+        let s = samp(1.0, 1.0, 0, 0.2);
+        let (p, _) = stop_token_stats(&r, 1, Some(&s)).unwrap();
+        assert!(near(p, 0.3 / 0.9), "{p}");
+        assert_eq!(stop_token_stats(&r, 2, Some(&s)).unwrap().0, 0.0);
+        // every kept probability sums to 1 (top-k 3 + top-p 0.9 + min_p together)
+        let r = row(&[2.0, 1.5, 1.0, 0.5, 0.0, -1.0]);
+        let s = samp(0.8, 0.9, 4, 0.05);
+        let total: f64 = (0..6).map(|t| stop_token_stats(&r, t, Some(&s)).unwrap().0).sum();
+        assert!((total - 1.0).abs() < 1e-9, "{total}");
+    }
+
+    /// A greedy token is its row's argmax: any other rank means the wrong row was read back.
+    #[test]
+    fn a_greedy_row_that_does_not_put_its_token_first_is_not_reported() {
+        assert_eq!(stop_info_checked(Some((0.9, 1)), true), Some((0.9, 1)));
+        assert_eq!(stop_info_checked(Some((0.01, 7)), true), None, "greedy + rank 7 = not the row that chose the token");
+        assert_eq!(stop_info_checked(Some((0.01, 7)), false), Some((0.01, 7)), "a sample can have any rank");
+        assert_eq!(stop_info_checked(Some((0.0, 40)), false), Some((0.0, 40)));
+        assert_eq!(stop_info_checked(None, true), None);
+        assert_eq!(stop_info_checked(Some((f64::NAN, 1)), false), None);
+    }
+
+    /// The readback is on the finishing step only: the two call sites sit behind `reason == "stop"`
+    /// inside the finish branch, and nothing else in the scheduler calls it (source pin: the unit
+    /// suite cannot run a step).
+    #[test]
+    fn the_readback_runs_only_when_a_request_finishes_on_a_stop_token() {
+        let src = include_str!("exl3_serve.rs");
+        // S-B9-CF-PACK4: the call gained a `packed` argument and step_mtp's emit loop moved into round_emit
+        let call = format!("self.send_{}(s, ", "stop_info");
+        assert_eq!(src.matches(call.as_str()).count(), 2, "round_emit (step_mtp's emit loop, packed or not) and step_plain");
+        // PACK4-REVIEW B4: the ROW argument is pinned again (the pin had been loosened to the call's prefix): a
+        // packed round reads the stop token's row at the lane's row offset + its index, a serial round row j
+        let (packed_call, plain_call) = (format!("self.send_{}(s, packed_row0.map_or(j, |r0| r0 + j), t, packed_row0.is_some())", "stop_info"),
+                                         format!("self.send_{}(s, j, t, false)", "stop_info"));
+        assert_eq!(src.matches(packed_call.as_str()).count(), 1, "round_emit reads the packed row r0 + j");
+        assert_eq!(src.matches(plain_call.as_str()).count(), 1, "step_plain reads row j of the shared step");
+        for (i, _) in src.match_indices(call.as_str()) {
+            let line_start = src[..i].rfind('\n').unwrap() + 1;
+            let line = &src[line_start..i];
+            assert!(line.contains("reason == \"stop\""), "a call not guarded by the stop reason: `{}`", line.trim());
+        }
+        let rb = format!(".logits_{}(", "row");
+        assert_eq!(src.matches(rb.as_str()).count(), 1, "one readback site in the scheduler (send_stop_info)");
+        let f = &src[src.find(format!("fn send_{}(&self", "stop_info").as_str()).expect("send_stop_info")..];
+        assert!(f.find("if self.tp.is_some() { return; }").unwrap() < f.find(rb.as_str()).unwrap(), "no readback under TP");
+    }
+
+    /// A vocabulary-sized logits row shaped like a served one: a bulk around `mean` with spread
+    /// `sd` (f16-rounded, so many exact ties), a few dozen plausible tokens above it and one clear
+    /// winner at index 7. `peaked` false = a flat row (a wide nucleus: the top-p loop runs long).
+    fn synth_row(seed: u64, n: usize, mean: f32, sd: f32, peaked: bool) -> Vec<u16> {
+        let mut x = seed | 1;
+        let mut u = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut v: Vec<f32> = (0..n).map(|_| {
+            let g = (-2.0 * u().max(1e-300).ln()).sqrt() * (std::f64::consts::TAU * u()).cos(); // Box-Muller
+            mean + sd * g as f32
+        }).collect();
+        if peaked {
+            for j in 0..48 { v[(j * 5003 + 11) % n] = 6.0 + 9.0 * (u() as f32); }
+            v[7] = 21.5;
+            v[9] = 19.0;
+        }
+        v.iter().map(|&f| half::f16::from_f32(f).to_bits()).collect()
+    }
+
+    /// SURFACE2 item 2: `stop_token_stats` no longer sorts the vocabulary nor takes one exp per
+    /// token; (p, rank) must equal the first implementation's BIT FOR BIT, on served-shape rows
+    /// and on the awkward ones (heavy ties, both zeros, infinities, NaN, masked rows, tiny rows).
+    #[test]
+    fn stop_token_stats_is_bit_identical_to_the_reference() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let bits = |r: Option<(f64, u32)>| r.map(|(p, k)| (p.to_bits(), k));
+        let mut rows: Vec<Vec<u16>> = vec![
+            synth_row(3, 248_320, -1.5, 2.6, true),
+            synth_row(4, 248_320, 0.0, 3.0, false),
+            synth_row(5, 40_000, 0.0, 0.02, false),                   // nearly every logit a tie
+            row(&[0.0, -0.0, 0.0, -0.0, -1.0, -0.0]),                 // the maximum is a zero of either sign
+            row(&[-0.0, 0.0, -3.0]),
+            row(&[2.0, f32::NEG_INFINITY, 2.0, 1.0, f32::NEG_INFINITY, f32::NAN, 0.5]),
+            row(&[f32::NAN, f32::NAN]),
+            row(&[f32::NEG_INFINITY, f32::NEG_INFINITY]),
+            row(&[1.0, f32::INFINITY]),
+            row(&[3.25]),
+            row(&[]),
+        ];
+        for i in 0..40 { // small rows from a small alphabet: ties, zeros and specials everywhere
+            let n = 1 + (rnd() % 60) as usize;
+            let vals = [0.0f32, -0.0, 1.0, 1.5, -2.0, 7.25, -7.25, 1e-3, f32::NEG_INFINITY, f32::NAN, 30.0, 0.5];
+            let lim = if i % 4 == 0 { vals.len() } else { 8 };
+            rows.push((0..n).map(|_| half::f16::from_f32(vals[(rnd() % lim as u64) as usize]).to_bits()).collect());
+        }
+        for _ in 0..3 { rows.push((0..3000).map(|_| (rnd() >> 13) as u16).collect()); } // raw f16 patterns
+        let samplers: Vec<Option<SampParams>> = {
+            let mut v = vec![None];
+            // (an infinite temperature is not refused by the API: with a -inf logit the weight is NaN)
+            for &t in &[1.0f32, 0.7, 0.05, 2.5, 1e-9, f32::INFINITY, 3e38] {
+                for &top_p in &[1.0f32, 0.95, 0.8, 0.5, 1e-6, 0.999_999] {
+                    for &top_k in &[0usize, 1, 2, 20, 64, 5000, usize::MAX] {
+                        for &min_p in &[0.0f32, 0.05, 0.5, 1.0, 1.5] {
+                            v.push(Some(SampParams { temperature: t, top_p, top_k: top_k.min(u32::MAX as usize) as u32,
+                                                     min_p, seed: 0, counter: 0 }));
+                        }
+                    }
+                }
+            }
+            v
+        };
+        let mut checked = 0usize;
+        for (ri, r) in rows.iter().enumerate() {
+            // the top token, a few random ones, the last one, and one past the end
+            let top = (0..r.len()).max_by(|&a, &b| half::f16::from_bits(r[a]).to_f32().total_cmp(&half::f16::from_bits(r[b]).to_f32())).unwrap_or(0);
+            let mut toks = vec![top, 0, r.len().saturating_sub(1), r.len()];
+            for _ in 0..3 { toks.push((rnd() % r.len().max(1) as u64) as usize); }
+            // every row takes a slice of the sampler grid, offset by the row index so the rows
+            // cover all of it between them (the reference sorts 248K values per call on the big
+            // rows; the new function's histogram is a fixed ~70 us per call on the small ones)
+            let stride = if r.len() > 10_000 { 11 } else { 9 };
+            for (si, sp) in samplers.iter().enumerate().filter(|(si, _)| (si + ri) % stride == 0) {
+                for &tok in if r.len() > 10_000 { &toks[..2] } else { &toks[..] } {
+                    let (got, want) = (stop_token_stats(r, tok, sp.as_ref()), stop_token_stats_reference(r, tok, sp.as_ref()));
+                    assert_eq!(bits(got), bits(want), "row {ri} (len {}), sampler {si} {sp:?}, tok {tok}: {got:?} vs {want:?}", r.len());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 40_000, "{checked} comparisons");
+    }
+
+    /// SURFACE2 item 2 instrument (run by hand: `cargo test --release --lib stop_token_stats_cost --
+    /// --ignored --nocapture`): the host pass of a finishing step, per sampler setting, on a
+    /// vocabulary-sized row. Prints min / median of 15 runs in ms.
+    #[test]
+    #[ignore]
+    fn stop_token_stats_cost() {
+        const V: usize = 248_320;
+        let time = |f: &dyn Fn() -> Option<(f64, u32)>| -> (f64, f64, Option<(f64, u32)>) {
+            let mut ts: Vec<f64> = (0..15).map(|_| { let t = std::time::Instant::now(); std::hint::black_box(f()); t.elapsed().as_secs_f64() * 1e3 }).collect();
+            ts.sort_by(|a, b| a.total_cmp(b));
+            (ts[0], ts[7], f())
+        };
+        for (shape, row) in [("peaked", synth_row(1, V, -1.5, 2.6, true)), ("flat", synth_row(2, V, 0.0, 3.0, false))] {
+            let distinct = row.iter().collect::<std::collections::HashSet<_>>().len();
+            println!("row {shape}: {V} logits, {distinct} distinct f16 values");
+            let cases: [(&str, Option<SampParams>, usize); 7] = [
+                ("greedy (softmax at T=1)", None, 7),
+                ("T=0.7 top_k=20 top_p=0.8", samp_opt(0.7, 0.8, 20, 0.0), 7),
+                ("T=0.7 top_k=20 top_p=1.0", samp_opt(0.7, 1.0, 20, 0.0), 7),
+                ("T=1.0 top_k=0  top_p=1.0", samp_opt(1.0, 1.0, 0, 0.0), 7),
+                ("T=0.7 top_k=0  top_p=0.95", samp_opt(0.7, 0.95, 0, 0.0), 7),
+                ("T=1.0 top_k=0  top_p=0.95", samp_opt(1.0, 0.95, 0, 0.0), 9),
+                ("T=1.0 top_k=0  top_p=0.95 min_p=0.05", samp_opt(1.0, 0.95, 0, 0.05), 7),
+            ];
+            for (name, sp, tok) in cases {
+                let (new_min, new_med, got) = time(&|| stop_token_stats(&row, tok, sp.as_ref()));
+                let (old_min, old_med, want) = time(&|| stop_token_stats_reference(&row, tok, sp.as_ref()));
+                assert_eq!(got.map(|(p, r)| (p.to_bits(), r)), want.map(|(p, r)| (p.to_bits(), r)), "{name}: not bit-exact");
+                println!("  {name:<38} reference min {old_min:7.3} med {old_med:7.3} ms | now min {new_min:7.3} med {new_med:7.3} ms | (p, rank) = {got:?}");
+            }
+        }
+    }
+}
+
+/// S-B9-CF-PACK4: `--lane-pack` wiring that no unit can run (the suite never builds a Scratch,
+/// AGENTS 1a-ter): source pins, so a later edit cannot silently drop a refusal or the gate.
+#[cfg(test)]
+mod lane_pack_wiring_tests {
+    #[test]
+    fn tp_is_refused_before_the_attach_on_both_ranks_and_in_build_serve() {
+        let src = include_str!("exl3_serve.rs");
+        let call = format!("lane_pack::{}(", "tp_refusal");
+        assert_eq!(src.matches(call.as_str()).count(), 3, "build_serve (any TP rank) + the head and node entry points");
+        // the head and node entry points refuse BEFORE tp_attach, build_serve before the model load
+        for entry in ["pub fn run_tp_head_serve(", "pub fn run_tp_node_serve("] {
+            let f = &src[src.find(entry).unwrap_or_else(|| panic!("{entry}"))..];
+            assert!(f.find(call.as_str()).unwrap() < f.find("tp_attach(ctx)").unwrap(), "{entry} refuses before the attach");
+        }
+        let b = &src[src.find("fn build_serve(").unwrap()..];
+        assert!(b.find(call.as_str()).unwrap() < b.find("let model = ").expect("the model-load anchor of build_serve was renamed: update this pin"),
+                "build_serve refuses before the load");
+        assert!(src.contains("--lane-pack on needs --lane-order rr"), "fcfs steps one lane, a pack steps two");
+    }
+
+    /// PACK4-REVIEW A2: the reasoned pin. `pack_finish` re-primes eagerly; `head_reprime` takes
+    /// `rp.pending` FIRST and, if a lone round left one behind (it failed between its
+    /// `reprime_dev_enqueue` and its `head_reprime`), would run `reprime_dev_finish` on the wrong
+    /// round and fail every live lane. The packed path therefore clears the hand-off first.
+    #[test]
+    fn a_packed_round_never_takes_a_stale_reprime_handoff() {
+        let fwd = include_str!("exl3_forward.rs");
+        let pf = &fwd[fwd.find("pub fn pack_finish(&self").unwrap()..];
+        let pf = &pf[..pf.find("\n    }\n").unwrap()];
+        assert!(pf.find("rp.pending = None;").expect("the stale hand-off is cleared")
+                < pf.find("self.head_reprime(sc, head, d.slot").unwrap(), "cleared BEFORE head_reprime can take it");
+        // the lone path is untouched: its enqueue still resets the hand-off itself, and head_reprime
+        // still consumes it with take()
+        let re = &fwd[fwd.find("fn reprime_dev_enqueue(&self").unwrap()..];
+        assert!(re[..re.find("\n    }\n").unwrap()].contains("rp.pending = None;"));
+        assert!(fwd.contains("sc.rp.as_mut().and_then(|r| r.pending.take())"));
+    }
+
+    /// PACK4-REVIEW A3: an error out of the packed part of a pair round switches the arm off (the
+    /// planner then returns None: master's loops), loudly and visibly; an error of the control
+    /// cadence's serial fallback does not.
+    #[test]
+    fn a_packed_round_error_turns_the_arm_off_for_the_boot() {
+        let src = include_str!("exl3_serve.rs");
+        let sk = &src[src.find("fn step_packed(&mut self").unwrap()..];
+        let sk = &sk[..sk.find("\n    }\n").unwrap()];
+        assert!(sk.contains("std::mem::take(&mut self.pack_stats.in_round)") && sk.contains("self.pack_disable(a, b, &e)"));
+        let sp = &src[src.find("fn step_pair(&mut self").unwrap()..];
+        let sp = &sp[..sp.find("\n    }\n").unwrap()];
+        // the fallback's serial rounds run BEFORE the flag is raised; the packed part raises it and
+        // lowers it on completion
+        let fallback = sp.find(["return self.", "step_mtp(sb);"].concat().as_str()).expect("the control-cadence fallback");
+        let raise = sp.find("self.pack_stats.in_round = true;").expect("flag raised");
+        let lower = sp.find("self.pack_stats.in_round = false;").expect("flag lowered");
+        assert!(fallback < raise && raise < lower);
+        let pd = &src[src.find("fn pack_disable(&mut self").unwrap()..];
+        let pd = &pd[..pd.find("\n    }\n").unwrap()];
+        assert!(pd.contains("self.lane_pack = crate::lane_pack::LanePack::Off;") && pd.contains("crate::metrics::lane_pack_disabled();"));
+        assert!(src[src.find("fn pack_plan(&mut self").unwrap()..].contains("if !self.lane_pack.on() || slots.len() < 2 { return None; }"),
+                "the planner returns None once the mode is Off: master's loops");
+    }
+
+    /// PACK4-REVIEW A4: the planner and the pair round both use the capped depth (one definition:
+    /// `lane_pack::PACK_DEPTH_MAX`), so the forward path never meets a pair `pack_rows` refuses.
+    #[test]
+    fn the_planner_and_the_pair_round_cap_the_depth_alike() {
+        let src = include_str!("exl3_serve.rs");
+        let pp = &src[src.find("fn pack_plan(&mut self").unwrap()..];
+        let pp = &pp[..pp.find("\n    }\n").unwrap()];
+        // the per-lane rule is the pure `lane_view` (PACK4-REVIEW B4), which applies the cap and the clamp flag
+        assert!(pp.contains("crate::lane_pack::lane_view(s, facts, l.pos, k_pre, kd_reg, self.in_prefill, self.pack_ready"));
+        let lp = include_str!("lane_pack.rs");
+        let lv = &lp[lp.find("pub(crate) fn lane_view(").unwrap()..];
+        let lv = &lv[..lv.find("\n}\n").unwrap()];
+        assert!(lv.contains("kd_reg.min(PACK_DEPTH_MAX)") && lv.contains("clamped: kd_reg < k_pre"));
+        let sp = &src[src.find("fn step_pair(&mut self").unwrap()..];
+        let sp = &sp[..sp.find("\n    }\n").unwrap()];
+        assert!(sp.contains("kd.min(crate::lane_pack::PACK_DEPTH_MAX)"));
+        // PACK4-REVIEW B4: step_pair drafts at the round's CLAMPED depth (round_depth's regime-clamped value), never at mtp_k
+        assert!(sp.contains("let (_, kd) = self.round_depth(l.pos, l.max_new.saturating_sub(l.generated));"));
+        assert!(!sp.contains("self.mtp_k.min("), "the pair round must not recompute a depth of its own");
+    }
+
+    /// PACK4-REVIEW B2: the packed precapture decides nothing from a free-memory delta; a capture
+    /// that did not land still fails the boot, per graph.
+    #[test]
+    fn the_packed_precapture_has_no_memory_delta_cap() {
+        let fwd = include_str!("exl3_forward.rs");
+        let pc = &fwd[fwd.find("pub fn pack_precapture(&self").unwrap()..];
+        let pc = &pc[..pc.find("\n    }\n").unwrap()];
+        assert!(!pc.contains("1usize << 30") && !pc.contains("precapture cap"), "no cuMemGetInfo-delta cap");
+        assert!(pc.contains("did not capture (see the EXL3_GRAPH line above)"), "a failed capture still fails the boot");
+    }
+
+    /// S-B9-CF-PACK5: the packed round's lockstep points, in source order. After BOTH lanes drafted:
+    /// the wasted-pass drain, then the ONE pre-verify exchange (before `pack_verify` launches the
+    /// R-keyed graph); after the finishes: the post-verify `tp_round` whose head ms / capture flag
+    /// feed `round_account` (never the local clock). The pack is built from lane state only.
+    #[test]
+    fn the_packed_round_runs_its_lockstep_points_in_order() {
+        let src = include_str!("exl3_serve.rs");
+        let sp = &src[src.find("fn step_pair(&mut self").unwrap()..];
+        let sp = &sp[..sp.find("\n    }\n").unwrap()];
+        let at = |pat: &str| sp.find(pat).unwrap_or_else(|| panic!("missing in step_pair: {pat}"));
+        let drafts_done = at("drafts.push(d);"); // the end of the per-lane draft loop body: BOTH lanes have drafted after it
+        let drain = at("self.model.pack_drain_wasted(&drafts)?;");
+        let pre = at("t.pre_verify_pack(r, segs[0].drafts.len() + 1, &words, launched)?;");
+        let verify = at("self.model.pack_verify(&mut self.sc, scp, &drafts[0], &drafts[1])?");
+        let fin = at("self.model.pack_finish(&mut self.sc, head, &drafts[j], &outs[j])?;");
+        let post = at("self.tp_round(\"pack-round\", outs[0].a + outs[1].a, r, &w, ms_local, 0.0, captured_local, true)?");
+        let acct = at("self.round_account(s, &outs[j], ms_lane, 0.0, captured,");
+        assert!(drafts_done < drain && drain < pre && pre < verify, "both drafts, then the drain, the pre-verify, then the verify");
+        assert!(verify < fin && fin < post && post < acct, "verify, finishes, post-verify agree, then the bookkeeping");
+        assert!(sp.contains("let ms_lane = lane_share_ms(ms_round, 2);"), "the lane's share of the AGREED (head) round time");
+        assert!(sp.contains("if self.tp.is_some() && tp_preverify_on() {"), "the pre-verify honours --exl3-tp-preverify=0 like the lone round");
+        // nothing in the pack is decided from rank-local clocks or graph presence: the drafts loop reads
+        // lane state and the pre list, the dds target comes from lane state + the head-agreed EMAs
+        assert!(!sp.contains("lane_share_ms(ms_of("), "a local clock must not be the lane's cost");
+        // the arm goes off after a packed-round error (PACK4-REVIEW A3), and a lone round's stale
+        // device re-prime hand-off cannot fail a pair (A2)
+        let sk = &src[src.find("fn step_packed(&mut self").unwrap()..];
+        let sk = &sk[..sk.find("\n    }\n").unwrap()];
+        assert!(sk.contains("self.pack_disable(a, b, &e)"));
+        let fwd = include_str!("exl3_forward.rs");
+        let pf = &fwd[fwd.find("pub fn pack_finish(&self").unwrap()..];
+        let pf = &pf[..pf.find("\n    }\n").unwrap()];
+        assert!(pf.find("rp.pending = None;").unwrap() < pf.find("self.head_reprime(sc, head, d.slot").unwrap(),
+                "pack_finish clears a stale re-prime hand-off before the eager re-prime");
+    }
+
+    #[test]
+    fn the_packed_arm_sits_behind_the_flag_and_in_front_of_the_serial_loops() {
+        let src = include_str!("exl3_serve.rs");
+        // the arms live in `step_rounds`; `step` is the wrapper that publishes after any of them
+        let st = &src[src.find("fn step_rounds(&mut self) -> Result<()>").unwrap()..];
+        let st = &st[..st.find("\n    }\n").unwrap()];
+        let (shared, pack, fcfs, serial) = (st.find(["return self.", "step_plain(&slots, true);"].concat().as_str()).unwrap(),
+            st.find("self.pack_plan(&slots)").expect("the packed arm"), st.find("self.lane_order == LaneOrder::Fcfs").unwrap(),
+            st.find("let mut plain: Vec<usize> = Vec::new();\n        for &s in &slots {").unwrap());
+        assert!(shared < pack && pack < fcfs && fcfs < serial, "shared-plain, then the packed arm, then the serial loops");
+        let pp = &src[src.find("fn pack_plan(&mut self").unwrap()..];
+        let pp = &pp[..pp.find("\n    }\n").unwrap()];
+        assert!(pp.contains("if !self.lane_pack.on() || slots.len() < 2 { return None; }"), "off or a lone request: master's path");
+        // the boot precaptures the packed family (never while serving) and refuses a half-built one
+        assert!(src.contains("model.pack_precapture(&mut scp, &fams)?"), "the families (greedy + real-q / match) are captured at boot");
+        assert!(src.contains("crate::lane_pack::fams(spec_ratio, sampled_ok)"), "one list of families for capture, readiness and the boot agree");
+        assert!(src.contains("the dense packed graph family is incomplete"));
+    }
+
+    /// S-B9-CF-PACK4S: the sampled-lane glue, pinned in source order. Per lane, inside ONE loop
+    /// body: the lane's own sampler staging on the served scratch (the lone round's two calls),
+    /// then its draft chain, then the hand-off of its real-q lists — so the first lane's lists
+    /// leave the served scratch before the second lane's chain overwrites them.
+    #[test]
+    fn a_pair_stages_drafts_and_hands_off_per_lane_in_order() {
+        let src = include_str!("exl3_serve.rs");
+        let src = &src[..src.find("mod lane_pack_wiring_tests").unwrap()]; // the code, not these pins
+        let sp = &src[src.find("fn step_pair(&mut self").unwrap()..];
+        let sp = &sp[..sp.find("\n    }\n").unwrap()];
+        let body = &sp[sp.find("for &(s, b, p, tap_row, kd, _) in &pre {").expect("the per-lane draft loop")..];
+        let body = &body[..body.find("let t1 = std::time::Instant::now();").unwrap()];
+        let at = |pat: &str| body.find(pat).unwrap_or_else(|| panic!("missing in the draft loop: {pat}"));
+        let (rows, stage, pen) = (at("samp_rows(k + 1), self.rq_stage(s)"), at("self.model.set_spec_sampling(&mut self.sc, &rows, rq)?"),
+                                  at("self.model.set_penalties(&mut self.sc, &vec![None; k + 1])?"));
+        let (dds, fixed, hand, push) = (at("Some(&mut keep), seg, rq)?"), at("tap_row, None, seg, rq)?"),
+                                        at("self.model.pack_list_handoff(&self.sc, scp, at, &d)?"), at("drafts.push(d);"));
+        assert!(rows < stage && stage < pen && pen < dds && dds < fixed && fixed < hand && hand < push,
+                "stage -> draft -> list hand-off, per lane");
+        assert!(at("at += d.drafts.len() + 1;") > hand, "the next segment's row offset follows this lane's rows");
+        // the lane's real-q flag reaches the accounting (ctr += k + 1, dctr += k, as in the lone round)
+        assert!(sp.contains("captured, false, false, drafts[j].samp.ratio, xcheck, true)?"));
+        // the all-greedy staging of PACK4 is gone: each lane stages its own
+        assert!(!sp.contains("set_spec_sampling(&mut self.sc, &vec![None; k + 1], None)"));
+        // the fixed-depth chain is allowed under lane-pack (the deterministic gate posture)
+        assert!(!src.contains(&format!("{} on needs the dynamic draft stop", "--lane-pack")));
+        // a control round never runs with --a-ctrl off, in the lone round and in the pair's check
+        assert!(src.contains("let control = (af.ctrl != 3 && self.ctrl_round % period == 0) || force_ctrl;"));
+        assert!(sp.contains("if af.ctrl != 3 && pair_owes_control(self.ctrl_round, per_a, per_b) {"));
+    }
+
+    /// S-B9-CF-PACK4S: the forward side. The real-q list follows the scratch width (16 rows for
+    /// the packed scratch); the packed verify stages its sampler block BEFORE it picks the graph
+    /// (the family is the staged pair's); the precapture leaves the scratch greedy.
+    #[test]
+    fn the_packed_verify_stages_per_row_samplers_and_picks_the_family() {
+        let fwd = include_str!("exl3_forward.rs");
+        assert_eq!(fwd.matches("rq_list: dev.htod_sync_copy(&vec![u32::MAX; crate::lane_pack::rq_list_rows(w) * crate::wp24::RQ_ROW])?").count(), 1,
+                   "the list is sized from the scratch width");
+        assert!(!fwd.contains("vec![u32::MAX; (MTP_MAX_K + 1) * crate::wp24::RQ_ROW]"), "the 8-row list is gone");
+        let pv = &fwd[fwd.find("pub fn pack_verify(&self").unwrap()..];
+        let pv = &pv[..pv.find("\n    }\n").unwrap()];
+        let at = |pat: &str| pv.find(pat).unwrap_or_else(|| panic!("missing in pack_verify: {pat}"));
+        let (samp, set, key, launch) = (at("crate::lane_pack::pack_samp(&meta.segs, &[d0.samp, d1.samp], scp.samp.len() / 8)?"),
+                                        at("self.set_pack_sampling(scp, &ps)?"),
+                                        at("pack_key(meta.r, q0, qb, scp.rq_live) | self.vp_key_st(scp.samp_live, false, scp.rq_live, meta.r) | sk(scp)"),
+                                        at(".launch();"));
+        assert!(samp < set && set < key && key < launch);
+        let pc = &fwd[fwd.find("pub fn pack_precapture(&self").unwrap()..];
+        let pc = &pc[..pc.find("\n    }\n").unwrap()];
+        // the family's sampler shadows are set BEFORE the capture (the verify tail is chosen from them)
+        // and restored to greedy after the last one; the graph key is the family's own (vp bits included)
+        assert!(pc.find("scp.rq_live = rq;").unwrap() < pc.find("self.capture_verify_graph_packed(").unwrap());
+        assert!(pc.find("scp.samp_live = samp;").unwrap() < pc.find("self.capture_verify_graph_packed(").unwrap());
+        assert!(pc.find("self.capture_verify_graph_packed(").unwrap() < pc.find("scp.rq_live = false;").unwrap());
+        assert!(pc.find("self.capture_verify_graph_packed(").unwrap() < pc.find("scp.samp_live = false;").unwrap());
+        assert!(pc.contains("self.pack_fam_key(scp, r, sparse, qb, fam)"), "one key function for capture, readiness and replay");
+        let fk = &fwd[fwd.find("fn pack_fam_key(&self").unwrap()..];
+        let fk = &fk[..fk.find("\n    }\n").unwrap()];
+        assert!(fk.contains("self.vp_key_st(samp, false, rq, r)"), "the vp tail bits are part of the family key");
+        // the hand-off is a D2D copy on the COMPUTE stream (AGENTS 2.3), never a sync copy
+        let ho = &fwd[fwd.find("pub fn pack_list_handoff(&self").unwrap()..];
+        let ho = &ho[..ho.find("\n    }\n").unwrap()];
+        assert!(ho.contains("cuMemcpyDtoDAsync_v2(dst, src, words * 4, self.stream.stream)") && !ho.contains("dtod_sync"));
+    }
+}
+
+/// S-B9-REL-SMALLFIXES 9a(iii) + 9a(iv): the scheduler side of the per-row attention regime.
+#[cfg(test)]
+mod regime_sched_tests {
+    use super::*;
+
+    const LIM: usize = 2051; // Flash-Next: qsa_limit()
+
+    /// Issue #24: what one lane reports to /metrics in each of its states.
+    #[test]
+    fn kv_lane_occupancy_states() {
+        // a running request: its position is used, and its own prefix snapshot is not "cached"
+        assert_eq!(kv_lane_occupancy(Some(1200), None, Some(900)), (1200, 0));
+        // a prefill in flight (the lane does not exist yet): the rows written so far
+        assert_eq!(kv_lane_occupancy(None, Some(4095), None), (4095, 0));
+        assert_eq!(kv_lane_occupancy(None, Some(0), None), (0, 0));
+        // a free lane: nothing used; the snapshot it keeps for the prefix cache
+        assert_eq!(kv_lane_occupancy(None, None, Some(900)), (0, 900));
+        assert_eq!(kv_lane_occupancy(None, None, None), (0, 0));
+        // the lane wins over a stale prefill marker (admit clears it; a nested interleave step
+        // publishes while it is still set for ANOTHER slot, which the caller filters by slot)
+        assert_eq!(kv_lane_occupancy(Some(7), Some(3), None), (7, 0));
+    }
+
+    /// Issue #24 wiring: every scheduler function that frees or fills a lane ends in a publish, and
+    /// the age gauge is written by the `step` wrapper (every arm), not by one arm of the rounds.
+    #[test]
+    fn kv_publish_points_are_wired() {
+        let src = include_str!("exl3_serve.rs");
+        let body = |name: &str| -> &str {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+            let end = src[at + name.len()..].find("\n    fn ").map_or(src.len(), |e| at + name.len() + e);
+            &src[at..end]
+        };
+        let publish = ["self.", "publish_kv()"].concat();
+        let touch = ["crate::metrics::", "sched_touch()"].concat();
+        for f in ["fn step(&mut self) -> Result<()> {", "fn admit(&mut self, req: BatchRequest) {", "fn die(mut self,",
+                  "fn tp_fail(&mut self,", "fn prefill_range(&mut self,"] {
+            assert!(body(f).contains(&publish), "{f} must publish the KV gauges");
+        }
+        assert!(body("fn step(&mut self) -> Result<()> {").contains(&touch), "the step wrapper writes the age gauge");
+        assert!(!body("fn step_rounds(&mut self) -> Result<()> {").contains(&touch),
+                "step_rounds must not write the age gauge itself (the fcfs and shared-plain arms return early)");
+        // a request's last round: its final position is published before the lane is dropped
+        // (the post-step publication sees a free lane), in the speculative and the plain step
+        assert_eq!(src.matches(&[publish.as_str(), "; // issue #24: the lane's final position"].concat()).count(), 1);
+        assert_eq!(src.matches(&["if finish { ", publish.as_str(), "; } // issue #24: the lane's final position"].concat()).count(), 1);
+        // both scheduler loops publish the idle value before they block
+        let idle = ["crate::metrics::", "sched_idle()"].concat();
+        let n_idle = src.matches(&idle).count();
+        let paired = src.matches(&[publish.as_str(), "; // issue #24: the idle value"].concat()).count();
+        assert!(n_idle >= 2 && paired == n_idle, "every sched_idle() site publishes first ({paired} of {n_idle})");
+    }
+
+    /// 9a(iv): step_plain's order — the lanes at/below the switch first, stable in each class.
+    #[test]
+    fn step_plain_orders_short_lanes_first() {
+        // slot -> the lane's next position
+        let pos = |s: usize| [100usize, 5000, 2051, 2052, 7, 30000][s];
+        // slots 0, 2, 4 are at/below the switch (2051 itself is dense); 1, 3, 5 are past it
+        assert_eq!(regime_ordered_slots(&[0, 1, 2, 3, 4, 5], pos, LIM), vec![0, 2, 4, 1, 3, 5]);
+        // a subset, given in another order: each class keeps the GIVEN order (a stable partition)
+        assert_eq!(regime_ordered_slots(&[5, 4, 3, 2], pos, LIM), vec![4, 2, 5, 3]);
+        // one-sided steps are untouched
+        assert_eq!(regime_ordered_slots(&[4, 0, 2], pos, LIM), vec![4, 0, 2]);
+        assert_eq!(regime_ordered_slots(&[5, 1, 3], pos, LIM), vec![5, 1, 3]);
+        assert_eq!(regime_ordered_slots(&[1], pos, LIM), vec![1]);
+        assert_eq!(regime_ordered_slots(&[], pos, LIM), Vec::<usize>::new());
+        // the result is always a permutation of the input
+        let mut o = regime_ordered_slots(&[3, 0, 5, 2, 1, 4], pos, LIM);
+        o.sort();
+        assert_eq!(o, vec![0, 1, 2, 3, 4, 5]);
+        // the dense rows lead, so forward_step's dense prefix covers every short lane of the step
+        let ord = regime_ordered_slots(&[1, 0, 3, 2, 5, 4], pos, LIM);
+        let p: Vec<usize> = ord.iter().map(|&s| pos(s)).collect();
+        assert_eq!(crate::exl3_forward::dense_prefix(&p, LIM), (3, 0), "3 leading dense rows, none behind a long row");
+    }
+
+    /// 9a(iv): with the flag off (or no sparse attention) the order is the identity.
+    #[test]
+    fn the_flag_off_order_is_the_identity() {
+        assert_eq!(regime_switch(true, true, LIM), LIM);
+        assert_eq!(regime_switch(true, false, LIM), usize::MAX, "--qsa-row-regime 0");
+        assert_eq!(regime_switch(false, true, LIM), usize::MAX, "no indexer / --qsa-exl3 0");
+        assert_eq!(regime_switch(false, false, LIM), usize::MAX);
+        let pos = |s: usize| [100usize, 5000, 2051, 2052, 7, 30000][s];
+        for slots in [vec![0, 1, 2, 3, 4, 5], vec![5, 4, 3, 2, 1, 0], vec![1, 0, 3], vec![]] {
+            assert_eq!(regime_ordered_slots(&slots, pos, regime_switch(true, false, LIM)), slots, "flag off: {slots:?}");
+            assert_eq!(regime_ordered_slots(&slots, pos, regime_switch(false, true, LIM)), slots, "no switch: {slots:?}");
+        }
+    }
+
+    /// The method the scheduler calls is exactly these two functions (source pin).
+    #[test]
+    fn regime_ordered_is_the_two_pure_functions() {
+        let src = include_str!("exl3_serve.rs");
+        let f = &src[src.find("fn regime_ordered(&self, slots: &[usize]) -> Vec<usize> {").expect("regime_ordered")..];
+        let f = &f[..f.find("\n    }\n").unwrap()];
+        assert!(f.contains("regime_switch(self.model.qsa_live(usize::MAX), crate::exl3_forward::row_regime_on(), self.model.qsa_limit())"));
+        assert!(f.contains("regime_ordered_slots(slots, |s| self.lanes[s].as_ref().map_or(0, |l| l.pos), lim)"));
+    }
+
+    /// 9a(iii): the count of mixed step shapes, and the idle line that reports the graphs.
+    #[test]
+    fn mixed_step_graph_accounting() {
+        use crate::exl3_forward::mixed_step_shapes;
+        assert_eq!((mixed_step_shapes(0), mixed_step_shapes(1), mixed_step_shapes(2)), (0, 0, 1));
+        assert_eq!(mixed_step_shapes(4), 6);
+        assert_eq!(mixed_step_shapes(16), 120);
+        // = the number of (width m in 2..=lanes, dense rows md in 1..m) pairs
+        for lanes in 0..=16usize {
+            let n = (2..=lanes).map(|m| m - 1).sum::<usize>();
+            assert_eq!(mixed_step_shapes(lanes), n, "lanes {lanes}");
+        }
+        assert_eq!(mixed_graphs_idle_line(0, 0, 4), None);
+        assert_eq!(mixed_graphs_idle_line(3, 3, 4), None, "nothing new: no line");
+        let l = mixed_graphs_idle_line(0, 2, 4).unwrap();
+        assert!(l.starts_with("[exl3-serve] mixed-step graphs idle: 0->2 captured since boot") && l.contains("4 lanes can form 6 mixed step shapes"), "{l}");
+        // the gauge is rendered (the count itself is a process global other tests may bump)
+        assert!(crate::metrics::render(true).contains("velogb10_graph_cache_mixed_step_entries "));
+    }
+}
+
+/// S-B9-REL-VISIONFIX H2: the `--vision-fail-gemm` drill through the real argument path
+/// (`opts::parse_cli`, what `main` runs on argv, then the accessor the serve path calls).
+#[cfg(test)]
+mod vision_drill_flag_tests {
+    use super::*;
+
+    /// The registry store is process-global: one test at a time writes the drill's row.
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn argv(tokens: &[&str]) -> Vec<String> { tokens.iter().map(|s| s.to_string()).collect() }
+
+    /// Parse `tokens` as the process would and ask the serve path's question.
+    fn armed_after_parsing(tokens: &[&str]) -> bool {
+        let drill = crate::opt!("vision-fail-gemm");
+        // hermetic: the command line may name no OTHER registered option (parse_cli would write
+        // its row into the store every other test shares)
+        for t in tokens.iter().filter_map(|t| t.strip_prefix("--")) {
+            let name = t.split('=').next().unwrap();
+            assert!(name == "vision-fail-gemm" || crate::opts::lookup(name).is_none(), "--{name} is a registry option: keep it out of this test");
+        }
+        crate::opts::test_set(drill, None);
+        crate::opts::parse_cli(&argv(tokens)).expect("parse_cli");
+        let armed = vision_fail_gemm_armed();
+        crate::opts::test_set(drill, None);
+        armed
+    }
+
+    #[test]
+    fn the_drill_arms_wherever_the_flag_stands() {
+        let _g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        // LAST argument: the case that was silently not armed
+        assert!(armed_after_parsing(&["--server", "--model-dir", "/m", "--vision-fail-gemm"]), "the flag as the last argument");
+        // in the middle, and first
+        assert!(armed_after_parsing(&["--server", "--vision-fail-gemm", "--model-dir", "/m"]), "the flag in the middle");
+        assert!(armed_after_parsing(&["--vision-fail-gemm", "--server", "--model-dir", "/m"]), "the flag first");
+        // alone
+        assert!(armed_after_parsing(&["--vision-fail-gemm"]));
+        // absent: not armed (the default of a server)
+        assert!(!armed_after_parsing(&["--server", "--model-dir", "/m"]), "absent");
+        assert!(!armed_after_parsing(&[]));
+        // an explicit off is off (the old reader ARMED the drill on `--vision-fail-gemm=0`)
+        assert!(!armed_after_parsing(&["--server", "--vision-fail-gemm=0", "--model-dir", "/m"]));
+        assert!(!armed_after_parsing(&["--server", "--vision-fail-gemm", "off"]));
+        assert!(armed_after_parsing(&["--server", "--vision-fail-gemm=1"]));
+        // a look-alike is not the flag
+        assert!(!armed_after_parsing(&["--server", "--vision-fail-gemm-x"]));
+    }
+
+    /// What the old reader answered on the same command lines: the bug, pinned as the reason.
+    #[test]
+    fn the_value_reader_misses_a_trailing_bare_flag() {
+        let last = argv(&["--server", "--model-dir", "/m", "--vision-fail-gemm"]);
+        assert!(arg(&last, "--vision-fail-gemm").is_none(), "a value reader sees no value after a trailing flag");
+        let mid = argv(&["--server", "--vision-fail-gemm", "--model-dir", "/m"]);
+        assert_eq!(arg(&mid, "--vision-fail-gemm"), Some("--model-dir"), "and takes the NEXT FLAG for the value in the middle");
+        let zero = argv(&["--vision-fail-gemm=0"]);
+        assert!(arg(&zero, "--vision-fail-gemm").is_some(), "and counts `=0` as given");
+    }
+
+    /// S-B9-REL-VISIONFIX2 V5: the other two members of H2's class, now registry flags: `--vision-cpu`
+    /// (NVFP4 server; a CPU tower is a multi-minute path, and `=0` used to FORCE it) and `--parity`
+    /// (a bench protocol flag; as the last argument it silently ran the non-parity recipe). Through
+    /// the real argument path: last, middle, first, alone, absent, `=0`, `=off`, `=1`, look-alike.
+    #[test]
+    fn vision_cpu_and_parity_are_read_by_presence_wherever_they_stand() {
+        let _g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        fn on_after(flag: &str, tokens: &[&str]) -> bool {
+            let id = crate::opts::lookup(flag).expect("a registry flag");
+            assert!(matches!(id.def().ty, crate::opts::Ty::Flag), "--{flag} is a presence flag");
+            for t in tokens.iter().filter_map(|t| t.strip_prefix("--")) {
+                let name = t.split('=').next().unwrap();
+                assert!(name == flag || crate::opts::lookup(name).is_none(), "--{name} is a registry option: keep it out of this test");
+            }
+            crate::opts::test_set(id, None);
+            crate::opts::parse_cli(&argv(tokens)).expect("parse_cli");
+            let r = crate::opts::on(id);
+            crate::opts::test_set(id, None);
+            r
+        }
+        for flag in ["vision-cpu", "parity"] {
+            let f = format!("--{flag}");
+            assert!(on_after(flag, &["--server", "--model-dir", "/m", &f]), "{f} as the LAST argument");
+            assert!(on_after(flag, &["--server", &f, "--model-dir", "/m"]), "{f} in the middle");
+            assert!(on_after(flag, &[&f, "--server", "--model-dir", "/m"]), "{f} first");
+            assert!(on_after(flag, &[&f]), "{f} alone");
+            assert!(!on_after(flag, &["--server", "--model-dir", "/m"]), "{f} absent");
+            assert!(!on_after(flag, &[]), "{f} absent, no arguments");
+            assert!(!on_after(flag, &["--server", &format!("{f}=0"), "--model-dir", "/m"]), "{f}=0 is off");
+            assert!(!on_after(flag, &["--server", &format!("{f}=off")]), "{f}=off is off");
+            assert!(!on_after(flag, &["--server", &f, "off"]), "{f} off is off");
+            assert!(on_after(flag, &["--server", &format!("{f}=1")]), "{f}=1 is on");
+            assert!(!on_after(flag, &["--server", &format!("{f}-x")]), "a look-alike is not the flag");
+        }
+        // the options exist in --help (Serve / Diag), each with a help text
+        for flag in ["vision-cpu", "parity"] {
+            let id = crate::opts::lookup(flag).unwrap();
+            assert!(id.def().help.len() > 40 && id.def().env.is_empty(), "--{flag}: a help text and no environment variable");
+        }
+    }
+
+    /// V4a: `--vision-cpu-threads` is range-checked when the command line is parsed (the process
+    /// exits 2 there): a bad value used to fail INSIDE the tower load, which booted the server
+    /// text-only with image requests rejected.
+    #[test]
+    fn a_bad_vision_cpu_threads_value_is_refused_at_startup() {
+        let _g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let id = crate::opt!("vision-cpu-threads");
+        for bad in ["0", "65", "-1", "abc", "1.5", ""] {
+            crate::opts::test_set(id, None);
+            let r = crate::opts::parse_cli(&argv(&["--server", "--vision-cpu-threads", bad]));
+            assert!(r.is_err(), "--vision-cpu-threads {bad:?} must be refused, got {r:?}");
+            let r = crate::opts::parse_cli(&argv(&[&format!("--vision-cpu-threads={bad}")]));
+            assert!(r.is_err(), "--vision-cpu-threads={bad:?} must be refused");
+            assert!(crate::opts::get(id).is_none(), "a refused value is not stored");
+        }
+        // The store is process-global and `VisualTower::load` (other test modules) reads this row: only the
+        // default value is ever written to it here; the other values go through the pure accessor.
+        crate::opts::test_set(id, None);
+        crate::opts::parse_cli(&argv(&["--vision-cpu-threads", "1"])).expect("a good value");
+        assert_eq!(crate::opts::ranged(id).unwrap(), 1);
+        crate::opts::test_set(id, None);
+        for (good, n) in [("1", 1i64), ("8", 8), ("64", 64), (" 4 ", 4)] {
+            assert_eq!(crate::opts::ranged_from(id, Some(good)).unwrap(), n);
+        }
+        assert_eq!(crate::opts::ranged(id).unwrap(), 1, "unset = the default 1");
+        // a value that reached the store another way is an Err for the accessor, never a silent default
+        for bad in ["0", "65", "-1", "many", ""] {
+            assert!(crate::opts::ranged_from(id, Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The serve path asks the registry, and nothing in the tree reads a registry flag with a value
+    /// reader's `is_some()` again. The value readers stay right for options that TAKE a value. The
+    /// two bare flags that were still misread (`--vision-cpu`, `--parity`) are registry flags since
+    /// S-B9-REL-VISIONFIX2 V5 (the list of bare-and-still-misread names is empty and may not grow).
+    #[test]
+    fn no_registry_flag_is_read_with_a_value_readers_is_some() {
+        const TAKES_A_VALUE: [&str; 3] = ["server-port", "bench-file", "model-dir"];
+        const BARE_AND_STILL_MISREAD: [&str; 0] = [];
+        let serve = include_str!("exl3_serve.rs");
+        assert_eq!(serve.matches(&["vision_boot(model_dir, ", "vision_fail_gemm_armed())"].concat()).count(), 1, "the serve path asks the registry");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() { dirs.push(p); } else if p.extension().map_or(false, |x| x == "rs") { files.push(p); }
+            }
+        }
+        assert!(files.len() > 40);
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            for reader in ["arg(args, \"--", "parse_arg(args, \"--", "arg_value(args, \"--", "parse_arg(&args, \"--"] {
+                for (at, _) in text.match_indices(reader) {
+                    let rest = &text[at + reader.len()..];
+                    let Some(q) = rest.find('"') else { continue };
+                    let after = rest[q + 1..].trim_start();
+                    let Some(after) = after.strip_prefix(')') else { continue };
+                    let after = after.trim_start();
+                    if !(after.starts_with(".is_some()") || after.starts_with(".is_none()")) { continue; }
+                    let name = rest[..q].to_string();
+                    if let Some(id) = crate::opts::lookup(&name) {
+                        assert!(!matches!(id.def().ty, crate::opts::Ty::Flag | crate::opts::Ty::Bool),
+                                "{}: --{name} is a registry flag read with a value reader's is_some(): use opts::on", f.display());
+                    }
+                    seen.insert(name);
+                }
+            }
+        }
+        let allowed: std::collections::BTreeSet<String> = TAKES_A_VALUE.iter().chain(BARE_AND_STILL_MISREAD.iter()).map(|s| s.to_string()).collect();
+        assert_eq!(seen, allowed, "options read with <value reader>(..).is_some(): a new one must take a value, or be read by presence");
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------
+// S-B9-CF-AGREE16: the lockstep words must tell every verify width apart (0..=31), 15 from 16 included.
+// These tests drive the real field packing (`tp_agree_fields`), the real token (`net::agree_token`) and the
+// real comparison (`tp_agree_decide`); only the wire is replaced: `net_agree` hands each rank the other
+// rank's token for the same step field, which is what `pair` does.
+// ------------------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tp_agree_width_tests {
+    use super::*;
+
+    type Said = (usize, usize, u32); // (accept, verify width, digest) as one rank passes them to tp_agree_eq
+
+    /// What the two ranks of a TP=2 pair decide at one lockstep point: (this rank, the peer).
+    fn pair(step: u64, a: Said, b: Said) -> (std::result::Result<(), String>, std::result::Result<(), String>) {
+        let token = |s: Said| tp_agree_fields(s.0, s.1).map(|(a8, k8)| (a8, k8, crate::net::agree_token(step, a8, k8, s.2)));
+        let side = |me: Said, other: Said| -> std::result::Result<(), String> {
+            let (a8, k8, _) = token(me)?; // this rank refused its own fields: it aborts the link
+            // a peer that refused never publishes a token: this rank's net_agree ends in an aborted link (None)
+            let reply = token(other).ok().map(|(_, _, t)| crate::net::agree_token_reply(t));
+            tp_agree_decide(a8, k8, me.2, reply)
+        };
+        (side(a, b), side(b, a))
+    }
+
+    /// Digests of the kind the lockstep points pass: FNVs of short id lists, plus the corner words.
+    fn digests() -> Vec<u32> {
+        let mut v = vec![0u32, u32::MAX, 0x8000_0000, 0x7800_0000, 0x0800_0000, 0xF800_0000, 0x07FF_FFFF, 1];
+        v.extend((0..32).map(|b| 1u32 << b));
+        for n in 0..24u32 {
+            v.push(fnv32(0, (0..n).map(|i| 1000 + 7 * i)));
+            v.push(fnv32(0x5EED, (0..n).map(|i| 31 * i + n)));
+        }
+        v
+    }
+
+    #[test]
+    fn the_digest_can_set_and_clear_every_bit_of_its_word() {
+        // the bits `h` can set: ALL 32. fnv32 is a full-width hash, so no bit of the 32-bit word is free for
+        // a width unless the word reserves it (which is what the next test demands).
+        let (mut any, mut all) = (0u32, u32::MAX);
+        for n in 0..200u32 {
+            let h = fnv32(0, (0..n % 17 + 1).map(|i| n.wrapping_mul(2654435761).wrapping_add(i)));
+            any |= h;
+            all &= h;
+        }
+        assert_eq!(any, u32::MAX, "the digest never set bits {:#010x}", !any);
+        assert_eq!(all, 0, "the digest never cleared bits {all:#010x}");
+    }
+
+    #[test]
+    fn the_width_owns_the_top_five_bits_whatever_the_digest_holds() {
+        const DIGEST_MASK: u32 = (1 << 27) - 1;
+        for h in digests() {
+            for k in 0..=31u8 {
+                let w = crate::net::agree_word(k, h);
+                assert_eq!(w >> 27, k as u32, "width {k}, digest {h:#010x}: the word's top five bits are {:#04x}", w >> 27);
+                assert_eq!(w & DIGEST_MASK, crate::net::agree_word(0, h) & DIGEST_MASK,
+                           "width {k} changed the digest part of the word (digest {h:#010x})");
+            }
+            // the 27-bit digest part still hears every one of the 32 digest bits
+            for b in 0..32 {
+                assert_ne!(crate::net::agree_word(0, h ^ (1 << b)), crate::net::agree_word(0, h),
+                           "digest bit {b} of {h:#010x} does not reach the word");
+            }
+        }
+    }
+
+    #[test]
+    fn equal_inputs_agree_and_every_width_or_accept_difference_is_refused_0_to_17() {
+        let step = agree_field(41, AGREE_A);
+        let mut silent: Vec<String> = Vec::new(); // differing inputs that BOTH ranks accepted
+        let mut loud: Vec<String> = Vec::new(); // equal inputs a rank refused
+        for h in [0u32, 0xDEAD_BEEF, u32::MAX, 0x7800_0000, fnv32(0, 0..16), fnv32(0, 0..15)] {
+            for (wa, wb) in (0..=17usize).flat_map(|a| (0..=17usize).map(move |b| (a, b))) {
+                for (aa, ab) in (0..=17usize).flat_map(|a| (0..=17usize).map(move |b| (a, b))) {
+                    let (ra, rb) = pair(step, (aa, wa, h), (ab, wb, h));
+                    let same = wa == wb && aa == ab;
+                    match (same, ra.is_ok() && rb.is_ok()) {
+                        (true, false) => loud.push(format!("width {wa} accept {aa}: {ra:?} / {rb:?}")),
+                        (false, true) => silent.push(format!("(width {wa}, accept {aa}) vs (width {wb}, accept {ab})")),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(loud.is_empty(), "equal inputs must agree; refused: {:?}", &loud[..loud.len().min(6)]);
+        let widths: std::collections::BTreeSet<(usize, usize)> = silent.iter()
+            .filter_map(|s| { let n: Vec<usize> = s.split(|c: char| !c.is_ascii_digit()).filter_map(|t| t.parse().ok()).collect();
+                              (n.len() == 4 && n[0] < n[2]).then(|| (n[0], n[2])) }).collect();
+        assert!(silent.is_empty(), "{} differing (width, accept) pairs agreed in silence; width pairs that alias: {widths:?}; first: {:?}",
+                silent.len(), &silent[..silent.len().min(4)]);
+    }
+
+    #[test]
+    fn no_digest_difference_can_cancel_a_width_difference() {
+        let step = agree_field(7, AGREE_PV);
+        let mut silent: Vec<String> = Vec::new();
+        let mut x = 0x9E37_79B9u32;
+        for (ka, kb) in (0..=17usize).flat_map(|a| (0..=17usize).map(move |b| (a, b))).filter(|(a, b)| a != b) {
+            for ha in digests() {
+                // the exact differences that cancel a width XOR-folded at bit 27 (4-bit and 5-bit folds), every
+                // other top-five-bit difference, and a spread of unrelated digests
+                let mut others: Vec<u32> = vec![ha ^ ((((ka ^ kb) & 0xF) as u32) << 27), ha ^ ((((ka ^ kb) & 0x1F) as u32) << 27),
+                                                ha ^ ((((ka.min(15) ^ kb.min(15)) & 0xF) as u32) << 27)];
+                others.extend((1..32u32).map(|d| ha ^ (d << 27)));
+                for _ in 0..8 { x ^= x << 13; x ^= x >> 17; x ^= x << 5; others.push(x); }
+                for hb in others {
+                    let (ra, rb) = pair(step, (3, ka, ha), (3, kb, hb));
+                    if ra.is_ok() || rb.is_ok() {
+                        silent.push(format!("width {ka} digest {ha:#010x} vs width {kb} digest {hb:#010x}"));
+                    }
+                }
+            }
+        }
+        assert!(silent.is_empty(), "{} (width, digest) pairs with DIFFERENT widths produced equal words; first: {:?}",
+                silent.len(), &silent[..silent.len().min(4)]);
+    }
+
+    #[test]
+    fn a_value_the_token_cannot_carry_is_refused_not_clamped() {
+        for a in 0..=255usize {
+            for k in 0..=31usize {
+                assert_eq!(tp_agree_fields(a, k), Ok((a as u8, k as u8)), "accept {a}, width {k} must ride the token exactly");
+            }
+        }
+        for (a, k) in [(0usize, 32usize), (0, 33), (0, 255), (0, 256), (256, 0), (257, 16), (usize::MAX, 16), (3, usize::MAX)] {
+            let e = tp_agree_fields(a, k).expect_err(&format!("accept {a}, width {k} cannot ride the token: it must be refused"));
+            assert!(e.contains("REFUSED"), "{e}");
+        }
+        // a rank that refuses takes its peer down with it (the peer sees the aborted link), never one-sided
+        let (ra, rb) = pair(agree_field(9, AGREE_A), (0, 32, 5), (0, 16, 5));
+        assert!(ra.is_err() && rb.is_err(), "{ra:?} / {rb:?}");
+        let (ra, rb) = pair(agree_field(9, AGREE_A), (256, 4, 5), (0, 4, 5));
+        assert!(ra.is_err() && rb.is_err(), "{ra:?} / {rb:?}");
+    }
+
+    #[test]
+    fn the_token_fields_do_not_overlap_and_the_reply_reads_them_back() {
+        for (counter, kind) in [(0u64, AGREE_A), (1, AGREE_PV), (0x3F_FFFF, AGREE_B), (0x40_0000, AGREE_GO), (12345, AGREE_A)] {
+            let step = agree_field(counter, kind);
+            assert!(step <= 0xFF_FFFF, "the step field is 24 bits");
+            for a in [0u8, 1, 15, 16, 17, 255] {
+                for k in [0u8, 1, 15, 16, 17, 31] {
+                    for h in [0u32, u32::MAX, 0xDEAD_BEEF] {
+                        let t = crate::net::agree_token(step, a, k, h);
+                        assert_eq!(t >> 40, step, "step field");
+                        assert_eq!(crate::net::agree_token_reply(t), (a, crate::net::agree_word(k, h)));
+                    }
+                }
+            }
+        }
+        // the boot agree's raw step word keeps its 24 bits too
+        assert_eq!(crate::net::agree_token(0xB0_0700, 0, 0, 1) >> 40, 0xB0_0700);
+    }
+
+    #[test]
+    fn the_step_go_fence_word_tells_step_and_event_count_apart() {
+        // the pairs master's XOR word could not tell apart, and the one a folded XOR word could not
+        let step = agree_field(3, AGREE_GO);
+        let word = |hs: u64, hn: usize| crate::net::agree_token(step, 0, 0, go_fence_word(hs, hn));
+        for ((hs_a, hn_a), (hs_b, hn_b)) in [((5u64, 0usize), (4u64, 8usize)), ((7, 0), (7 ^ (1 << 24), 1)), ((9, 0), (9, 256)),
+                                             ((9, 1), (9, 257)), ((1, 0), (1 + (1 << 32), 0)), ((0, 1), (1, 0))] {
+            assert_ne!(word(hs_a, hn_a), word(hs_b, hn_b), "(step {hs_a}, {hn_a} events) vs (step {hs_b}, {hn_b} events)");
+        }
+        // and a dense block: 64 steps x 64 event counts, all different
+        let mut seen = std::collections::HashSet::new();
+        for hs in 0..64u64 { for hn in 0..64usize { assert!(seen.insert(word(1000 + hs, hn)), "step {hs}, events {hn} repeats a word"); } }
+    }
+
+    #[test]
+    fn a_lane_count_the_pairwise_token_cannot_name_is_refused_at_boot() {
+        for w in [1usize, 4, 16, 31] { assert_eq!(tp_lane_width_fits(2, w), Ok(()), "TP=2 --max-batch {w}"); }
+        for w in [32usize, 33, 64] {
+            let e = tp_lane_width_fits(2, w).expect_err("TP=2 with more than 31 lanes must not boot");
+            assert!(e.contains("--max-batch") && e.contains("31"), "{e}");
+        }
+        // TP=1 has no lockstep and the world > 2 frames carry whole u32 words: no bound from the token
+        for world in [1u32, 4, 8] { assert_eq!(tp_lane_width_fits(world, 64), Ok(())); }
+    }
+
+    /// The pairwise lockstep points hand `tp_agree_eq` the real accept count and the real width: no
+    /// saturation may come back between the scheduler and the token (source pin; the call sites need a
+    /// live link, so they cannot be driven from a unit test).
+    #[test]
+    fn the_lockstep_call_sites_pass_the_real_width() {
+        let src = include_str!("exl3_serve.rs");
+        let body = |from: &str, to: &str| -> &str {
+            let s = &src[src.find(from).unwrap_or_else(|| panic!("{from} not found"))..];
+            &s[..s.find(to).unwrap_or_else(|| panic!("{to} not found after {from}"))]
+        };
+        let sat15 = ["min", "(15)"].concat();
+        let sat255 = ["min", "(255)"].concat();
+        for (name, text) in [("pre_verify", body("    fn pre_verify(&mut self, w: usize", "impl TpSync {")),
+                             ("round_hub", body("    pub(crate) fn round_hub<X", "/// TP-E: the 24-bit agree step field")),
+                             ("tp_agree_eq", body("pub(crate) fn tp_agree_eq(", "fn fnv32(")),
+                             ("tp_round", body("    fn tp_round(&mut self, what: &str", "        let digests = if ident"))] {
+            assert!(!text.contains(&sat15), "{name} saturates a verify width at 15");
+            assert!(!text.contains(&sat255), "{name} saturates an accept count at 255");
+        }
+        assert!(body("    fn pre_verify(&mut self, w: usize", "impl TpSync {").contains("tp_agree_eq(step, w, w + 1, h)"));
+        assert!(body("    fn tp_round(&mut self, what: &str", "        let digests = if ident")
+                    .contains("tp_agree_eq(agree_field(step, AGREE_A), a, t.width_said(m), h)"));
+    }
+}
+
+/// S-B9-CF-AGREE16B: the one-shot, rank-dependent width drill (W3) and the hoisted `--max-batch` refusal (W4).
+#[cfg(test)]
+mod agree16b_tests {
+    use super::*;
+    use crate::net::hub_mock::{run_ranks, Net};
+    use std::time::Duration;
+
+    fn armed(rank: usize, world: usize, n: usize) -> TpSync {
+        let mut t = TpSync::new(rank as i32, world as i32);
+        assert_eq!(t.drill_width, None, "no drill flag is set in the unit suite");
+        t.drill_width = Some(n);
+        t
+    }
+
+    /// W3: the drill lies ONCE (it used to lie on every N-row round), and only about its own width.
+    #[test]
+    fn the_width_drill_fires_once_then_tells_the_truth() {
+        for world in [2usize, 4] {
+            for rank in 0..world {
+                let mut t = armed(rank, world, 16);
+                for m in [0usize, 1, 5, 15, 17] { assert_eq!(t.width_said(m), m, "width {m} is not the drill's"); }
+                assert_eq!(t.drill_hits, 0, "still armed");
+                assert_eq!(t.width_said(16), 15 - rank, "rank {rank}: the first 16-row round is reported as 16 - 1 - rank");
+                assert_eq!(t.drill_hits, 1);
+                for _ in 0..8 { assert_eq!(t.width_said(16), 16, "rank {rank}: spent, the truth from here on"); }
+                assert_eq!(t.drill_hits, 1);
+            }
+        }
+        // not armed: the truth, always
+        let mut t = TpSync::new(0, 2);
+        for m in 0..=31 { assert_eq!(t.width_said(m), m); }
+        // a width the rank term cannot go below zero for is left alone even if forced past `drill_plan`
+        let mut t = armed(1, 2, 1);
+        assert_eq!((t.width_said(1), t.drill_hits), (1, 0));
+    }
+
+    /// W3, TP=2 (the pairwise token): armed on the head only it is the 15-against-16 fault; armed on the
+    /// node only, or on BOTH ranks, the two words still differ, in both directions. Before AGREE16B two
+    /// armed ranks both said N - 1 and agreed.
+    #[test]
+    fn a_width_drill_on_one_rank_or_on_both_fails_the_pairwise_agree() {
+        let words = |said: [usize; 2], h: u32| -> [(u8, u8, (u8, u32)); 2] {
+            [0, 1].map(|r| {
+                let (a, k) = tp_agree_fields(0, said[r]).unwrap();
+                (a, k, crate::net::agree_token_reply(crate::net::agree_token(agree_field(87, AGREE_A), a, k, h)))
+            })
+        };
+        let fails = |said: [usize; 2], h: u32| {
+            let w = words(said, h);
+            let (e0, e1) = (tp_agree_decide(w[0].0, w[0].1, h, Some(w[1].2)), tp_agree_decide(w[1].0, w[1].1, h, Some(w[0].2)));
+            assert!(e0.is_err() && e1.is_err(), "widths said {said:?} (digest {h:08x}) must fail on both ranks: {e0:?} / {e1:?}");
+            (e0.unwrap_err(), e1.unwrap_err())
+        };
+        for n in 2..=31usize {
+            for h in [0u32, 0x99915f3e, 0xFFFF_FFFF] {
+                let said = |on: [bool; 2]| [0, 1].map(|r| if on[r] { armed(r, 2, n).width_said(n) } else { n });
+                assert_eq!(said([false, false]), [n, n]);
+                assert_eq!(said([true, false]), [n - 1, n], "the head alone");
+                assert_eq!(said([false, true]), [n, n - 2], "the node alone");
+                assert_eq!(said([true, true]), [n - 1, n - 2], "both ranks: two different lies");
+                for on in [[true, false], [false, true], [true, true]] { fails(said(on), h); }
+                let w = words(said([false, false]), h);
+                assert_eq!(tp_agree_decide(w[0].0, w[0].1, h, Some(w[1].2)), Ok(()), "no drill: the round agrees");
+            }
+        }
+        // the gate's line, head armed with 16: "this rank (accept 0, width 15, ..) vs peer (accept 0, width 16, ..)"
+        let (head, node) = fails([15, 16], 0x99915f3e);
+        assert!(head.contains("this rank (accept 0, width 15, word 79915f2d) vs peer (accept 0, width 16, word 81915f2d)"), "{head}");
+        assert!(node.contains("this rank (accept 0, width 16, word 81915f2d) vs peer (accept 0, width 15, word 79915f2d)"), "{node}");
+    }
+
+    /// W3, world 4 (the hub frames): the drill armed on EVERY rank still fails the 16-row round on every
+    /// rank (each reports a different width), and a rank armed for another width does not disturb it.
+    #[test]
+    fn a_width_drill_on_every_rank_fails_the_hub_round_on_every_rank() {
+        const W: usize = 4;
+        let net = Net::new(W, true);
+        let out = run_ranks(&net, Some(Duration::from_secs(5)), |r, hub| {
+            let mut t = armed(r, W, 16);
+            let first = t.round_hub(hub, "verify", 2, 5, &[1, 2], 1.0, 1.0, false, 0, |_| Ok(vec![])).map(|_| ()).map_err(|e| format!("{e:#}"));
+            let second = t.round_hub(hub, "plain-step", 0, 16, &[1, 2], 1.0, 1.0, false, 0, |_| Ok(vec![])).map(|_| ()).map_err(|e| format!("{e:#}"));
+            (first, second, t.drill_hits)
+        });
+        for (r, (first, second, hits)) in out.iter().enumerate() {
+            assert!(first.is_ok(), "rank {r}: a 5-row round is not the drill's width: {first:?}");
+            let e = second.as_ref().expect_err(&format!("rank {r}: every rank lied differently about the 16-row round — it must fail"));
+            assert!(e.contains("verify width"), "rank {r}: {e}");
+            assert_eq!(*hits, 1, "rank {r}: fired once");
+        }
+    }
+
+    /// W4, now F2 (owner 2026-10-10): the lane count from the argv alone, through the ONE resolver the
+    /// serve uses. A `--max-batch` above 16 no longer refuses anywhere: the cap resolves it to 16
+    /// first (16 always fits the pairwise agree width), the boot prints the one plain line, and
+    /// further requests wait in the queue.
+    #[test]
+    fn the_max_batch_refusal_reads_the_argv_the_serve_reads() {
+        let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(max_batch_arg(&argv(&["--server", "--tp", "2"])), 8, "the serve's default");
+        assert_eq!(max_batch_arg(&argv(&["--max-batch", "16"])), 16);
+        for ok in [&["--max-batch", "1"][..], &["--max-batch", "16"], &["--max-batch", "31"], &["--server"]] {
+            assert!(tp_lane_width_refusal(&argv(ok), 2).is_ok(), "{ok:?} boots at TP=2");
+        }
+        for bad in ["32", "33", "64", "256", "287"] {
+            let raw: usize = bad.parse().unwrap();
+            for world in [1u32, 2, 4] {
+                assert!(tp_lane_width_refusal(&argv(&["--server", "--max-batch", bad, "--tp", "2"]), world).is_ok(),
+                        "--max-batch {bad} at world {world}: the 16-lane cap resolves it, it does not refuse");
+            }
+            assert_eq!(resolved_max_batch(&argv(&["--max-batch", bad])), (16, raw), "the one resolver caps at 16");
+        }
+        assert_eq!(resolved_max_batch(&argv(&["--server"])), (8, 8), "the default sits under the cap, uncapped");
+    }
+
+    /// W4, now F2, the call sites (pinned in the source: they sit in the boot path of a TP pair). The
+    /// cap call sites remain as the BACKSTOP for a caller that bypasses the 16-lane resolver — the
+    /// head before discovery and the pack sync, the node before the link, both before the RDMA
+    /// attach; and `build_serve` resolves `--max-batch` through the same resolver before its backstop.
+    #[test]
+    fn the_max_batch_refusal_runs_before_any_network_step() {
+        let code = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let body = |src: &str, from: &str, to: &str| -> String {
+            let a = src.find(from).unwrap_or_else(|| panic!("{from} not found"));
+            let b = src[a + from.len()..].find(to).unwrap_or_else(|| panic!("{to} not found after {from}")) + a + from.len();
+            code(&src[a..b])
+        };
+        let before = |text: &str, first: &str, then: &str, what: &str| {
+            let (a, b) = (text.find(first).unwrap_or_else(|| panic!("{what}: `{first}` is missing")),
+                          text.find(then).unwrap_or_else(|| panic!("{what}: `{then}` is missing")));
+            assert!(a < b, "{what}: `{first}` must come before `{then}`");
+        };
+        let main = include_str!("main.rs");
+        let head = body(main, "fn run_exl3_tp_serve_head(", "\nfn ");
+        before(&head, "tp_lane_width_refusal(args, world as u32)", "run_head_retain(", "the head's main");
+        before(&head, "tp_lane_width_refusal(args, world as u32)", "TpConfig::from_opts()", "the head's main");
+        let prelink = body(main, "fn exl3_tp_node_prelink(", "\nfn ");
+        before(&prelink, "tp_lane_width_refusal(&argv, tpc.world as u32)?", "Exl3NodeProgram::Serve(argv)", "the node's prelink");
+        let serve = include_str!("exl3_serve.rs");
+        let h = body(serve, "pub fn run_tp_head_serve(", "\npub fn ");
+        before(&h, "tp_lane_width_refusal(args, ctx.world as u32)?", "tp_attach(ctx)", "run_tp_head_serve");
+        let n = body(serve, "pub fn run_tp_node_serve(", "\nfn ");
+        before(&n, "tp_lane_width_refusal(args, node_world as u32)?", "tp_attach(ctx)", "run_tp_node_serve");
+        let b = body(serve, "fn build_serve(", "\nfn ");
+        before(&b, "let (width, raw_width) = resolved_max_batch(args);", "tp_lane_width_fits(tp_world, width)", "build_serve (the 16-lane cap, then the backstop)");
+        before(&b, "tp_lane_width_fits(tp_world, width)", "FwdModel::load", "build_serve (the backstop, before the load)");
+    }
+}
+
+/// S-B9-REL-INTEG F1 (review of the orchestrator's `2d52ad79`): `--lane-pack-sampled-tp` through the real
+/// argument path (`opts::parse_cli`, then the accessor the boot reads), and the three properties the option
+/// rests on: it rides to every rank (Spmd, in the TpConfig snapshot and the boot-agree digest), `off`
+/// restores the earlier graph set (greedy family only), and a bad value is refused at startup.
+#[cfg(test)]
+mod lane_pack_sampled_tp_tests {
+    use super::*;
+
+    /// The registry store is process-global: one test at a time writes this option's row.
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn argv(tokens: &[&str]) -> Vec<String> { tokens.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn the_option_reaches_the_boot_and_rides_to_the_nodes() {
+        let _g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let id = crate::opt!("lane-pack-sampled-tp");
+        crate::opts::test_set(id, None);
+        // default: ON (sampled requests join packed rounds under TP)
+        assert!(pack_sampled_under_tp(), "the default is on");
+        assert_eq!(id.def().def, "on");
+        // the head ships it: an SPMD option (the node installs the head's value; the boot agree digest covers it)
+        assert_eq!(id.def().scope, crate::opts::Scope::Spmd);
+        crate::opts::parse_cli(&argv(&["--lane-pack-sampled-tp", "off"])).unwrap();
+        assert!(!pack_sampled_under_tp(), "--lane-pack-sampled-tp off");
+        let shipped = crate::opts::snapshot();
+        assert!(shipped.contains(&("lane-pack-sampled-tp".to_string(), "off".to_string())), "in the TpConfig snapshot: {shipped:?}");
+        assert!(crate::opts::spmd_digest().is_some(), "and in the boot-agree digest");
+        crate::opts::test_set(id, None);
+        crate::opts::parse_cli(&argv(&["--lane-pack-sampled-tp=on"])).unwrap();
+        assert!(pack_sampled_under_tp(), "--lane-pack-sampled-tp=on");
+        // a value that is not on|off is refused when the command line is parsed, with the accepted spellings
+        crate::opts::test_set(id, None);
+        let e = crate::opts::parse_cli(&argv(&["--lane-pack-sampled-tp", "maybe"])).unwrap_err();
+        assert!(e.contains("--lane-pack-sampled-tp") && e.contains("'maybe'"), "{e}");
+        assert!(crate::opts::parse_cli(&argv(&["--lane-pack-sampled-tp"])).is_err(), "a bare flag needs a value");
+        assert!(crate::opts::get(id).is_none(), "a refused value is not stored");
+        // `off` keeps the graph set of the builds before the option: the greedy family alone; `on` adds the
+        // family the boot's sampling rule asks for (real-q under --spec-sampling ratio, the default)
+        use crate::lane_pack::{fams, PackFam};
+        assert_eq!(fams(true, false), vec![PackFam::Greedy]);
+        assert_eq!(fams(false, false), vec![PackFam::Greedy]);
+        assert_eq!(fams(true, true), vec![PackFam::Greedy, PackFam::Rq]);
+        assert_eq!(fams(false, true), vec![PackFam::Greedy, PackFam::Match]);
+        // the boot's decision: TP=1 always packs sampled requests; under TP the option decides (and a skipped
+        // sampled lane is counted as `sampled`: `sampled_lone = dump_on || !pack_sampled`)
+        let src = include_str!("exl3_serve.rs");
+        let code = &src[..src.find("mod lane_pack_sampled_tp_tests").unwrap()];
+        assert!(code.contains("let sampled_ok = tp_rank.is_none() || pack_sampled_under_tp();"));
+        assert!(code.contains("sampled_lone: crate::wp24::dump_on() || !self.pack_sampled,"));
+        crate::opts::test_set(id, None);
+    }
+}
+
+/// S-B9-REL-INTEG: the `--lane-pack on` boot warning for penalty defaults (the owner's posture has
+/// `--default-presence-penalty 1.5`, under which no request packs).
+#[cfg(test)]
+mod lane_pack_penalty_warning_tests {
+    use super::*;
+
+    #[test]
+    fn the_warning_follows_the_server_defaults() {
+        // the no-op defaults (rep 1, presence 0, frequency 0): nothing to warn about
+        assert!(lane_pack_penalty_warning(1.0, 0.0, 0.0).is_none());
+        // the owner's posture, and each sibling on its own
+        for (r, p, f) in [(1.0, 1.5, 0.0), (1.0, 0.0, 0.3), (1.1, 0.0, 0.0), (1.1, 1.5, 0.3)] {
+            let w = lane_pack_penalty_warning(r, p, f).unwrap_or_else(|| panic!("({r}, {p}, {f}) must warn"));
+            assert!(w.starts_with("[exl3-serve] lane-pack WARNING") && w.contains("never joins a packed verify")
+                    && w.contains("--default-presence-penalty") && w.contains(&format!("presence {p}")), "{w}");
+        }
+        // it is asked exactly where the defaults are parsed, and only when the arm is on
+        let src = include_str!("exl3_serve.rs");
+        let code = &src[..src.find("mod lane_pack_penalty_warning_tests").unwrap()];
+        let at = code.find("if let Some(w) = lane_pack_penalty_warning(").expect("the call");
+        assert!(code[..at].trim_end().ends_with("if lane_pack.on() {"), "the warning is only for a boot with the arm on");
     }
 }

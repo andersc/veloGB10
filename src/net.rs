@@ -163,26 +163,162 @@ pub fn agree(step: u64, accept_count: u8, hash: u32) -> Option<(u8, u32)> {
     agree_ext(step, accept_count, 0, hash)
 }
 
+/// The widest verify the lockstep token can name (its width field is five bits).
+pub const AGREE_WIDTH_MAX: usize = 31;
+
+/// A verify width as the token carries it, or None when it does not fit. S-B9-CF-AGREE16B (W5): this is
+/// the ONLY narrowing of a width on its way into a lockstep word. The NVFP4 and DFlash call sites used to
+/// write `width as u8` and leave the range check to `agree_ext`, which then saw the wrapped value: 256 + k
+/// would have arrived as k and passed. Unreachable with today's widths (at most 16); structurally
+/// impossible now, because the check sees the whole `usize` before any cast.
+pub fn agree_width(k_verify: usize) -> Option<u8> {
+    if k_verify <= AGREE_WIDTH_MAX { Some(k_verify as u8) } else { None }
+}
+const AGREE_DIGEST_BITS: u32 = 27;
+// What this proves: the NVFP4 / DFlash verify widths (rows 1..=MAX_VERIFY) fit the field. The EXL3 widths
+// are `drafts + 1 <= MTP_MAX_K + 1` and, for a shared plain step, the number of busy lanes: that one is
+// bounded by `--max-batch`, which the EXL3 server checks against AGREE_WIDTH_MAX at boot (TP=2 only: the
+// world > 2 frames carry whole u32 words). A wider verify needs a wider field, not a clamp.
+const _: () = assert!(crate::gpu::MAX_VERIFY + 1 <= AGREE_WIDTH_MAX);
+
+/// What the two lockstep fault drills do on THIS process (S-B9-CF-AGREE16B, W3). Pure: the callers pass
+/// the stored option values, the pack kind and the TP position, and print `lines` at boot.
+///
+/// * `--tp-width-drill N` (EXL3 packs): ONE-SHOT. The first N-row round is reported as width
+///   `N - 1 - rank` in the post-round lockstep word, then the rank tells the truth. It used to lie on
+///   EVERY N-row round and report `N - 1` on every rank: a launcher that passed the flag to both boxes
+///   made both say 15 for 16, which agrees, and a real 15-against-16 disagreement was masked for the
+///   whole boot. The rank-dependent lie cannot cancel between ranks (two armed ranks report different
+///   widths, so the round fails), and one shot bounds what a forgotten flag can hide to one round.
+/// * `--tp-agree-drill S` (NVFP4 packs): this rank corrupts its agree hash at scheduler step S (one
+///   step by nature); `drill_hash_flip` makes that corruption rank-dependent for the same reason.
+///
+/// A flag that cannot act where it was given (the other pack kind, TP=1, N <= rank) arms nothing and
+/// says so: an INERT line, never silence.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrillPlan {
+    /// EXL3: the row count whose first round is misreported (None = not armed)
+    pub width: Option<usize>,
+    /// NVFP4: the scheduler step whose hash is corrupted (None = not armed)
+    pub hash_step: Option<u64>,
+    /// one line per flag that is set: `DRILL ARMED ..` or `.. INERT ..`
+    pub lines: Vec<String>,
+}
+
+/// `tp` = Some((rank, world)) under TP, None at TP=1. See `DrillPlan`.
+pub fn drill_plan(agree_drill: Option<&str>, width_drill: Option<&str>, exl3: bool, tp: Option<(i32, i32)>) -> DrillPlan {
+    let mut p = DrillPlan::default();
+    let pack = if exl3 { "EXL3" } else { "NVFP4" };
+    if let Some(v) = width_drill {
+        let n = v.trim().parse::<usize>().ok().filter(|n| (1..=AGREE_WIDTH_MAX).contains(n));
+        p.lines.push(match (n, tp) {
+            (None, _) => format!("[tp-agree] --tp-width-drill '{v}' is INERT: not an integer from 1 to {AGREE_WIDTH_MAX}"),
+            (Some(n), _) if !exl3 => format!("[tp-agree] --tp-width-drill {n} is INERT on an NVFP4 pack: it drills the EXL3 \
+                                             lockstep word (the NVFP4 drill is --tp-agree-drill <step>)"),
+            (Some(n), None) => format!("[tp-agree] --tp-width-drill {n} is INERT at TP=1: there is no lockstep to drill"),
+            (Some(n), Some((rank, _))) if rank as usize >= n => format!(
+                "[tp-agree] --tp-width-drill {n} is INERT on rank {rank}: this rank would report width N - 1 - rank, so it needs \
+                 N > {rank}"),
+            (Some(n), Some((rank, world))) => {
+                p.width = Some(n);
+                format!("[tp-agree] DRILL ARMED (--tp-width-drill {n}, rank {rank} of TP={world}): the FIRST {n}-row round on this \
+                         rank will be REPORTED as width {} in its lockstep word, once; the guard must abort the link there. \
+                         This boot is a fault drill, not a serving boot. It fires only if a {n}-row round occurs ({n} busy \
+                         lanes sharing a plain step, or a {n}-row verify)", n - 1 - rank as usize)
+            }
+        });
+    }
+    if let Some(v) = agree_drill {
+        let s = v.trim().parse::<u64>().ok();
+        p.lines.push(match (s, tp) {
+            (None, _) => format!("[tp-agree] --tp-agree-drill '{v}' is INERT: not a step number (an integer >= 0)"),
+            (Some(s), _) if exl3 => format!("[tp-agree] --tp-agree-drill {s} is INERT on an EXL3 pack: it drills the NVFP4 agree \
+                                            hash (the EXL3 drill is --tp-width-drill <rows>)"),
+            (Some(s), None) => format!("[tp-agree] --tp-agree-drill {s} is INERT at TP=1: there is no lockstep to drill"),
+            (Some(s), Some((rank, world))) => {
+                p.hash_step = Some(s);
+                format!("[tp-agree] DRILL ARMED (--tp-agree-drill {s}, rank {rank} of TP={world}, {pack} pack): this rank will \
+                         corrupt its agree hash at scheduler step {s}, once; the guard must abort the link there. This boot \
+                         is a fault drill, not a serving boot")
+            }
+        });
+    }
+    p
+}
+
+/// The NVFP4 drill's corruption of a rank's agree hash: different on every rank (bits 16.. carry
+/// `rank + 1`), so two ranks that both carry `--tp-agree-drill S` still publish different hashes.
+pub fn drill_hash_flip(rank: i32) -> u32 { 0xDEAD ^ ((((rank as u32) & 0xFF) + 1) << 16) }
+
+/// The 32-bit low word of the lockstep token (S-B9-CF-AGREE16):
+///
+/// ```text
+///    31        27 26                                   0
+///   +------------+--------------------------------------+
+///   | width  (5) |            digest27  (27)            |
+///   +------------+--------------------------------------+
+///   width    = the step's verify width, 0..=31, in bits of its own
+///   digest27 = (hash ^ (hash >> 27)) & 0x07FF_FFFF: the 32-bit digest folded to 27 bits (its top five
+///              bits land on bits 4..0, so every digest bit still reaches the word)
+/// ```
+///
+/// Before this the word was `hash ^ ((width & 0xF) << 27)`: four bits, so 16 folded to 0 (and the EXL3
+/// call sites saturated at 15 first: a 15-row and a 16-row round made the same width contribution, and
+/// only the digests' own difference could tell them apart), and XOR-ed into bits the digest also sets,
+/// so it was never a field: a digest difference in bits 27..30 could cancel a width difference. Now two
+/// ranks whose widths differ ALWAYS send different words, whatever their digests hold; the price is a
+/// 27-bit digest instead of a 32-bit one for a same-width content divergence (one chance in 134 million
+/// per divergent round instead of one in 4 billion, and the next round tests the diverged state again).
+/// Callers must pass a DIGEST as `hash` (the fold maps its top five bits onto bits 4..0): a structured
+/// word whose top bits carry meaning has to be hashed first (`exl3_serve::go_fence_word`).
+///
+/// The token stays 64 bits and every frame keeps its size. A width above 31 is never clamped into the
+/// field: `agree_ext` and `exl3_serve::tp_agree_fields` refuse it before a word is built, and this
+/// function panics on one (in release builds too) instead of masking it.
+pub fn agree_word(k_verify: u8, hash: u32) -> u32 {
+    assert!(k_verify as usize <= AGREE_WIDTH_MAX, "verify width {k_verify} does not fit the token's 5-bit width field");
+    ((k_verify as u32) << AGREE_DIGEST_BITS) | ((hash ^ (hash >> AGREE_DIGEST_BITS)) & ((1 << AGREE_DIGEST_BITS) - 1))
+}
+
+/// The whole 64-bit pairwise token: `[63..40] step field | [39..32] accept count | [31..0] agree_word`.
+pub fn agree_token(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> u64 {
+    ((step & 0xFF_FFFF) << 40) | ((accept_count as u64) << 32) | agree_word(k_verify, hash) as u64
+}
+
+/// What a rank reads back from the peer's token: (accept count, agree_word).
+pub fn agree_token_reply(token: u64) -> (u8, u32) {
+    (((token >> 32) & 0xFF) as u8, (token & 0xFFFF_FFFF) as u32)
+}
+
 /// B8/G1 EXTENDED determinism token: `(step | k_verify | accept_count | hash_of_ids)`.
 /// `k_verify` is this step's VERIFY WIDTH (the confidence-truncated bucket width under DSpark; the
 /// plain chain width under MTP). Ranks that disagree on k_verify execute different barrier
 /// sequences — the I9 silent-desync class — so it joins the per-step agreement token. The wire
-/// shape stays the 64-bit token (no protocol change): the 24-bit step field keeps [40..64),
-/// accept_count [32..40), and k_verify is folded into the hash word at bits [27..31) (4 bits,
-/// MAX_VERIFY=16 fits exactly), which every caller already compares in full. MTP callers can keep
-/// the 3-arg `agree` (k_verify=0); speculative callers that choose a width MUST use this one.
+/// shape stays the 64-bit token: see `agree_token` / `agree_word` for the layout (width 0..=31 in a field
+/// of its own; a wider one is refused, never clamped).
+/// MTP callers can keep the 3-arg `agree` (k_verify=0); speculative callers that choose a width MUST
+/// use this one, and compare the returned word against `agree_word(k_verify, hash)`.
 pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option<(u8, u32)> {
     let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
     if c == 0 { return None; }
-    let h_ext = (hash ^ ((k_verify as u32 & 0xF) << 27)) as u32;
-    let val = ((step & 0xFF_FFFF) << 40) | ((accept_count as u64) << 32) | h_ext as u64;
+    if k_verify as usize > AGREE_WIDTH_MAX {
+        // Never clamp a width into the field: two different widths would share one word. This rank aborts
+        // its link here and returns None (every caller's "link aborted" arm). No token is published, so at
+        // world 2 the peer leaves its own agree at the 10 s deadline (or at once, if it refused the same
+        // width); at world > 2 the abort is fanned out to the other ranks by the proxy.
+        eprintln!("[tp-agree] REFUSED at step field {step:#x}: verify width {k_verify} does not fit the token's 5-bit width \
+                   field (max {AGREE_WIDTH_MAX}) — aborting instead of sending a width the peer could mistake for another");
+        abort_link();
+        return None;
+    }
+    let val = agree_token(step, accept_count, k_verify, hash);
     let ctx = c as *mut NetCtx;
     let world = unsafe { net_world(ctx) };
     if world <= 2 {
         // R1: pairwise path unchanged.
         let got = unsafe { net_agree(ctx, val, 0xFF_FFFF << 40, (step & 0xFF_FFFF) << 40) };
         if got == 0 { return None; }
-        return Some((((got >> 32) & 0xFF) as u8, (got & 0xFFFF_FFFF) as u32));
+        return Some(agree_token_reply(got));
     }
     // ---- world > 2: head-hub gather + broadcast over the dedicated control slots. ----
     // Control frame layout (nbytes = 32): [0..8) token u64, [8..16) status u64 (0 = ok, 1 = mismatch),
@@ -275,7 +411,7 @@ pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option
                 }
             }
             if round1_failed || !all_equal { return None; }
-            Some((((val >> 32) & 0xFF) as u8, (val & 0xFFFF_FFFF) as u32))
+            Some(agree_token_reply(val))
         } else {
             // Node: one round-1 exchange (send my token), one round-2 exchange (receive consensus).
             let rc1 = net_exchange_one(ctx, 0, AGREE_NBYTES as c_int);
@@ -313,7 +449,7 @@ pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option
                 return None;
             }
             if out == 0 { return None; }
-            Some((((out >> 32) & 0xFF) as u8, (out & 0xFFFF_FFFF) as u32))
+            Some(agree_token_reply(out))
         }
     }
 }
@@ -1291,5 +1427,110 @@ mod tp2race_tests {
         assert_eq!(probe_gen_delta(0, 0), 7);   // next gen 1 -> slot 1; want 0 -> +7
         assert_eq!(probe_gen_delta(0, 1), 0);   // next gen 1 -> slot 1
         assert_eq!(probe_gen_delta(0, 2), 1);
+    }
+}
+
+/// S-B9-CF-AGREE16B: the checked width narrowing (W5) and the drill plan (W3).
+#[cfg(test)]
+mod agree16b_tests {
+    use super::*;
+
+    /// W5: the only narrowing of a width on its way into a lockstep word sees the whole usize.
+    #[test]
+    fn a_width_is_range_checked_before_it_is_narrowed() {
+        for k in 0..=AGREE_WIDTH_MAX { assert_eq!(agree_width(k), Some(k as u8)); }
+        for k in AGREE_WIDTH_MAX + 1..=1024 { assert_eq!(agree_width(k), None, "width {k}"); }
+        // the wrap an `as u8` before the check would have produced: 256 + k arriving as k
+        for k in 0..=AGREE_WIDTH_MAX {
+            for wraps in [256usize, 512, 65536, 1 << 32] {
+                assert_eq!((wraps + k) as u8 as usize, k, "the cast wraps {} to {k}", wraps + k);
+                assert_eq!(agree_width(wraps + k), None, "{} must be refused, not read as {k}", wraps + k);
+            }
+        }
+        assert_eq!(agree_width(usize::MAX), None);
+    }
+
+    /// W5, the call sites (they need a live link, so they are pinned in the source): the NVFP4 step agree
+    /// and the DFlash agree narrow through `agree_width`, and no `agree_ext(` call takes an `as u8`.
+    #[test]
+    fn the_nvfp4_and_dflash_agree_sites_narrow_through_agree_width() {
+        let code = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let body = |src: &str, from: &str, to: &str| -> String {
+            let a = src.find(from).unwrap_or_else(|| panic!("{from} not found"));
+            let b = src[a..].find(to).unwrap_or_else(|| panic!("{to} not found after {from}")) + a;
+            code(&src[a..b])
+        };
+        let batch = include_str!("batch.rs");
+        let step = body(batch, "    fn tp_agree_step(&self, step: u64)", "    /// TP serving head loop");
+        assert!(step.contains("crate::net::agree_width(k_real)"), "tp_agree_step narrows through agree_width");
+        assert!(!step.contains("depth() as u8"), "tp_agree_step casts the depth before the range check");
+        let gpu = include_str!("gpu.rs");
+        let df = body(gpu, "    pub fn tp_generate_dflash(", "\n    }\n");
+        assert!(df.contains("crate::net::agree_width(dblock)"), "tp_generate_dflash narrows through agree_width");
+        assert!(!df.contains("dblock as u8"), "tp_generate_dflash casts the block before the range check");
+        let call = ["agree", "_ext("].concat();
+        for (name, src) in [("batch.rs", batch), ("gpu.rs", gpu), ("exl3_serve.rs", include_str!("exl3_serve.rs")),
+                            ("exl3_forward/xtp.rs", include_str!("exl3_forward/xtp.rs"))] {
+            for (i, l) in code(src).lines().enumerate() {
+                assert!(!(l.contains(&call) && l.contains(" as u8")), "src/{name}:{}: a cast inside an agree call: {}", i + 1, l.trim());
+            }
+        }
+    }
+
+    /// W3: what each drill flag does where. Every set flag yields exactly one line: ARMED or INERT.
+    #[test]
+    fn the_drill_plan_arms_or_says_why_not() {
+        assert_eq!(drill_plan(None, None, true, Some((0, 2))), DrillPlan::default());
+        assert_eq!(drill_plan(None, None, false, None), DrillPlan::default());
+        // EXL3 width drill, armed: the head says N - 1, rank r says N - 1 - r
+        for (rank, said) in [(0, 15), (1, 14), (3, 12)] {
+            let p = drill_plan(None, Some("16"), true, Some((rank, 4)));
+            assert_eq!((p.width, p.hash_step, p.lines.len()), (Some(16), None, 1), "rank {rank}");
+            assert!(p.lines[0].starts_with(&format!("[tp-agree] DRILL ARMED (--tp-width-drill 16, rank {rank} of TP=4)")), "{}", p.lines[0]);
+            assert!(p.lines[0].contains(&format!("REPORTED as width {said} ")) && p.lines[0].contains("once"), "{}", p.lines[0]);
+            assert!(p.lines[0].contains("not a serving boot"));
+        }
+        // inert, each with its reason
+        let inert = |p: DrillPlan, why: &str| {
+            assert_eq!((p.width, p.hash_step, p.lines.len()), (None, None, 1), "{p:?}");
+            assert!(p.lines[0].contains("INERT") && p.lines[0].contains(why), "{} (wanted: {why})", p.lines[0]);
+        };
+        inert(drill_plan(None, Some("16"), true, None), "at TP=1");
+        inert(drill_plan(None, Some("16"), false, Some((0, 2))), "on an NVFP4 pack");
+        inert(drill_plan(None, Some("1"), true, Some((1, 2))), "N > 1");
+        inert(drill_plan(None, Some("3"), true, Some((3, 4))), "N > 3");
+        for bad in ["0", "-1", "32", "sixteen", ""] { inert(drill_plan(None, Some(bad), true, Some((0, 2))), "not an integer from 1 to 31"); }
+        assert_eq!(drill_plan(None, Some("31"), true, Some((0, 2))).width, Some(31));
+        assert_eq!(drill_plan(None, Some("2"), true, Some((1, 2))).width, Some(2));
+        // NVFP4 hash drill
+        let p = drill_plan(Some("5"), None, false, Some((1, 2)));
+        assert_eq!((p.width, p.hash_step, p.lines.len()), (None, Some(5), 1));
+        assert!(p.lines[0].starts_with("[tp-agree] DRILL ARMED (--tp-agree-drill 5, rank 1 of TP=2, NVFP4 pack)"), "{}", p.lines[0]);
+        assert_eq!(drill_plan(Some("0"), None, false, Some((0, 2))).hash_step, Some(0), "step 0 is a step");
+        inert(drill_plan(Some("5"), None, true, Some((0, 2))), "on an EXL3 pack");
+        inert(drill_plan(Some("5"), None, false, None), "at TP=1");
+        inert(drill_plan(Some("-5"), None, false, Some((0, 2))), "not a step number");
+        // both flags on one command line: one line each, each judged by itself
+        let p = drill_plan(Some("7"), Some("16"), true, Some((0, 2)));
+        assert_eq!((p.width, p.hash_step, p.lines.len()), (Some(16), None, 2));
+        assert!(p.lines[0].contains("DRILL ARMED") && p.lines[1].contains("INERT on an EXL3 pack"));
+    }
+
+    /// W3: the NVFP4 drill's corruption differs on every rank, so two armed ranks cannot agree on it.
+    #[test]
+    fn the_hash_drill_corrupts_every_rank_differently() {
+        let flips: Vec<u32> = (0..16).map(drill_hash_flip).collect();
+        for (i, a) in flips.iter().enumerate() {
+            assert_ne!(*a, 0, "rank {i}: a zero flip corrupts nothing");
+            for (j, b) in flips.iter().enumerate() { if i != j { assert_ne!(a, b, "ranks {i} and {j} corrupt alike"); } }
+        }
+        // through the word both ranks compare: same digest, same width, both armed -> different words
+        for h in [0u32, 0x811c_9dc5, 0xFFFF_FFFF, 0x99915f3e] {
+            for k in [0u8, 2, 7] {
+                assert_ne!(agree_word(k, h ^ drill_hash_flip(0)), agree_word(k, h ^ drill_hash_flip(1)), "digest {h:08x} width {k}");
+                assert_ne!(agree_word(k, h ^ drill_hash_flip(0)), agree_word(k, h), "an armed head against an honest node");
+                assert_ne!(agree_word(k, h ^ drill_hash_flip(1)), agree_word(k, h), "an armed node against an honest head");
+            }
+        }
     }
 }

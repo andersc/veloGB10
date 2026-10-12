@@ -273,9 +273,14 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
   context with the default q8 KV cache, 2.8 GB at 131K). With one busy request the engine speculates
   exactly as before. From about four busy requests (earlier on low-acceptance prose) it shares one batched
   step across all of them (`--spec-lanes-max auto`, the default): on one node roughly ×1.45 aggregate at 8
-  requests and ×1.9 at 16, with TP=2 and TP=4 gaining proportionally (numbers in the CHANGELOG). **Two or
-  three concurrent requests still take turns** — the aggregate stays at the single-request rate — and a
-  packed multi-request verify for that range is in development. Each request's greedy output is
+  requests and ×1.9 at 16, with TP=2 and TP=4 gaining proportionally (numbers in the CHANGELOG). **Two or three concurrent requests used to take turns** — the aggregate stayed at the single-request rate.
+  Since v0.7.4 lane packing is on by default (`--lane-pack off` restores the previous behaviour): two
+  requests share one speculative verification, which measured 1.15 to 1.34 times the aggregate for two
+  requests with short prompts on one machine and 1.17 to 1.32 on two machines, but about 12 % at best on
+  agent-style prompts of about 5,500 tokens, and nothing at three (the CHANGELOG has every figure with its
+  request class; TP=4 was exercised by hand and no gate chain ran there; a request with a penalty or an
+  image never packs; about 1.8 GiB of device memory per machine; a posture it cannot serve boots with it
+  inactive and one line saying why). `--max-batch` above 16 boots with 16 and says so. Each request's greedy output is
   byte-identical to running it alone. `--spec-lanes-max N` shares the step only above N busy requests; `0`
   keeps serial speculation.
 - **Memory and lane count.** The weights, the n-gram table and every lane's KV share the same unified
@@ -319,12 +324,20 @@ tables above stay the measured reference; the 4.05 rows are untuned smoke tests,
   - *`--max-seq-len` above 262,144 is clamped* with a warning line (before, the server booted
     at the larger size and speculative rounds could write past a device buffer).
   - *`--mtp off` is honoured* (it was ignored on this server before): plain decoding only.
-<!-- CUT: re-check the CPU-tower timings in the next bullet against the vision fix session's report (F2) if it is merged before the cut -->
 - **Images after a GPU error (v0.7.4).** A GPU vision-tower error is no longer an outage: that
   one request is answered by the CPU tower and the next image uses the GPU tower again. The
-  CPU answer is slow (53.8 s for one image on one machine, 173 to 218 s on the head at TP=2 in
-  our measurements). The log line is `[vision] GPU tower failed (...), falling back to CPU
-  tower`.
+  CPU answer is slow and grows with the image (172.9 s for a 448 x 448 image at the default one
+  thread; `--vision-cpu-threads 8` made it 31.0 s with bit-identical embeddings). The log line is
+  `[vision] GPU tower failed (...), falling back to CPU tower`. An image request that coincides
+  with a CUDA graph capture no longer fails the tower or costs the scheduler its capture.
+- **Streaming and tool calls (v0.7.4).** The role chunk of a streamed reply leaves with the
+  first generated token; `: keep-alive` comment lines every 10 s while a request waits
+  (`--sse-keepalive 0` = off); a non-streaming reply that ends inside its think block returns
+  `reasoning_content` (`--unclosed-think content` restores the old bytes). Tool-call changes are
+  in section 8.
+- **Options (v0.7.4).** An option followed by another flag instead of its value exits 2 (write
+  `--option=value` for a value that starts with `--`); an unknown flag prints one warning; bare
+  `--tp` is two machines. A head and a node must be the same build.
 - **A long prompt joining running streams (v0.7.4, opt-in).** While a long prompt prefills,
   the requests already generating wait: 14.1 s for a 20K-token prompt in our measurement.
   `--prefill-interleave 1` lets them decode between the prefill chunks. The last chunk is the
@@ -398,23 +411,60 @@ Caveat: the model still SEES the tools and is merely told not to call them — a
 `<tool_call>` comes back as visible text instead of being executed. `--exit-on-fatal` pairs
 well with a supervisor for unattended runs (see `docs/OPERATIONS.md`).
 
-<!-- CUT: see the matching marker in CHANGELOG.md (the two-quoted-calls clause below) -->
-**Tool-call values that quote tool-call syntax.** A parameter value may itself contain the
-text `</parameter>` (an agent writing a file that documents the tool-call format). The parser
-ends a value only at the *structural* `</parameter>` — the one followed by the next
-`<parameter=`, by the `</function>` closing the call, by another call's tag (`<function=`, or
-a line starting with `function=`), or by the end of the call block. Embedded close tags that
-fail this lookahead stay part of the value. Three ambiguities are inherent to the format:
-(1) a value that quotes a call with two or more parameters is cut at the first quoted
-`</parameter>`, because what follows it is a `<parameter=`, exactly as at a real parameter
-boundary (the same holds when a `<function=` tag or a line starting with `function=`
-follows; a value that quotes two calls with no `</function>` between them is then read as
-two calls); (2) a value that ends with the *complete* closing sequence (`</parameter>` +
-`</function>`) right at the end of the call block is indistinguishable from the structural
-close and is cut there; (3) an embedded `</tool_call>` still ends the whole tool-call block. Advice for agent authors: when a tool must write text that quotes
-tool-call syntax, prefer an edit/patch tool with a diff, or break the closing sequence (write
-`< /parameter>` or insert a blank line inside the tag) — the parser cannot recover a complete
-closing sequence at the very end of a value.
+**Tool-call values that quote tool-call syntax (v0.7.4).** When the model writes a file or a
+message ABOUT tool calls (a document, a test fixture, a prompt, this very format), the quoted
+calls contain the same tags as a real call, and the parser has to decide which tags are
+structure and which are text. What v0.7.4 does:
+
+- *Fixed by default* (each only changes responses that were wrong before; the old reading is
+  one flag away): a `</tool_call>` inside an argument value is text, not the end of the block
+  (`--tool-block-end after-function`; `first` restores v0.7.3); one wrapping newline is removed
+  from a value, not all of them, as vLLM does (`--tool-value-trim one`; `all` restores v0.7.3);
+  a `<think>` tag inside an argument no longer leaks the call as text, and a thinking-off
+  `</think>` inside an argument no longer loses the call; a Qwen call whose value mentions the
+  Hy3 tag stays a Qwen call; a JSON body that quotes an XML call is read whole.
+- *Not fixed by default: a value that quotes a call with two or more parameters.* The quoted
+  `</parameter>` followed by a `<parameter=` looks exactly like a real boundary, so at default
+  flags such a document is read as a cut value plus extra calls, and a value that quotes two
+  calls comes back as two calls (the second one made of the quoted text, which an agent would
+  execute). Measured with the v0.7.4 binary (one machine, 3.05 pack, streamed, default flags,
+  30 offered tools): a response that quoted 40 two-parameter calls came back as 40 calls; the
+  right answer was one `write_file`. On recorded outputs that copy such documents
+  (non-streamed, mostly thinking off, client-set temperatures; 7 documents x 3 phrasings,
+  resampled) the v0.7.3 reading returned a phantom call in 348 of 1,000 and a cut file in 506
+  of 1,000.
+- *Opt-in readings that handle it:* `--tool-quote-pairing on` pairs each quoted open tag with
+  its close and reads the document whole; `--tool-quote-pairing cost` picks the cheapest
+  consistent reading and reads more. Neither is the default because each has a class it reads
+  worse than the default: `on` mishandles a value that mentions an open tag once, unclosed,
+  followed by a real close; `cost` mishandles a real second call that follows a first argument
+  holding a lone open tag. We do not yet know how often either class happens on real traffic.
+- *Help us measure it.* Start the server with `--tool-shadow-cost on` (diagnostic only: it
+  also reads every tool-call response under the `cost` rule and counts how often the result
+  would differ; it changes nothing that is returned and costs about 0.05 ms per response, 6 ms
+  in the worst shape measured). The counters are on `/metrics` as `velogb10_toolcall_*`. The
+  counts, or a sample of the responses where the readings differed (with anything private
+  removed), are what we need to choose the default for the next release.
+- *A block the model never closed* (no `</tool_call>`): dropped, as in v0.7.3
+  (`--tool-unclosed drop`, the default). `--tool-unclosed complete` returns the call when its
+  `</function>` is present and the model ended by itself (finish `stop`), as vLLM does; a call
+  cut inside an argument, or by the token limit, is dropped under both settings, because it would
+  run with missing arguments. `complete` is not the default: in the recorded outputs there was no
+  clean case for it and one junk call. The counter `velogb10_toolcall_unclosed_total` says how
+  often each outcome happens.
+- *Inherent to the format under every setting:* a value that ends with a quoted closing
+  sequence followed by a quoted call is byte for byte two real calls, and the second one is
+  returned; a quoted call whose last argument is empty lets a quoted call after it through as a
+  call; a value that ends with the *complete* closing sequence (`</parameter>` + `</function>`)
+  right at the very end of the block is indistinguishable from the structural close and is cut
+  there. So no setting makes it safe to copy untrusted text into a tool argument.
+- *Advice for agent authors:* when a tool must write a document that contains tool-call
+  markup, escape or split the quoted tags (write `< /parameter>`), prefer an edit/patch tool
+  with a diff, or write the file through a path that does not go through a tool-call value; and
+  ask for confirmation before a destructive tool runs.
+
+The Hy3 and DeepSeek V4 tool-call formats keep the old value and block rules. These changes were
+run on one machine and the EXL3 server, not on two or four machines and not on the NVFP4 server.
 
 ## 9. The stack we measured on, and what decode speed to expect
 

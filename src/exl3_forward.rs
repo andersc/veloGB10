@@ -1395,8 +1395,29 @@ fn mem_available_bytes() -> u64 {
         .unwrap_or(0) * 1024
 }
 
-/// Headroom `auto` keeps free after a RAM-resident table (the AGENTS §5 rule).
-const PLE_AUTO_HEADROOM: u64 = 16 << 30;
+/// Headroom `auto` keeps free after a RAM-resident table (the AGENTS §5 rule): a 16 GiB base.
+/// The pre-port fixed headroom base (GiB) — one definition, used by the arithmetic below.
+const PLE_BASE_HEADROOM_GIB: f64 = 16.0;
+
+/// PR #17 (ported, opt-in): `--ple-ram auto` headroom in GiB = 16 + `--ple-headroom-per-lane-gb`
+/// per ADDITIONAL decode lane (width-1). Default per-lane 0 reproduces the pre-port fixed
+/// 16 GiB exactly (bit-identical residency decision). The PR's hardcoded 2 GiB/lane default is
+/// deliberately NOT taken — changing the default residency decision is the owner's call
+/// (context: the public memory-spike report, S-B9-REL-MEMSPIKE).
+pub(crate) fn ple_auto_headroom_gib(per_lane_gib: f64, width: usize) -> u64 {
+    let lanes = width.saturating_sub(1) as f64;
+    // inf * 0 = NaN would zero the headroom at width 1 (review nit): no lanes -> no per-lane term.
+    let per_lane_total = if lanes == 0.0 { 0.0 } else { per_lane_gib.max(0.0) * lanes };
+    let total = PLE_BASE_HEADROOM_GIB + per_lane_total;
+    (total.max(0.0) as u64).saturating_mul(1 << 30)
+}
+
+/// The resolved `--ple-ram auto` headroom for THIS boot's lane width (flag -> default 0).
+pub(crate) fn ple_auto_headroom(width: usize) -> u64 {
+    let per_lane: f64 = crate::opts::var(crate::opt!("ple-headroom-per-lane-gb"))
+        .ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
+    ple_auto_headroom_gib(per_lane, width)
+}
 
 /// Read every shard's data section into host memory (8 threads).
 fn ple_read_table(shards: &[std::fs::File], data_off: &[u64], per: usize) -> Result<Vec<Vec<u8>>> {
@@ -1848,7 +1869,7 @@ mod ple_ngram_tests {
 /// PLE n-gram table location at weight-load time. `ram`: read into host memory now. `ssd`: per-token pread
 /// through the page cache (identical bytes; ~1-2% decode, a few % prefill). `auto` (default): start on ssd and let
 /// `FwdModel::ple_promote_auto` decide once the whole boot has allocated (CF-P1d).
-fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes: usize) -> Result<Option<Vec<Vec<u8>>>> {
+fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes: usize, width: usize) -> Result<Option<Vec<Vec<u8>>>> {
     let mode = ple_mode();
     let per = rows as usize * row_bytes;
     let need = per as u64 * shards.len() as u64;
@@ -1859,7 +1880,10 @@ fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes
             Ok(None)
         }
         "auto" => {
-            println!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + 16 GiB stay free (--ple-ram auto)", gib(need));
+            // PR #17: print the headroom the post-boot promote gate will apply, either way
+            // (with the default per-lane 0 this reads the same 16.0 GiB as before the port).
+            println!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + {:.1} GiB headroom stay free (--ple-ram auto, {} lane(s); --ple-headroom-per-lane-gb)",
+                     gib(need), ple_auto_headroom(width) as f64 / (1u64 << 30) as f64, width);
             Ok(None)
         }
         _ => {
@@ -2459,7 +2483,7 @@ pub struct Scratch {
     wp27_cls: u8,
     // TP-C: this Scratch's graph-key id (sk): graphs are keyed by (width, ..., scratch)
     gid: u32,
-    // WP24 (real-q speculative sampling, opt-in): rq_list [(MTP_MAX_K+1) * RQ_ROW] u32 = per
+    // WP24 (real-q speculative sampling): rq_list [lane_pack::rq_list_rows(w) * RQ_ROW] u32 = per
     // draft pass i its top-32 candidate ids | logits (f32) | q' (f32, the exact law the pass
     // sampled from; 0 = outside it), written by xq_rq_draft; rq_part / rq_cnt = its cross-block
     // keys + self re-arming last-block counter (one real zero at allocation); rq_dsamp [8] =
@@ -2480,14 +2504,143 @@ pub struct Scratch {
     rq_draft_i: Option<usize>,
 }
 
-/// S-A3-i: scratch-side max_pos bound (trained window; scratch over-allocates harmlessly).
-fn max_pos_of(cfg: &crate::qwen::Config) -> usize {
-    cfg.max_position_embeddings.clamp(1, 262144)
+/// The widest `max_pos` (cache positions per slot) the launch-argument bit-packings can carry: the
+/// QSA geometry word (`crate::gpu::pack_qsa_geom`, unpacked `geom & 0xFFFFF` in gpu_batch.cu) and
+/// `rdim_mp` (`rdim | max_pos << 8 | kv_fmt << 28`, exl3_bench.cu) both give it 20 bits. One past
+/// that lands in the neighbouring field, so `FwdModel::load_tp` refuses it (public PR #21).
+pub const MAX_POS_PACKED: usize = 1 << 20;
+
+/// `FwdModel::load_tp`'s window guard (pure: unit-tested without a device).
+pub(crate) fn check_max_pos_packable(max_pos: usize) -> Result<()> {
+    anyhow::ensure!(max_pos < MAX_POS_PACKED,
+        "max_pos {max_pos} does not fit the launch-argument bit-packings (max_pos < {MAX_POS_PACKED} = 2^20: \
+         the QSA geometry word and the attention rdim/max_pos word carry it in 20 bits, so a wider window \
+         would overflow into a neighbouring field). Lower --max-seq-len.");
+    Ok(())
+}
+
+/// Per-row pitch of every QSA score plane: one f32 per `ratio`-token block of the SERVED window.
+/// The scorers write `scores[row * pitch + j]` for `j < (pos + 1) / ratio` (gpu_batch.cu
+/// `qsa_score_pooled_mr` / `qsa_score_pooled_b` / `qsa_score_b`), so the scratch that receives them
+/// must be sized with this same function of the same `max_pos` (public PR #21: it was sized from the
+/// trained window capped at 262144, and a wider served window made rows >= 1 write past its end).
+pub(crate) fn qsa_nblk_stride(max_pos: usize, ratio: usize) -> usize {
+    (max_pos / ratio.max(1)).max(1)
+}
+
+/// Tail slack of the score plane, in f32. The top-k kernels load whole quads: `xq_tk3_ld4`
+/// (exl3_bench.cu) reads blocks 4q..4q+3 whenever 4q < nb, so with a pitch that is not a multiple
+/// of 4 the last row's last quad reaches up to 3 f32 past the row. Inside the plane that is the
+/// next row (masked, never used); past the last row it must still be the scratch's own memory.
+/// (The old trained-window size hid this for every window below 262144; review of PR #21's port.)
+pub(crate) const QSA_SCORES_PAD: usize = 8;
+
+/// f32 count of `Scratch::qsa_scores` for `w` rows of a model serving `max_pos` positions per slot
+/// (0 when the pack has no indexer): `w` rows of `qsa_nblk_stride` plus `QSA_SCORES_PAD`.
+pub(crate) fn qsa_scores_len(has_indexer: bool, ratio: usize, w: usize, max_pos: usize) -> usize {
+    if has_indexer { w * qsa_nblk_stride(max_pos, ratio) + QSA_SCORES_PAD } else { 0 }
+}
+
+#[cfg(test)]
+mod served_window_tests {
+    use super::*;
+
+    /// Highest `scores[]` index the scorers write for `m` rows when the last row sits at `pos`:
+    /// `scores[(r0 + r) * nblk_stride + j]` for `j < (pos + 1) / ratio` (gpu_batch.cu).
+    fn last_score_index(m: usize, pos: usize, max_pos: usize, ratio: usize) -> Option<usize> {
+        let nb = (pos + 1) / ratio;
+        (nb > 0).then(|| (m - 1) * qsa_nblk_stride(max_pos, ratio) + nb - 1)
+    }
+
+    /// The scratch holds everything the kernels touch, for every served window: the scorer's last
+    /// write of the last row at the last position, and the top-k kernels' whole-quad read of that
+    /// row's last blocks (`xq_tk3_ld4`: blocks 4q..4q+3 whenever 4q < nb) -- also when the pitch is
+    /// not a multiple of 4, which the old fixed 65536-block rows used to hide.
+    #[test]
+    fn the_score_plane_holds_every_write_and_every_quad_read() {
+        for max_pos in [2usize, 4097, 32_769, 65_537, 100_011, 262_145, 262_148, 300_001, 524_289, MAX_POS_PACKED - 1] {
+            for ratio in [1usize, 4, 64] {
+                for w in [1usize, 2, 8, 9, 13, 16] {
+                    let len = qsa_scores_len(true, ratio, w, max_pos);
+                    let pitch = (max_pos / ratio).max(1);
+                    for m in 1..=w {
+                        let Some(top) = last_score_index(m, max_pos - 1, max_pos, ratio) else { continue };
+                        assert!(top < len, "write: max_pos {max_pos} ratio {ratio} w {w} m {m}: index {top} >= {len}");
+                        // the quad holding the row's last block, read whole
+                        let nb = max_pos / ratio;
+                        let quad_end = (m - 1) * pitch + 4 * ((nb - 1) / 4) + 3;
+                        assert!(quad_end < len, "quad read: max_pos {max_pos} ratio {ratio} w {w} m {m}: index {quad_end} >= {len}");
+                    }
+                }
+            }
+        }
+        // without the pad the last row's quad read leaves the plane whenever the pitch is not a multiple of 4
+        let (max_pos, ratio, w) = (100_011usize, 4usize, 9usize);
+        let pitch = max_pos / ratio;
+        assert_eq!(pitch % 4, 2);
+        assert!((w - 1) * pitch + 4 * ((pitch - 1) / 4) + 3 >= w * pitch, "the unpadded plane is 2 f32 short here");
+        assert_eq!(qsa_scores_len(false, 4, 8, 262_145), 0, "no indexer: no score plane");
+    }
+
+    /// The bug public PR #21 reported, on the shipped shape (Flash-Next: ratio 4, verify width 8): the
+    /// old size came from the trained window capped at 262144. It agrees with the scorer up to
+    /// max_pos 262147 (floor division) and is overrun by every wider served window.
+    #[test]
+    fn the_trained_window_sizing_was_overrun_by_a_wider_served_window() {
+        let (ratio, w) = (4usize, 8usize);
+        let old_len = w * (262_144usize.clamp(1, 262_144) / ratio).max(1);
+        for max_pos in [4097usize, 32_769, 262_145, 262_147] {
+            assert!(last_score_index(w, max_pos - 1, max_pos, ratio).unwrap() < old_len, "max_pos {max_pos} fitted");
+            assert!(w * qsa_nblk_stride(max_pos, ratio) <= old_len);
+        }
+        // one block past: the last verify row overruns near the end of the window
+        assert!(last_score_index(w, 262_147, 262_148, ratio).unwrap() >= old_len);
+        // --max-seq-len 524288: row 4's very first block is already past the end, at any position
+        assert_eq!(last_score_index(5, 3, 524_289, ratio).unwrap(), old_len);
+        // the new size holds both
+        assert!(last_score_index(w, 262_147, 262_148, ratio).unwrap() < qsa_scores_len(true, ratio, w, 262_148));
+        assert!(last_score_index(w, 524_288, 524_289, ratio).unwrap() < qsa_scores_len(true, ratio, w, 524_289));
+    }
+
+    /// The loader refuses a window the 20-bit packings cannot carry, and names the flag to lower.
+    #[test]
+    fn the_loader_guard_stops_at_the_packing_width() {
+        assert!(check_max_pos_packable(1).is_ok());
+        assert!(check_max_pos_packable(262_145).is_ok());
+        assert!(check_max_pos_packable(MAX_POS_PACKED - 1).is_ok());
+        for bad in [MAX_POS_PACKED, MAX_POS_PACKED + 1, usize::MAX] {
+            let e = check_max_pos_packable(bad).unwrap_err().to_string();
+            assert!(e.contains("2^20") && e.contains("--max-seq-len"), "{e}");
+        }
+        // the guard and the geometry word agree on the last window that fits
+        let top = MAX_POS_PACKED - 1;
+        assert_eq!(crate::gpu::pack_qsa_geom(top, 640, qsa_nblk_stride(top, 4)) & 0xFFFFF, top as u64);
+    }
+
+    /// Wiring pin (the unit suite cannot build a `Scratch`): the score plane is allocated from the
+    /// served-window argument, the decode scorer pitches by the same function and checks the plane,
+    /// and the loader runs the guard. The served path itself is covered by the GPU gate.
+    #[test]
+    fn the_scratch_is_sized_from_the_served_window() {
+        let src = include_str!("exl3_forward.rs");
+        let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let once = |needle: &str| assert_eq!(code.matches(needle).count(), 1, "expected exactly once: {needle}");
+        // (needles are split so this test's own text never matches)
+        let once = |a: &str, b: &str| once(&[a, b].concat());
+        once("qsa_scores: dev.alloc_zeros::<f32>(", "qsa_scores_len(cfg.has_indexer(), cfg.indexer_compress_ratio, w, max_pos))?,");
+        once("pub fn new(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, ", "w: usize, rdim: usize, max_pos: usize) -> Result<Self> {");
+        once("anyhow::ensure!(sc.qsa_scores.len() ", ">= m * nblk_stride,");
+        once("check_max_pos_packable(", "max_pos)?;");
+        let trained = ["max_position_embeddings", ".clamp(1, 262144)"].concat();
+        assert!(!code.contains(&trained), "no buffer may be sized from the trained window");
+    }
 }
 
 impl Scratch {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize, rdim: usize) -> Result<Self> {
+    /// `max_pos` is the SERVED window of the model this scratch works for (`FwdModel::max_pos()`):
+    /// the QSA score plane is pitched by it, never by the config's trained window.
+    pub fn new(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize, rdim: usize, max_pos: usize) -> Result<Self> {
         let h = cfg.hidden_size;
         let hc = cfg.hc_count.max(1);
         let rw = h * hc;
@@ -2547,7 +2700,7 @@ impl Scratch {
             // S-A3-i QSA pipes (0-sized when the pack has no indexer)
             qsa_qk: dev.alloc_zeros::<u16>(w * if cfg.has_indexer() { (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim } else { 0 })?,
             qsa_qkb: dev.alloc_zeros::<u16>(w * if cfg.has_indexer() { (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim } else { 0 })?,
-            qsa_scores: dev.alloc_zeros::<f32>(w * if cfg.has_indexer() { (max_pos_of(cfg) / cfg.indexer_compress_ratio).max(1) } else { 0 })?,
+            qsa_scores: dev.alloc_zeros::<f32>(qsa_scores_len(cfg.has_indexer(), cfg.indexer_compress_ratio, w, max_pos))?,
             qsa_sel: dev.alloc_zeros::<i32>(w * if cfg.has_indexer() { cfg.indexer_budget + cfg.indexer_compress_ratio } else { 0 })?,
             qsa_psel: dev.alloc_zeros::<i32>(w)?,
             slot_ids: dev.alloc_zeros::<i32>(w)?,
@@ -2682,7 +2835,10 @@ impl Scratch {
             gid: SCRATCH_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             // WP24: real -1 ids / a real zero counter (AGENTS §2.2 — alloc_zeros does not zero);
             // rq_part is fully written by stage 1 before the last block reads it.
-            rq_list: dev.htod_sync_copy(&vec![u32::MAX; (MTP_MAX_K + 1) * crate::wp24::RQ_ROW])?,
+            // PACK4S: one list row per verify ROW a real-q sampler can read — a packed verify
+            // reads list row row0_j + i (up to row 14 of 16), so the list follows the scratch
+            // width (lane_pack::rq_list_rows: MTP_MAX_K + 1 rows, as before, up to 8 rows).
+            rq_list: dev.htod_sync_copy(&vec![u32::MAX; crate::lane_pack::rq_list_rows(w) * crate::wp24::RQ_ROW])?,
             rq_part: dev.alloc_zeros::<u64>(crate::wp24::RQ_NB_MAX * crate::wp24::RQ_K)?,
             rq_cnt: dev.htod_sync_copy(&[0u32])?,
             rq_dsamp: dev.htod_sync_copy(&[0u32; 8])?,
@@ -3733,6 +3889,33 @@ unsafe fn launch_pss_raw(stream: cudarc::driver::sys::CUstream, f: cudarc::drive
 fn recon_min_rows() -> usize {
     crate::opts::var(crate::opt!("exl3-recon-min"))
         .ok().and_then(|v| v.parse().ok()).unwrap_or(17)
+}
+
+/// S-B9-REL-INTEG D1: the bit widths the WIDE trellis GEMM family decodes. Its kernel switches
+/// (`exl3_hmma_gemm_wide`, `_wide_grouped`, `_wide_tiles`) carry cases 3, 4 and 5 and `default: break;` in BOTH
+/// modules (the K=6 module adds `case 6` to the other switches, not to these), so a 6-bit module launched
+/// there writes NOTHING and the request is answered 200 with garbage. The reconstruct + cuBLASLt arm is
+/// bits-generic, which is why the default `--exl3-recon-min 17` is safe for the 4.05 pack's 6-bit modules.
+pub(crate) fn wide_trellis_supports_bits(bits: usize) -> bool { (3..=5).contains(&bits) }
+
+/// The pipelined prefill MoE expert kernels (`xq_moe_pf*`, `--pf-moe-kernel`) decode 3- and 4-bit trellises only.
+pub(crate) fn moe_pf_kernel_supports_bits(bits: usize) -> bool { matches!(bits, 3 | 4) }
+
+/// The refusal text of the dense wide arm (the one `--exl3-recon-min` selects).
+pub(crate) fn wide_arm_bits_refusal(bits: usize, m: usize, k: i32, n: i32, recon_min: usize, have_recon_buffers: bool) -> String {
+    let cause = if !have_recon_buffers {
+        "this call site has no reconstruct buffers — they exist only where a reconstruct-capable arm is \
+wired; serve these modules from a call site that carries them, or ship the pack in 3-, 4- or 5-bit"
+    } else {
+        "the call site HAS reconstruct buffers but the dispatch did not take them — a routing invariant \
+broke; report this"
+    };
+    format!("EXL3 prefill chain of {m} rows on a {bits}-bit module (K = {k}, N = {n}): the wide trellis GEMM \
+(exl3_hmma_gemm_wide) decodes 3-, 4- and 5-bit trellises only and would leave this module's output \
+unwritten (HTTP 200 with garbage). Since F3 the dispatch sends every such module through the reconstruct + \
+cuBLASLt arm whenever the call site carries reconstruct buffers, whatever --exl3-recon-min ({recon_min}) says — \
+the option cannot cause this any more, and neither can an oversized plain step (the serve caps --max-batch at \
+16 lanes). What can still reach this refusal: {cause}")
 }
 
 // ---------------------------------------------------------------------------
@@ -6637,6 +6820,9 @@ fn chain_wide_raw(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlice
     chain_wide_gemm(l, q, xh, yraw, m, rb)
 }
 
+/// F3: the once-per-boot note for a module the wide arm cannot serve (forced to the reconstruct arm).
+static WIDE_FALLBACK_NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// The m > 16 GEMM of exl3_chain_impl (xh -> y_raw), factored out for chain_wide_raw.
 fn chain_wide_gemm(l: &Launcher, q: &Quad, xh: &mut CudaSlice<u16>, yraw: &mut CudaSlice<u16>, m: usize,
                    rb: Option<&ReconBufs>) -> Result<()> {
@@ -6644,8 +6830,22 @@ fn chain_wide_gemm(l: &Launcher, q: &Quad, xh: &mut CudaSlice<u16>, yraw: &mut C
         // S-A3-f-g dispatch: reconstruct+cuBLASLt when the caller supplied buffers
         // AND --exl3-recon-min > 0 AND m >= the threshold; else the wide-M
         // trellis kernel (S-A3-f-b) — row-wise bitwise equal to the m16 body.
+        // F3 (owner 2026-10-10): a module the wide kernel cannot decode (any width outside 3..=5,
+        // e.g. the 4.05 pack's 6-bit modules) runs the reconstruct arm WHATEVER --exl3-recon-min
+        // says — the option can no longer route such a module into a kernel that would leave its
+        // output unwritten. Once per boot, one line names the option, the module width and what is
+        // used instead; /metrics counts the served GEMMs (`velogb10_exl3_recon_forced_total`).
         let rmin = recon_min_rows();
         let recon = match rb {
+            Some(r) if !wide_trellis_supports_bits(q.bits as usize) => {
+                if WIDE_FALLBACK_NOTE.set(()).is_ok() {
+                    crate::rprintln!("[exl3] --exl3-recon-min {rmin}: this pack has {}-bit modules the wide trellis kernel \
+cannot decode (3-, 4- and 5-bit only); those modules serve through the reconstruct + cuBLASLt arm, whatever the option says",
+                                     q.bits);
+                }
+                crate::metrics::exl3_recon_forced(q.bits);
+                Some(r)
+            }
             Some(r) if rmin > 0 && m >= rmin => Some(r),
             _ => None,
         };
@@ -6657,6 +6857,10 @@ fn chain_wide_gemm(l: &Launcher, q: &Quad, xh: &mut CudaSlice<u16>, yraw: &mut C
             exl3_lt_matmul(l, r.ws, *xh.device_ptr() as u64, *yraw.device_ptr() as u64,
                            q.k as usize, q.n as usize, m, false, r.ltws, r.ltws_len)?;
         } else {
+            // S-B9-REL-INTEG D1: no 6-bit (or 1-, 2-, 7-, 8-bit) arm exists here: refuse, never launch a kernel
+            // whose `default: break;` writes nothing.
+            anyhow::ensure!(wide_trellis_supports_bits(q.bits as usize),
+                            "{}", wide_arm_bits_refusal(q.bits as usize, m, q.k, q.n, rmin, rb.is_some()));
             // S-A3-f-b chunked prefill (M > 16): wide-M kernel — row-wise bitwise
             // equal to the m16 body (same decode, same fixed K-ascending mma
             // sequence per element); gated by --probe-exl3-wide before serving use.
@@ -6687,6 +6891,8 @@ impl FwdModel {
     /// attached (payload set, proxy thread spawned) before the model is returned. Everything else
     /// (hc mixers, router, shared expert, attention/GDN, lm_head, PLE, the MTP head) is REPLICATED.
     pub fn load_tp(pack_dir: &str, width: usize, max_pos: usize, tp: Option<xtp::TpAttach>) -> Result<Arc<FwdModel>> {
+        // Public PR #21: every later packing of max_pos (the QSA geometry word, rdim_mp) relies on this.
+        check_max_pos_packable(max_pos)?;
         // TUNE §4.6: the table is frozen before any knob is read (Load-scope knobs are read below);
         // entry points that booted no table run the built-in defaults (today's behaviour).
         tune::ensure_frozen("FwdModel::load");
@@ -7087,11 +7293,13 @@ impl FwdModel {
                     if idx.is_some() {
                         let plane = width * max_pos * cfg.indexer_head_dim;
                         qsa_keys_plane = Some(dev.htod_sync_copy(&vec![0u16; plane])?);
+                        crate::metrics::kv_pool_add_bytes(1, 2 * plane as u64); // issue #24 (bf16 plane)
                         if pool_on {
                             // WP02: ceil (the partial last block of a window that is not a multiple of
                             // the ratio has a home; the per-slot stride stays max_pos/ratio).
                             let pl = width * max_pos.div_ceil(cfg.indexer_compress_ratio).max(1) * cfg.indexer_head_dim;
                             qsa_pool_plane = Some(dev.htod_sync_copy(&vec![0u16; pl])?);
+                            crate::metrics::kv_pool_add_bytes(1, 2 * pl as u64);
                         }
                     }
                     match tsplit.as_ref() {
@@ -7228,10 +7436,12 @@ impl FwdModel {
                 } else { None },
             };
             let head_qsa_keys = if attn.idx.is_some() {
+                crate::metrics::kv_pool_add_bytes(2, 2 * (width * max_pos * cfg.indexer_head_dim) as u64); // issue #24
                 Some(dev.htod_sync_copy(&vec![0u16; width * max_pos * cfg.indexer_head_dim])?)
             } else { None };
             let head_qsa_pool = if attn.idx.is_some() && pool_on {
                 let pl = width * max_pos.div_ceil(cfg.indexer_compress_ratio).max(1) * cfg.indexer_head_dim; // WP02: ceil
+                crate::metrics::kv_pool_add_bytes(2, 2 * pl as u64);
                 Some(dev.htod_sync_copy(&vec![0u16; pl])?)
             } else { None };
             // TP-A (T1): the MTP head is REPLICATED on every rank — no EP shard, no reduce sites.
@@ -7256,6 +7466,7 @@ impl FwdModel {
             let nkv = cfg.num_kv_heads;
             let hd = cfg.head_dim;
             let kv = dev.alloc_zeros::<u8>(width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd))?;
+            crate::metrics::kv_pool_add_bytes(2, (width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd)) as u64); // issue #24
             println!(
                 "  MTP draft head (mtp.*) loaded as EXL3 (M1 decision): fc 4bpw, attn 5bpw, experts 3bpw ({:.0}s)",
                 t0h.elapsed().as_secs_f32()
@@ -7303,6 +7514,7 @@ impl FwdModel {
         let mut k_cache = Vec::new();
         for _ in 0..n_attn {
             k_cache.push(dev.alloc_zeros::<u8>(width * 2 * tc.num_kv_heads * max_pos * kv_rowbytes(kv_fmt, tc.head_dim))?);
+            crate::metrics::kv_pool_add_bytes(0, (width * 2 * tc.num_kv_heads * max_pos * kv_rowbytes(kv_fmt, tc.head_dim)) as u64); // issue #24
         }
 
         println!(
@@ -7472,7 +7684,7 @@ impl FwdModel {
                     }
                     let ram = std::sync::OnceLock::new();
                     let row_bytes = row_words * 2;
-                    if let Some(t) = ple_ram_load(&shards, &shard_data_off, rows_per_shard, row_bytes)? { let _ = ram.set(t); }
+                    if let Some(t) = ple_ram_load(&shards, &shard_data_off, rows_per_shard, row_bytes, width)? { let _ = ram.set(t); }
                     let pd = PleDev {
                         key_w,
                         value_w,
@@ -9626,6 +9838,12 @@ impl FwdModel {
         let (g, b) = self.qsa_grid_bucket(max_pos_in_step);
         (g, if self.qsa_bucket_free() { 0 } else { b })
     }
+    /// S-B9-REL-QSAREGIME: the deepest speculative round at position `p` (depth <= `k`) whose
+    /// verify rows p..p+depth are all on one side of the sparse switch. Past the switch, without
+    /// an indexer, with --qsa-exl3 0 or with --qsa-row-regime 0 it is `k`.
+    pub fn regime_depth(&self, p: usize, k: usize) -> usize {
+        regime_depth_at(p, k, if self.qsa_live(usize::MAX) && row_regime_on() { Some(self.qsa_limit()) } else { None })
+    }
     // (WP04's own `stream_capturing` was byte-identical to WP09's — p2 keeps WP09's copy.)
     /// QSA live at this context? (--qsa-exl3=0 = the owner's A/B escape hatch.)
     pub fn qsa_live(&self, max_visible: usize) -> bool {
@@ -9721,7 +9939,7 @@ impl FwdModel {
                    qk_dim as i32, (heads * hdx) as i32, hdx as i32, m as i32))?;
         if let (Some(pool_p), Some(params)) = (self.qsa_pool_p(att_i), ix.params.as_ref()) {
             let nblk_stride = (self.max_pos / cfg.indexer_compress_ratio).max(1);
-            let geom: u64 = (self.max_pos as u64) | ((nblk_stride as u64) << 40);
+            let geom: u64 = crate::gpu::pack_qsa_geom(self.max_pos, 0, nblk_stride);
             gblaunch!(l, "qsa_pool_update_b", ((m.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0,
                       (pool_p, keys_p, &sc.pos, &sc.slot_ids, (*params.device_ptr()) as u64, geom as i64, m as i32))?;
         }
@@ -9785,7 +10003,12 @@ impl FwdModel {
             .expect("qsa_attn_step: indexer without params");
         let (hdx, heads, ratio) = (cfg.indexer_head_dim, cfg.indexer_n_heads, cfg.indexer_compress_ratio);
         let qk_dim = (heads + 1) * hdx;
-        let nblk_stride = (self.max_pos / ratio).max(1);
+        let nblk_stride = qsa_nblk_stride(self.max_pos, ratio);
+        // The scorers write scores[row * nblk_stride + j]: a scratch pitched for a narrower window
+        // (public PR #21) must fail here, not write into whatever the allocator put after it.
+        anyhow::ensure!(sc.qsa_scores.len() >= m * nblk_stride,
+                        "qsa_attn_step: score scratch holds {} f32 < {m} rows x {nblk_stride} blocks (max_pos {}): \
+                         the scratch was not sized for this model's served window", sc.qsa_scores.len(), self.max_pos);
         let sel_max = self.qsa_limit();
         let keys_p = self.qsa_keys_p(att_i).context("qsa_attn_step: no key plane")?;
         let params_p = (*params.device_ptr()) as u64;
@@ -9805,7 +10028,7 @@ impl FwdModel {
         gblaunch!(l, "qsa_key_write_b", ((m * hdx) as u32, 1, 1), (256, 1, 1), 0,
                   (keys_p, &sc.qsa_qkb, &sc.pos, &sc.slot_ids, self.max_pos as i32, 0i32,
                    qk_dim as i32, (heads * hdx) as i32, hdx as i32, m as i32))?;
-        let geom: u64 = (self.max_pos as u64) | ((qk_dim as u64) << 20) | ((nblk_stride as u64) << 40);
+        let geom: u64 = crate::gpu::pack_qsa_geom(self.max_pos, qk_dim, nblk_stride);
         let grid_nblk = if sc.qsa_grid_nblk > 0 { sc.qsa_grid_nblk.min(nblk_stride) } else { nblk_stride };
         if let Some(pool_p) = self.qsa_pool_p(att_i) {
             // refresh the blocks this step's rows touched, then score from the plane (exact)
@@ -10180,6 +10403,26 @@ impl FwdModel {
         Ok(())
     }
 
+    /// The dense attention of `m` decode-step rows (rows = lanes, own slots) into sc.normed rows
+    /// 0..m: dense v3 where the layer admits it, else xq_attn_decode — the dense branch of the
+    /// decode-step dispatch, shared by a dense step (all its rows) and a mixed step (its leading
+    /// short rows, S-B9-REL-QSAREGIME). Launches only; every grid depends on m alone (graph-safe).
+    fn dense_attn_step(&self, l: &Launcher, sc: &mut Scratch, a: &AttnLayer, att_i: usize, m: usize,
+                       nh_p: i32, hd_p: i32) -> Result<()> {
+        let cfg = &self.tc; // TP-B: the trunk's per-rank geometry
+        if self.dense_v3_ok(a) {
+            // WP13: dense v3, bitwise to xq_attn_decode (--exl3-dense-v3=0 = it)
+            self.dense_attn_v3(l, sc, a, (*self.k_cache[att_i].device_ptr()) as u64, m, false, att_i)?;
+        } else {
+            xqlaunch!(l, "xq_attn_decode", ((m as u32) * (cfg.num_heads as u32), 1, 1), (cfg.head_dim as u32, 1, 1), 0,
+                      (&mut sc.normed, &sc.qg, &sc.kp, &sc.vp,
+                       (*self.k_cache[att_i].device_ptr()) as u64,
+                       &a.qnkn, &sc.cos, &sc.slots,
+                       nh_p, hd_p, self.mpf(), cfg.rms_eps))?;
+        }
+        Ok(())
+    }
+
     pub fn forward_step(&self, sc: &mut Scratch, toks: &[i32], pos_host: &[usize], slots: &[usize],
                         mut ladder: Option<&mut LadderCtx>) -> Result<Vec<i32>> {
         let m = toks.len();
@@ -10226,10 +10469,23 @@ impl FwdModel {
         let qsa = self.qsa_live(pos_host.iter().copied().max().unwrap_or(0));
         let (qg, qb) = self.qsa_grid_bucket_key(pos_host.iter().copied().max().unwrap_or(0));
         sc.qsa_grid_nblk = qg;
+        // S-B9-REL-QSAREGIME: the regime of a ROW is a function of its own position. In a sparse
+        // step the leading `md` rows at/below qsa_limit keep the dense kernels (what they run alone
+        // or next to other short rows), so a lane's bits no longer depend on a longer lane sharing
+        // its step. The serve orders short lanes first (regime_order); a short row behind a long
+        // one stays on the sparse kernels and is reported once.
+        let md = if qsa && row_regime_on() {
+            // the step's rows are the first m positions (a probe may pass a longer position list)
+            let rows = &pos_host[..m.min(pos_host.len())];
+            let (md, late) = dense_prefix(rows, self.qsa_limit());
+            row_regime_note(md, rows.len() - md - late, late);
+            md
+        } else { 0 };
         // WP15: a penalized step is its own graph (bit 40), so unpenalized steps replay the
         // pre-WP15 graphs untouched. WP04: the base key is gkey_of (shared with the precapture,
-        // which runs unpenalized: pen_live is false at boot).
-        let gkey = gkey_of(m, qsa, qb) | ((sc.pen_live as usize) << 40) | sk(sc) // TP-C: + the scratch id
+        // which runs unpenalized: pen_live is false at boot). QSAREGIME: a mixed step is its own
+        // graph per dense-row count (mixed_key_bits; 0 = the pre-existing keys, bit for bit).
+        let gkey = gkey_of(m, qsa, qb) | mixed_key_bits(md) | ((sc.pen_live as usize) << 40) | sk(sc) // TP-C: + the scratch id
             | self.vp_key(sc, m); // TP-H #4: the vocab-parallel greedy tail = its own graph
 
         // RoPE: gather this step's rows from the load-time table. The table was built
@@ -10267,7 +10523,7 @@ impl FwdModel {
         } else if graphed {
             self.graphs.lock().unwrap().get(&gkey).unwrap().launch();
         } else {
-            self.forward_step_kernels(&l, sc, m, ladder.as_deref_mut(), dump_active, qsa)?;
+            self.forward_step_kernels(&l, sc, m, ladder.as_deref_mut(), dump_active, qsa, md)?;
         }
         self.dev.synchronize()?;
         let ids = self.dev.dtoh_sync_copy(&sc.argmax)?;
@@ -10288,7 +10544,7 @@ impl FwdModel {
         // already read back above — record the same kernel sequence into a graph for the
         // next step. Capture failure is loud and leaves this engine eager (never wrong).
         if want_graph && !graphed {
-            self.capture_step_graph(&l, sc, m, gkey, qsa);
+            self.capture_step_graph(&l, sc, m, gkey, qsa, md);
         }
         Ok(ids)
     }
@@ -10296,8 +10552,10 @@ impl FwdModel {
     /// S-A3-f Item 1b: the decode-step kernel sequence (embed gather → layers → final
     /// mixer → lm_head → argmax). Launches ONLY — no uploads, no host reads, no
     /// allocations — so it is legal to run eager, or record into a CUDA graph.
+    /// `md` (S-B9-REL-QSAREGIME): in a sparse step, the leading rows at/below qsa_limit that keep
+    /// the dense attention kernels (0 = none; always 0 in a dense step).
     fn forward_step_kernels(&self, l: &Launcher, sc: &mut Scratch, m: usize,
-                            mut ladder: Option<&mut LadderCtx>, diag: bool, qsa: bool) -> Result<()> {
+                            mut ladder: Option<&mut LadderCtx>, diag: bool, qsa: bool, md: usize) -> Result<()> {
         let _tc = tune::enter(tune::Ctx::fam(tune::Fam::Step, m).regime(qsa)); // TUNE family scope
         let cfg = &self.tc; // TP-B: the trunk's per-rank geometry
         let h = cfg.hidden_size;
@@ -10532,18 +10790,20 @@ impl FwdModel {
                     // to the pre-port engine, graphs included).
                     if qsa && a.idx.is_some() {
                         self.qsa_attn_step(l, sc, a, att_i, m, idx_pre, false)?;   // rows = lanes (own slots)
+                        if md > 0 {
+                            // S-B9-REL-QSAREGIME: rows 0..md are at/below qsa_limit — their attention
+                            // is the dense kernels', exactly as in a dense step. The launches above
+                            // already appended every row's indexer keys and wrote every row's K/V
+                            // words (the dense prep rewrites the same words for these rows). The dense
+                            // kernels read sc.qg / kp / vp / cos / slots, which the sparse launches
+                            // leave untouched; of what a later launch reads they replace rows 0..md
+                            // of sc.normed only (their own sc.qstage rows and the dv3 score planes
+                            // are scratch nothing after this attention reads; the next layer re-preps).
+                            self.dense_attn_step(l, sc, a, att_i, md, nh_p, hd_p)?;
+                        }
                     } else {
                     self.qsa_keys_append_dense(l, sc, a, att_i, m, idx_pre)?;
-                    if self.dense_v3_ok(a) {
-                        // WP13: dense v3, bitwise to xq_attn_decode (--exl3-dense-v3=0 = it)
-                        self.dense_attn_v3(l, sc, a, (*self.k_cache[att_i].device_ptr()) as u64, m, false, att_i)?;
-                    } else {
-                    xqlaunch!(l, "xq_attn_decode", ((m as u32) * (cfg.num_heads as u32), 1, 1), (cfg.head_dim as u32, 1, 1), 0,
-                              (&mut sc.normed, &sc.qg, &sc.kp, &sc.vp,
-                               (*self.k_cache[att_i].device_ptr()) as u64,
-                               &a.qnkn, &sc.cos, &sc.slots,
-                               nh_p, hd_p, self.mpf(), cfg.rms_eps))?;
-                    }
+                    self.dense_attn_step(l, sc, a, att_i, m, nh_p, hd_p)?;
                     }
                     self.chain_o(l, &a.o_proj, &sc.normed, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.mixer_out, m, &sc.chain_ws)?; // TP-B: row-parallel -> all-reduce
                     att_i += 1;
@@ -10683,21 +10943,23 @@ impl FwdModel {
 
     /// S-A3-f Item 1b: record forward_step_kernels at width m into a CUDA graph on the
     /// model's blocking stream (gpu.rs CudaGraph wrapper — the DSV4 capture mechanism).
-    fn capture_step_graph(&self, l: &Launcher, sc: &mut Scratch, m: usize, gkey: usize, qsa: bool) {
+    fn capture_step_graph(&self, l: &Launcher, sc: &mut Scratch, m: usize, gkey: usize, qsa: bool, md: usize) {
         use cudarc::driver::sys;
         let raw = self.stream.stream;
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
                 crate::rprintln!("EXL3_GRAPH: BeginCapture failed ({r:?}) at width {m} — staying eager");
+                crate::metrics::graph_capture_lost("step", &format!("width {m}, qsa={qsa}, mixed rows={md}"), &format!("{r:?}"));
                 return;
             }
         }
-        let cap = self.forward_step_kernels(l, sc, m, None, false, qsa);
+        let cap = self.forward_step_kernels(l, sc, m, None, false, qsa, md);
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
             crate::rprintln!("EXL3_GRAPH: capture failed (end={r2:?}, body={:?}) at width {m} — staying eager", cap.err());
+            crate::metrics::graph_capture_lost("step", &format!("width {m}, qsa={qsa}, mixed rows={md}"), &capture_lost_status(r2));
             return;
         }
         crate::exl3_wp27::finish(graph, "step", m); // WP27: node priorities + DAG receipt
@@ -10709,9 +10971,18 @@ impl FwdModel {
             if r3 == sys::CUresult::CUDA_SUCCESS {
                 precap_upload(exec, raw);
                 crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(gkey, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
-                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured decode step at width {m}"); }
+                // S-B9-REL-SMALLFIXES 9a(iii): the mixed-step graphs are lazy and uncapped — count
+                // them (gauge + the scheduler's idle line) and say so once, at the first capture.
+                if md > 0 && crate::metrics::mixed_step_graph_captured() == 1 {
+                    crate::rprintln!("[exl3] per-row attention regime: first mixed-step graph captured (width {m}, {md} dense row(s)). \
+One is captured lazily per step shape seen (width, dense rows, sparse grid bucket); they are not capped. Count: \
+velogb10_graph_cache_mixed_step_entries on /metrics and the scheduler's idle line");
+                }
+                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured decode step at width {m}{}",
+                                                      if md > 0 { format!(" (mixed regime: {md} dense rows)") } else { String::new() }); }
             } else {
                 crate::rprintln!("EXL3_GRAPH: instantiate failed ({r3:?}) at width {m} — staying eager");
+                crate::metrics::graph_capture_lost("step", &format!("width {m}, qsa={qsa}, mixed rows={md}"), &format!("instantiate {r3:?}"));
             }
         }
     }
@@ -10952,7 +11223,7 @@ const EOS_IDS: [i32; 2] = [248044, 248046];
 
 pub fn run(a: &FwdArgs) -> Result<()> {
     let model = FwdModel::load(&a.dir, a.width.max(a.widths.iter().copied().max().unwrap_or(1)), a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, a.width.max(a.widths.iter().copied().max().unwrap_or(1)), model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, a.width.max(a.widths.iter().copied().max().unwrap_or(1)), model.cfg.rotary_dim, model.max_pos)?;
 
     // prompt ids: explicit file wins; else tokenizer encode
     let mut prompt_ids: Vec<u32> = match &a.ids_file {
@@ -11100,7 +11371,7 @@ pub fn run(a: &FwdArgs) -> Result<()> {
         for w in widths {
             // states reset per width via a fresh load (the honest offline reset)
             let m2 = FwdModel::load(&a.dir, w, a.max_pos)?;
-            let mut sc2 = Scratch::new(&m2.dev, &m2.cfg, w, m2.cfg.rotary_dim)?;
+            let mut sc2 = Scratch::new(&m2.dev, &m2.cfg, w, m2.cfg.rotary_dim, m2.max_pos)?;
             let mut pos2 = 0usize;
             let mut last2 = prompt_ids[0] as i32;
             for (i, t) in prompt_ids.iter().enumerate() {
@@ -11158,7 +11429,7 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
         None => bail!("pack has no mtp.* draft head — M1 unavailable"),
     };
     // S-A3-o: the verify round needs width depth+1 (was 1 -> "scratch width 1 < verify width").
-    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim, model.max_pos)?;
 
     let prompt_ids: Vec<u32> = match &a.ids_file {
         Some(f) => {
@@ -11217,6 +11488,7 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
     model.mtp_seam_prime(&mut sc, psc_keep.as_ref(), head, last, plen, 0)?; // WP03 (the serve's prime)
     let mut rounds: Vec<DraftRound> = Vec::new();
     let mut round_ms: Vec<f64> = Vec::new();
+    let mut drafted_n = 0usize; // drafts actually run (a round clamped at the sparse switch drafts fewer than `depth`)
     {
         let mut b = pred0 as i32;
         let mut p = plen;
@@ -11226,8 +11498,10 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
         let first_eos = EOS_IDS.contains(&(pred0 as i32));
         while !first_eos && actual.len() < a.max_new {
             let tr = std::time::Instant::now();
-            let out = model.mtp_round(&mut sc, head, 0, depth, b, p, tap_row)?;
+            // clamped at the sparse switch like the serve (S-B9-REL-SMALLFIXES item 2)
+            let out = model.mtp_round_clamped(&mut sc, head, 0, depth, b, p, tap_row)?;
             round_ms.push(tr.elapsed().as_secs_f64() * 1e3);
+            drafted_n += out.drafts.len();
             for &e in out.emitted.iter() {
                 actual.push(e as u32);
             }
@@ -11246,8 +11520,9 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
         v.get(v.len() / 2).copied().unwrap_or(0.0)
     };
     // S-A3-f-d: acceptance is now DEVICE-COMPUTED per round (the accept kernel's
-    // `a`), not post-hoc. drafted = rounds x depth; accepted = sum of round a's.
-    let drafted = rounds.len() * depth;
+    // `a`), not post-hoc. drafted = the drafts each round ran (depth, fewer for a round clamped at
+    // the sparse switch); accepted = sum of round a's.
+    let drafted = drafted_n;
     let accepted: usize = rounds.iter().map(|r| r.drafts.len()).sum();
     let mean_prefix = if rounds.is_empty() { 0.0 } else {
         accepted as f64 / rounds.len() as f64
@@ -11343,7 +11618,7 @@ pub fn probe_state_exl3(a: &FwdArgs) -> Result<()> {
     let w = 8usize;
     let k_steps = a.max_new.clamp(4, 64);
     let model = FwdModel::load(&a.dir, w, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let v = model.cfg.vocab_size as i32;
     println!("EXL3 GDN state-equivalence probe: prompt={} tokens, K={} continuations, N=1..={w}",
@@ -11633,7 +11908,7 @@ mod l10_prefillx_tests {
 /// prefill_chunk while the same ids through forward_step were exact).
 pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
     let model = FwdModel::load(&a.dir, 1, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let n = ids.len();
     println!("EXL3 prefill-equivalence probe: prompt={n} tokens");
@@ -11844,7 +12119,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
                 model.dev.htod_copy_into(pv, &mut sc.pos)?;
                 model.dev.htod_copy_into(vec![0i32; sc.slot_ids.len()], &mut sc.slot_ids)?;
                 let keys_p = *model.qsa_keys[last_att].device_ptr() as u64;
-                let geom: u64 = (model.max_pos as u64) | ((qk_dim as u64) << 20) | ((nbs as u64) << 40);
+                let geom: u64 = crate::gpu::pack_qsa_geom(model.max_pos, qk_dim, nbs);
                 gblaunch!(l, "qsa_score_b", ((nbs.div_ceil(8)) as u32, 1u32, 1), (256, 1, 1), 0,
                           (&mut sc.qsa_scores, &sc.qsa_qkb, keys_p, &sc.pos, &sc.slot_ids,
                            0u64, 0u64, params_p, geom as i64))?;
@@ -11998,7 +12273,7 @@ pub fn probe_pfx_trace(a: &FwdArgs) -> Result<()> {
         std::fs::create_dir_all(d)?;
     }
     let model = FwdModel::load(&a.dir, 1, a.max_pos)?;
-    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let nl = model.layers.len();
     println!("EXL3 prefill TRACE: {} tokens, {nl} layers; stage diff @ token 0 + first-divergent-token sweep", ids.len());
@@ -12238,7 +12513,7 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
     };
     // scratch holds the VERIFY width m=k+1 (mtp_round asserts it); arm S's m=1
     // steps ride the same buffer fine.
-    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim)?;
+    let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim, model.max_pos)?;
     let prompt_ids = gate_prompt_ids(a)?;
     let plen = prompt_ids.len();
     println!("MTP end-to-end probe (exl3): prompt={plen} tokens, depth={depth}, max_new={} model={}",
@@ -12321,7 +12596,9 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
                 }
             }
             let tt = std::time::Instant::now();
-            let out = model.mtp_round(&mut sc, head, 0, depth, b, p, tap_row)?;
+            // clamped at the sparse switch like the serve (S-B9-REL-SMALLFIXES item 2): a LOSSLESS
+            // run crossing it no longer verifies with a straddling round
+            let out = model.mtp_round_clamped(&mut sc, head, 0, depth, b, p, tap_row)?;
             if let Some(last) = cover_rows.last_mut() { if last.0 == p { last.2 = out.a; } }
             trunk_ms.push(tt.elapsed().as_secs_f64() * 1e3);
             for &e in out.emitted.iter() {
@@ -12357,7 +12634,8 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
     // ---- acceptance scoring from the DEVICE accept count (out.a per round).
     // The chain round emits a variable number of tokens, so the old post-hoc
     // stream-index scoring (k+1+j) no longer applies; out.a is authoritative.
-    let drafted = rounds.len() * depth;
+    // (drafts actually run: a round clamped at the sparse switch drafts fewer than `depth`)
+    let drafted: usize = rounds.iter().map(|r| r.drafts.len()).sum();
     let accepted: usize = rounds.iter().map(|r| r.accepted).sum();
     let prefix_sum: usize = rounds.iter().map(|r| r.accepted).sum();
     let med = |v: &mut Vec<f64>| -> f64 {
@@ -12699,8 +12977,10 @@ impl FwdModel {
             .map(|r| r.iter().map(|v| v.len() as u64).sum()).unwrap_or(0)
     }
     /// CF-P1d `--ple-ram auto`: called once the boot has allocated every lane's KV, scratch, graphs and the vision
-    /// tower. Moves the n-gram table into RAM iff it fits with 16 GiB to spare, measured now; otherwise it stays on
-    /// SSD (identical output, ~1-2% decode) and the log says why. No-op for ram / ssd or a model without PLE.
+    /// tower. Moves the n-gram table into RAM iff it fits with headroom to spare (16 GiB base +
+    /// `--ple-headroom-per-lane-gb` per additional lane; default per-lane 0 = the old fixed 16 GiB
+    /// — PR #17 ported as opt-in), measured now; otherwise it stays on SSD (identical output,
+    /// ~1-2% decode) and the log says why. No-op for ram / ssd or a model without PLE.
     pub fn ple_promote_auto(&self) -> Result<()> {
         let Some(p) = self.ple.as_ref() else { return Ok(()) };
         if ple_mode() != "auto" || p.ram.get().is_some() { return Ok(()); }
@@ -12708,10 +12988,11 @@ impl FwdModel {
         let need = per as u64 * p.shards.len() as u64;
         let avail = mem_available_bytes();
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        if avail < need + PLE_AUTO_HEADROOM {
-            println!("  PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + 16 GiB headroom; \
+        let headroom = ple_auto_headroom(self.width);
+        if avail < need + headroom {
+            println!("  PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + {:.1} GiB headroom; \
                       output is identical, decode ~1-2% slower; fewer lanes / a shorter --max-seq-len would let it move to RAM)",
-                     gib(avail), gib(need));
+                     gib(avail), gib(need), headroom as f64 / (1u64 << 30) as f64);
             return Ok(());
         }
         let t0 = std::time::Instant::now();
@@ -12762,8 +13043,8 @@ impl FwdModel {
     }
 
     /// Scratch constructor for the serve backend (fields stay private to this module).
-    pub fn scratch(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize) -> Result<Scratch> {
-        Scratch::new(dev, cfg, w, cfg.rotary_dim)
+    pub fn scratch(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, w: usize, max_pos: usize) -> Result<Scratch> {
+        Scratch::new(dev, cfg, w, cfg.rotary_dim, max_pos)
     }
 }
 
@@ -13059,6 +13340,9 @@ pub struct PrefillScratch {
     // TP-SP: this rank's row block while a sequence-parallel chunk's MoE runs (set by prefill_chunk
     // around moe_prefill: the EP combine then reduce-SCATTERS into the own rows)
     sp_rows: Option<xtp::SpRows>,
+    // S-B9-REL-PPL: Some only inside `--perplexity` (exl3_ppl.rs): every row of the chunk goes through
+    // the lm_head and is scored. None everywhere else — serving never constructs it.
+    ppl: Option<ppl::PplSink>,
 }
 
 impl FwdModel {
@@ -13192,6 +13476,7 @@ impl FwdModel {
             pf_hook: None,
             pf_hooked: false,
             sp_rows: None,
+            ppl: None,
         })
     }
 
@@ -13355,6 +13640,18 @@ impl FwdModel {
             let max_tiles = (r / 16 + ne) as u32;
             // A5-P1 knobs (all bitwise; default OFF): pipelined kernel, WP19 per-expert MT, glue fold.
             let pk = tune::get(&T_PF_MOE_KERNEL, &l.cx()) != 0 && mi % 128 == 0 && h % 128 == 0;
+            // S-B9-REL-INTEG D1: both arms switch on `bits` with `default: break;` (a launch that writes nothing):
+            // xq_moe_pf* knows 3 and 4, exl3_hmma_gemm_wide_tiles 3, 4 and 5. Refuse before the first launch.
+            if pk {
+                anyhow::ensure!(moe_pf_kernel_supports_bits(moe.bits),
+                    "EXL3 prefill MoE: the pipelined expert kernel (xq_moe_pf*, on by default; --pf-moe-kernel) decodes 3- and 4-bit \
+trellises only and would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200 with garbage); \
+boot with --pf-moe-kernel off to use the wide tiles kernel (3..5 bits)", moe.bits);
+            } else {
+                anyhow::ensure!(wide_trellis_supports_bits(moe.bits),
+                    "EXL3 prefill MoE: the wide tiles kernel (exl3_hmma_gemm_wide_tiles) decodes 3-, 4- and 5-bit trellises only and \
+would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200 with garbage)", moe.bits);
+            }
             let pe = tune::get(&T_PF_MOE_MT_PE, &l.cx()) != 0 && psc.pf_tiles4.len() > 1;
             let fold = pk && tune::get(&T_PF_MOE_FOLD, &l.cx()) != 0;
             // A5-L2: MT-class mask of the smem-ring twin (needs the P1 kernel; 16-B aligned trellis runs).
@@ -13471,6 +13768,15 @@ impl FwdModel {
         // is not expert-parallel — refuse loudly instead of computing remote experts' rows.
         anyhow::ensure!(ep.is_none(), "moe_prefill: the host-routing path is not EP-wired (TP-B) — \
                          unset --exl3-moe-recon-min / --exl3-moe-devroute=0 under TP");
+        // F3 (owner 2026-10-10): the host-routed arm's grouped kernels decode 3- and 4-bit experts
+        // only and no shipped pack has any other width (the 3.05 pack: 3-bit; the 4.05 pack: 4-bit),
+        // so say what is served and what to use instead, at the first prefill — the boot warm-up
+        // runs this path, which makes it a load-time refusal — instead of leaving a 5/6-bit pack's
+        // expert output unwritten (HTTP 200 with garbage).
+        anyhow::ensure!((3..=4).contains(&moe.bits),
+            "this pack's experts are {}-bit; this engine serves 3 and 4 on the host-routed MoE path \
+(--exl3-moe-recon-min / no tile lists). Use a pack whose routed experts are 3- or 4-bit, or one with tile \
+lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         self.dev.synchronize()?;
         let ids_h = self.dev.dtoh_sync_copy(&psc.ids)?;
         let r = c * topk;
@@ -14517,6 +14823,13 @@ impl FwdModel {
             xqlaunch!(l, "xq_argmax", (1, 1, 1), (1024, 1, 1), (1024 * 12) as u32,
                      (&mut psc.argmax, 0i32, &psc.logits, 0i64, v as i32))?;
             self.tr_u16(ld, false, 0, &psc.logits, "logits", v)?;
+        } else if psc.ppl.is_some() {
+            // S-B9-REL-PPL (`--perplexity`): EVERY row of the chunk through the lm_head, scored on the
+            // host. Same chunk, same kernels up to here; only the head differs from serving.
+            let mut sink = psc.ppl.take().unwrap();
+            let r = self.ppl_all_rows(&l, psc, &mut sink, c);
+            psc.ppl = Some(sink);
+            r?;
         }
         // S-A3-t: fill the MTP draft head's KV for this chunk's prompt positions (AGENTS §2.6:
         // the head attends over the prompt; before this it saw ZEROS for every prompt position).
@@ -14770,7 +15083,13 @@ impl FwdModel {
                     }
                 }
             }
-            unsafe { let _ = lt::destroy_handle(handle); }
+            // S-B9-REL-VISIONFIX2 V2a: the handle is NOT destroyed. cublasLtDestroy is not refused, but it
+            // invalidates a graph capture that the scheduler thread has open at that moment (measured,
+            // every capture mode: tests/vision_capture_race_test.rs
+            // `destroying_a_library_handle_invalidates_another_threads_capture`), and this thread
+            // finishes at an arbitrary time after boot while the scheduler captures lazily. One handle
+            // per boot stays allocated for the life of the process (host objects only).
+            let _ = handle;
             println!("PFX1: cuBLASLt prefill plans pre-populated in {:.1} s (background): {built} built, \
                       {had} already cached, {lost} raced the prefill; {nf} shape families x chunk rows 1..={cmax} (m >= {rmin})",
                      t0.elapsed().as_secs_f32());
@@ -14893,7 +15212,7 @@ impl FwdModel {
                     if self.graphs.lock().unwrap().contains_key(&key) { continue; }
                     if over() { note += CAP; return Ok(note); }
                     sc.qsa_grid_nblk = qg;
-                    self.capture_step_graph(&l, sc, m, key, sparse);
+                    self.capture_step_graph(&l, sc, m, key, sparse, 0); // mixed-regime steps capture lazily, per (m, md) seen
                 }
             }
             let Some(h) = head else { continue };
@@ -15233,6 +15552,81 @@ impl FwdModel {
 // only valid-row states, and the head never feeds back into the trunk.
 // ---------------------------------------------------------------------------
 
+/// S-B9-CF-PACK4: host wall ms of the three parts of one packed verify (attribution only).
+#[derive(Default, Clone, Copy, Debug)]
+pub struct PackVerifyMs {
+    /// plan + PLE host half + the metadata uploads + the PLE-ring shadow copies
+    pub stage: f64,
+    /// graph replay + the taps hand-off + the device synchronize (the GPU time of the verify)
+    pub graph: f64,
+    /// accept readback + the per-segment parse + the host n-gram ring restore
+    pub read: f64,
+    /// PACK4S: host time of the --wp24-xcheck re-derivation (0 unless that diagnostic is on);
+    /// not round cost — the serve subtracts it, as it does a lone round's `diag_ms`
+    pub diag: f64,
+}
+
+/// S-B9-CF-PACK4: one request's drafted chain awaiting the packed verify (`FwdModel::pack_draft`).
+pub struct PackDraft {
+    pub slot: usize,
+    /// the bonus token at position `p`
+    pub b: i32,
+    pub p: usize,
+    /// the drafts the verify will judge (>= 1)
+    pub drafts: Vec<i32>,
+    /// per-pass confidences (the DDS calibrator's labels; empty for a fixed-depth chain)
+    pub confs: Vec<f32>,
+    spec: bool,
+    /// PACK4S: the lane's sampler for its verify rows (greedy = `SegSamp::GREEDY`) and the
+    /// real-q draft sampler its chain ran with (None = an argmax chain)
+    pub samp: crate::lane_pack::SegSamp,
+    pub rq: Option<RqStage>,
+    /// S-B9-CF-PACK5: head draft passes this rank issued for the chain (loop + speculative
+    /// launches; a fixed-depth chain = its depth): the pre-verify word the ranks compare
+    pub launched: usize,
+    /// a speculative pass was launched and then stopped by the DDS: its collective epochs may
+    /// still be in flight when the pack's host exchange runs (`pack_drain_wasted`)
+    pub wasted: bool,
+}
+
+/// S-B9-CF-PACK4: the once-per-boot LIVE line of the served packed verify (AGENTS 4: a new
+/// dispatch path names the entry that served it — identical hashes are not a liveness receipt).
+fn pack_live_note(r: usize, qsa: bool) {
+    static LIVE: std::sync::Once = std::sync::Once::new();
+    LIVE.call_once(|| crate::rprintln!("[exl3] lane-pack LIVE: a packed speculative verify replayed ONE graph for two requests (the readback and the per-segment tripwires follow; first at R = {r} rows, {} regime; seg kernels xq_gdn_step_chunk_seg / xq_conv1d_chunk_seg_ns / xq_ple_conv_chunk_seg, accept xq_accept_seg, commit xq_conv_commit_seg / xq_gdn_commit_ring_seg / xq_ple_ring_commit_seg)",
+                                       if qsa { "sparse" } else { "dense" }));
+}
+
+/// S-B9-CF-PACK4S: the once-per-boot LIVE lines of SAMPLED rows in a packed verify — one for
+/// the real-q family (`xq_sample_rows_rq` in the replayed graph) and one for match-mode rows
+/// (`xq_sample_rows` of the greedy family), each naming the staging of the pair that hit it.
+fn pack_sampled_live_note(r: usize, rq: bool, kinds: [&str; 2]) {
+    static RQ: std::sync::Once = std::sync::Once::new();
+    static MATCH: std::sync::Once = std::sync::Once::new();
+    if rq {
+        RQ.call_once(|| crate::rprintln!("[exl3] lane-pack LIVE (sampled, real-q): a packed verify of R = {r} rows replayed the rq graph family (xq_sample_rows_rq; segment 0 = a {} lane, segment 1 = a {} lane; per-row sampler blocks with each lane's own seed and counters, draft lists at each segment's row offset)", kinds[0], kinds[1]));
+    } else {
+        MATCH.call_once(|| crate::rprintln!("[exl3] lane-pack LIVE (sampled, match rule): a packed verify of R = {r} rows sampled its rows with xq_sample_rows (segment 0 = a {} lane, segment 1 = a {} lane; the greedy graph family)", kinds[0], kinds[1]));
+    }
+}
+
+/// S-B9-CF-PACK4: what the draft half of an adaptive round hands to its verify.
+struct DraftHalf {
+    /// the w verified drafts, clamped to the vocabulary
+    drafts: Vec<i32>,
+    /// per-pass confidences of every pass that ran
+    confs: Vec<f32>,
+    w: usize,
+    /// head draft passes this rank issued (loop + speculative launches): the TP pre-verify word
+    launched: usize,
+    /// position of a launched pass the DDS then stopped before
+    wasted: Option<usize>,
+    /// the speculative next pass was live this round
+    spec: bool,
+    tp0: std::time::Instant,
+    tp1: std::time::Instant,
+}
+
 pub struct MtpRoundOut {
     pub a: usize,            // accepted drafts
     pub emitted: Vec<i32>,   // a+1 tokens: d_0..d_{a-1}, e_a
@@ -15272,9 +15666,122 @@ impl SampParams {
         self.pack_flag(1)
     }
     /// WP24: the same row with row flag `flag` (1 = sampled, 2 = sampled real-q verify row).
-    fn pack_flag(&self, flag: u32) -> [u32; 8] {
+    pub(crate) fn pack_flag(&self, flag: u32) -> [u32; 8] {
         [flag, self.temperature.to_bits(), self.top_p.to_bits(), self.top_k,
          self.seed as u32, (self.seed >> 32) as u32, self.counter, self.min_p.to_bits()]
+    }
+}
+
+/// S-B9-REL-SMALLFIXES item 5(a): where a finishing stop token stood in the distribution it was
+/// drawn from. `row` = the step's logits row (f16 bits, AFTER the penalties: xq_pen_rows edits
+/// sc.logits in place before the argmax and the sampler), `tok` = the token, `samp` = the row's
+/// sampler (None = a greedy row). Returns (p, rank):
+///   rank = 1 + the number of tokens with a strictly greater logit (1 = the top token);
+///   p    = a sampled row: the token's probability in the law xq_sample_rows draws from (logits / T;
+///          candidates = top-k, every logit >= the k-th largest, and the min_p floor
+///          l >= l_max + T ln(min_p); then the smallest descending prefix whose mass reaches top_p
+///          of the candidates' mass, boundary ties included; renormalized). 0 = truncated away.
+///          A greedy row: the softmax probability at temperature 1 (an argmax has no law to take
+///          a probability under; rank 1 says the token was the choice).
+/// A host recomputation in f64 of what the kernel does in f32: p agrees to rounding, and a top-p
+/// boundary decided by the last bits of the mass sum can fall on the other side.
+/// None = `tok` out of range, or its logit / the row maximum is not finite.
+///
+/// S-B9-REL-SURFACE2 item 2 (cost): the logits are f16, so a row holds at most 65,536 distinct
+/// values. One histogram pass replaces the sort of the whole vocabulary (the descending order is
+/// the order of the bit patterns) and one exp per DISTINCT value replaces one per token. Every
+/// floating-point sum still adds the same terms in the same order as the first implementation
+/// (kept verbatim in the tests as `stop_token_stats_reference`), so (p, rank) is bit-identical.
+/// Measured on a 248,320-logit row: 3.6 ms worst case before (top-k off, top-p < 1), 0.5 ms now.
+pub fn stop_token_stats(row: &[u16], tok: usize, samp: Option<&SampParams>) -> Option<(f64, u32)> {
+    let lg = |b: u16| half::f16::from_bits(b).to_f32() as f64;
+    let xt = lg(*row.get(tok)?);
+    let mut cnt = vec![0u32; 1 << 16];
+    for &b in row { cnt[b as usize] += 1; }
+    // The distinct values present, descending: +inf .. +0.0 are the patterns 0x7C00 down to 0,
+    // -0.0 .. -inf the patterns 0x8000 up to 0xFC00 (NaN patterns lie outside both ranges: a NaN
+    // logit is never a candidate and never outranks anything). Values that compare equal share a
+    // group (+0.0 and -0.0), as they share a tie run in a sorted row.
+    let mut groups: Vec<(f64, u32)> = Vec::new();
+    for b in (0x0000u32..=0x7C00).rev().chain(0x8000..=0xFC00) {
+        let n = cnt[b as usize];
+        if n == 0 { continue; }
+        let x = lg(b as u16);
+        match groups.last_mut() {
+            Some(g) if g.0 == x => g.1 += n,
+            _ => groups.push((x, n)),
+        }
+    }
+    let lmax = groups.first().map_or(f64::NEG_INFINITY, |g| g.0);
+    if !xt.is_finite() || !lmax.is_finite() { return None; }
+    let rank = 1 + groups.iter().take_while(|g| g.0 > xt).map(|g| g.1).sum::<u32>();
+    let Some(s) = samp else {
+        // exp(x - lmax) once per pattern present; the sum runs over the row in row order
+        let mut tab = vec![0f64; 1 << 16];
+        for (b, &n) in cnt.iter().enumerate() {
+            if n > 0 { tab[b] = (lg(b as u16) - lmax).exp(); }
+        }
+        let z: f64 = row.iter().map(|&b| tab[b as usize]).filter(|w| w.is_finite()).sum();
+        return Some(((xt - lmax).exp() / z, rank));
+    };
+    let t = (s.temperature as f64).max(1e-6);
+    let w = |x: f64| ((x - lmax) / t).exp();
+    // top-k: tau = the k-th largest logit (every tie of it survives)
+    let tau = if s.top_k > 0 && (s.top_k as usize) < row.len() {
+        let valid: usize = groups.iter().map(|g| g.1 as usize).sum();
+        let k = (s.top_k as usize - 1).min(valid - 1);
+        let mut seen = 0usize;
+        groups.iter().find(|g| { seen += g.1 as usize; seen > k }).map_or(f64::NEG_INFINITY, |g| g.0)
+    } else {
+        f64::NEG_INFINITY
+    };
+    let mfloor = if s.min_p > 0.0 { lmax + t * (s.min_p as f64).ln() } else { f64::NEG_INFINITY };
+    let is_cand = |x: f64| x >= tau && x >= mfloor;
+    // the candidates' weights, once per pattern. Candidacy is its own table: a weight can be NaN
+    // (an infinite temperature and a -inf logit), and the sum must carry it as the first
+    // implementation's did.
+    let mut wtab = vec![0f64; 1 << 16];
+    let mut ctab = vec![false; 1 << 16];
+    for (b, &n) in cnt.iter().enumerate() {
+        if n > 0 {
+            let x = lg(b as u16);
+            if is_cand(x) { ctab[b] = true; wtab[b] = w(x); }
+        }
+    }
+    let mass: f64 = row.iter().filter(|&&b| ctab[b as usize]).map(|&b| wtab[b as usize]).sum();
+    // top-p: theta = the logit at which the descending mass first reaches top_p * mass
+    let mut theta = f64::NEG_INFINITY;
+    let cut = s.top_p < 1.0 && mass > 0.0;
+    if cut {
+        let (target, mut cum) = (s.top_p as f64 * mass, 0.0f64);
+        for &(x, n) in groups.iter().filter(|g| is_cand(g.0)) {
+            let wx = w(x);
+            for _ in 0..n { cum += wx; } // one add per token, as a pass over the sorted row makes
+            theta = x;
+            if cum >= target { break; }
+        }
+    }
+    if !(is_cand(xt) && xt >= theta) { return Some((0.0, rank)); }
+    // the kept mass: descending over the nucleus after a cut, else every candidate in row order
+    // (which is `mass`, term for term)
+    let z: f64 = if cut {
+        groups.iter().filter(|g| is_cand(g.0) && g.0 >= theta)
+            .flat_map(|&(x, n)| std::iter::repeat(w(x)).take(n as usize)).sum()
+    } else {
+        mass
+    };
+    Some((w(xt) / z, rank))
+}
+
+impl FwdModel {
+    /// S-B9-REL-SMALLFIXES item 5(a): ONE logits row of the last step, read back to the host
+    /// (vocab f16 values, about 0.5 MB). A host sync: call it on a request's FINISHING step only.
+    pub fn logits_row(&self, sc: &Scratch, row: usize) -> Result<Vec<u16>> {
+        let v = self.cfg.vocab_size;
+        anyhow::ensure!((row + 1) * v <= sc.logits.len(), "logits row {row} outside the scratch ({} rows)", sc.logits.len() / v);
+        let mut out = vec![0u16; v];
+        self.dev.dtoh_sync_copy_into(&sc.logits.slice(row * v..(row + 1) * v), &mut out)?;
+        Ok(out)
     }
 }
 
@@ -15460,6 +15967,14 @@ pub fn kv_rowbytes(fmt: u32, hd: usize) -> usize {
 #[path = "exl3_kvnll.rs"]
 mod kvnll;
 pub use kvnll::{probe_kv_nll, probe_kv_q8_selftest, KvNllArgs};
+// S-B9-REL-PPL: `--perplexity` on an EXL3 pack — the served chunked prefill with an all-rows lm_head.
+#[path = "exl3_ppl.rs"]
+mod ppl;
+pub use ppl::{perplexity_exl3, PplArgs};
+// S-B9-REL-QSAREGIME: --probe-exl3-regime (the mixed-regime decode-step instrument; same child-module reason).
+#[path = "exl3_regime.rs"]
+mod regime;
+pub use regime::{probe_regime, RegimeArgs};
 
 /// Attention-target sentinel for the MTP draft head in the shared QSA helpers.
 const HEAD_ATT: usize = usize::MAX;
@@ -15542,6 +16057,234 @@ pub(crate) fn dv3_plan(g: usize, m: usize) -> (&'static str, &'static str, usize
         (false, true) => ("xq_attn_dense_acc4_g6", 64),
     };
     (dots, acc, sd, 16 * g as u32)
+}
+
+#[cfg(test)]
+mod qsaregime_tests {
+    use super::*;
+
+    const LIM: usize = 2051; // Flash-Next: indexer_budget 2048 + ratio 4 - 1
+
+    #[test]
+    fn dense_prefix_counts_only_leading_short_rows_of_a_mixed_step() {
+        // one-sided steps are not mixed
+        assert_eq!(dense_prefix(&[], LIM), (0, 0));
+        assert_eq!(dense_prefix(&[10], LIM), (0, 0));
+        assert_eq!(dense_prefix(&[10, 2051, 300], LIM), (0, 0));
+        assert_eq!(dense_prefix(&[2052, 20_000], LIM), (0, 0));
+        // the switch itself: 2051 is dense, 2052 is the first sparse position
+        assert_eq!(dense_prefix(&[2051, 2052], LIM), (1, 0));
+        assert_eq!(dense_prefix(&[1500, 1600, 20_000], LIM), (2, 0));
+        assert_eq!(dense_prefix(&[1500, 20_000, 30_000, 40_000], LIM), (1, 0));
+        // short rows behind a long row are reported, never counted
+        assert_eq!(dense_prefix(&[20_000, 1500], LIM), (0, 1));
+        assert_eq!(dense_prefix(&[1500, 20_000, 1600, 30_000, 7], LIM), (1, 2));
+    }
+
+    #[test]
+    fn regime_order_is_a_stable_partition_and_the_identity_on_one_sided_steps() {
+        assert_eq!(regime_order(&[5, 9, 100], LIM), vec![0, 1, 2]);
+        assert_eq!(regime_order(&[5000, 9000, 2052], LIM), vec![0, 1, 2]);
+        assert_eq!(regime_order(&[20_000, 1500, 30_000, 7, 2051, 2052], LIM), vec![1, 3, 4, 0, 2, 5]);
+        // no switch (no indexer / QSA off / the fix off): the caller passes usize::MAX
+        assert_eq!(regime_order(&[20_000, 1500, 30_000], usize::MAX), vec![0, 1, 2]);
+    }
+
+    /// After regime_order every short row is in the dense prefix, and the prefix never holds a row
+    /// past the switch (the dense kernels' score plane ends at DV3_TS positions).
+    #[test]
+    fn ordered_steps_have_no_late_rows_and_the_prefix_never_holds_a_long_row() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..4000 {
+            let mut pos = Vec::new();
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = 1 + (x >> 60) as usize; // 1..=16 rows
+            for _ in 0..n {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                pos.push(match (x >> 61) & 3 { 0 => LIM, 1 => LIM + 1, 2 => (x >> 40) as usize % (LIM + 1), _ => LIM + 1 + (x >> 40) as usize % 200_000 });
+            }
+            let (md0, late0) = dense_prefix(&pos, LIM);
+            // as given: the prefix stops at the first long row, and prefix + late = every short row of a mixed step
+            assert!(md0 == pos.len() || pos[md0] > LIM || md0 + late0 == 0, "{pos:?}");
+            let ord: Vec<usize> = regime_order(&pos, LIM).into_iter().map(|i| pos[i]).collect();
+            let (md, late) = dense_prefix(&ord, LIM);
+            let short = pos.iter().filter(|&&p| p <= LIM).count();
+            let mixed = short > 0 && short < pos.len();
+            assert_eq!(late, 0, "{pos:?}");
+            assert_eq!(md, if mixed { short } else { 0 }, "{pos:?}");
+            assert_eq!(md0 + late0, md, "{pos:?}: unsorted, the same short rows are split into prefix + late");
+            assert!(md < pos.len(), "a mixed step keeps at least one sparse row");
+            // forward_step looks at the first m positions only: any prefix of the list is safe (no row
+            // count can go negative, and a long position beyond the rows makes the step one-sided)
+            for m in 0..=pos.len() {
+                let (a, b) = dense_prefix(&ord[..m], LIM);
+                assert!(a + b <= m && (m == 0 || a < m), "{ord:?} m {m}");
+            }
+            // every dense row fits the dense-v3 score plane
+            assert!(ord[..md].iter().all(|&p| p < DV3_TS));
+        }
+    }
+
+    /// No speculative round straddles the switch: its rows p..p+depth are all dense or all sparse,
+    /// the depth is untouched wherever the full round already is on one side, and a round is only
+    /// ever shortened, down to a plain step exactly at the switch.
+    #[test]
+    fn a_round_never_straddles_the_switch() {
+        for p in LIM.saturating_sub(12)..LIM + 12 {
+            for k in 0..=7usize {
+                let d = regime_depth_at(p, k, Some(LIM));
+                assert!(d <= k);
+                assert!(p > LIM || p + d <= LIM, "p {p} k {k} -> {d} straddles");
+                if p > LIM || p + k <= LIM { assert_eq!(d, k, "p {p} k {k}: a one-sided round must keep its depth"); }
+                else { assert_eq!(d, LIM - p); }
+                assert_eq!(regime_depth_at(p, k, None), k);
+            }
+        }
+        assert_eq!(regime_depth_at(LIM, 7, Some(LIM)), 0);      // the switch itself: a plain step
+        assert_eq!(regime_depth_at(LIM + 1, 7, Some(LIM)), 7);  // the first sparse position
+        assert_eq!(regime_depth_at(0, 7, Some(LIM)), 7);
+    }
+
+    /// S-B9-REL-SMALLFIXES item 2: the round of the callers outside the scheduler (--bench-mtp, the
+    /// draft-quality bench, the KV-NLL probe: `mtp_round_clamped`) at positions 2,049..2,053 — the
+    /// serve's clamp exactly, and at the switch itself the plain step, never `mtp_round` with k = 0.
+    #[test]
+    fn the_bench_round_is_clamped_at_the_switch_like_the_serve() {
+        let plan = |p: usize, k: usize| clamped_round_plan(p, k, Some(LIM));
+        assert_eq!(LIM, 2051);
+        // the gate's --depth 2, the serve's 5, WP23's 7
+        assert_eq!((plan(2049, 2), plan(2049, 5), plan(2049, 7)), (Some(2), Some(2), Some(2))); // rows 2049..=2051
+        assert_eq!((plan(2050, 2), plan(2050, 5), plan(2050, 7)), (Some(1), Some(1), Some(1))); // rows 2050, 2051
+        assert_eq!((plan(2051, 2), plan(2051, 5), plan(2051, 7)), (None, None, None));          // the switch: a plain step
+        assert_eq!((plan(2052, 2), plan(2052, 5), plan(2052, 7)), (Some(2), Some(5), Some(7))); // first sparse row: untouched
+        assert_eq!((plan(2053, 2), plan(2053, 5), plan(2053, 7)), (Some(2), Some(5), Some(7)));
+        for p in 2040..2064usize {
+            for k in 1..=7usize {
+                // the same number the serve's step_mtp gets from regime_depth
+                assert_eq!(plan(p, k).unwrap_or(0), regime_depth_at(p, k, Some(LIM)), "p {p} k {k}");
+                match plan(p, k) {
+                    Some(d) => {
+                        assert!(d >= 1 && d <= k, "p {p} k {k} -> {d}");
+                        assert!(p > LIM || p + d <= LIM, "p {p} k {k} -> {d}: verify rows p..=p+d straddle the switch");
+                    }
+                    None => assert_eq!(p, LIM, "only the switch itself has no room for a draft (p {p} k {k})"),
+                }
+                // no switch (no indexer, --qsa-exl3 0, --qsa-row-regime 0): the round is untouched
+                assert_eq!(clamped_round_plan(p, k, None), Some(k));
+            }
+            assert_eq!(plan(p, 0), None, "a zero-depth round is a plain step (mtp_round refuses k = 0)");
+        }
+    }
+
+    /// The unit suite cannot run a round (no Scratch, AGENTS 1a-ter (4)): the callers are pinned in
+    /// the source. Every direct call of the unclamped round is listed here; a new one fails this
+    /// test until it is either routed through `mtp_round_clamped` or added with its reason.
+    #[test]
+    fn every_direct_caller_of_the_unclamped_round_is_listed() {
+        // the patterns are built from pieces so this test's own text never matches them
+        let direct = format!(".mtp_{}(", "round");
+        let clamped = format!(".mtp_{}_clamped(", "round");
+        let n = |s: &str, pat: &str| s.matches(pat).count();
+        let (fwd, serve, kvnll, tune, regime) = (include_str!("exl3_forward.rs"), include_str!("exl3_serve.rs"),
+            include_str!("exl3_kvnll.rs"), include_str!("exl3_autotune.rs"), include_str!("exl3_regime.rs"));
+        assert_eq!(n(fwd, &direct), 1, "exl3_forward.rs: only mtp_round_clamped itself calls the unclamped round");
+        assert_eq!(n(fwd, &clamped), 2, "the LOSSLESS --bench-mtp and the draft-quality bench go through the clamp");
+        assert_eq!((n(kvnll, &direct), n(kvnll, &clamped)), (0, 1), "the KV-NLL acceptance probe goes through the clamp");
+        assert_eq!(n(regime, &direct), 0);
+        assert_eq!(n(serve, &direct), 1, "exl3_serve.rs: step_mtp, which clamps k_eff itself");
+        let mtp = &serve[serve.find("fn step_mtp(&mut self, s: usize)").expect("step_mtp")..];
+        // S-B9-CF-PACK4: the clamps moved into `round_depth` (one definition for step_mtp and the packed
+        // arm's plan): step_mtp must take its depth from it before the round, and it must hold the switch clamp
+        assert!(mtp.find("self.round_depth(p, remaining)").expect("step_mtp's clamp") < mtp.find(direct.as_str()).expect("step_mtp's round"),
+                "the serve clamps before it runs the round");
+        let rd = &serve[serve.find("fn round_depth(&self").expect("round_depth")..];
+        let rd = &rd[..rd.find("\n    }\n").expect("end of round_depth")];
+        assert!(rd.find("saturating_sub(p + 2)").unwrap() < rd.find("rem_clamp").unwrap()
+                && rd.find("rem_clamp").unwrap() < rd.find("self.model.regime_depth(p, k_eff)").expect("round_depth clamps at the switch"),
+                "round_depth = window clamp, then budget clamp, then the switch clamp, in step_mtp's old order");
+        // NOT clamped, on purpose (REL_SMALLFIXES_REPORT item 2): the autotune passes run their rounds
+        // inside the tuner's armed measurement window; a clamp there needs a GPU-verified change.
+        assert_eq!(n(tune, &direct), 3, "exl3_autotune.rs: run_mtp_pass, Session::one_round, gen_once (fixed chain)");
+        // the helper is the serve's rule and the serve's plain step, in this order
+        let h = &fwd[fwd.find(format!("pub fn mtp_{}_clamped(", "round").as_str()).expect("the helper")..];
+        let h = &h[..h.find(format!("pub fn mtp_{}(", "round").as_str()).expect("the round follows the helper")];
+        let at = |pat: &str| h.find(pat).unwrap_or_else(|| panic!("mtp_round_clamped must contain `{pat}`"));
+        let (prime, step, snap) = (at("self.mtp_plain_prime(sc, head, slot, b, p, tap_row)?;"),
+                                   at("self.forward_step(sc, &[b], &[p], &[slot], None)?;"), at("self.tap_snapshot(sc, slot)?;"));
+        assert!(prime < step && step < snap, "the plain step is prime -> forward_step -> tap snapshot, as step_mtp");
+        at("if self.qsa_live(usize::MAX) && row_regime_on() { Some(self.qsa_limit()) } else { None }");
+    }
+
+    /// A mixed step is its own graph per (width, dense rows); every pre-existing key is unchanged
+    /// and no mixed key lands on another key family or on the penalty / vp / scratch-id bits.
+    #[test]
+    fn mixed_step_graph_keys_are_distinct_and_leave_the_old_keys_alone() {
+        assert_eq!(mixed_key_bits(0), 0);
+        let mut seen = std::collections::HashSet::new();
+        for m in 1..=16usize {
+            assert!(seen.insert(gkey_of(m, false, 0)));
+            for qb in [0usize, 10, 63] {
+                for md in 0..m {
+                    let k = gkey_of(m, true, qb) | mixed_key_bits(md);
+                    assert!(seen.insert(k), "duplicate step key m {m} qb {qb} md {md}");
+                    assert_eq!(k >> 27, 0, "step key reaches the family / penalty / vp / scratch bits");
+                    assert_eq!(k & 0xFF, m);
+                }
+            }
+        }
+        // every other graph family lives at or above bit 30
+        for (name, k) in [("verify", vkey_of(0, 1, false, 0)), ("draft", dkey_of(0, 1, false, 0)), ("prime", pkey_of(0, 0, false, 0))] {
+            assert!(k >> 30 != 0, "{name} keys must not share the step family's range");
+        }
+    }
+
+    /// The unit suite cannot build a Scratch (AGENTS 1a-ter (4)), so the wiring is pinned in the
+    /// source: forward_step computes md once and hands it to the eager launches AND the capture,
+    /// the boot precapture stays one-regime, and the serve orders the lanes before staging a row.
+    #[test]
+    fn the_per_row_regime_is_wired_through_step_capture_and_scheduler() {
+        let f = include_str!("exl3_forward.rs");
+        // each pattern is given in two pieces so this test's own text never matches it
+        let once = |a: &str, b: &str| {
+            let pat = format!("{a}{b}");
+            assert_eq!(f.matches(pat.as_str()).count(), 1, "expected exactly one `{pat}`");
+        };
+        once("let (md, late) = dense_prefix(", "rows, self.qsa_limit());");
+        once("let gkey = gkey_of(m, qsa, qb) | ", "mixed_key_bits(md) |");
+        once("self.forward_step_kernels(&l, sc, m, ", "ladder.as_deref_mut(), dump_active, qsa, md)?;");
+        once("self.capture_step_graph(&l, sc, m, ", "gkey, qsa, md);");
+        once("self.capture_step_graph(&l, sc, m, ", "key, sparse, 0);");
+        once("self.dense_attn_step(l, sc, a, att_i, ", "md, nh_p, hd_p)?;");
+        let s = include_str!("exl3_serve.rs");
+        let body = &s[s.find("fn step_plain(&mut self, slots: &[usize], sync_head: bool)").expect("step_plain")..];
+        let (o, st) = (body.find("let ordered = self.regime_ordered(slots);").expect("step_plain orders its lanes"),
+                       body.find("let toks: Vec<i32> = slots.iter()").expect("step_plain stages rows"));
+        assert!(o < st && o < body.find("mtp_plain_prime").unwrap(), "the order must be fixed before any row is staged");
+        let sh = body.find("let slots: &[usize] = &ordered;").expect("step_plain must USE the ordered list (shadow `slots`)");
+        assert!(o < sh && sh < st && sh < body.find("mtp_plain_prime").unwrap(), "every row of the step must come from the ordered list");
+        let mtp = &s[s.find("fn step_mtp(&mut self, s: usize)").expect("step_mtp")..];
+        let (c, r) = (mtp.find("self.round_depth(p, remaining)").expect("step_mtp clamps the round at the switch (round_depth)"),
+                      mtp.find("let plain_step = control || k_eff == 0;").expect("step_mtp's plain-step rule"));
+        assert!(c < r, "the switch clamp must precede the plain-step decision");
+        let t = include_str!("opts_table.rs");
+        assert!(t.contains("flag: \"qsa-row-regime\", env: \"\", ty: Ty::Bool, def: \"on\""), "the option row (no environment variable)");
+    }
+
+    /// S-B9-REL-VISIONFIX2 V2a: the `pfx1-ltplans` thread runs at an arbitrary time after boot, while the
+    /// scheduler thread captures graphs lazily. A cublasLtDestroy on it invalidates the scheduler's
+    /// open capture (not refused: it returns ok; measured in tests/vision_capture_race_test.rs), so the
+    /// thread must never call it. The body is read from the source, comment lines excluded.
+    #[test]
+    fn the_ltplans_thread_never_destroys_a_library_handle() {
+        let f = include_str!("exl3_forward.rs");
+        let a = f.find("pub fn lt_prewarm_start(&self)").expect("lt_prewarm_start");
+        let b = a + f[a..].find("/// WP04 (PLAN/SURPASS_PLAN_2026-09-26.md)").expect("end of lt_prewarm_start");
+        let code: String = f[a..b].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        for banned in [["destroy", "_handle"].concat(), ["cublasLt", "Destroy"].concat(), ["cublas", "Destroy"].concat()] {
+            assert!(!code.contains(banned.as_str()), "the ltplans thread names `{banned}`: it would invalidate a capture on the scheduler thread");
+        }
+        assert!(code.contains("lt::create_handle()") && code.contains("lt_plan_build("), "the guard reads the right function body");
+    }
 }
 
 #[cfg(test)]
@@ -16268,6 +17011,13 @@ const QSA_MR_ROWS: usize = 8;
 /// only the boot graphs gain from an early upload).
 static PRECAP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRECAP_UPLOAD_FAIL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// S-B9-REL-VISIONFIX2 V2b: the status `metrics::graph_capture_lost` classifies a lost capture by:
+/// the failing `cuStreamEndCapture` result, or "body error" when the capture closed cleanly but the
+/// recorded body returned an error.
+fn capture_lost_status(end: cudarc::driver::sys::CUresult) -> String {
+    if end != cudarc::driver::sys::CUresult::CUDA_SUCCESS { format!("{end:?}") } else { "body error".to_string() }
+}
+
 fn graph_log_on() -> bool { !PRECAP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) }
 /// WP04-v2: during the boot precapture, upload a freshly instantiated exec to the device on the
 /// compute stream (cuGraphUpload performs the replay-time instantiation work WITHOUT launching a
@@ -16293,6 +17043,67 @@ static SCRATCH_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 fn gkey_of(m: usize, qsa: bool, qb: usize) -> usize {
     m + if qsa { (1 << 20) | (qb << 21) } else { 0 }
 }
+/// S-B9-REL-QSAREGIME: the decode-step graph key bits of a mixed step, `md` = its dense-row count
+/// (bits 8..15 of the step family; gkey_of keeps m in bits 0..7, the regime in bit 20 and the bucket
+/// in bits 21..26). 0 for every non-mixed step, so the pre-existing keys are unchanged.
+fn mixed_key_bits(md: usize) -> usize {
+    debug_assert!(md < 256);
+    (md & 0xFF) << 8
+}
+/// S-B9-REL-QSAREGIME: for a decode step with these row positions, (the number of LEADING rows at or
+/// below the sparse switch `lim` = qsa_limit() when some row is past it, the number of rows at/below
+/// the switch that sit BEHIND a row past it). (0, 0) = not a mixed step. The leading rows keep the
+/// dense kernels; the late ones cannot (the dense launches address rows 0..md) and stay sparse.
+pub(crate) fn dense_prefix(pos: &[usize], lim: usize) -> (usize, usize) {
+    if !pos.iter().any(|&p| p > lim) { return (0, 0); }
+    let md = pos.iter().take_while(|&&p| p <= lim).count();
+    (md, pos[md..].iter().filter(|&&p| p <= lim).count())
+}
+/// S-B9-REL-QSAREGIME: the row order a decode step needs for the per-row regime — the indices of
+/// `pos` with the rows at/below the sparse switch first, each class in its given order (stable).
+/// The identity whenever the rows are all on one side.
+pub fn regime_order(pos: &[usize], lim: usize) -> Vec<usize> {
+    let mut o: Vec<usize> = (0..pos.len()).filter(|&i| pos[i] <= lim).collect();
+    o.extend((0..pos.len()).filter(|&i| pos[i] > lim));
+    o
+}
+/// S-B9-REL-QSAREGIME: `k` clamped so that rows p..p+k do not straddle the sparse switch `lim`
+/// (None = no switch): at/below the switch the round ends on it, past it nothing changes.
+pub(crate) fn regime_depth_at(p: usize, k: usize, lim: Option<usize>) -> usize {
+    match lim { Some(l) if p <= l => k.min(l - p), _ => k }
+}
+/// S-B9-REL-SMALLFIXES item 2: what a clamped round at position `p` runs — Some(depth >= 1) = a
+/// speculative round of that depth (rows p..p+depth on one side of the switch), None = no draft
+/// fits (p is the switch itself, or k == 0): the head-synced plain step.
+pub(crate) fn clamped_round_plan(p: usize, k: usize, lim: Option<usize>) -> Option<usize> {
+    match regime_depth_at(p, k, lim) { 0 => None, d => Some(d) }
+}
+/// S-B9-REL-SMALLFIXES 9a(iii): how many distinct mixed step shapes `lanes` lanes can form — a
+/// step of width m in 2..=lanes with 1..=m-1 leading dense rows: lanes * (lanes - 1) / 2 (6 at 4
+/// lanes, 120 at 16). The graph key also carries the sparse grid bucket and the penalty bit
+/// (`gkey_of(m, qsa, qb) | mixed_key_bits(md) | pen_live << 40`), so the number of mixed-step
+/// GRAPHS a boot can capture is this many per (bucket, penalty state) it meets, not this many.
+pub fn mixed_step_shapes(lanes: usize) -> usize {
+    lanes * lanes.saturating_sub(1) / 2
+}
+/// S-B9-REL-QSAREGIME: per-row attention regime in decode steps. Default on; `--qsa-row-regime 0`
+/// restores one regime per step from its largest position (the pre-fix rule), for A/B.
+pub fn row_regime_on() -> bool {
+    crate::opts::var(crate::opt!("qsa-row-regime")).as_deref() != Ok("0")
+}
+/// Once-per-boot liveness lines of the per-row regime (AGENTS 4: a new dispatch path names itself).
+fn row_regime_note(md: usize, long: usize, late: usize) {
+    static LIVE: std::sync::Once = std::sync::Once::new();
+    static LATE: std::sync::Once = std::sync::Once::new();
+    if md > 0 {
+        LIVE.call_once(|| crate::rprintln!("[exl3] per-row attention regime LIVE: a decode step with {md} row(s) at/below the sparse \
+switch and {long} past it keeps the short row(s) on the dense kernels (--qsa-row-regime 0 = one regime per step)"));
+    }
+    if late > 0 {
+        LATE.call_once(|| crate::rprintln!("[exl3] per-row attention regime: {late} row(s) at/below the sparse switch sit BEHIND a \
+longer row in a decode step and stay on the sparse kernels (the caller did not order short rows first)"));
+    }
+}
 fn vkey_of(slot: usize, m: usize, qsa: bool, qb: usize) -> usize {
     (1usize << 30) | ((qsa as usize) << 29) | (if qsa { qb << 16 } else { 0 }) | (slot << 8) | m
 }
@@ -16312,6 +17123,13 @@ fn pkey_of(slot: usize, i: usize, qsa: bool, qb: usize) -> usize {
 /// this at lookup). Probe-only; the served boot never captures this family.
 fn pkeyv_of(rpad: usize, qsa: bool, qb: usize) -> usize {
     (4usize << 30) | ((qsa as usize) << 29) | (if qsa { qb << 16 } else { 0 }) | rpad
+}
+/// PACK4S: the SERVED packed verify key = PACK3's family key + the real-q sampler bit (bit 44,
+/// the lone verify key's own `rq_verify_bits`): a pair holding a real-q lane replays the rq
+/// family (its body runs `xq_sample_rows_rq`), every other pair the PACK4 family, whose key
+/// this is bit for bit with `rq` false.
+fn pack_key(r: usize, qsa: bool, qb: usize, rq: bool) -> usize {
+    pkeyv_of(r, qsa, qb) | rq_verify_bits(rq)
 }
 /// WP24: draft graph key bits 42-43 = the passes' rq mode (0 = today's tail: the boot precapture's
 /// keys and graphs; 1 = + the dump list; 2 = real-q old-tail sampling). Verify keys carry the
@@ -16353,6 +17171,25 @@ mod wp24_key_tests {
         assert_ne!(d1, d2);
         assert_ne!(d1, dkey_of(1, 7, true, 3));
         assert_eq!(vkey_of(2, 8, false, 0) | rq_verify_bits(false), vkey_of(2, 8, false, 0));
+    }
+
+    /// PACK4S: the packed family key gains the rq bit and nothing else; with the bit clear it is
+    /// PACK4's key exactly, and the bit touches no field of the packed key or the scratch id.
+    #[test]
+    fn packed_key_rq_family_bit() {
+        for &(r, qsa, qb) in &[(4usize, false, 0usize), (16, false, 0), (10, true, 0), (16, true, 5), (15, true, 511)] {
+            let (g, q) = (pack_key(r, qsa, qb, false), pack_key(r, qsa, qb, true));
+            assert_eq!(g, pkeyv_of(r, qsa, qb), "greedy and match-mode pairs keep the PACK4 family");
+            assert_eq!(q, g | (1usize << 44));
+            assert_ne!(q, g);
+            assert_eq!(g & (1usize << 44), 0);
+            assert_eq!((q | g) & (0x7Fusize << 48), 0, "the scratch id field stays free");
+            assert_eq!(q >> 30 & 7, 4, "still the packed class");
+        }
+        // 13 widths x 2 families are 26 distinct keys per regime
+        let keys: std::collections::BTreeSet<usize> = crate::lane_pack::PACK_WIDTHS
+            .flat_map(|r| [pack_key(r, false, 0, false), pack_key(r, false, 0, true)]).collect();
+        assert_eq!(keys.len(), 26);
     }
 
     /// SampParams' packing is unchanged by the flag parameter (flag 1 = today's rows).
@@ -16401,8 +17238,44 @@ impl FwdModel {
     }
 }
 
+/// Which switch turned the EXL3 draft head off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MtpOff {
+    /// `--mtp off` (the documented user switch; also its older spellings `0` / `false`)
+    MtpFlag,
+    /// `--exl3-no-mtp` (the diagnostics hatch, AGENTS 1b)
+    Hatch,
+}
+
+impl MtpOff {
+    /// The flag as the user typed it (banners, error messages).
+    pub fn flag(self) -> &'static str {
+        match self { MtpOff::MtpFlag => "--mtp off", MtpOff::Hatch => "--exl3-no-mtp" }
+    }
+}
+
+/// S-B9-REL-SMALLFIXES item 1: what the EXL3 engine makes of `--mtp <auto|on|off>` and
+/// `--exl3-no-mtp`. `mtp` = the raw registry value (None = not passed), `hatch` = --exl3-no-mtp set.
+/// None = speculation ON (`auto`, `on` and "not passed" are the same thing here: the head runs with
+/// the per-request profitability control). v0.7.3 and earlier did not read `--mtp` in this engine at all.
+pub fn mtp_off_of(mtp: Option<&str>, hatch: bool) -> Option<MtpOff> {
+    if hatch { return Some(MtpOff::Hatch); }
+    match mtp {
+        Some("off" | "0" | "false") => Some(MtpOff::MtpFlag),
+        _ => None,
+    }
+}
+
+/// The process's resolved switch (both options are Spmd: a TP node sees the head's values).
+pub fn mtp_off_by_opt() -> Option<MtpOff> {
+    mtp_off_of(crate::opts::var(crate::opt!("mtp")).ok().as_deref(),
+               crate::opts::var(crate::opt!("exl3-no-mtp")).is_ok())
+}
+
+/// THE gate every EXL3 site reads (serve boot + every step, the TP boot agree, the graph
+/// precapture, the WP24 gate): the draft head is off by `--mtp off` or by the hatch.
 pub fn mtp_disabled_by_opt() -> bool {
-    crate::opts::var(crate::opt!("exl3-no-mtp")).is_ok() // diagnostics hatch ONLY (AGENTS 1b)
+    mtp_off_by_opt().is_some()
 }
 
 /// WP02/WP03 (PLAN/SURPASS_PLAN_2026-09-26) diagnostic escapes — A/B and bisect only, never a
@@ -16413,6 +17286,12 @@ pub fn mtp_disabled_by_opt() -> bool {
 ///   plen-1 from the tap AFTER plen-1); `=headprime`: full-row snapshot + the old head_prime;
 /// - `--a-ctrl=old`: control rounds write no head row p, leave the tap in sc.resid, 1/128;
 ///   `=fixed128`: the new head-row write + tap snapshot, but the old fixed 1/128 cadence;
+///   `=off` (S-B9-CF-PACK4S, gate diagnostics): NO cadence control round. The cadence counter is
+///   scheduler-wide (one tick per lane round of ANY lane), so with it a request's round
+///   structure — and with it the sampler counters a SAMPLED request draws — depends on what
+///   else the server ran; with `off` (and the plain reference therefore never measured, so the
+///   per-request cost control never turns speculation off) a request's rounds are a function of
+///   its own content and seeds. Not a serving posture: the profitability control is blind;
 /// - `--a-remclamp=0`: no remaining-max_new clamp of the draft window.
 /// The context-end clamp (p+k+1 < max_pos) and the cancel sweep have NO escape: they only act
 /// where the old path wrote past the KV/QSA/cos buffers or decoded for a client that is gone.
@@ -16421,7 +17300,8 @@ pub struct AFlags {
     pub taps_shared: bool,
     /// 0 = new (KV-only prime from the prefill carry), 1 = headprime, 2 = old
     pub seam: u8,
-    /// 0 = new (head row p + snapshot, cost-gated 1/1024 cadence), 1 = fixed128, 2 = old
+    /// 0 = new (head row p + snapshot, cost-gated 1/1024 cadence), 1 = fixed128, 2 = old,
+    /// 3 = off (S-B9-CF-PACK4S, gate diagnostics: no cadence control round ever runs)
     pub ctrl: u8,
     pub rem_clamp: bool,
 }
@@ -16434,7 +17314,7 @@ pub fn a_flags() -> AFlags {
         let f = AFlags {
             taps_shared: all_off || v(crate::opt!("a-taps")).as_deref() == Some("shared"),
             seam: if all_off { 2 } else { match v(crate::opt!("a-seam")).as_deref() { Some("old") => 2, Some("headprime") => 1, _ => 0 } },
-            ctrl: if all_off { 2 } else { match v(crate::opt!("a-ctrl")).as_deref() { Some("old") => 2, Some("fixed128") => 1, _ => 0 } },
+            ctrl: if all_off { 2 } else { match v(crate::opt!("a-ctrl")).as_deref() { Some("old") => 2, Some("fixed128") => 1, Some("off") => 3, _ => 0 } },
             rem_clamp: !(all_off || v(crate::opt!("a-remclamp")).as_deref() == Some("0")),
         };
         if f != (AFlags { taps_shared: false, seam: 0, ctrl: 0, rem_clamp: true }) {
@@ -17543,9 +18423,11 @@ impl FwdModel {
         let dqsa = self.qsa_live(p + k - 1);
         let (dg, _) = self.qsa_grid_bucket_key(p + k - 1);
         sc.qsa_grid_nblk = dg;
-        // mtp_round stages slot_ids for the chain UNCONDITIONALLY (the head key
-        // write targets slot_ids[b]'s plane even in the dense regime); a
-        // conditional stage leaks the previous op's slot into the chain writes.
+        // This PROBE stages slot_ids for the chain UNCONDITIONALLY (the head key write targets
+        // slot_ids[b]'s plane even in the dense regime). The SERVED draft (`mtp_draft_adaptive`)
+        // stages them only when the chain's last pass is in the sparse regime, so a dense round
+        // writes the head's raw-key / pooled planes at the previous op's slot (PACK4 review
+        // note 1: acceptance only, never bytes: those planes are read by the head's scorer alone).
         self.dev.htod_copy_into(vec![slot as i32; sc.slot_ids.len()], &mut sc.slot_ids)?;
         self.draft_block(l, sc, head, k, dqsa)?;
         self.dev.synchronize()?;
@@ -17942,7 +18824,7 @@ impl FwdModel {
         let k = 4usize;
         let m = k + 1;
         let rounds = 20usize;
-        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         anyhow::ensure!(sc.d_dev.len() >= m + k, "packstate: d_dev narrower than 2 x k");
         println!("PACKSTATE: packed ROUND probe (2 requests, k={k}, {rounds} rounds x 3 pairs; \
                   serial = lone verify per request through the served verify_block; \
@@ -18215,7 +19097,7 @@ impl FwdModel {
         let m = k + 1;
         let rpad = 2 * m;
         let m0 = 6usize; // the 6+4 split's first segment length
-        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         anyhow::ensure!(sc.d_dev.len() >= 2 * (k + 1), "pack3: d_dev narrower than 2 x (k+1)");
         println!("PACK3A: graphed round-pair A/B (k={k}, m={m}, R_pad={rpad}; graph = seg trunk + accept_seg + commit_seg; \
                   eager tail = PLE shadow + per-segment taps)");
@@ -18832,7 +19714,7 @@ impl FwdModel {
         let k = 4usize;
         let m = k + 1;
         let v = self.cfg.vocab_size;
-        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim)?;
+        let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         println!("PACK2: eager packed-verify probe (2 requests x {m} rows, scratch w=16, nostore, eager)");
         let pairs = [(97usize, 89usize), (513usize, 523usize), (2201usize, 2201usize)];
         let mut ratios: Vec<f64> = Vec::new();
@@ -18968,6 +19850,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
                 crate::rprintln!("EXL3_GRAPH: verify BeginCapture failed ({r:?}) at m={m} — staying eager");
+                crate::metrics::graph_capture_lost("verify", &format!("m={m}, slot={slot}, qsa={qsa}"), &format!("{r:?}"));
                 return;
             }
         }
@@ -18976,6 +19859,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
             crate::rprintln!("EXL3_GRAPH: verify capture failed (end={r2:?}, body={:?}) at m={m} — staying eager", cap.err());
+            crate::metrics::graph_capture_lost("verify", &format!("m={m}, slot={slot}, qsa={qsa}"), &capture_lost_status(r2));
             return;
         }
         crate::exl3_wp27::finish(graph, "verify", m); // WP27: node priorities + DAG receipt
@@ -18990,6 +19874,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                 if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured verify block at m={m} (qsa={qsa}, slot={slot})"); }
             } else {
                 crate::rprintln!("EXL3_GRAPH: verify instantiate failed ({r3:?}) at m={m} — staying eager");
+                crate::metrics::graph_capture_lost("verify", &format!("m={m}, slot={slot}, qsa={qsa}"), &format!("instantiate {r3:?}"));
             }
         }
     }
@@ -19047,6 +19932,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
                 crate::rprintln!("EXL3_GRAPH: packed BeginCapture failed ({r:?}) at rpad={rpad} — staying eager");
+                crate::metrics::graph_capture_lost("packed-verify", &format!("rpad={rpad}, k_seg={k_seg}, qsa={qsa}"), &format!("{r:?}"));
                 return;
             }
         }
@@ -19055,6 +19941,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
             crate::rprintln!("EXL3_GRAPH: packed capture failed (end={r2:?}, body={:?}) at rpad={rpad} — staying eager", cap.err());
+            crate::metrics::graph_capture_lost("packed-verify", &format!("rpad={rpad}, k_seg={k_seg}, qsa={qsa}"), &capture_lost_status(r2));
             return;
         }
         crate::exl3_wp27::finish(graph, "packed-verify", rpad);
@@ -19069,8 +19956,417 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                 if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured packed verify at rpad={rpad} (k_seg={k_seg}, qsa={qsa})"); }
             } else {
                 crate::rprintln!("EXL3_GRAPH: packed instantiate failed ({r3:?}) at rpad={rpad} — staying eager");
+                crate::metrics::graph_capture_lost("packed-verify", &format!("rpad={rpad}, k_seg={k_seg}, qsa={qsa}"), &format!("instantiate {r3:?}"));
             }
         }
+    }
+
+    // ==================== PACK4 LEG 4 (S-B9-CF-PACK4): the SERVED packed round ====================
+    // `--lane-pack on`: two requests share one packed verify (PACK4: greedy; PACK4S: sampled
+    // and mixed pairs too). Drafting and the head
+    // re-prime stay per request on the SERVED scratch (`mtp_draft_adaptive`, `head_reprime`);
+    // the verify runs on its own 16-row scratch through the PACK3 graph family, keyed on the
+    // exact row total R. The one cross-scratch hand-off is the taps: the verify's resid rows
+    // go into each slot's window of the SERVED scratch, where the next draft and the
+    // re-prime read them exactly as after a lone verify.
+
+    /// Can this boot run the packed verify at all? The segmented kernels exist for the ring
+    /// commit, the WP12 nostore conv and kd = vd = 128 only (verify_kernels refuses the rest),
+    /// and the served arm replays GRAPHS only: it never runs an eager packed block and never
+    /// captures while serving.
+    pub fn pack_supported(&self) -> Result<()> {
+        let cfg = &self.tc;
+        anyhow::ensure!(self.mtp.is_some() && !mtp_disabled_by_opt(), "--lane-pack on needs the MTP draft head (this boot has none, or MTP is off)");
+        // TP=1, TP=2 and TP=4 (owner 2026-10-10: the TP=4 refusal is lifted); a larger world is
+        // refused before the network (xtp::world_gt2_flag_refusals) and, structurally, here
+        anyhow::ensure!(self.tp.as_ref().map_or(true, |t| t.world as u32 <= crate::lane_pack::LANE_PACK_MAX_WORLD),
+                        "--lane-pack runs at TP=1, TP=2 and TP=4 (this boot is TP={})", self.tp.as_ref().map_or(1, |t| t.world));
+        anyhow::ensure!(cfg.lin_k_dim == 128 && cfg.lin_v_dim == 128,
+                        "--lane-pack on: the segmented GDN kernels need kd = vd = 128 (this pack: {} / {})", cfg.lin_k_dim, cfg.lin_v_dim);
+        anyhow::ensure!(gdn_commit_mode(cfg.lin_k_dim, cfg.lin_v_dim) == 1,
+                        "--lane-pack on: the per-segment commit is the ring commit (--exl3-gdn-ring 0 / --exl3-gdn-ring-check are set)");
+        anyhow::ensure!(crate::opts::var(crate::opt!("exl3-no-graph")).is_err()
+                        && crate::opts::var(crate::opt!("mtp-dump")).map_or(true, |s| s.is_empty())
+                        && !wp12_xcheck(),
+                        "--lane-pack on replays captured graphs only (--exl3-no-graph / --mtp-dump / the WP12 cross-check turn the verify graphs off)");
+        anyhow::ensure!(!a_flags().taps_shared, "--lane-pack on needs the per-slot taps windows (--a-taps=shared is set)");
+        Ok(())
+    }
+
+    /// The packed verify's own scratch: 16 rows, a greedy sampler block (real zeros until a
+    /// sampled pair stages it, `set_pack_sampling`) and no penalties (never staged: the packed
+    /// arm serves unpenalized lanes only), with its own graph-key id (`sk`), so no served graph
+    /// can replay on it. PACK4S: its real-q list holds one row per verify row (16).
+    pub fn pack_scratch(&self) -> Result<Scratch> {
+        let scp = Self::scratch(&self.dev, &self.cfg, crate::lane_pack::PACK_ROWS_MAX, self.max_pos)?;
+        anyhow::ensure!(!scp.samp_live && !scp.pen_live && !scp.rq_live && scp.rq_mode == 0,
+                        "lane-pack: a fresh scratch must be greedy and unpenalized");
+        anyhow::ensure!(scp.rq_list.len() >= crate::lane_pack::PACK_ROWS_MAX * crate::wp24::RQ_ROW
+                        && scp.samp.len() == crate::lane_pack::PACK_ROWS_MAX * 8,
+                        "lane-pack: the packed sampler block / real-q list are narrower than {} rows", crate::lane_pack::PACK_ROWS_MAX);
+        anyhow::ensure!(scp.d_dev.len() >= crate::lane_pack::PACK_ROWS_MAX && scp.accept_out.len() >= crate::lane_pack::PACK_ROWS_MAX
+                        && scp.seg.len() >= crate::lane_pack::PACK_K * 4 && scp.acc_seg.len() >= crate::lane_pack::PACK_K * 2,
+                        "lane-pack: packed staging buffers narrower than {} rows", crate::lane_pack::PACK_ROWS_MAX);
+        Ok(scp)
+    }
+
+    /// The regimes a packed verify can be asked for on this boot: dense always; sparse when the
+    /// pack has a live indexer, the scorer is bucket-free (one graph per regime serves every
+    /// context — the served precapture's own rule) and the window reaches the switch.
+    fn pack_regimes(&self) -> Vec<(bool, usize)> {
+        let mut regimes = vec![(false, 0usize)];
+        if self.cfg.has_indexer() && !qsa_disabled() && self.qsa_bucket_free() {
+            let ps = self.qsa_limit() + 1;
+            if ps < self.max_pos && self.qsa_live(ps) { regimes.push((true, ps)); }
+        }
+        regimes
+    }
+
+    /// The packed verify graph key of one (family, regime, width): PACK3's family key, the real-q
+    /// bit (PACK4S), the vocabulary-parallel tail bits the family's sampler state selects (TP:
+    /// S-B9-CF-PACK5; zero at TP=1, where there is no vocab-parallel head, so every TP=1 key is
+    /// PACK4S's bit for bit) and the packed scratch's id.
+    fn pack_fam_key(&self, scp: &Scratch, r: usize, sparse: bool, qb: usize, fam: crate::lane_pack::PackFam) -> usize {
+        let (samp, rq) = fam.state();
+        pack_key(r, sparse, qb, rq) | self.vp_key_st(samp, false, rq, r) | sk(scp)
+    }
+
+    /// Boot precapture of the packed families on `scp`: every exact width R in 4..=16 for each
+    /// reachable regime and each family in `fams` (capture-only: nothing executes, no device byte
+    /// changes). The served arm NEVER captures a packed graph while serving, so a width that
+    /// failed to capture fails the boot loudly instead of leaving a lazy path behind.
+    ///
+    /// PACK4S: `fams` carries the real-q family under `--spec-sampling ratio`. Each family is
+    /// captured with the scratch's sampler shadows set to the state its graphs replay under
+    /// (`PackFam::state`, restored after): the TP verify tail is chosen from that state. At TP=1
+    /// the match-rule family has the greedy family's key and is not captured twice.
+    ///
+    /// PACK4-REVIEW B2: the 1 GB cap that read a `cuMemGetInfo` free-memory delta is GONE. That
+    /// figure moved by up to +724 MB for the same captures (unified memory, concurrent
+    /// allocations) and could refuse a healthy boot; a real out-of-memory shows up as a capture
+    /// that did not land in the graph map, which is checked per graph below and is the exact
+    /// condition the cap was a noisy proxy for. The memory delta is still returned for the boot
+    /// line (informational, labelled noisy there).
+    ///
+    /// TP: the loop's order and contents are a function of resolved flags and the pack config only
+    /// (regimes, widths, `fams`), so both ranks capture the same keys in the same order; the boot
+    /// agree compares the resulting set (`pack_graph_set`) before the first request.
+    /// Returns (graphs captured, device-memory delta in MB, the regimes line).
+    pub fn pack_precapture(&self, scp: &mut Scratch, fams: &[crate::lane_pack::PackFam]) -> Result<(usize, f64, String)> {
+        self.pack_supported()?;
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let free0 = cudarc::driver::result::mem_get_info().map(|x| x.0).unwrap_or(0);
+        let regimes = self.pack_regimes();
+        let mut n = 0usize;
+        // Host-side one-time init the first launch of a 9..16-row entry would otherwise do INSIDE
+        // a capture: the raw-module handles of the R16 router fold and hc fuse (and the 10..16-row
+        // expert epilogues; the served precapture resolves the rest of its list).
+        for f in ["xq_router_fold_c_r16", "xq_hc_fuse_i8_rbk_r16", "xq_moe_gu_epi_c2", "xq_moe_gu_epi_c4",
+                  "xq_moe_gu_epi_b4_c2", "xq_moe_gu_epi_b4_c4", "xq_moe_dn_epi_k10", "xq_moe_dn_epi_b4_k10"] {
+            let _ = xq_raw_fn(f);
+        }
+        // `--lane-pack-drill-skip-sparse` (diagnostic, one-sided per box): this rank holds no sparse-regime
+        // packed graphs, so the TP boot agree has a rank-local graph-set difference to refuse
+        let drill_skip_sparse = crate::opts::var(crate::opt!("lane-pack-drill-skip-sparse")).map_or(false, |v| !matches!(v.trim(), "" | "0" | "off"));
+        if drill_skip_sparse {
+            crate::rprintln!("[exl3-serve] lane-pack DRILL (--lane-pack-drill-skip-sparse): this rank captures NO sparse-regime packed verify graphs; \
+its packed graph set will differ from its peer's — the TP boot agree must refuse the boot");
+        }
+        PRECAP_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = (|| -> Result<()> {
+            for &fam in fams {
+                // the capture records the row sampler and the vp tail the family replays
+                // (verify_kernels reads the shadows)
+                let (samp, rq) = fam.state();
+                scp.samp_live = samp;
+                scp.rq_live = rq;
+                for &(sparse, p) in &regimes {
+                    if sparse && drill_skip_sparse { continue; }
+                    let (qg, qb) = self.qsa_grid_bucket_key(p);
+                    for r in crate::lane_pack::PACK_WIDTHS {
+                        let key = self.pack_fam_key(scp, r, sparse, qb, fam);
+                        if self.graphs.lock().unwrap().contains_key(&key) { continue; }
+                        scp.qsa_grid_nblk = qg;
+                        self.capture_verify_graph_packed(&l, scp, r, crate::lane_pack::PACK_K, sparse, key);
+                        anyhow::ensure!(self.graphs.lock().unwrap().contains_key(&key),
+                                        "lane-pack: the packed verify graph at R = {r} ({} regime, {} family) did not capture (see the EXL3_GRAPH line above) — boot with --lane-pack off",
+                                        if sparse { "sparse" } else { "dense" }, fam.label());
+                        n += 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        // a fresh packed scratch is greedy until a sampled pair stages it
+        scp.samp_live = false;
+        scp.rq_live = false;
+        PRECAP_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.dev.synchronize()?; // the uploads were queued on the compute stream; no kernel ran
+        r?;
+        let free1 = cudarc::driver::result::mem_get_info().map(|x| x.0).unwrap_or(free0);
+        let note = format!("regimes: dense{}", match (regimes.len() > 1, self.cfg.has_indexer() && !qsa_disabled()) {
+            (true, _) => ", sparse (bucket-free)",
+            (false, true) => " only (sparse lanes are not packed: bucketed scorer or the window ends before the switch)",
+            (false, false) => " only (no sparse attention on this boot)",
+        });
+        Ok((n, (free0 as f64 - free1 as f64) / 1e6, note))
+    }
+
+    /// Is the whole packed family `fam` present for a round whose rows are on the `sparse` side?
+    /// (the arm asks BEFORE drafting: once two lanes have drafted, their verify must be able to run.)
+    pub fn pack_family_ready(&self, scp: &Scratch, sparse: bool, fam: crate::lane_pack::PackFam) -> bool {
+        let Some(&(_, p)) = self.pack_regimes().iter().find(|(s, _)| *s == sparse) else { return false };
+        let (_, qb) = self.qsa_grid_bucket_key(p);
+        let g = self.graphs.lock().unwrap();
+        crate::lane_pack::PACK_WIDTHS.clone().all(|r| g.contains_key(&self.pack_fam_key(scp, r, sparse, qb, fam)))
+    }
+
+    /// S-B9-CF-PACK5: the packed graph set this rank holds, as (graphs present, FNV digest of the
+    /// (family, regime, width, present) table in the capture loop's own order, a description).
+    /// The digest and count go into the TP boot agree: a pack whose ranks hold DIFFERENT sets (the
+    /// receipt of the CF-P1e TP=2 `--max-batch 16` death was exactly such a rank-local graph
+    /// presence read by a scheduling decision) refuses to boot instead of deciding rank-locally.
+    pub fn pack_graph_set(&self, scp: &Scratch, fams: &[crate::lane_pack::PackFam]) -> (usize, u32, String) {
+        let regimes = self.pack_regimes();
+        let g = self.graphs.lock().unwrap();
+        let (mut n, mut h) = (0usize, 0x811c_9dc5u32);
+        let mut parts: Vec<String> = Vec::new();
+        for (fi, &fam) in fams.iter().enumerate() {
+            for &(sparse, p) in &regimes {
+                let (_, qb) = self.qsa_grid_bucket_key(p);
+                let mut have = 0usize;
+                for r in crate::lane_pack::PACK_WIDTHS {
+                    let present = g.contains_key(&self.pack_fam_key(scp, r, sparse, qb, fam));
+                    have += present as usize;
+                    for b in [fi as u8, sparse as u8, r as u8, present as u8] {
+                        h ^= b as u32;
+                        h = h.wrapping_mul(0x0100_0193);
+                    }
+                }
+                n += have;
+                parts.push(format!("{} {} R={}..{} x{}", fam.label(), if sparse { "sparse" } else { "dense" },
+                                   crate::lane_pack::PACK_WIDTHS.start(), crate::lane_pack::PACK_WIDTHS.end(), have));
+            }
+        }
+        (n, h, parts.join(", "))
+    }
+
+    /// One request's draft chain for a packed round: exactly the lone round's draft half, on the
+    /// served scratch. `keep` = Some: the DDS chain (`mtp_draft_adaptive`: tap restore, DDS
+    /// passes, speculative next pass, clamped drafts); None (`--draft-confidence 0`): the
+    /// fixed-depth chain of exactly `kmax` drafts (`mtp_draft_fixed`, the lone `mtp_round`'s
+    /// own). The caller staged the lane's draft sampler on `sc` first (`set_spec_sampling`), as
+    /// the lone round does; `samp` / `rq` record what it staged for the packed verify.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_draft(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, kmax: usize, b: i32, p: usize,
+                      tap_row: usize, keep: Option<&mut dyn FnMut(usize, f32) -> bool>,
+                      samp: crate::lane_pack::SegSamp, rq: Option<RqStage>) -> Result<PackDraft> {
+        anyhow::ensure!(samp.ratio == rq.map_or(false, |r| r.mode == 2) && sc.rq_live == samp.ratio && sc.rq_mode == rq.map_or(0, |r| r.mode),
+                        "pack_draft: slot {slot} drafts with a sampler staging that is not its own (ratio {}, staged mode {})", samp.ratio, sc.rq_mode);
+        let (drafts, confs, spec, launched, wasted) = match keep {
+            Some(keep) => {
+                let d = self.mtp_draft_adaptive(sc, head, slot, kmax, b, p, tap_row, keep)?;
+                (d.drafts, d.confs, d.spec, d.launched, d.wasted.is_some())
+            }
+            // the fixed-depth chain: exactly `kmax` passes, no speculative one
+            None => (self.mtp_draft_fixed(sc, head, slot, kmax, b, p, tap_row)?.0, Vec::new(), false, kmax, false),
+        };
+        Ok(PackDraft { slot, b, p, drafts, confs, spec, samp, rq, launched, wasted })
+    }
+
+    /// S-B9-CF-PACK5: TP-I's drain for the packed round. A wasted speculative pass of EITHER lane
+    /// is a collective whose doorbell epoch may still be in flight; the pack's one pre-verify
+    /// exchange stages in send slot 0 and lands in recv slot `gen & 7` of the same rings, so it
+    /// must not run before the device has consumed the peer's epoch and the proxy has retired
+    /// ours (the lone round does exactly this before ITS exchange, `mtp_round_adaptive`). Same
+    /// condition: world 2 with the sharded draft head, only when a pass was wasted (~4.5% of
+    /// lane rounds); one device sync covers both lanes' passes (they run on one stream, in order).
+    pub fn pack_drain_wasted(&self, ds: &[PackDraft]) -> Result<()> {
+        if ds.iter().any(|d| d.wasted) && self.tp.as_ref().map_or(false, |t| t.world == 2) && xtp::dh_shard_on() {
+            self.dev.synchronize()?;
+            crate::net::drain_sends(std::time::Duration::from_millis(200))?;
+        }
+        Ok(())
+    }
+
+    /// PACK4S: hand a drafted real-q lane's lists to the packed scratch. The lane's chain wrote
+    /// list rows 0..w of the SERVED scratch (one per draft pass); its verify rows start at row
+    /// `row0` of the packed verify, where `xq_sample_rows_rq` reads list row `row0 + i`. A D2D
+    /// copy enqueued on the COMPUTE stream (AGENTS 2.3), i.e. behind the chain that wrote the
+    /// rows and ahead of everything issued later: the caller issues it BEFORE the next lane
+    /// drafts, because that chain writes the same served rows. No-op for a greedy or match lane.
+    pub fn pack_list_handoff(&self, sc: &Scratch, scp: &mut Scratch, row0: usize, d: &PackDraft) -> Result<()> {
+        let Some((doff, words)) = crate::lane_pack::list_handoff(row0, d.drafts.len(), d.samp.ratio, scp.rq_list.len())? else { return Ok(()) };
+        anyhow::ensure!(words <= sc.rq_list.len(), "pack_list_handoff: {words} list words > the served list ({})", sc.rq_list.len());
+        use cudarc::driver::sys;
+        self.dev.bind_to_thread()?;
+        let (dst, src) = (*scp.rq_list.device_ptr() + (doff * 4) as u64, *sc.rq_list.device_ptr());
+        let r = unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, words * 4, self.stream.stream) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "pack_list_handoff: list copy failed ({r:?})");
+        Ok(())
+    }
+
+    /// PACK4S: stage the packed verify's per-row sampler block (`lane_pack::pack_samp`) and the
+    /// two shadows the graph key and the kernels follow. An all-greedy pair after an all-greedy
+    /// state uploads nothing and leaves the scratch exactly as PACK4 had it.
+    fn set_pack_sampling(&self, scp: &mut Scratch, ps: &crate::lane_pack::PackSamp) -> Result<()> {
+        anyhow::ensure!(ps.words.len() == scp.samp.len(), "set_pack_sampling: {} words for a {}-word block", ps.words.len(), scp.samp.len());
+        if ps.samp_live || scp.samp_live {
+            self.dev.htod_copy_into(ps.words.clone(), &mut scp.samp)?;
+        }
+        scp.samp_live = ps.samp_live;
+        scp.rq_live = ps.rq_live;
+        Ok(())
+    }
+
+    /// PACK4S (`--wp24-xcheck`): re-derive every real-q segment of the packed verify that just
+    /// completed on the host (wp24::xcheck_round: the draft draw, q', the accept test, the
+    /// residual support, the bonus row) from the PACKED scratch's own rows — the list rows at
+    /// the segment's row offset, its sampler blocks and its drafts. Diagnostics; syncs.
+    fn pack_xcheck(&self, scp: &Scratch, meta: &crate::lane_pack::PackMeta, ds: [&PackDraft; 2], acc: [usize; 2]) -> Result<()> {
+        static SEGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let v = self.cfg.vocab_size;
+        self.dev.synchronize()?;
+        let logits = self.dev.dtoh_sync_copy(&scp.logits)?;
+        let emitted = self.dev.dtoh_sync_copy(&scp.argmax)?;
+        let samp = self.dev.dtoh_sync_copy(&scp.samp)?;
+        let list = self.dev.dtoh_sync_copy(&scp.rq_list)?;
+        for (j, d) in ds.into_iter().enumerate() {
+            let (Some(rq), true) = (d.rq, d.samp.ratio) else { continue };
+            let (row0, m) = (meta.segs[j][1] as usize, meta.segs[j][2] as usize);
+            let w = m - 1;
+            anyhow::ensure!(logits.len() >= (row0 + m) * v && emitted.len() >= row0 + m && samp.len() >= (row0 + m) * 8
+                            && list.len() >= (row0 + w) * crate::wp24::RQ_ROW, "pack_xcheck: packed scratch narrower than segment {j}");
+            crate::wp24::xcheck_round(&crate::wp24::Round {
+                slot: d.slot, pos: d.p, w, a: acc[j], mode: 2, v,
+                logits: &logits[row0 * v..(row0 + m) * v], emitted: &emitted[row0..row0 + m],
+                samp: &samp[row0 * 8..(row0 + m) * 8],
+                list: &list[row0 * crate::wp24::RQ_ROW..(row0 + w) * crate::wp24::RQ_ROW], drafts: &d.drafts,
+                dsamp: rq.pack(), dctr: rq.dctr,
+            });
+            let n = SEGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n % 64 == 0 {
+                crate::rprintln!("WP24_XCHECK lane-pack: {n} real-q segments of PACKED verifies re-derived on the host so far (latest: slot {} rows {row0}..{} of R = {})",
+                         d.slot, row0 + m - 1, meta.r);
+            }
+        }
+        Ok(())
+    }
+
+    /// ONE packed verify for two drafted requests: stage both segments on the packed scratch,
+    /// replay the R-keyed graph (seg trunk + per-segment accept + per-segment commit) between
+    /// the eager PLE-ring shadow and the taps hand-off into the SERVED scratch's per-slot
+    /// windows, read back once, and restore each slot's host n-gram ring to its accepted
+    /// prefix. Each returned round is what `mtp_verify` returns for that request alone.
+    /// PACK4S: the rows carry each lane's own sampler block (`set_pack_sampling`); a real-q
+    /// lane's draft lists were already copied to its row offset (`pack_list_handoff`), and a
+    /// pair holding one replays the rq family.
+    pub fn pack_verify(&self, sc: &mut Scratch, scp: &mut Scratch, d0: &PackDraft, d1: &PackDraft) -> Result<([MtpRoundOut; 2], PackVerifyMs)> {
+        use crate::lane_pack::{pack_meta, seg_result, SegIn};
+        let tv0 = std::time::Instant::now();
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
+        let grid = |n: i64| (((n + 255) / 256).max(1) as u32, 1, 1);
+        for d in [d0, d1] {
+            // WP02: verify rows p..p+k write trunk K/V, indexer keys and read cos_tab — all max_pos rows
+            anyhow::ensure!(d.p + d.drafts.len() < self.max_pos,
+                            "pack_verify: slot {} rows {}..={} past the KV window (max_pos {})", d.slot, d.p, d.p + d.drafts.len(), self.max_pos);
+        }
+        let meta = pack_meta(&SegIn { slot: d0.slot, b: d0.b, p: d0.p, drafts: &d0.drafts },
+                             &SegIn { slot: d1.slot, b: d1.b, p: d1.p, drafts: &d1.drafts }, scp.d_dev.len())?;
+        // one regime for the whole verify, from each request's LAST row (the lone verify's rule)
+        let (q0, q1) = (self.qsa_live(d0.p + d0.drafts.len()), self.qsa_live(d1.p + d1.drafts.len()));
+        anyhow::ensure!(q0 == q1, "pack_verify: slots {} and {} are on different sides of the sparse switch", d0.slot, d1.slot);
+        let (qg, qb) = self.qsa_grid_bucket_key((d0.p + d0.drafts.len()).max(d1.p + d1.drafts.len()));
+        // PACK4S: per-row sampler blocks (segment j row i = lane j's params, counter ctr_j + i);
+        // an all-greedy pair stages nothing and keeps the greedy family
+        let ps = crate::lane_pack::pack_samp(&meta.segs, &[d0.samp, d1.samp], scp.samp.len() / 8)?;
+        self.set_pack_sampling(scp, &ps)?;
+        // the family the staged state selects: PACK3's key + the real-q bit + (TP) the vp tail bits
+        let pkey = pack_key(meta.r, q0, qb, scp.rq_live) | self.vp_key_st(scp.samp_live, false, scp.rq_live, meta.r) | sk(scp);
+        anyhow::ensure!(self.graphs.lock().unwrap().contains_key(&pkey),
+                        "pack_verify: no packed graph at R = {} (qsa {q0}, {} family) — the arm must not have packed this pair",
+                        meta.r, crate::lane_pack::fam_of(scp.samp_live, scp.rq_live).label());
+        // the host n-gram ring pair of each slot BEFORE the staging advances it
+        let hp: Vec<(i32, i32)> = {
+            let h = self.ple_hist.lock().unwrap();
+            [d0, d1].iter().map(|d| (h[d.slot * 2], h[d.slot * 2 + 1])).collect()
+        };
+        self.pack2_stage(scp, &meta.rows)?;
+        self.dev.htod_copy_into(meta.d_dev.clone(), &mut scp.d_dev)?;
+        let mut seg_flat: Vec<i32> = meta.segs.iter().flat_map(|s| s.iter().copied()).collect();
+        seg_flat.resize(scp.seg.len(), 0);
+        self.dev.htod_copy_into(seg_flat, &mut scp.seg)?;
+        scp.qsa_grid_nblk = qg;
+        self.pack_eager_tail_pre(&l, scp, &meta.segs)?;
+        let tv1 = std::time::Instant::now();
+        self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
+        pack_live_note(meta.r, q0);
+        if ps.samp_live {
+            let kind = |d: &PackDraft| if d.samp.samp.is_none() { "greedy" } else if d.samp.ratio { "real-q sampled" } else { "match-rule sampled" };
+            pack_sampled_live_note(meta.r, ps.rq_live, [kind(d0), kind(d1)]);
+        }
+        // taps: segment rows row0..row0+len of the packed resid -> rows 0..len of the slot's
+        // window in the SERVED scratch (the lone verify's snapshot, per segment)
+        for sg in meta.segs.iter() {
+            let (slot, row0, len) = (sg[0] as usize, sg[1] as usize, sg[2] as usize);
+            let tb = self.tap_base(sc, slot)?;
+            xqlaunch!(l, "xq_copy_f32", grid((he * len) as i64), (256, 1, 1), 0,
+                      (&mut sc.taps_keep, &scp.resid, (he * len) as i64, tb as i64, (row0 * he) as i64))?;
+        }
+        self.dev.synchronize()?;
+        let tv2 = std::time::Instant::now();
+        let out = self.dev.dtoh_sync_copy(&scp.accept_out)?;
+        let acc = self.dev.dtoh_sync_copy(&scp.acc_seg)?;
+        if let Some(st) = sc.wp05.as_mut() { st.inflight = false; } // WP05: the draft stage's copies retired
+        let mut res: Vec<MtpRoundOut> = Vec::with_capacity(2);
+        for (j, d) in [d0, d1].into_iter().enumerate() {
+            let (a, emitted) = seg_result(&out, &acc, j, &meta.segs[j])?;
+            anyhow::ensure!(a <= d.drafts.len(), "pack_verify: slot {} accept {a} past its {} drafts", d.slot, d.drafts.len());
+            // host ring restore (mtp_verify's rule): the staging advanced it by m; a + 1 tokens committed
+            {
+                let mut hist = self.ple_hist.lock().unwrap();
+                if a == 0 {
+                    hist[d.slot * 2] = hp[j].1;
+                    hist[d.slot * 2 + 1] = d.b;
+                } else {
+                    let tok = |i: usize| if i == 0 { d.b } else { d.drafts[i - 1] };
+                    hist[d.slot * 2] = tok(a - 1);
+                    hist[d.slot * 2 + 1] = tok(a);
+                }
+            }
+            let last = emitted[a];
+            res.push(MtpRoundOut { a, emitted, pos_next: d.p + a + 1, last_tok: last, tap_row: a,
+                                   drafts: d.drafts.clone(), diag_ms: 0.0 });
+        }
+        let r1 = res.pop().unwrap();
+        let r0 = res.pop().unwrap();
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        let tv3 = std::time::Instant::now();
+        // PACK4S diagnostics (off unless --wp24-xcheck): the host re-derivation of the real-q segments
+        if ps.rq_live && crate::wp24::xcheck_on() {
+            self.pack_xcheck(scp, &meta, [d0, d1], [r0.a, r1.a])?;
+        }
+        Ok(([r0, r1], PackVerifyMs { stage: ms(tv0, tv1), graph: ms(tv1, tv2), read: ms(tv2, tv3), diag: tv3.elapsed().as_secs_f64() * 1e3 }))
+    }
+
+    /// The per-request tail of a packed round: where the speculative next pass expects this
+    /// lane's next round, then the head re-prime from the taps the verify left in the lane's
+    /// window (the eager a-row re-prime: the device re-prime's bits for rows < a).
+    pub fn pack_finish(&self, sc: &mut Scratch, head: &DraftHead, d: &PackDraft, out: &MtpRoundOut) -> Result<()> {
+        // PACK4-REVIEW A2: a packed round re-primes with the EAGER a-row path; the lone round's
+        // device re-prime is never enqueued here. A hand-off a lone round left behind (it failed
+        // between `reprime_dev_enqueue` and its own `head_reprime`; the engine keeps serving after
+        // such an error) would otherwise be taken by `head_reprime` below, fail
+        // `reprime_dev_finish`'s slot / position check and kill both lanes of the pair again. A lone
+        // verify clears it itself (`rp.pending = None` in `reprime_dev_enqueue`).
+        if let Some(rp) = sc.rp.as_mut() { rp.pending = None; }
+        if d.spec {
+            if let Some(np) = sc.wp05.as_mut().and_then(|s| s.spec.as_mut()).and_then(|s| s.next_p.get_mut(d.slot)) {
+                *np = out.pos_next;
+            }
+        }
+        self.head_reprime(sc, head, d.slot, d.p, &out.drafts[..out.a])
     }
 
     /// S-A3-p: the k-pass draft chain as launches only (graph-capturable): per pass, stage
@@ -19147,6 +20443,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
                 crate::rprintln!("EXL3_GRAPH: draft-pass BeginCapture failed ({r:?}) at i={i} — staying eager");
+                crate::metrics::graph_capture_lost("draft-pass", &format!("i={i}, qsa={qsa}"), &format!("{r:?}"));
                 return;
             }
         }
@@ -19155,6 +20452,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
             crate::rprintln!("EXL3_GRAPH: draft-pass capture failed (end={r2:?}, body={:?}) at i={i} — staying eager", cap.err());
+            crate::metrics::graph_capture_lost("draft-pass", &format!("i={i}, qsa={qsa}"), &capture_lost_status(r2));
             return;
         }
         crate::exl3_wp27::finish(graph, "draft-pass", i); // WP27: node priorities + DAG receipt (m = pass index)
@@ -19168,6 +20466,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                 crate::metrics::set_graph_entries({ let mut g = self.graphs.lock().unwrap(); g.insert(key, crate::gpu::CudaGraph::from_exec(exec, raw)); g.len() as u64 });
             } else {
                 crate::rprintln!("EXL3_GRAPH: draft-pass instantiate failed ({r3:?}) at i={i} — staying eager");
+                crate::metrics::graph_capture_lost("draft-pass", &format!("i={i}, qsa={qsa}"), &format!("instantiate {r3:?}"));
             }
         }
     }
@@ -19179,6 +20478,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
                 crate::rprintln!("EXL3_GRAPH: draft BeginCapture failed ({r:?}) at k={k} — staying eager");
+                crate::metrics::graph_capture_lost("draft-chain", &format!("k={k}, qsa={qsa}"), &format!("{r:?}"));
                 return;
             }
         }
@@ -19187,6 +20487,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
             crate::rprintln!("EXL3_GRAPH: draft capture failed (end={r2:?}, body={:?}) at k={k} — staying eager", cap.err());
+            crate::metrics::graph_capture_lost("draft-chain", &format!("k={k}, qsa={qsa}"), &capture_lost_status(r2));
             return;
         }
         crate::exl3_wp27::finish(graph, "draft-chain", k); // WP27: node priorities + DAG receipt (m = k)
@@ -19201,6 +20502,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                 if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured draft chain at k={k}"); }
             } else {
                 crate::rprintln!("EXL3_GRAPH: draft instantiate failed ({r3:?}) at k={k} — staying eager");
+                crate::metrics::graph_capture_lost("draft-chain", &format!("k={k}, qsa={qsa}"), &format!("instantiate {r3:?}"));
             }
         }
     }
@@ -19557,7 +20859,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                    qk_dim as i32, (heads * hdx) as i32, hdx as i32, m as i32, meta_p))?;
         if let (Some(pool_p), Some(params)) = (self.qsa_pool_p(att_i), ix.params.as_ref()) {
             let nblk_stride = (self.max_pos / cfg.indexer_compress_ratio).max(1);
-            let geom: u64 = (self.max_pos as u64) | ((nblk_stride as u64) << 40);
+            let geom: u64 = crate::gpu::pack_qsa_geom(self.max_pos, 0, nblk_stride);
             gblaunch!(l, "qsa_pool_update_b", ((m.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0,
                       (pool_p, keys_p, &sc.pos, &sc.slot_ids, (*params.device_ptr()) as u64, geom as i64, m as i32))?;
         }
@@ -19628,6 +20930,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
                 crate::rprintln!("EXL3_GRAPH: re-prime BeginCapture failed ({r:?}) at rows={rows} — staying eager");
+                crate::metrics::graph_capture_lost("reprime", &format!("rows={rows}, slot={slot}"), &format!("{r:?}"));
                 return;
             }
         }
@@ -19636,6 +20939,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
             crate::rprintln!("EXL3_GRAPH: re-prime capture failed (end={r2:?}, body={:?}) at rows={rows} — staying eager", cap.err());
+            crate::metrics::graph_capture_lost("reprime", &format!("rows={rows}, slot={slot}"), &capture_lost_status(r2));
             return;
         }
         if !self.tp_spine_audit(graph, "reprime", rows) { unsafe { sys::cuGraphDestroy(graph); } return; } // TP-C
@@ -19648,6 +20952,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                 crate::rprintln!("EXL3_GRAPH: captured head re-prime at rows={rows} (key {key:#x})");
             } else {
                 crate::rprintln!("EXL3_GRAPH: re-prime instantiate failed ({r3:?}) at rows={rows} — staying eager");
+                crate::metrics::graph_capture_lost("reprime", &format!("rows={rows}, slot={slot}"), &format!("instantiate {r3:?}"));
             }
         }
     }
@@ -19774,8 +21079,57 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         Ok(())
     }
 
+    /// S-B9-REL-SMALLFIXES item 2: the served round for callers OUTSIDE the scheduler (--bench-mtp,
+    /// the draft-quality bench, the KV-NLL acceptance probe): `mtp_round` behind the scheduler's
+    /// clamp at the sparse switch (`regime_depth`, exactly `step_mtp`'s). A verify and its draft
+    /// chain run ONE attention regime chosen from the last row, so a round straddling qsa_limit()
+    /// puts its rows at/below the switch on the sparse kernels — not the plain decode's bits
+    /// (AGENTS 2.4) — and a LOSSLESS run crossing the switch could report a mismatch the serve no
+    /// longer has. Here the round ends on the switch; where no draft fits (p == qsa_limit) it is the
+    /// scheduler's head-synced plain step (`step_mtp`, k_eff == 0): the head's row p written KV-only
+    /// from the saved tap, one forward_step, its tap snapshotted as the next round's row 0.
+    /// Identity for every round that does not reach the switch, and with --qsa-row-regime 0.
+    pub fn mtp_round_clamped(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, k: usize,
+                             b: i32, p: usize, tap_row: usize) -> Result<MtpRoundOut> {
+        let lim = if self.qsa_live(usize::MAX) && row_regime_on() { Some(self.qsa_limit()) } else { None };
+        match clamped_round_plan(p, k, lim) {
+            Some(d) => {
+                if d < k {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| crate::rprintln!("[exl3] per-row attention regime: a bench/probe round at position {p} stops at the \
+sparse switch (depth {k} -> {d}; --qsa-row-regime 0 = rounds may straddle it)"));
+                }
+                self.mtp_round(sc, head, slot, d, b, p, tap_row)
+            }
+            None => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::rprintln!("[exl3] per-row attention regime: a bench/probe round at position {p} is a plain \
+step (no draft fits before the sparse switch)"));
+                self.mtp_plain_prime(sc, head, slot, b, p, tap_row)?;
+                let ids = self.forward_step(sc, &[b], &[p], &[slot], None)?;
+                self.tap_snapshot(sc, slot)?;
+                Ok(MtpRoundOut { a: 0, emitted: vec![ids[0]], pos_next: p + 1, last_tok: ids[0], tap_row: 0,
+                                 drafts: Vec::new(), diag_ms: 0.0 })
+            }
+        }
+    }
+
     pub fn mtp_round(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, k: usize,
                      b: i32, p: usize, tap_row: usize) -> Result<MtpRoundOut> {
+        // S-B9-CF-PACK4S: the draft half is `mtp_draft_fixed` (its statements moved there
+        // unchanged, in order) so the packed arm's fixed-depth chain is this very code.
+        let (drafts, t) = self.mtp_draft_fixed(sc, head, slot, k, b, p, tap_row)?;
+        let out = self.mtp_verify(sc, slot, k, b, p, drafts, t)?;
+        self.head_reprime(sc, head, slot, p, &out.drafts[..out.a])?;
+        Ok(out)
+    }
+
+    /// The DRAFT half of the fixed-depth `mtp_round` (S-B9-CF-PACK4S: split out unchanged so the
+    /// lone round and the packed arm's `--draft-confidence 0` chain run one copy): tap restore,
+    /// the k-pass chain (graphed per (k, slot)), the drafts readback and clamp. Returns the k
+    /// drafts and the round's three phase stamps for `mtp_verify`.
+    fn mtp_draft_fixed(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, k: usize,
+                       b: i32, p: usize, tap_row: usize) -> Result<(Vec<i32>, [std::time::Instant; 3])> {
         let l = Launcher { dev: &self.dev, stream: &self.stream };
         let hcn = self.cfg.hc_count.max(1);
         let m = k + 1;
@@ -19850,9 +21204,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
             }
         }
 
-        let out = self.mtp_verify(sc, slot, k, b, p, drafts, [tp0, tp1, tp2])?;
-        self.head_reprime(sc, head, slot, p, &out.drafts[..out.a])?;
-        Ok(out)
+        Ok((drafts, [tp0, tp1, tp2]))
     }
 
     // ---- HOST / RO-5(a) speculative next draft pass: helpers of mtp_round_adaptive (see SpecPass) ----
@@ -20130,17 +21482,13 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         Ok(())
     }
 
-    /// API-parity DDS: an MTP round whose draft chain STOPS EARLY. Drafting runs one graphed
-    /// pass at a time; after pass i the host reads its confidence (the max draft logit) and
-    /// `keep(i, conf)` decides whether to draft pass i+1. The verify then runs at the chosen
-    /// width m = w+1 (graphs per width). Emitted tokens obey the same accept/commit contract
-    /// as `mtp_round` (greedy stays bitwise lossless: only WHICH drafts are proposed changes).
-    /// Returns the round and the per-pass confidences of the w verified drafts.
-    pub fn mtp_round_adaptive(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, kmax: usize,
-                              b: i32, p: usize, tap_row: usize,
-                              keep: &mut dyn FnMut(usize, f32) -> bool,
-                              pre_verify: Option<&mut dyn FnMut(usize, &[i32], usize) -> Result<()>>)
-                              -> Result<(MtpRoundOut, Vec<f32>)> {
+    /// The DRAFT half of `mtp_round_adaptive` (S-B9-CF-PACK4: split out unchanged so the lone
+    /// round and the packed arm run one copy): tap restore, the DDS pass loop with its pinned
+    /// stage and speculative next pass, and the clamped drafts. Leaves the head's rows p..p+w-1
+    /// written from its own chain and `sc.d_dev[..w]` on the device.
+    fn mtp_draft_adaptive(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, kmax: usize,
+                          b: i32, p: usize, tap_row: usize,
+                          keep: &mut dyn FnMut(usize, f32) -> bool) -> Result<DraftHalf> {
         let l = Launcher { dev: &self.dev, stream: &self.stream };
         let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
         let tp0 = std::time::Instant::now();
@@ -20286,7 +21634,6 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         }
         if spec { self.spec_pass_end(&l, sc, head, slot, kmax, w, wasted)?; }
         let tp1 = std::time::Instant::now();
-        let tp2 = tp1;
         let drafts: Vec<i32> = if stage {
             // WP05: tv_run = [b, d_0 .. d_{w-1}] (clamped) came back pass by pass; one verify PLE
             // row was built per executed pass (rows 0..w, tokens tv_run[..w]); mtp_verify builds
@@ -20304,6 +21651,25 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         }
         drafts
         };
+        Ok(DraftHalf { drafts, confs, w, launched, wasted, spec, tp0, tp1 })
+    }
+
+    /// API-parity DDS: an MTP round whose draft chain STOPS EARLY. Drafting runs one graphed
+    /// pass at a time; after pass i the host reads its confidence (the max draft logit) and
+    /// `keep(i, conf)` decides whether to draft pass i+1. The verify then runs at the chosen
+    /// width m = w+1 (graphs per width). Emitted tokens obey the same accept/commit contract
+    /// as `mtp_round` (greedy stays bitwise lossless: only WHICH drafts are proposed changes).
+    /// Returns the round and the per-pass confidences of the w verified drafts.
+    pub fn mtp_round_adaptive(&self, sc: &mut Scratch, head: &DraftHead, slot: usize, kmax: usize,
+                              b: i32, p: usize, tap_row: usize,
+                              keep: &mut dyn FnMut(usize, f32) -> bool,
+                              pre_verify: Option<&mut dyn FnMut(usize, &[i32], usize) -> Result<()>>)
+                              -> Result<(MtpRoundOut, Vec<f32>)> {
+        // S-B9-CF-PACK4: the draft half is `mtp_draft_adaptive` (its statements moved there
+        // unchanged, in order) so the packed arm drafts each request with this very code.
+        let DraftHalf { drafts, confs, w, launched, wasted, spec, tp0, tp1 } =
+            self.mtp_draft_adaptive(sc, head, slot, kmax, b, p, tap_row, keep)?;
+        let tp2 = tp1;
         // TP-I (latent TP-H defect, found while collecting routing histograms): with the sharded
         // draft-head screen every pass is a collective, and a WASTED speculative pass (launched, then
         // stopped by the DDS) is never synchronized by the loop above — its bmax doorbell epoch can
@@ -20780,4 +22146,122 @@ mod vis2_tests {
 /// --qsa-key-rope full|half (VIS-3; see the option's help).
 pub fn qsa_key_rope_full() -> bool {
     crate::opts::var(crate::opt!("qsa-key-rope")).map_or(true, |v| v.trim() != "half")
+}
+
+#[cfg(test)]
+mod ple_headroom_tests {
+    //! PR #17 (opt-in port): the `--ple-ram auto` headroom arithmetic.
+    //! `ple_auto_headroom_gib(per_lane, width)` = 16 GiB base + per_lane per ADDITIONAL lane.
+    //! Default per-lane 0 must reproduce the pre-port fixed 16 GiB exactly (same decision).
+    use super::ple_auto_headroom_gib;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn default_zero_is_the_old_fixed_16gib_exactly() {
+        for width in [1usize, 2, 4, 10, 32] {
+            assert_eq!(ple_auto_headroom_gib(0.0, width), 16 * GIB, "width {width}");
+        }
+    }
+
+    #[test]
+    fn two_gib_per_lane_matches_the_pr_arithmetic() {
+        // the PR's measured case: --max-batch 10 -> 16 + 2*(10-1) = 34 GiB
+        assert_eq!(ple_auto_headroom_gib(2.0, 10), 34 * GIB);
+        assert_eq!(ple_auto_headroom_gib(2.0, 4), 16 * GIB + 6 * GIB);
+    }
+
+    #[test]
+    fn single_lane_never_gains_headroom() {
+        assert_eq!(ple_auto_headroom_gib(8.0, 1), 16 * GIB);
+        assert_eq!(ple_auto_headroom_gib(0.0, 1), 16 * GIB);
+    }
+
+    #[test]
+    fn inf_per_lane_with_width_one_is_still_16gib_not_nan_zeroed() {
+        // inf * 0 lanes = NaN -> `as u64` = 0: the guard must keep the 16 GiB base.
+        assert_eq!(ple_auto_headroom_gib(f64::INFINITY, 1), 16 * GIB);
+        assert_eq!(ple_auto_headroom_gib(f64::NAN, 1), 16 * GIB);
+    }
+
+    #[test]
+    fn saturates_instead_of_overflowing() {
+        assert_eq!(ple_auto_headroom_gib(f64::INFINITY, 64), u64::MAX);
+        assert_eq!(ple_auto_headroom_gib(-5.0, 8), 16 * GIB, "negative per-lane clamps to 0");
+    }
+}
+
+/// S-B9-REL-INTEG D1: a wide trellis launch on a bit width its switch has no case for writes nothing (the
+/// kernels end in `default: break;`) and the request is answered 200 with garbage. Reachable only off the
+/// default flags (`--exl3-recon-min 0`, or a call site without reconstruct buffers; `--pf-moe-kernel` on a
+/// pack with 5-bit routed experts); the host refuses before the first launch. The GPU check is G6 of the
+/// integration gates (the 4.05 pack with `--exl3-recon-min 0`).
+#[cfg(test)]
+mod wide_bits_guard_tests {
+    use super::*;
+
+    #[test]
+    fn the_predicates_match_the_kernels_switches() {
+        for b in [3usize, 4, 5] { assert!(wide_trellis_supports_bits(b), "{b}"); }
+        for b in [0usize, 1, 2, 6, 7, 8] { assert!(!wide_trellis_supports_bits(b), "{b}"); }
+        for b in [3usize, 4] { assert!(moe_pf_kernel_supports_bits(b), "{b}"); }
+        for b in [0usize, 1, 2, 5, 6, 8] { assert!(!moe_pf_kernel_supports_bits(b), "{b}"); }
+        // the kernel source agrees (the K6 module adds `case 6` to the OTHER switches, not to these)
+        let cu = include_str!("../kernels/exl3_bench.cu");
+        for sw in ["switch (bits) { EXL3_WT_CASE(3) EXL3_WT_CASE(4) EXL3_WT_CASE(5) default: break; }",
+                   "switch (bits) { EXL3_WG_CASE(3) EXL3_WG_CASE(4) EXL3_WG_CASE(5) default: break; }",
+                   "EXL3_WIDE_CASE(3);\n        EXL3_WIDE_CASE(4);\n        EXL3_WIDE_CASE(5);\n        default: break;"] {
+            assert!(cu.contains(sw), "the wide kernel's bit switch changed (a 6-bit case?): update wide_trellis_supports_bits\n{sw}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_width_the_option_and_the_arm() {
+        let t = wide_arm_bits_refusal(6, 2048, 2048, 4096, 0, true);
+        for needle in ["6-bit module", "2048 rows", "--exl3-recon-min", "reconstruct + cuBLASLt", "garbage"] {
+            assert!(t.contains(needle), "{needle:?} missing: {t}");
+        }
+        // F3 (owner 2026-10-10): the text names the REAL remaining cause (a call site without
+        // reconstruct buffers) and blames neither --exl3-recon-min (the dispatch now overrides it
+        // for these widths) nor --max-batch (the serve caps lanes at 16) — it may MENTION
+        // --max-batch only to say the cap removed it as a cause.
+        assert!(!t.contains("taken because --max-batch"), "no --max-batch blame: {t}");
+        assert!(t.contains("the serve caps --max-batch at 16 lanes"), "the cap is named as the removed cause: {t}");
+        // buffers ARE present here, so the cause must read as the routing-invariant bug branch:
+        assert!(t.contains("routing invariant"), "buffers present but unused reads as a bug: {t}");
+        // and the no-buffers branch names the only thing that can still reach the refusal:
+        let t3 = wide_arm_bits_refusal(6, 40, 2048, 4096, 17, false);
+        assert!(t3.contains("no reconstruct buffers"), "the remaining cause is named: {t3}");
+    }
+
+    /// F3: the 4.05 pack's 6-bit modules never reach the wide arm when reconstruct buffers exist —
+    /// the dispatch forces the reconstruct arm whatever --exl3-recon-min says (owner 2026-10-10:
+    /// "either support things properly or gracefully fall back").
+    #[test]
+    fn wide_bits_forced_to_the_reconstruct_arm() {
+        let src: String = include_str!("exl3_forward.rs").lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let f = &src[src.find("fn chain_wide_gemm(").expect("chain_wide_gemm")..];
+        let f = &f[..f.find("\n}\n").expect("fn end")];
+        let forced = f.find("Some(r) if !wide_trellis_supports_bits(q.bits as usize) => {").expect("the forced-recon arm");
+        let option = f.find("rmin > 0 && m >= rmin").expect("the option's arm");
+        assert!(forced < option, "the forced arm must be matched BEFORE the option's arm");
+        assert!(f.contains("WIDE_FALLBACK_NOTE.set(())"), "the once-per-boot line");
+        assert!(f.contains("exl3_recon_forced(q.bits)"), "the /metrics counter");
+    }
+
+    /// The guards sit IN FRONT of the launches they protect (a refusal after the launch protects nothing).
+    #[test]
+    fn the_guards_precede_the_launches() {
+        let src: String = include_str!("exl3_forward.rs").lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let src = &src[..src.find("mod wide_bits_guard_tests").unwrap()];
+        let f = &src[src.find("fn chain_wide_gemm(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        let (g, l) = (f.find("wide_trellis_supports_bits(q.bits").expect("guard"), f.find("\"exl3_hmma_gemm_wide\"").expect("launch"));
+        assert!(g < l, "the bit-width guard must come before the wide launch");
+        let m = &src[src.find("let pk = tune::get(&T_PF_MOE_KERNEL").expect("pk")..];
+        let (g1, g2, l) = (m.find("moe_pf_kernel_supports_bits(moe.bits)").expect("pf guard"),
+                           m.find("wide_trellis_supports_bits(moe.bits)").expect("tiles guard"),
+                           m.find("\"xq_moe_pf_count").expect("first launch"));
+        assert!(g1 < l && g2 < l, "the MoE guards must come before the first MoE launch");
+    }
 }

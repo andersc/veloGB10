@@ -384,7 +384,7 @@ pub fn load_quantized(dir: &str) -> Result<(LoadedArtifact, QuantArtifact), anyh
             tensors.push(QuantTensor::Fp8(PackedFp8 {
                 name: name.clone(),
                 qweight: qw.data().to_vec(),
-                row_scale: bytemuck::cast_slice(rs.data()).to_vec(),
+                row_scale: crate::podread::pod_vec::<f32>(rs.data()),
                 m: *m, k: *k,
             }));
         } else {

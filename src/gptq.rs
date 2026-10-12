@@ -123,7 +123,7 @@ impl ShardReader {
     pub fn read_bf16(&self, name: &str) -> Result<(Vec<usize>, Vec<bf16>)> {
         let (m, b) = self.read_bytes(name)?;
         anyhow::ensure!(m.dtype == "BF16", "{name}: expected BF16, got {}", m.dtype);
-        Ok((m.shape, bytemuck::cast_slice::<u8, bf16>(&b).to_vec()))
+        Ok((m.shape, crate::podread::pod_vec::<bf16>(&b)))
     }
 }
 

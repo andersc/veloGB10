@@ -384,8 +384,9 @@ fn fork_blocking_stream(dev: &Arc<CudaDevice>) -> cudarc::driver::CudaStream {
     s
 }
 
-fn bf16_slice(data: &[u8]) -> &[bf16] {
-    bytemuck::cast_slice(data)
+fn bf16_slice(data: &[u8]) -> std::borrow::Cow<'_, [bf16]> {
+    // safetensors data offsets are not guaranteed aligned (S-B9-REL-PPL): borrow when aligned, copy when not
+    crate::podread::pod_cow::<bf16>(data)
 }
 
 impl DflashDrafter {

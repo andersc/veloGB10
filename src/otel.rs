@@ -14,6 +14,17 @@
 //!   `event` (stream_start|stream_delta|stream_end|status), `generation.id` (per POST).
 //!   `timeUnixNano`/`observedTimeUnixNano` at push time (64-bit ints as the
 //!   decimal STRINGS proto3-JSON mandates).
+//!   ONE record is not a wire event at its timestamp: `stream_start` (S-B9-REL-SURFACE2B R6g).
+//!   It is pushed when the server starts the stream (the request is accepted: before the queue
+//!   wait and the prefill), and its body is the role chunk. Since S-B9-REL-BENCHFIX the client
+//!   receives that role chunk later, with the request's first generated token. The time the
+//!   role chunk is on the wire is the time of the first `stream_delta` record whenever the first
+//!   token produces a delta (the two are yielded together); a first token that produces no
+//!   delta (a tool call being buffered) has no record at that instant. There is no record kind
+//!   for "role chunk sent": the receiver decodes exactly the four kinds above, a fifth kind or a
+//!   `stream_delta` carrying the role chunk would change its token count, and `stream_start`
+//!   keeps its meaning (the request began), so first `stream_delta` minus `stream_start` is
+//!   still the time to the first output.
 //! - `event: status` — periodic server record (not per request) carrying the live
 //!   `model.id`+`topology` pair; `request.id` is the empty string (never collides with a
 //!   session key). This is what refreshes the client's "currently running: model @ topology".
@@ -514,7 +525,8 @@ pub struct OtelRequest {
 }
 
 impl OtelRequest {
-    /// stream_start — the SSE role chunk. token.index 0.
+    /// stream_start — the request's stream began. token.index 0; the body is the SSE role chunk,
+    /// which goes on the wire later, with the first generated token (module doc: THE CONTRACT).
     pub fn start(&self, chunk: &str) {
         let i = self.next_index.fetch_add(1, Ordering::Relaxed);
         self.sink.push_record(&self.ctx, EVENT_START, i, chunk);
@@ -904,6 +916,39 @@ mod tests {
         }
         // The internal attrmap agrees with the decoded one (belt and braces).
         assert_eq!(attrmap(&rows[0])[4], ("event".into(), "stream_start".into()));
+    }
+
+    /// S-B9-REL-BENCHFIX / BENCHFIX2: the chat stream's role chunk leaves the server with the
+    /// request's first generated token (server::chat_sse_stream), not at stream start. The
+    /// stream_start record is still pushed exactly once, first, when the stream begins (before
+    /// any token: the telemetry timeline is unchanged), and its body is that role chunk. Driven
+    /// through the generator the server runs, so a hook that moves fails here.
+    #[tokio::test(start_paused = true)]
+    async fn stream_start_is_recorded_once_when_the_stream_begins() {
+        use crate::server::benchfix_sse_tests as sse;
+        use tokio_stream::StreamExt;
+        let (sink, req) = sink_and_req(true, "sess-1");
+        let (tx, rx, bl) = crate::server::tok_channel();
+        let stream = sse::chat_with_otel(rx, bl, req);
+        tokio::pin!(stream);
+        // the stream is polled, the request waits 30 s (queue + prefill): nothing on the wire
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await.is_err());
+        let rows = drain(&sink);
+        assert_eq!(rows.len(), 1, "stream_start is recorded when the stream begins, before any token");
+        assert_eq!(attrmap(&rows[0])[4], ("event".into(), "stream_start".into()));
+        assert_eq!(attrmap(&rows[0])[3], ("token.index".into(), "0".into()));
+        assert_eq!(record_json(&rows[0])["body"]["stringValue"].as_str().unwrap(), sse::role_json());
+        // the first token, then the end: role + delta + finish + [DONE] on the wire
+        tx.send(crate::batch::TokEvent::Tok(0)).unwrap();
+        tx.send(crate::batch::TokEvent::Finish { reason: "stop".into() }).unwrap();
+        let mut wire = 0;
+        while let Some(ev) = stream.next().await {
+            ev.unwrap();
+            wire += 1;
+        }
+        assert_eq!(wire, 4, "role + delta + finish + [DONE] on the wire");
+        let events: Vec<String> = drain(&sink).iter().map(|r| attrmap(r)[4].1.clone()).collect();
+        assert_eq!(events, ["stream_delta", "stream_end"], "no second stream_start");
     }
 
     /// LIFECYCLE: start → n×delta → end per request; two concurrent requests stay independently

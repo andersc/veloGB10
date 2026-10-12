@@ -8,6 +8,9 @@ pub mod vision_tower;
 pub mod vision_encoder;
 pub mod vision_gpu;
 pub mod gpu;
+/// S-B9-REL-PPL: alignment-safe reads of file-derived bytes (safetensors offsets are not
+/// guaranteed aligned; a bare `bytemuck::cast_slice` panics on them).
+pub mod podread;
 /// S1 (REL_V0_7_3 review): THE one `=`-aware command-line flag reader, shared by BOTH
 /// servers' hand-rolled arg loops (EXL3's `arg()` and the NVFP4 path's `parse_arg()`).
 /// Accepts `--flag value` AND `--flag=value`, exactly like the option registry
@@ -51,6 +54,8 @@ pub mod engine;
 pub mod tokenizer;
 pub mod server;
 pub mod metrics;
+pub mod mtp_reprobe;
+pub mod lane_pack; // S-B9-CF-PACK4: --lane-pack (pure decision; the arm lives in exl3_serve)
 pub mod otel;
 pub mod net;
 // HOST / RO-7: big-core detection + pinning of the serving engine's critical host threads.
@@ -73,6 +78,7 @@ pub mod dsv4_graph;
 pub mod dsv4_model;
 pub mod dsv4_convert;
 pub mod dsv4_chat;
+pub mod dsv4_sse;
 pub mod dsv4_dspark;
 pub mod dflash;
 pub mod dspark;
@@ -141,4 +147,124 @@ pub fn make_timings(
 /// [draft-dir] option by the paths that need it after `resolve_draft_dir`; CLI-1: no env alias).
 pub fn draft_dir_env() -> Option<String> {
     crate::opts::var(crate::opt!("draft-dir")).ok()
+}
+
+/// S-B9-REL-SMALLFIXES item 4: `scripts/run_tp_server.sh` derives `--tp` from the number of
+/// `--node` flags (it used to default to 2 while documenting "must equal 1 + number of --node",
+/// unchecked: three `--node` started a TP=2 engine). The REAL script, run with `--dry-run` from a
+/// scratch deployed dir (a stub engine next to it, a stub model dir).
+#[cfg(test)]
+mod tp_launcher_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    const PEERS: [&str; 3] = ["192.0.2.12:29500", "192.0.2.13:29500", "192.0.2.14:29500"];
+
+    /// (exit code, stdout, stderr) of `run_tp_server.sh --model-dir model <--node x n_nodes> <extra> --dry-run`
+    fn dry_run(tag: &str, n_nodes: usize, extra: &[&str]) -> (i32, String, String) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = std::env::temp_dir().join(format!("gb10_tp_launcher_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("model")).unwrap();
+        std::fs::copy(root.join("scripts/run_tp_server.sh"), dir.join("run_tp_server.sh")).unwrap();
+        std::fs::write(dir.join("model/config.json"), "{}").unwrap();
+        let stub = dir.join("gb10_inference");
+        std::fs::write(&stub, "#!/bin/sh\necho STUB_ENGINE_RAN \"$@\"\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = Command::new("bash");
+        c.arg(dir.join("run_tp_server.sh")).args(["--model-dir", "model"]);
+        for p in &PEERS[..n_nodes] { c.args(["--node", p]); }
+        let out = c.args(extra).arg("--dry-run").output().expect("run bash");
+        let _ = std::fs::remove_dir_all(&dir);
+        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(),
+         String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    #[test]
+    fn tp_defaults_to_one_plus_the_node_count() {
+        let (code, out, err) = dry_run("n1", 1, &[]);
+        assert_eq!(code, 0, "one --node: {err}");
+        assert!(out.contains("--tp 2 --nodes 192.0.2.12:29500"), "one --node must give --tp 2: {out}");
+        // the first v0.7.3 packet's TP=4 command: three --node and no --tp
+        let (code, out, err) = dry_run("n3", 3, &[]);
+        assert_eq!(code, 0, "three --node: {err}");
+        assert!(out.contains("--tp 4 --nodes"), "three --node must give --tp 4 (was --tp 2): {out}");
+        assert!(!out.contains("--tp 2"), "{out}");
+        assert!(!out.contains("STUB_ENGINE_RAN"), "--dry-run must not start the engine: {out}");
+    }
+
+    #[test]
+    fn an_explicit_tp_must_match_the_node_count() {
+        let (code, out, err) = dry_run("ok", 3, &["--tp", "4"]);
+        assert_eq!(code, 0, "an explicit matching --tp is accepted: {err}");
+        assert!(out.contains("--tp 4 --nodes"), "{out}");
+        let (code, out, err) = dry_run("bad", 3, &["--tp", "2"]);
+        assert_eq!(code, 2, "a --tp that disagrees with the --node count is exit 2 (stdout {out:?})");
+        assert!(err.contains("--tp 2 does not match the 3 peer(s) given with --node") && err.contains("--tp 4"), "{err}");
+        assert!(out.is_empty(), "a refused command prints no engine line: {out}");
+        let (code, _, err) = dry_run("nan", 1, &["--tp", "two"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("--tp needs a whole number"), "{err}");
+    }
+
+    #[test]
+    fn a_world_the_engine_refuses_is_refused_by_the_launcher() {
+        // two peers = world 3: the engine takes a power of two only, and would blame a --tp the
+        // user never typed
+        let (code, out, err) = dry_run("n2", 2, &[]);
+        assert_eq!(code, 2, "stdout {out:?}");
+        assert!(err.contains("2 peer(s) given with --node make a world of 3") && err.contains("power-of-two"), "{err}");
+    }
+
+    /// S-B9-REL-SURFACE2 item 3: one `--node` holding a comma list is that many PEERS (it used to
+    /// count as one peer: `--node a,b,c` started `--tp 2 --nodes a,b,c`), and `--tp 02` no longer
+    /// reaches the engine. The full case list is the shell test, which this runs so that
+    /// `cargo test` covers it.
+    #[test]
+    fn a_comma_list_in_one_node_flag_is_that_many_peers() {
+        let list = PEERS.join(",");
+        let (code, out, err) = dry_run("csv", 0, &["--node", &list]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.replace("\\,", ",").contains(&format!("--tp 4 --nodes {list}")), "three peers in one flag = TP=4: {out}");
+        let (code, _, err) = dry_run("csv_bad", 0, &["--node", "192.0.2.12:29500,,192.0.2.13:29500"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("has an empty peer"), "{err}");
+        let (code, out, err) = dry_run("tp02", 1, &["--tp", "02"]);
+        assert_eq!(code, 2, "stdout {out:?}");
+        assert!(err.contains("without leading zeros (got '02')"), "{err}");
+        // The shell test is a file of the development tree. A tree that carries the launchers
+        // without it (the public sync copies the two launchers only: RELEASE_PROTOCOLS.md A1)
+        // cannot run its 27 checks: say so where nobody can miss it, not in captured output,
+        // and do not fail on a file that was never shipped. The three checks above ran.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test_run_tp_server.sh");
+        if !script.is_file() {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "\n*** SKIPPED: scripts/test_run_tp_server.sh is not in this tree, so the launcher's \
+                                                 27-case shell test did NOT run (3 launcher checks did). ***\n");
+            return;
+        }
+        let sh = Command::new("bash").arg(&script).output().expect("run bash");
+        let text = String::from_utf8_lossy(&sh.stdout);
+        assert!(sh.status.success() && text.contains("RUN_TP_SERVER TEST PASS") && !text.contains("FAIL "), "{text}");
+    }
+
+    #[test]
+    fn help_prints_the_header_block_only() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // --help needs a binary next to the script too: reuse the dry-run scaffold through a tiny copy
+        let dir = std::env::temp_dir().join(format!("gb10_tp_launcher_{}_help", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(root.join("scripts/run_tp_server.sh"), dir.join("run_tp_server.sh")).unwrap();
+        let stub = dir.join("gb10_inference");
+        std::fs::write(&stub, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = Command::new("bash").arg(dir.join("run_tp_server.sh")).arg("--help").output().expect("run bash");
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(text.contains("default: 1 + the number of peers given"), "{text}");
+        assert!(text.contains("separated by commas"), "the comma form is documented: {text}");
+        assert!(text.trim_end().ends_with("--max-tokens 4096)"), "--help must end with the header block: {text}");
+    }
 }

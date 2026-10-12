@@ -373,24 +373,19 @@ pub struct MtpLayer {
     pub final_norm: Vec<f32>,           // [hidden]
 }
 
+// S-B9-REL-PPL: these two read FILE-derived bytes (a safetensors tensor at whatever offset the
+// header length left it). The old `from_raw_parts(data.as_ptr() as *const u16/f32, n)` was UB on a
+// misaligned tensor; explicit little-endian element reads have no alignment requirement.
 fn bf16_slice_to_f32(data: &[u8]) -> Vec<f32> {
-    let n = data.len() / 2;
-    let mut out = Vec::with_capacity(n);
-    let bytes: &[u16] =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, n) };
-    for &b in bytes {
-        out.push(bf16::from_bits(b).to_f32());
-    }
-    out
+    data.chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect()
 }
 
 fn f32_slice_to_f32(data: &[u8]) -> Vec<f32> {
-    let n = data.len() / 4;
-    let mut out = Vec::with_capacity(n);
-    let bytes: &[f32] =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-    out.extend_from_slice(bytes);
-    out
+    data.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn load_w(

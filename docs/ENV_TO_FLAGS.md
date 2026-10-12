@@ -290,7 +290,7 @@ node's own command line carries only the per-box options (scope `local`).
 | `GB10_TAIL_FIXED` | `--tail-fixed` | flag | off | spmd | NVFP4 fixed tail |
 | `GB10_TPC_DEBUG` | `--tpc-debug` | flag | off | spmd | TP config debug print |
 | `GB10_TP_ACCEPT` | `--tp-accept` | int | unset | spmd | TP bench_accept depth (set = run the accept branch) |
-| `GB10_TP_AGREE_DRILL` | `--tp-agree-drill` | int | unset | local | test drill: corrupt THIS rank's agree hash at step N (per box: set it on the node's own command line for a one-sided fault) |
+| `GB10_TP_AGREE_DRILL` | `--tp-agree-drill` | int >= 0 | unset | local | test drill, NVFP4 packs, one-sided (per box): corrupt THIS rank's agree hash at scheduler step N, once (rank-dependent, so two armed ranks cannot cancel). Inert, with a boot line, on EXL3 packs and at TP=1. The EXL3 drill is `--tp-width-drill <rows>` (1 to 31; new in S-B9-CF-AGREE16B, never an env var): one-shot, THIS rank reports width N-1-rank for the first N-row round |
 | `GB10_TP_BATCH_PROBE` | `--tp-batch-probe` | int | unset | spmd | TP batch probe width |
 | `GB10_TP_BINV_TP` | `--tp-binv-tp` | flag | off | spmd | TP batch-invariance probe (also --probe-binv-tp) |
 | `GB10_TP_BOOT_DELAY` | `--tp-boot-delay` | text | unset | spmd | test drill: <rank>:<seconds> sleep before the boot rendezvous |
