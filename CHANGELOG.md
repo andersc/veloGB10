@@ -26,6 +26,15 @@ request each figure was measured.
 Several defaults change what a client receives in narrow cases. They are listed together in the
 next section, each with the flag that restores the v0.7.3 reading.
 
+**Two defaults were set at the cut by the maintainer:** `--lane-pack` is on (listed in the table
+below with its restore flag), and `--tool-unclosed` stays `drop`, the v0.7.3 reading
+(`--tool-unclosed complete` is available).
+
+**Artifacts.** `velogb10-v0.7.4-gb10-sm121.tar.gz` (the binary, all 19 PTX files and the two TP
+launchers; binary sha256 `21a54db93d53c067e5045a2fcf49f1e92f28d02f5089f0cbba91312663b49f0b`),
+`SHA256SUMS.txt`, `PROVENANCE.txt`. Built from the public tree at commit `f06f1c1` (the
+release source), a clean checkout; the kernel files and the PTX are byte-identical to v0.7.3.
+
 ### Behaviour changes at default flags
 
 | what a client sees at default flags | restore the v0.7.3 reading with |
@@ -33,7 +42,7 @@ next section, each with the flag that restores the v0.7.3 reading.
 | Greedy text can differ from v0.7.3 for a request whose context crosses about 2,051 tokens under speculation, and for a short request that shared a decode step with a longer one (the v0.7.3 bytes of those depended on timing). Details under "a request's greedy text could depend on what else was being served" | `--qsa-row-regime off` |
 | A `</tool_call>` inside an argument value is text, and so is a quoted complete block; before, the first `</tool_call>` ended the block and cut the call there | `--tool-block-end first` |
 | A string argument loses exactly one wrapping newline instead of all of them (a file the model ends with a blank line arrives with its final newline) | `--tool-value-trim all` |
-| **`--lane-pack` is ON by default** (it was off): two concurrent requests share one speculative verification; greedy bytes are unchanged, sampled requests draw from the same distribution; it holds about 1.8 GiB of device memory per machine (a second 16-row scratch and its graphs, captured at boot); a posture it cannot serve boots with it inactive and one line saying why; a request with a penalty or an image never packs | `--lane-pack off` |
+| **`--lane-pack` is ON by default** (it was off): two concurrent requests share one speculative verification; greedy bytes are unchanged, sampled requests draw from the same distribution; it holds about 1.8 GiB more device memory per machine (a second 16-row scratch and its graphs, captured at boot), also for a single request; a posture it cannot serve boots with it inactive and one line saying why; a request with a penalty or an image never packs | `--lane-pack off` |
 | Streamed call whose argument holds `<think>`: no raw call markup as content and no split into reasoning. Thinking off and an argument holding `</think>`: the call is kept (it was thrown away). A Qwen call whose value mentions the Hy3 call tag stays a Qwen call. A JSON-bodied block whose string quotes `</tool_call>` is read whole | none: defect fixes |
 | A streamed chat response carries an SSE comment line `: keep-alive` every 10 s while it waits in the queue, prefills or buffers a tool call; the role chunk leaves with the first generated token (data events, bytes and order are unchanged) | `--sse-keepalive 0` for the lines; the role chunk's time has no flag |
 | A non-streaming chat response that ends inside its think block returns that text as `reasoning_content` with an empty `content` (as the streaming API always did) | `--unclosed-think content` |
@@ -467,9 +476,9 @@ its own tokens. The flag was opt-in in the release candidates; the maintainer de
   3 of the 4 standard cells.
 - Cost: about 1.7 to 1.8 GiB of device memory per machine (a second 16-row scratch and its
   graphs, captured at boot), also for a server that never has two requests at once. The boot
-  line prints the free memory after the boot. Not measured for this release with the default
-  on: the free host memory before and after on the 4.05 pack at `--max-seq-len 262144
-  --max-batch 4` (the tight cell).
+  line prints the free memory after the boot. Paid by default now; `--lane-pack off` gives it
+  back. Not measured for this release with the default on: the free host memory before and
+  after on the 4.05 pack at `--max-seq-len 262144 --max-batch 4` (the tight cell).
 
 Measured (request class stated on each line; all unpenalized, no sampler fields; every number
 below was taken with the flag typed `--lane-pack on`, before it became the default):
@@ -498,6 +507,14 @@ below was taken with the flag typed `--lane-pack on`, before it became the defau
   `velogb10_lane_pack_lane_rounds_total{kind}`, `velogb10_lane_pack_skip_total{reason}` (why a
   request was kept out of a packed round), `velogb10_lane_pack_disabled`,
   `velogb10_lane_pack_active{reason}`.
+- **What was exercised on the release binary.** The maintainer ran the previous build by hand
+  on one machine, at `--max-batch 1`, at TP=2 and at TP=4, with packed rounds (the flag typed
+  `--lane-pack on`), for daily use, and noted no crash or error; the speed benefit is clearest
+  on one and two machines and smaller at TP=4 (no numbers are published). No automated gate
+  chain was run on this exact binary. The gate results quoted in this section are those of the
+  release candidate `7a4117643a52` and of the gate sessions named, carried over by argument: the
+  packed arm is the same code the gates ran with the flag typed; what the cut changes is that it
+  is on by default and how that is resolved and agreed between machines (read, not booted).
 
 ### Added — KV occupancy gauges (issue #24)
 
@@ -785,6 +802,9 @@ measurement. The Flash-Next guide has a short note on this behaviour.
   `[opts] unknown option ...` warning line printed at startup is the signal.
   `scripts/owner_check.py` (shipped in the repository from this release) says "NOT EXPORTED by
   this build" for a series that is absent and never reads an absent series as "all clear".
+- **Not part of this release:** the other experiments of the lane-packing work (for example
+  packing aware of the speculation arm), and the typing and ranging of the 173 hand-read flags
+  in the option registry.
 - **Still open from earlier releases:** the legacy minimal DSV4 server does not report the
   newer usage fields; a JSON schema sent in `response_format` is accepted but not enforced (the
   reply header `x-json-schema-enforced: none` says so); on several machines an error in a step stops
@@ -873,9 +893,11 @@ measured on that class and no other):
   differs from the typed-flag path only in how the option is resolved and agreed between
   machines; that code was read, not booted by a test session; `--tool-unclosed drop` as the
   default is the v0.7.3 reading, which the in-tree differential tests pin.
-- Four machines (TP=4): not run by any gate session; the maintainer's hand test is the only
-  evidence there. A warm multi-turn agent conversation with lane packing, and the four-request
-  off/on speed pairs after the shared-step probe of this release, were not measured.
+- Four machines (TP=4): no gate chain of this release was run on four machines. The maintainer
+  ran TP=4 with packed rounds by hand for daily use with no crash or error noted (no numbers
+  are published). Until a gate chain is run, "not gated on four machines" is the accurate
+  statement. A warm multi-turn agent conversation with lane packing, and the four-request off/on
+  speed pairs after the shared-step probe of this release, were not measured.
 - The DeepSeek V4 server (the streamer move and the greedy `timings` correction), DFlash under
   TP, images together with `--lane-pack`, and the NVFP4 `--rope-yarn-factor 2 --max-seq-len
   524288` guard.
@@ -901,6 +923,11 @@ In this order:
    and for requests with a penalty (that code is written and has not yet run on hardware).
 4. **A new request must not freeze the others**, on one machine and on several.
 5. **A prompt cache that several conversations can share.**
+
+Direction, without numbers: a production baseline at default sampling on one, two and four
+machines; a review of the lane-packing results and the defaults that follow from it; a three-
+or four-request pack; the routed-expert kernel; moving the hand-read flags into the registry;
+YaRN (issues #19 and #22); a long soak and TP=4 gate numbers.
 
 We will not put numbers on these before we have measured them. Also known and not in this
 release: the Hy3 and DeepSeek V4 tool-call formats (parked until those models are in scope),

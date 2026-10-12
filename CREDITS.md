@@ -23,6 +23,8 @@ We would like to thank the following people for their contributions to this proj
 - [@ccgauvin94](https://github.com/ccgauvin94) — [#19](https://github.com/sf-stav/veloGB10/issues/19) (YaRN support) and the confirmation of [#10](https://github.com/sf-stav/veloGB10/issues/10).
 
 - **bddh** (NVIDIA developer forum) — the payloads and the notes on how tool-call arguments that quote tool calls are read, which drove the parser work of v0.7.4.
-- **TimoGoetze** (NVIDIA developer forum) — the benchmark run that showed the first streamed chunk arriving long before any output (fixed in v0.7.4).
+- **TimoGoetze** (NVIDIA developer forum) — the llama-benchy tables that showed the first streamed chunk arriving long before any output (fixed in v0.7.4) and the concurrency numbers behind the lane-packing work.
+- **cdzinpin** (NVIDIA developer forum) — the server logs behind the speculation re-arm fix (v0.7.4).
+- **p1140** and **emX0r** (NVIDIA developer forum) — reports of an agent stopping where a tool call was expected (the `[gen]` stop fields of v0.7.4 make such a stop readable) and of a memory spike (under investigation); no fix is claimed.
 
 and the community members on the NVIDIA developer forum who posted logs, benchmarks and bug reports.
