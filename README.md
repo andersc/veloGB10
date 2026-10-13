@@ -530,6 +530,30 @@ recipe is ~76 GB.
 
 ---
 
+## Security: tool-secret scrub (opt-in)
+
+Agentic traffic can carry credentials inside tool results, and a model will sometimes echo one
+back into its own output (thinking text included). `--scrub-tool-secrets` is an opt-in,
+emission-side redaction for exactly that, default off (a boot without the flag serves
+byte-identical output):
+
+- `off` (default) - nothing is redacted; zero cost, no served byte changes.
+- `provenance` - strings echoed from this conversation's tool results are redacted
+  (`[redacted:tool-secret]`): credential-shaped values and values assigned to secret-named
+  keys, matched exactly and via shingles so partial echoes redact too.
+- `pattern` - key-shaped text is redacted anywhere (`[redacted:key-shape]`): `sk-`/`AKIA`/`gh_`
+  token shapes, JWTs, hex runs of 16+ digits (UUID/IPv6-shaped), high-entropy runs.
+- `all` - both layers.
+
+The scrub applies only to what the server *sends*: `reasoning_content`, `content` and tool-call
+arguments, in streamed SSE deltas and non-streaming bodies alike. The model's own context is
+never modified - the tool-call parser, stop handling and server logs still see the raw text.
+Redactions are counted on `/metrics` as `velogb10_scrub_hits_total{layer=...}`. Deployers serving
+agentic traffic where tool results carry credentials may want this on; the engine deliberately
+imposes no system prompt (owner ruling 2026-10-13: inference engines should not inject one).
+
+---
+
 ## EXL3 packs (Qwen3.8-Flash-Next)
 
 `--model-dir` also accepts an **EXL3 (ExLlamaV3 trellis)** pack. The model on this path is
