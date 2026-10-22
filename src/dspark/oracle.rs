@@ -842,3 +842,11 @@ pub fn yaarn_freqs(
     }
     freqs
 }
+
+/// The vLLM YaRN attention mscale: `0.1·ln(factor)+1` for factor > 1, exactly 1.0 otherwise
+/// (the factor-1.0 multiply must be the f32 identity so legacy tables stay byte-identical).
+/// ONE copy of the formula lives here; every trunk's table build and boot line takes it from
+/// this (YARN1).
+pub fn yaarn_mscale(factor: f32) -> f32 {
+    if factor > 1.0 { 0.1f32 * factor.ln() + 1.0 } else { 1.0 }
+}

@@ -1013,6 +1013,10 @@ LMH_ENTRY(4, 8, 6)
 LMH_ENTRY(4, 16, 6)
 LMH_ENTRY(3, 8, 6)
 LMH_ENTRY(3, 16, 6)
+// C4STEP1: 6-bit lm_head (head_bits=6 packs, e.g. EXL3 4.05bpw Flash-Next) previously had no
+// persistent entry and kept exl3_hmma_gemm; same body template, ring depth 6 like 3/4-bit.
+LMH_ENTRY(6, 8, 6)
+LMH_ENTRY(6, 16, 6)
 
 // ---------------------------------------------------------------------------
 // S-A3-f-b: WIDE-M GEMM (chunked prefill). Same operator, tile contract and
@@ -2423,6 +2427,30 @@ extern "C" __global__ void xq_gdn_gate(__half* __restrict__ out, const __half* _
     if (tid < vd) {
         float g = xq_h2f(z[(long long)b * (nh * vd) + (long long)head * vd + tid]);
         out[base + tid] = xq_f2h(v * inv * xq_h2f(w[tid]) * xq_sig(g));
+    }
+}
+
+// EXL27B: xq_gdn_gate for the Qwen3.5-class packs (output_gate_type swish / absent): the gated RMSNorm
+// with silu(z) instead of sigmoid(z) — a copy; xq_gdn_gate (FN, sigmoid) is untouched.
+// out = x * rsqrt(mean(x^2)+eps) * w[i] * silu(z). grid B*nh, block vd.
+extern "C" __global__ void xq_gdn_gate_silu(__half* __restrict__ out, const __half* __restrict__ x,
+                                            const __half* __restrict__ z, const __half* __restrict__ w,
+                                            int vd, int nh, int B, float eps) {
+    XQ_PDL_ENTRY();
+    int blk = blockIdx.x;
+    int b = blk / nh;
+    int head = blk % nh;
+    extern __shared__ float s[];
+    int tid = threadIdx.x;
+    long long base = (long long)b * (nh * vd) + (long long)head * vd;
+    float v = (tid < vd) ? xq_h2f(x[base + tid]) : 0.0f;
+    s[tid] = v * v;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) { if (tid < s2) s[tid] += s[tid + s2]; __syncthreads(); }
+    float inv = rsqrtf(s[0] / (float)vd + eps);
+    if (tid < vd) {
+        float g = xq_h2f(z[(long long)b * (nh * vd) + (long long)head * vd + tid]);
+        out[base + tid] = xq_f2h(v * inv * xq_h2f(w[tid]) * (g * xq_sig(g)));
     }
 }
 
@@ -9388,6 +9416,56 @@ extern "C" __global__ void xq_attn_kv_prefill_rows(__half* __restrict__ kp, __ha
     xq_kv_put(kc.v + p * kc.rb, kc.fmt, hd, tid, xq_h2f(vp[row + tid]));
 }
 
+// ---- S-C4PRIMEA: the multi-slot twin of xq_attn_kv_prefill_rows. Row t writes
+// to (slot, pos) taken PER ROW from the pairs buffer (sc.slots: [slot,pos] i32
+// pairs) instead of the single (slot, pos0+t). Per-row math is IDENTICAL
+// (xq_k_norm_rope / xq_kv_put on the same inputs), so the bytes written for a
+// lane's row are bit-identical to the per-lane xq_attn_kv_prefill launch -
+// only the addressing differs. Serves the BATCHED shared-step prime; the
+// control site keeps xq_attn_kv_prefill.
+extern "C" __global__ void xq_attn_kv_prefill_pairs(__half* __restrict__ kp, __half* __restrict__ vp,
+                                                    float* __restrict__ kcvc, const __half* __restrict__ qnkn,
+                                                    const float* __restrict__ cossin, const int* __restrict__ pairs,
+                                                    int nkv_hd, int rdim_maxpos, int C, float eps) {
+    XQ_PDL_ENTRY();
+    const int nkv = nkv_hd & 0xFFFF;
+    const int hd = ((unsigned)nkv_hd) >> 16;
+    const int rdim = rdim_maxpos & 0xFF;
+    const int max_pos = (int)(((((unsigned)rdim_maxpos) >> 8) & 0xFFFFFu) | ((((unsigned)rdim_maxpos) >> 28) << 28));
+    const int t = blockIdx.x / nkv;
+    const int kvh = blockIdx.x % nkv;
+    if (t >= C) return;                           // block-uniform (grid is exactly C*nkv)
+    const int tid = threadIdx.x;
+    const __half* knw = qnkn + hd;
+    __shared__ float red[1024];
+    __shared__ float kbuf[1024];
+    const int slot = pairs[2 * t];                // per-row slot (block-uniform)
+    const XqKv kc = xq_kv_make(kcvc, max_pos, hd, nkv, slot, kvh);
+    const long long row = (long long)t * nkv * hd + (long long)kvh * hd;
+    xq_k_norm_rope(kbuf, red, kp + row, knw, cossin + (long long)t * 2 * rdim,
+                   cossin + (long long)t * 2 * rdim + rdim, tid, hd, rdim, eps);
+    const long long p = pairs[2 * t + 1];         // per-row pos
+    xq_kv_put(kc.k + p * kc.rb, kc.fmt, hd, tid, kbuf[tid]);
+    xq_kv_put(kc.v + p * kc.rb, kc.fmt, hd, tid, xq_h2f(vp[row + tid]));
+}
+
+// ---- S-C4PRIMEA: ONE-launch gather of the shared step's per-lane tap rows
+// into the re-prime's lane-major resid rows (replaces the per-lane xq_copy_f32
+// launches). meta[i] = slot | (tap_row << 12); row i copies he floats from
+// taps_keep[slot*win_f + tap_row*he] to resid[i*he]. Bytes identical to the
+// per-lane copies (plain float copy).
+extern "C" __global__ void xq_gather_tap_rows(float* __restrict__ dst, const float* __restrict__ src,
+                                              const int* __restrict__ meta, long long win_f, int he, int L) {
+    XQ_PDL_ENTRY();
+    const int i = blockIdx.x;
+    if (i >= L) return;
+    const int slot = meta[i] & 0xFFF;
+    const int row = meta[i] >> 12;
+    const float* s = src + (long long)slot * win_f + (long long)row * he;
+    float* d = dst + (long long)i * he;
+    for (int j = threadIdx.x; j < he; j += blockDim.x) d[j] = s[j];
+}
+
 // ---- full-attention prefill: per (head), loop the chunk's query positions;
 // q-norm + rope per position, two-pass softmax over t' <= pos (cache layout as
 // decode, ascending t). Output row layout = decode's attn [pos][head][hd].
@@ -12408,6 +12486,158 @@ extern "C" __global__ void __launch_bounds__(256) exl3_hmma_gemm_ks_fx_x2(const 
 
 // ---- fixed-order combine of the split-K partials: ascending ks, fp32, one
 // fp16 RN store per element (same final rounding as the single-block epilogue).
+
+template <int BITS, int MODE>
+__device__ __forceinline__ uint16_t exl3_probe_dq(const uint32_t* __restrict__ ring,
+                                                        int i0, int i1, int sf) {
+    if (MODE == 2) { const uint32_t w0 = ring[i0]; const uint32_t w1 = ring[i1]; (void)sf; return (uint16_t)(w0 ^ w1); }
+    return exl3_dq_from(ring, i0, i1, sf);
+}
+template <int BITS, int MODE>
+__device__ __forceinline__ void exl3_gemm_body_ks_probe(const uint16_t* __restrict__ trellis,
+                                                  const __half* __restrict__ xh,
+                                                  float* __restrict__ ws,
+                                                  int M, int K, int N, int cta_tile,
+                                                  int kb0, int kb1, int ks_id, int w_kb) {
+    __shared__ __half sa[16][16];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int cta_n = cta_tile * 128;
+    const int nb_col = cta_n / 16 + warp;
+    const int nb = N >> 4;
+
+    // hoisted per-lane slot constants (same as exl3_gemm_body)
+    int s_i0m[8], s_i1m[8], s_sf[8];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int r = 2 * (lane & 3) + (s & 1) + 8 * (s >> 1);
+            const int c = 8 * h + (lane >> 2);
+            const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
+            const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1)
+                              + 4 * (c >> 3) + 32 * (c & 1);
+            const int b1 = (t + 257) * BITS;
+            const int i0 = (b1 - 16) >> 5;
+            const int i1 = (b1 - 1) >> 5;
+            s_i0m[h * 4 + s] = i0 % (BITS * 8);
+            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
+        }
+    }
+
+    float acc[2][4];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
+
+    const uint32_t* __restrict__ ring0 =
+        (const uint32_t*)(trellis + ((size_t)kb0 * nb + nb_col) * (16 * BITS));
+    const size_t ring_kstride = (size_t)nb * 8u * BITS;
+    const int span = kb1 - kb0;
+    const int wk = (MODE == 1 && w_kb > 0 && w_kb < span) ? w_kb : span;
+
+    for (int kb = kb0; kb < kb1; ++kb) {
+        const uint32_t* __restrict__ ring =
+            ring0 + (size_t)((kb - kb0) % wk) * ring_kstride;
+        {
+            const int row = tid >> 4, col = tid & 15;
+            const bool live = (row < M) && (kb * 16 + col < K);
+            sa[row][col] = live ? xh[(size_t)row * K + kb * 16 + col]
+                                : __ushort_as_half(0);
+        }
+        __syncthreads();
+
+        uint32_t bfrag[2][2];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint16_t r0 = exl3_probe_dq<BITS, MODE>(ring, s_i0m[h*4+0], s_i1m[h*4+0], s_sf[h*4+0]);
+            const uint16_t r1 = exl3_probe_dq<BITS, MODE>(ring, s_i0m[h*4+1], s_i1m[h*4+1], s_sf[h*4+1]);
+            const uint16_t r2 = exl3_probe_dq<BITS, MODE>(ring, s_i0m[h*4+2], s_i1m[h*4+2], s_sf[h*4+2]);
+            const uint16_t r3 = exl3_probe_dq<BITS, MODE>(ring, s_i0m[h*4+3], s_i1m[h*4+3], s_sf[h*4+3]);
+            bfrag[h][0] = (uint32_t)r0 | ((uint32_t)r1 << 16);
+            bfrag[h][1] = (uint32_t)r2 | ((uint32_t)r3 << 16);
+        }
+
+        const int gid = lane >> 2, tig = lane & 3;
+        const uint32_t a0 = *(const uint32_t*)&sa[gid][2 * tig];
+        const uint32_t a1 = *(const uint32_t*)&sa[gid + 8][2 * tig];
+        const uint32_t a2 = *(const uint32_t*)&sa[gid][2 * tig + 8];
+        const uint32_t a3 = *(const uint32_t*)&sa[gid + 8][2 * tig + 8];
+
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[h][0]), "+f"(acc[h][1]), "+f"(acc[h][2]), "+f"(acc[h][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(bfrag[h][0]), "r"(bfrag[h][1]));
+        }
+        __syncthreads();
+    }
+
+    // ---- fp32 partial epilogue: ws[ks_id][row][col] (rows >= M skipped, as before)
+    const int gid = lane >> 2, tig = lane & 3;
+    const int row0 = gid, row1 = gid + 8;
+    float* base = ws + (size_t)ks_id * M * N;
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int col = cta_n + 16 * warp + 8 * h + 2 * tig;
+        if (row0 < M) {
+            base[(size_t)row0 * N + col]     = acc[h][0];
+            base[(size_t)row0 * N + col + 1] = acc[h][1];
+        }
+        if (row1 < M) {
+            base[(size_t)row1 * N + col]     = acc[h][2];
+            base[(size_t)row1 * N + col + 1] = acc[h][3];
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// S-C4STEP5 ablation-ladder probe (bench-harness ONLY — never launched by the
+// served path; timed to decompose the ks_fx dense cost, nothing ships from it):
+//   MODE 1 = ring wraps into a w_kb-row window (L2-resident trellis reads).
+//   MODE 2 = load-preserving decode stub (both ring loads kept, bit assembly
+//            removed) — isolates the decode ALU cost.
+// Verbatim body of exl3_gemm_body_ks except the two probe points above.
+// ----------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(256) exl3_hmma_gemm_ks_fx_probe(const uint16_t* __restrict__ trellis,
+                                                const __half* __restrict__ xh,
+                                                float* __restrict__ ws,
+                                                const __half* __restrict__ svh,
+                                                __half* __restrict__ y,
+                                                unsigned int* __restrict__ cnt,
+                                                int M, int K, int N, int bits, int mode, int w_kb) {
+    const int ks = gridDim.y;
+    const int KB = K >> 4;
+    const int chunk = KB / ks;
+    const int kb0 = blockIdx.y * chunk;
+    const int kb1 = kb0 + chunk;
+    XQ_PDL_ENTRY();
+    if (mode == 2) {
+        switch (bits) {
+            case 3: exl3_gemm_body_ks_probe<3,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
+            case 4: exl3_gemm_body_ks_probe<4,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
+            case 5: exl3_gemm_body_ks_probe<5,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
+            EXL3_CASE6(case 6: exl3_gemm_body_ks_probe<6,2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;)
+            default: break;
+        }
+    } else {
+        switch (bits) {
+            case 3: exl3_gemm_body_ks_probe<3,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
+            case 4: exl3_gemm_body_ks_probe<4,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
+            case 5: exl3_gemm_body_ks_probe<5,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;
+            EXL3_CASE6(case 6: exl3_gemm_body_ks_probe<6,1>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y, w_kb); break;)
+            default: break;
+        }
+    }
+    exl3_ks_fixup(ws, svh, y, cnt, M, N);
+}
+
 extern "C" __global__ void exl3_ks_combine(const float* __restrict__ ws,
                                            __half* __restrict__ yraw,
                                            int M, int N, int KS) {
@@ -14606,6 +14836,72 @@ extern "C" __global__ void xq_qsa_h2b(__nv_bfloat16* __restrict__ out, const __h
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const long long gs = (long long)gridDim.x * blockDim.x;
     for (; i < n; i += gs) out[i] = xq_f2b(xq_h2f(in[i]));
+}
+
+// ---- 1b. EXL27C-DF2 (fwd): the DFlash2 tap capture for the EXL3 f32 residual staging.
+//
+// The NVFP4 trunk taps hidden_states[l+1] with a plain bf16->bf16 2D D2D
+// (dflash2::capture::capture_cols_into). The EXL3 forward stages its residual as
+// f32, token-major [rows][pitch] with pitch = hcn*h (xq_hc_norm: stream s of token
+// b lives at b*hcn*h + s*h; xq_hc_inject writes every stream), so the capture must
+// BOTH down-cast f32->bf16 AND stride over the hcn*h row pitch. cuMemcpy2D cannot
+// convert element types, so the capture is this kernel instead (the documented
+// choice; see the exl27c_fwd report).
+//
+// The LIVE-RESIDUAL slice read is elements [r*pitch + 0, r*pitch + h) of each token
+// row — stream 0, offset 0. Evidence: (a) the 27B EXL3 packs are Family::Qwen35 with
+// hc_count = 1 (exl3.rs "the plain residual recipe rides hc_count=1"), so the staging
+// row IS the single live residual; (b) the trunk's own S4F tap passes h (NOT
+// resid_width()) as the source row stride into the resid_width()-wide residual — the
+// stream-0 slice — which is the whole row exactly because the 27B trunk is hc_count=1.
+//
+// dst is the sink staging, row-major [cols][TAP_CONCAT_DIM] (the same bytes
+// capture_cols_into produces): token r's tap-li slice lands at
+// dst[r*dst_pitch + tap_li*h + c] = bf16(src[r*pitch + c]).
+//
+// Grid-stride over n*h elements, block 256. One launch per tap layer per round,
+// stream-ordered on the compute stream (AGENTS §2.3), fixed addresses (the sink's
+// staging is allocated once per process) — CUDA-graph-safe. Zero cost when the sink
+// is unarmed (the caller never launches).
+extern "C" __global__ void xq_df2_tap_cvt(__nv_bfloat16* __restrict__ dst,
+                                          const float* __restrict__ src,
+                                          long long n_elems, int h, long long pitch,
+                                          int tap_li, long long dst_pitch) {
+    XQ_PDL_ENTRY();
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long gs = (long long)gridDim.x * blockDim.x;
+    for (; i < n_elems; i += gs) {
+        const long long r = i / h;
+        const int c = (int)(i % h);
+        dst[r * dst_pitch + (long long)tap_li * h + c] = xq_f2b(src[r * pitch + c]);
+    }
+}
+
+// ---- 1c. EXL27C-DF2 (fwd): boot-time tiled f16 transpose [K, N] -> [N, K].
+//
+// One step of the one-shot df2 head materialization (FwdModel::df2_boot_ptrs): the
+// EXL3 reconstruct (exl3_decode_dump) yields W_dec [K=hidden, N=vocab] f16 row-major;
+// the DF2 round's bf16 head contract is [vocab, hidden] row-major. 32x32
+// shared-memory tiles (padded +1 to avoid bank conflicts), guard-remnant edges.
+// BOOT-ONLY (once per process, ~2x2.4 GB traffic); never on a serving round.
+#define XQ_DF2_TT 32
+extern "C" __global__ void xq_df2_transpose_f16(__half* __restrict__ out, const __half* __restrict__ in,
+                                                int k, int n) {
+    XQ_PDL_ENTRY();
+    __shared__ __half tile[XQ_DF2_TT][XQ_DF2_TT + 1];
+    const int k0 = blockIdx.x * XQ_DF2_TT;
+    const int n0 = blockIdx.y * XQ_DF2_TT;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    if (k0 + ty < k && n0 + tx < n) {
+        // coalesced read along n: thread (tx, ty) reads in[k0+ty][n0+tx]
+        tile[ty][tx] = in[(size_t)(k0 + ty) * n + (n0 + tx)];
+    }
+    __syncthreads();
+    if (n0 + ty < n && k0 + tx < k) {
+        // coalesced write along k: thread (tx, ty) writes out[n0+ty][k0+tx] = tile[tx][ty]
+        // (out row n0+ty, col k0+tx — consecutive tx write consecutive k-columns).
+        out[(size_t)(n0 + ty) * k + (k0 + tx)] = tile[tx][ty];
+    }
 }
 
 // ---- 2. indexer-q fused per-head RMSNorm + RoPE, rmsnorm_rope_b's math on

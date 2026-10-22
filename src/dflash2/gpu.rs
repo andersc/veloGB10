@@ -242,12 +242,12 @@ impl Df2Gpu {
         let dev = CudaDevice::new(0).context("CudaDevice")?;
         let stream = fork_blocking_stream(&dev);
 
-        let bptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
+        let bptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         let bfnames = ["rmsnorm_b", "rmsnorm_perhead_b", "rope_b", "gather_rope_b",
             "write_kv_b", "add_residual_b", "silu_mul_b", "kernel_build_id"];
         dev.load_ptx(bptx, "gpu_batch", &bfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
-        let kptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_kernels.ptx")?);
+        let kptx = Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         let kfnames = ["gemm_dsp_b_m8_r2", "gemm_dsp_b_m8_r4", "gemm_tiled_b",
             "conv2_dynamic_b", "gqa_attn_band_b", "kernel_build_id"];
         dev.load_ptx(kptx, "gpu_kernels", &kfnames)?;

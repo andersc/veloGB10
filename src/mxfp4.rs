@@ -150,7 +150,7 @@ impl Mxfp4State {
         if !on {
             return Ok(None);
         }
-        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_mxfp4.ptx")?);
+        let ptx = Ptx::from_src(crate::ptx_embed::GPU_MXFP4);
         dev.load_ptx(ptx, "gpu_mxfp4", &["mxfp4_gemv_native_b", "mxfp4_quant_pack_b",
                                          "mxfp4_gemv_native_fused_b1", "mxfp4_gemv_native_fused_b8",
                                          "mxfp4_gemv_native_fused_b16",
@@ -164,7 +164,7 @@ impl Mxfp4State {
         let sfb = dev.alloc_zeros::<u32>(MXFP4_GROUPS * nks_max * 32).unwrap();
         // MoE module: grouped/slot GEMVs + the N-group quant. Sized from the grouped arm's worst
         // case (ppad_max = MAX_VERIFY·topk + ne·16 rows → ppad/8 eight-token groups).
-        let ptx_moe = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_mxfp4_moe.ptx")?);
+        let ptx_moe = Ptx::from_src(crate::ptx_embed::GPU_MXFP4_MOE);
         dev.load_ptx(ptx_moe, "gpu_mxfp4_moe",
                      &["mxfp4_gemm_moe_grouped_native_b", "mxfp4_gemm_moe_slot_native_b",
                        "mxfp4_quant_pack_ng_b",

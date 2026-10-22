@@ -33,7 +33,7 @@
 //! values (same source row, same positions) — the R1 probe asserts this too (decode-capture vs
 //! verify-capture of the same span are bit-identical).
 
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice, LaunchAsync};
 use std::sync::Arc;
 
 use crate::dflash2::{block, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
@@ -140,3 +140,66 @@ pub fn capture_cols(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUstream
     capture_cols_into(dev, stream, *sink.staging.device_ptr() as u64, TAP_CONCAT_DIM,
                       res_ptr, h, n, tap_li)
 }
+
+// EXL27C-DF2 (fwd): the PITCH-AWARE, DTYPE-CONVERTING tap capture for the EXL3 serve path.
+//
+// DESIGN CHOICE (documented per the exl27c_fwd brief): `capture_cols_into` above is a
+// cuMemcpy2DAsync bf16→bf16 D2D — it CANNOT convert element types, and the EXL3 forward
+// stages its residual as f32, token-major `[rows][pitch]` (`xq_hc_norm`: stream s of
+// token b at b·pitch + s·h; pitch = hcn·h), so the EXL3 capture is a small KERNEL
+// instead of a memcpy: `xq_df2_tap_cvt` (kernels/exl3_bench.cu) reads the live-residual
+// slice `[r·pitch + 0, r·pitch + h)` of each token row — STREAM 0; for the 27B packs
+// (Family::Qwen35, hc_count = 1) that is the WHOLE row; the hcn>1 case reads the same
+// stream-0 slice the NVFP4 trunk's tap reads (gpu.rs passes h — not resid_width() — as
+// the source stride) — and writes the dense bf16 tap slice `dst[r·dst_pitch + tap_li·h,
+// +h)`. One launch per tap layer, stream-ordered on the caller's (compute) stream
+// (AGENTS §2.3), no host reads, fixed device addresses → CUDA-graph-safe.
+//
+// The kernel lives in the exl3_bench module (the EXL3 kernel book); this function fetches
+// it by name, so it requires that module to be loaded (any FwdModel path does).
+pub fn capture_cols_f32_into(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
+                             dst_ptr: u64, dst_pitch: usize, src_ptr: u64, src_pitch: usize,
+                             h: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
+    use cudarc::driver::LaunchConfig;
+    anyhow::ensure!(h > 0 && n > 0, "df2 f32 tap: empty capture (h={h}, n={n})");
+    anyhow::ensure!(src_pitch >= h, "df2 f32 tap: src pitch {src_pitch} < h {h}");
+    anyhow::ensure!(h == HIDDEN, "df2 f32 tap: h {h} != HIDDEN {HIDDEN} (non-27B pack?)");
+    let elems = (h as i64) * (n as i64);
+    let f = dev.get_func("exl3_bench", "xq_df2_tap_cvt")
+        .ok_or_else(|| anyhow::anyhow!("df2 f32 tap: xq_df2_tap_cvt not loaded (is the exl3_bench module loaded?)"))?;
+    let blocks = (((elems + 255) / 256).min(65535) as u32, 1u32, 1u32);
+    unsafe {
+        f.clone().launch_on_stream(
+            stream,
+            LaunchConfig { grid_dim: blocks, block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+            (dst_ptr as u64, src_ptr as u64, elems, h as i32, src_pitch as i64,
+             tap_li as i32, dst_pitch as i64),
+        )?;
+    }
+    Ok(())
+}
+
+/// The TAP-sink wrapper (the 8-column staging; dst pitch = TAP_CONCAT_DIM): the EXL3
+/// mirror of `capture_cols` for the decode/verify hooks. `n` must fit the sink's column
+/// count (`n <= block()` for the standard sink — the caller gates, same as the trunk).
+pub fn capture_cols_f32(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
+                        sink: &Df2TapSink, res_ptr: u64, src_pitch: usize,
+                        h: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(n <= sink.staging.len() / TAP_CONCAT_DIM,
+                    "df2 f32 tap: n {n} > sink columns {}", sink.staging.len() / TAP_CONCAT_DIM);
+    capture_cols_f32_into(dev, stream, *sink.staging.device_ptr() as u64, TAP_CONCAT_DIM,
+                          res_ptr, src_pitch, h, n, tap_li)
+}
+
+/// The PRIME-sink wrapper (one prefill window): writes rows [0, n) of the prime sink —
+/// trunk-identical (gpu.rs's S5F prefill capture) — for `prime_window(n, pos_start)` to
+/// consume per chunk. The prefill is eager, so this is outside any captured graph.
+pub fn capture_prime_f32(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
+                         prime: &Df2PrimeSink, res_ptr: u64, src_pitch: usize,
+                         h: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(n <= prime.taps.len() / TAP_CONCAT_DIM,
+                    "df2 prime tap: n {n} > prime columns {}", prime.taps.len() / TAP_CONCAT_DIM);
+    capture_cols_f32_into(dev, stream, *prime.taps.device_ptr() as u64, TAP_CONCAT_DIM,
+                          res_ptr, src_pitch, h, n, tap_li)
+}
+

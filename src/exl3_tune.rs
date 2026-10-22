@@ -684,13 +684,27 @@ pub fn driver_version() -> String {
         .unwrap_or_default()
 }
 
-/// This process's fingerprint (reads the PTX / fatbin files and the pack's config files).
+/// This process's fingerprint (the EMBEDDED PTX modules, the on-disk fatbin when one is present,
+/// and the pack's config files). FIX1 #78: the PTX hashes come from `ptx_embed` — the bytes the
+/// engine actually loads — never from src/ptx on disk, so a binary-alone EMB1 deploy still
+/// computes them and the tune-table fast path still hits.
 pub fn current_fingerprint(model_dir: &str, tp: u32, clock_mhz: u32) -> Fingerprint {
     let d = model_dir.trim_end_matches('/');
     let mut ptx = BTreeMap::new();
     let mut fatbin = BTreeMap::new();
+    // FIX1 #78 (EMB1): hash the PTX the binary EMBEDS, not src/ptx files on disk. A deploy is
+    // ONE file (EMB1): on a binary-alone box src/ptx/ does not exist, the disk read came back
+    // empty, and strict_match then rejected every tune table on ptx_sha256 — the boot silently
+    // fell back to the built-in defaults (the slow path) on hardware that HAD a valid table.
+    // The embedded bytes are the modules the engine loads, so this is the fingerprint that was
+    // always meant; it is CWD-independent and, on a source tree of the same build, byte-identical
+    // to the old disk hash (include_str! reads the very file build.rs emitted).
+    let embedded: [(&str, &str); 2] = [("exl3_bench", crate::ptx_embed::EXL3_BENCH),
+                                       ("gpu_batch", crate::ptx_embed::GPU_BATCH)];
+    for (stem, src) in embedded {
+        ptx.insert(stem.to_string(), sha256_hex(src.as_bytes()));
+    }
     for stem in PTX_STEMS {
-        if let Some(h) = sha256_file(Path::new(&format!("src/ptx/{stem}.ptx"))) { ptx.insert(stem.to_string(), h); }
         if let Some(h) = sha256_file(Path::new(&format!("src/ptx/{stem}.fatbin"))) { fatbin.insert(stem.to_string(), h); }
     }
     let (gpu, cuda) = gpu_identity();
@@ -1009,23 +1023,25 @@ fn print_boot_line(st: &BootStatus) {
         "DEFAULTS" => format!("TUNE: DEFAULTS ({}) — built-in defaults; early_lookups {}", st.reason, early_lookups()),
         _ => format!("TUNE: FALLBACK({}) — built-in defaults for everything; early_lookups {}", st.reason, early_lookups()),
     };
-    println!("{head}");
+    if crate::boot_report::debug() {
+    crate::dprintln!("{head}");
     if !st.ignored.is_empty() {
-        println!("TUNE: {} table decision(s) ignored: {}", st.ignored.len(), st.ignored.join("; "));
+        crate::dprintln!("TUNE: {} table decision(s) ignored: {}", st.ignored.len(), st.ignored.join("; "));
     }
     if !ov.is_empty() {
         let s: Vec<String> = ov.iter().map(|(id, env, v)| format!("{env} -> {id}={v}")).collect();
-        println!("TUNE: OVERRIDDEN(flag: {}) — override flags are diagnostics; they win over the table", s.join(", "));
+        crate::dprintln!("TUNE: OVERRIDDEN(flag: {}) — override flags are diagnostics; they win over the table", s.join(", "));
     }
-    println!("TUNE: registry {} entries, schema {}, tune_build_id {}",
+    crate::dprintln!("TUNE: registry {} entries, schema {}, tune_build_id {}",
              REGISTRY.len(), &registry_schema()[..12], env!("TUNE_BUILD_ID"));
+    }
 }
 
 /// Resolve the table for this process, freeze it, print the boot line. Call BEFORE FwdModel::load.
 /// Never fails the boot: every problem is a loud FALLBACK to the built-in defaults (bitwise).
 pub fn boot(req: &BootReq) {
     if FROZEN.get().is_some() {
-        println!("TUNE: boot requested after the table was frozen — keeping the frozen table");
+        crate::dprintln!("TUNE: boot requested after the table was frozen — keeping the frozen table");
         return;
     }
     let tp = req.tp.max(1);
@@ -1074,7 +1090,7 @@ pub fn boot(req: &BootReq) {
         }
     };
     if pick.table.fingerprint.clock_mhz != profile {
-        println!("TUNE: no {profile} MHz profile table ({psrc}); nearest is {} MHz — loading it",
+        crate::dprintln!("TUNE: no {profile} MHz profile table ({psrc}); nearest is {} MHz — loading it",
                  pick.table.fingerprint.clock_mhz);
     }
     if pick.table.fingerprint.driver != have.driver || pick.table.fingerprint.cuda != have.cuda {
@@ -1718,8 +1734,7 @@ pub fn assert_gpu_batch_build_id(dev: &std::sync::Arc<cudarc::driver::CudaDevice
         return crate::gpu::GpuModel::assert_kernel_build_id(dev, "gpu_batch");
     }
     let expect = u64::from_str_radix(env!("KERNEL_BUILD_ID"), 16).unwrap_or(0);
-    let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx")
-        .map_err(|e| anyhow::anyhow!("src/ptx/gpu_batch.ptx unreadable for the build-ID handshake: {e}"))?;
+    let ptx = crate::ptx_embed::GPU_BATCH;
     match ptx_build_id(&ptx, expect) {
         Some(got) if got == expect => Ok(()),
         Some(got) => anyhow::bail!(
@@ -2105,6 +2120,24 @@ mod tests {
         // the clock profile is NOT a strict field (nearest-profile selection happens in boot)
         let b3 = Fingerprint { clock_mhz: 2000, ..a.clone() };
         assert!(strict_match(&a, &b3, &p, &p).is_ok());
+    }
+
+    /// FIX1 #78: the PTX hashes come from the EMBEDDED modules — a binary-alone deploy (no
+    /// src/ptx next to the executable, any CWD) still computes them, so the table fast path hits
+    /// instead of silently falling back to the built-in defaults.
+    #[test]
+    fn fingerprint_ptx_hashes_come_from_the_embedded_modules() {
+        let fp = current_fingerprint("/nonexistent-fix1-model-dir", 1, 0);
+        assert_eq!(fp.ptx_sha256.len(), PTX_STEMS.len(), "every PTX stem hashed, CWD-independent");
+        assert_eq!(fp.ptx_sha256.get("exl3_bench").map(String::as_str),
+                   Some(sha256_hex(crate::ptx_embed::EXL3_BENCH.as_bytes()).as_str()));
+        assert_eq!(fp.ptx_sha256.get("gpu_batch").map(String::as_str),
+                   Some(sha256_hex(crate::ptx_embed::GPU_BATCH.as_bytes()).as_str()));
+        let fp2 = current_fingerprint("/nonexistent-fix1-model-dir", 1, 0);
+        assert_eq!(fp.ptx_sha256, fp2.ptx_sha256);
+        let p = Posture::default();
+        assert!(strict_match(&fp, &fp2, &p, &p).is_ok(),
+                "the fast path must hit: a table written by this binary's fingerprint loads back");
     }
 
     #[test]

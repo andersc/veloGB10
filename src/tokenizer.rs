@@ -1303,8 +1303,10 @@ fn load_chat_env(tokenizer_path: &str) -> Option<(minijinja::Environment<'static
     register_pycompat(&mut env);
     match env.add_template("chat", static_src) {
         Ok(_) => {
-            eprintln!("[tokenizer] loaded chat template from {} (sha256 {} {} bytes, raw_tool_args_history={})",
-                      origin, &digest[..12], nbytes, raw_tool_args);
+            if crate::boot_report::debug() {
+                crate::deprintln!("[tokenizer] loaded chat template from {} (sha256 {} {} bytes, raw_tool_args_history={})",
+                          origin, &digest[..12], nbytes, raw_tool_args);
+            }
             Some((env, (origin, digest, nbytes), raw_tool_args))
         }
         Err(e) => {
@@ -1552,10 +1554,12 @@ impl TokCache {
         // construction whatever the crate version computes it as.
         let vocab_size = tokenizer.get_vocab_size(true);
         let stream = StreamTables::build(tokenizer, &vocab, &special_ids(json_path));
-        eprintln!("[tokenizer] WP01 tables cached at load: vocab={} ids={} specials={} dup_ids={} \
+        if crate::boot_report::debug() {
+            crate::deprintln!("[tokenizer] WP01 tables cached at load: vocab={} ids={} specials={} dup_ids={} \
                    think_hy={} eos={} ({:.1} ms)",
                   vocab.len(), stream.kind.len(), stream.n_special, stream.dup_ids, think_hy, eos_id,
                   t0.elapsed().as_secs_f64() * 1e3);
+        }
         Self { think_hy, eos_id, vocab_size, stream: std::sync::Arc::new(stream) }
     }
 }

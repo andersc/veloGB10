@@ -125,6 +125,27 @@ fn to_f16_bits(raw: &[u8], dtype: &str) -> Result<Vec<u16>> {
             }
             Ok(out)
         }
+        "F32" => {
+            // EXL27 (owner scope add 2026-10-16): some packs (e.g. Qwen3.5-9B-exl3-3.5bpw) store
+            // their plain (non-trellis) tensors as F32. Convert to the internal f16 with
+            // round-to-nearest; every rounded value is counted and reported at load (never silent,
+            // §1b-bis 8: support + show, no refusal).
+            let mut out = Vec::with_capacity(raw.len() / 4);
+            let mut n_round = 0u64;
+            for c in raw.chunks_exact(4) {
+                let b = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let val = f32::from_bits(b);
+                let h = f16::from_f32(val);
+                if h.to_f32() != val && val.is_finite() {
+                    n_round += 1;
+                }
+                out.push(h.to_bits());
+            }
+            if n_round > 0 {
+                crate::rprintln!("[exl3] plain F32 tensor: {n_round} values rounded f32->f16 at load");
+            }
+            Ok(out)
+        }
         other => bail!("unsupported plain dtype {other}"),
     }
 }
@@ -139,6 +160,18 @@ fn bf16_to_f32(raw: &[u8]) -> Vec<f32> {
     raw.chunks_exact(2)
         .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
         .collect()
+}
+
+/// EXL27B: a NON-BF16 plain tensor as f32 by its stored dtype (the f32 loaders keep bf16_to_f32 for
+/// BF16 — every FN tensor). The Qwen3.5-9B pack stores `linear_attn.A_log` as F32: read as BF16, each
+/// float became two values (its low half — noise — then its high half) and every GDN head read the
+/// wrong decay (9B perplexity 28.2 vs 9.3 for the NVFP4 9B).
+fn plain_to_f32(raw: &[u8], dtype: &str) -> Result<Vec<f32>> {
+    match dtype {
+        "F16" => Ok(raw.chunks_exact(2).map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect()),
+        "F32" => Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+        other => bail!("unsupported plain dtype {other} for an f32 tensor"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +211,20 @@ struct Quad {
 // Pure function of (k, n): deterministic per model, m-independent (G-A3-5).
 pub(crate) fn chain_ks(k: i32, n: i32) -> u32 { chain_ks_target(k, n, 200) }
 
+/// EXL27B: chain_ks for a dense pack's MLP quads (a copy; chain_ks itself is untouched). chain_ks
+/// treats >= 128 column tiles as lm_head-class and picks ks = 1 — the per-k16-step barrier body —
+/// which put the 27B's gate/up (N 17408 = 136 tiles, K 5120) 27% behind the split-K path.
+pub(crate) fn dense_chain_ks(k: i32, n: i32) -> u32 {
+    let tiles = (n.max(0) as u32) / 128;
+    let kb = (k.max(0) as u32) / 16;
+    if tiles == 0 || kb == 0 { return 1; }
+    if tiles >= 512 { return 1; }
+    let target = ((200 + tiles - 1) / tiles).min(kb).max(1);
+    let mut ks = target;
+    while ks > 1 && kb % ks != 0 { ks -= 1; }
+    ks
+}
+
 /// chain_ks with an explicit resident-block target (`chain_ks` = 200). TP-I #8: the TP-sliced
 /// quads may re-derive theirs from --tp-ks-target (xtp::tp_chain_ks).
 pub(crate) fn chain_ks_target(k: i32, n: i32, blocks: u32) -> u32 {
@@ -215,7 +262,7 @@ fn router_ks(k: i32, ne: i32) -> u32 {
 // 3-kernel path runs consistently (batch invariance never splits across paths).
 fn hc_fuse_co_residency(_dev: &Arc<CudaDevice>) -> u32 {
     use cudarc::driver::sys;
-    let Ok(ptx) = std::fs::read_to_string(crate::exl3_bench::bench_ptx_path()) else { return 0; };
+    let ptx = crate::exl3_bench::bench_ptx_src();
     let Ok(ptx_c) = std::ffi::CString::new(ptx) else { return 0; };
     let mut module: sys::CUmodule = std::ptr::null_mut();
     let r = unsafe {
@@ -272,24 +319,24 @@ fn gdn_chunk_tc_fn(v2: bool) -> Option<cudarc::driver::sys::CUfunction> {
             Ok("0") => "xq_gdn_chunk_tc_s0", Ok("1") => "xq_gdn_chunk_tc_s1",
             Ok("3") => "xq_gdn_chunk_tc_s3", _ => if v2 { "xq_gdn_chunk_tc2" } else { "xq_gdn_chunk_tc" },
         };
-        let ptx = std::fs::read_to_string(crate::exl3_bench::bench_ptx_path()).ok()?;
+        let ptx = crate::exl3_bench::bench_ptx_src();
         let ptx_c = std::ffi::CString::new(ptx).ok()?;
         let mut module: sys::CUmodule = std::ptr::null_mut();
         let r = unsafe {
             sys::cuModuleLoadDataEx(&mut module, ptx_c.as_ptr() as *const std::ffi::c_void,
                                     0, std::ptr::null_mut(), std::ptr::null_mut())
         };
-        if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gtc-x] module load failed ({r:?})"); return None; }
+        if r != sys::CUresult::CUDA_SUCCESS { crate::deprintln!("[gtc-x] module load failed ({r:?})"); return None; }
         let cname = std::ffi::CString::new(kname).ok()?;
         let mut f: sys::CUfunction = std::ptr::null_mut();
         let r = unsafe { sys::cuModuleGetFunction(&mut f, module, cname.as_ptr()) };
-        if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gtc-x] get {kname} failed ({r:?})"); return None; }
+        if r != sys::CUresult::CUDA_SUCCESS { crate::deprintln!("[gtc-x] get {kname} failed ({r:?})"); return None; }
         const _: () = assert!(GTC_SMEM <= 99 * 1024, "xq_gdn_chunk_tc smem over the GB10 opt-in cap");
         let r = unsafe {
             sys::cuFuncSetAttribute(f, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, GTC_SMEM)
         };
-        if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[gtc-x] smem opt-in failed ({r:?})"); return None; }
-        eprintln!("[gtc-x] chunkwise GDN prefill scan loaded: {kname} (dynamic smem {GTC_SMEM} B)");
+        if r != sys::CUresult::CUDA_SUCCESS { crate::deprintln!("[gtc-x] smem opt-in failed ({r:?})"); return None; }
+        crate::deprintln!("[gtc-x] chunkwise GDN prefill scan loaded: {kname} (dynamic smem {GTC_SMEM} B)");
         Some(FnH(f))
     }).map(|h| h.0)
 }
@@ -310,18 +357,18 @@ pub(crate) fn xq_raw_fn(name: &str) -> Option<cudarc::driver::sys::CUfunction> {
     static FNS: std::sync::Mutex<Vec<(String, FnH)>> = std::sync::Mutex::new(Vec::new());
     if let Some((_, f)) = FNS.lock().ok()?.iter().find(|(n, _)| n == name) { return Some(f.0); }
     let module = MODULE.get_or_init(|| {
-        let ptx = std::fs::read_to_string(crate::exl3_bench::bench_ptx_path()).ok()?;
+        let ptx = crate::exl3_bench::bench_ptx_src();
         let ptx_c = std::ffi::CString::new(ptx).ok()?;
         let mut m: sys::CUmodule = std::ptr::null_mut();
         let r = unsafe { sys::cuModuleLoadDataEx(&mut m, ptx_c.as_ptr() as *const std::ffi::c_void,
                                                   0, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[xq-raw] module load failed ({r:?})"); return None; }
+        if r != sys::CUresult::CUDA_SUCCESS { crate::deprintln!("[xq-raw] module load failed ({r:?})"); return None; }
         Some(H(m))
     }).as_ref()?.0;
     let cname = std::ffi::CString::new(name).ok()?;
     let mut f: sys::CUfunction = std::ptr::null_mut();
     let r = unsafe { sys::cuModuleGetFunction(&mut f, module, cname.as_ptr()) };
-    if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[xq-raw] get {name} failed ({r:?})"); return None; }
+    if r != sys::CUresult::CUDA_SUCCESS { crate::deprintln!("[xq-raw] get {name} failed ({r:?})"); return None; }
     FNS.lock().ok()?.push((name.to_string(), FnH(f)));
     Some(f)
 }
@@ -382,7 +429,7 @@ fn round_prof_add(v: [f64; 5]) {
     g.push(v);
     if g.len() % 100 == 0 {
         let med = |j: usize| { let mut c: Vec<f64> = g.iter().map(|r| r[j]).collect(); c.sort_by(|a, b| a.partial_cmp(b).unwrap()); c[c.len() / 2] };
-        crate::rprintln!("ROUND_PROF n={} median ms: draft_issue {:.2} draft_drain {:.2} host_ple_upload {:.2} verify_issue {:.2} verify_drain {:.2} (sum {:.2})",
+        crate::drprintln!("ROUND_PROF n={} median ms: draft_issue {:.2} draft_drain {:.2} host_ple_upload {:.2} verify_issue {:.2} verify_drain {:.2} (sum {:.2})",
                  g.len(), med(0), med(1), med(2), med(3), med(4), (0..5).map(med).sum::<f64>());
     }
 }
@@ -435,7 +482,7 @@ fn hc_int8_check(r: &[u16], t: &[u16]) {
     let mut g = ST.lock().unwrap();
     g.0 += 1; g.1 = g.1.max(rel); g.2 += rel; g.3 += bad;
     if bad > 0 || g.0 % 200 == 0 {
-        println!("HC_INT8_CHECK: calls {} rel-L2 mean {:.3e} max {:.3e} nonfinite {} (this {:.3e})",
+        crate::dprintln!("HC_INT8_CHECK: calls {} rel-L2 mean {:.3e} max {:.3e} nonfinite {} (this {:.3e})",
                  g.0, g.2 / g.0 as f64, g.1, g.3, rel);
     }
 }
@@ -506,6 +553,18 @@ struct IndexerDev {
     params: Option<CudaSlice<u8>>,
 }
 
+/// EXL27B: the routed experts of a Qwen3.5-class MoE pack. The gate tables live in MoeLayer::gu_tr /
+/// suh_gu / svh_gu (stacked per expert, NOT interleaved with up), the down tables in d_tr / suh_d /
+/// svh_d; these are the up tables plus the per-layer prefill offsets (e * words: the pack mixes 3-
+/// and 4-bit layers, so the scratch's model-wide offset tables cannot address them).
+struct SplitGu {
+    up_tr: CudaSlice<u16>,
+    suh_u: CudaSlice<u16>,
+    svh_u: CudaSlice<u16>,
+    offs_e: CudaSlice<u64>,
+    offs_d: CudaSlice<u64>,
+}
+
 struct MoeLayer {
     router: CudaSlice<u16>,
     sg: CudaSlice<u16>,
@@ -530,6 +589,14 @@ struct MoeLayer {
     /// TP-I: trunk layer index (usize::MAX = the MTP head) — keys the per-layer EP deal and the
     /// --tp-ep-hist routing histogram.
     li: usize,
+    /// EXL27B: a Qwen3.5-class MoE pack's routed experts (Qwen3.6-35B-A3B): gate and up are separate
+    /// stacked tables with their OWN suh / svh (moe_split / moe_split_prefill). FN: always None.
+    split: Option<SplitGu>,
+    /// EXL27B: a dense pack's MLP (Qwen3.5-class 27B/9B): gate / up / down are the three plain quads
+    /// in sh_gate / sh_up / sh_down — each with its OWN input transform (suh), output scales (svh) and
+    /// bit width — computed by dense_mlp / dense_mlp_prefill (copies of the shared-expert chain code);
+    /// the routed-expert buffers are 1-element placeholders and no MoE code runs. FN: always false.
+    dense: bool,
 }
 
 struct PleDev {
@@ -762,6 +829,16 @@ impl PinnedHost {
         };
         anyhow::ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "pinned dtoh ({r:?})");
         Ok(())
+    }
+    /// LANERES2: read a copied region back as bytes (after the stream synchronize).
+    fn as_bytes(&self, off: usize, n: usize) -> &[u8] {
+        assert!(off + n <= self.len);
+        unsafe { std::slice::from_raw_parts(self.ptr.add(off), n) }
+    }
+    /// LANERES2: stage bytes for an HtoD copy.
+    fn copy_from_slice(&self, off: usize, src: &[u8]) {
+        assert!(off + src.len() <= self.len);
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(off), src.len()) }
     }
     /// Read a 4-byte word the DMA engine wrote (call only after the stream synchronize).
     fn read_u32(&self, off: usize) -> u32 {
@@ -1031,7 +1108,7 @@ fn rp_mode() -> RpMode {
             _ => RpMode::Dev,
         };
         if m != RpMode::Dev {
-            println!("REPRIME: mode {m:?} (--exl3-reprime / --exl3-reprime-eager / --wp22r1-off — diagnostic escape)");
+            crate::dprintln!("REPRIME: mode {m:?} (--exl3-reprime / --exl3-reprime-eager / --wp22r1-off — diagnostic escape)");
         }
         m
     })
@@ -1359,21 +1436,72 @@ mod reprime_tests {
     }
 }
 
+/// YARN1: the ONE place the EXL3 trunk's rope rescaling lives — the per-dim inverse
+/// frequencies and the attention mscale of every table this model serves (decode cos_tab,
+/// the prefill host loop, the QSA indexer tables, the vision mrope rows). Native, or YaRN at
+/// factor > 1 via the dspark oracle's validated ramp (`yaarn_freqs`) + `yaarn_mscale`.
+/// Factor 1.0 reproduces the pre-YaRN tables bit-for-bit: the same
+/// `theta.powf(-(2i)/rdim)` formula and op order, mscale exactly 1.0 (an exact f32 identity,
+/// so `x * mscale` cannot perturb a value). The factor is resolved once per process by
+/// `qwen::resolved_yarn` (--rope-yarn-factor > shipped TpConfig > the pack's `rope_scaling`);
+/// the boot line names the factor and its source.
+pub(crate) struct RopeFreqs {
+    mscale: f32,
+    inv: Vec<f32>,
+}
+
+impl RopeFreqs {
+    /// Native RoPE — the load-time loop's formula and op order, verbatim.
+    pub fn native(rdim: usize, theta: f32) -> RopeFreqs {
+        RopeFreqs { mscale: 1.0, inv: (0..rdim / 2).map(|i| theta.powf(-(2.0 * i as f32) / rdim as f32)).collect() }
+    }
+
+    /// YaRN at an explicit factor (no resolution, no boot line): the oracle ramp + mscale.
+    pub fn yarn(rdim: usize, theta: f32, factor: f32, native_max: usize) -> RopeFreqs {
+        RopeFreqs { mscale: crate::dspark::oracle::yaarn_mscale(factor),
+                    inv: crate::dspark::oracle::yaarn_freqs(rdim, theta, factor, native_max, 32, 1) }
+    }
+
+    /// The rope this process serves for `cfg`: native, or YaRN at the resolved factor
+    /// (vLLM per-dim ramp, beta 32/1, over `native_max`). Prints the boot line when active.
+    pub fn for_opts(rdim: usize, theta: f32, native_max: usize, cfg: &crate::qwen::Config) -> RopeFreqs {
+        let (factor, src) = crate::qwen::resolved_yarn(cfg);
+        if factor <= 1.0 {
+            return RopeFreqs::native(rdim, theta);
+        }
+        let src = match src {
+            Some(crate::qwen::YarnSource::Flag) => "--rope-yarn-factor",
+            Some(crate::qwen::YarnSource::Tp) => "shipped TpConfig",
+            Some(crate::qwen::YarnSource::Config) | None => "config rope_scaling",
+        };
+        crate::drprintln!("[rope] EXL3 trunk YaRN factor {factor} (from {src}): mscale {:.4}, native {native_max} (vLLM per-dim ramp, beta 32/1; shared oracle yaarn_freqs)",
+                 crate::dspark::oracle::yaarn_mscale(factor));
+        RopeFreqs::yarn(rdim, theta, factor, native_max)
+    }
+
+    /// (cos(p·inv[i]), sin(p·inv[i])) scaled by mscale. At factor 1.0 mscale is exactly 1.0,
+    /// so the multiply is the f32 identity and legacy tables stay byte-identical.
+    pub fn cos_sin(&self, p: usize, i: usize) -> (f32, f32) {
+        let f = p as f32 * self.inv[i];
+        (f.cos() * self.mscale, f.sin() * self.mscale)
+    }
+
+    pub fn inv(&self, i: usize) -> f32 { self.inv[i] }
+    pub fn mscale(&self) -> f32 { self.mscale }
+    pub fn half(&self) -> usize { self.inv.len() }
+}
+
 /// The prefill prologue's pre-WP05 host RoPE rows for positions pos0..pos0+c (per row:
 /// cos[rdim/2] | 0[rdim/2] | sin[rdim/2] | 0[rdim/2]) — the old per-chunk loop verbatim; the
-/// --wp05-off=pro path and the load-time cos_tab comparison.
-fn prefill_cossin_host(theta: f32, rdim: usize, pos0: usize, c: usize) -> Vec<f32> {
+/// --wp05-off=pro path and the load-time cos_tab comparison. YARN1: takes the model's
+/// `RopeFreqs` — the tables' own source — so the host loop and the tables can never disagree
+/// about a YaRN factor.
+fn prefill_cossin_host(fr: &RopeFreqs, rdim: usize, pos0: usize, c: usize) -> Vec<f32> {
     let mut cossin: Vec<f32> = Vec::with_capacity(c * 2 * rdim);
     for p in pos0..pos0 + c {
-        for i in 0..rdim / 2 {
-            let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-            cossin.push((p as f32 * inv).cos());
-        }
+        for i in 0..rdim / 2 { cossin.push(fr.cos_sin(p, i).0); }
         for _ in 0..rdim / 2 { cossin.push(0.0); }
-        for i in 0..rdim / 2 {
-            let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-            cossin.push((p as f32 * inv).sin());
-        }
+        for i in 0..rdim / 2 { cossin.push(fr.cos_sin(p, i).1); }
         for _ in 0..rdim / 2 { cossin.push(0.0); }
     }
     cossin
@@ -1542,7 +1670,7 @@ pub(crate) fn ple_sidecar_shard_plan(
     if let Some(m) = hdr.get("__metadata__") {
         if let Some(sr) = m.get("shard_rows").and_then(|v| v.as_i64()) {
             if sr != rows_per_shard {
-                println!("  [ple] note: sidecar metadata shard_rows={sr} but shard shapes say {rows_per_shard}; trusting the shapes");
+                crate::dprintln!("  [ple] note: sidecar metadata shard_rows={sr} but shard shapes say {rows_per_shard}; trusting the shapes");
             }
         }
     }
@@ -1876,13 +2004,13 @@ fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     match mode {
         "ssd" => {
-            println!("  PLE n-gram table: on SSD, read through the page cache (--ple-ram ssd; table {:.1} GiB stays out of RAM)", gib(need));
+            crate::dprintln!("  PLE n-gram table: on SSD, read through the page cache (--ple-ram ssd; table {:.1} GiB stays out of RAM)", gib(need));
             Ok(None)
         }
         "auto" => {
             // PR #17: print the headroom the post-boot promote gate will apply, either way
             // (with the default per-lane 0 this reads the same 16.0 GiB as before the port).
-            println!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + {:.1} GiB headroom stay free (--ple-ram auto, {} lane(s); --ple-headroom-per-lane-gb)",
+            crate::dprintln!("  PLE n-gram table: on SSD until the boot has allocated everything else; then RAM iff table {:.1} GiB + {:.1} GiB headroom stay free (--ple-ram auto, {} lane(s); --ple-headroom-per-lane-gb)",
                      gib(need), ple_auto_headroom(width) as f64 / (1u64 << 30) as f64, width);
             Ok(None)
         }
@@ -1890,7 +2018,7 @@ fn ple_ram_load(shards: &[std::fs::File], data_off: &[u64], rows: i64, row_bytes
             let avail = mem_available_bytes();
             let t0 = std::time::Instant::now();
             let out = ple_read_table(shards, data_off, per)?;
-            println!("  PLE n-gram table RAM-resident: {:.1} GiB in {:.1}s (--ple-ram ram; MemAvailable was {:.1} GiB)",
+            crate::dprintln!("  PLE n-gram table RAM-resident: {:.1} GiB in {:.1}s (--ple-ram ram; MemAvailable was {:.1} GiB)",
                      gib(need), t0.elapsed().as_secs_f32(), gib(avail));
             Ok(Some(out))
         }
@@ -2165,6 +2293,9 @@ struct VpHead {
 pub struct FwdModel {
     dev: Arc<CudaDevice>,
     pub cfg: crate::qwen::Config,
+    /// YARN1: the trunk's rope (per-dim frequencies + mscale) — the source cos_tab, the
+    /// prefill host loop, the QSA indexer tables and the vision mrope rows were ALL built from.
+    pub(crate) rope: RopeFreqs,
     // TP-B: the TRUNK's per-rank geometry (attention / GDN head counts divided by the world when
     // the trunk is head-sharded; == cfg at TP=1). Every trunk mixer / state site reads its head
     // counts from here; the replicated MTP head keeps `cfg` (T1 contract, design §4.1).
@@ -2278,6 +2409,20 @@ pub struct FwdModel {
     // buffer). None = TP=1. Reduce sites key off the TENSOR (MoeLayer::ep), this only carries
     // the transport.
     tp: Option<xtp::TpState>,
+    // EXL27C-DF2 (fwd): the DFlash2 draft-round capture state - DEFAULT OFF (all None; every
+    // hook below is a dead `Option` check: zero launches, zero host work). `set_df2_capture`
+    // arms the sinks (Arc-shared with the Df2Round the serve agent owns; their staging
+    // addresses are fixed for the process lifetime, so the taps are CUDA-graph-safe).
+    df2_sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+    df2_prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>,
+    // The boot-time DF2 head ([vocab, hidden] bf16 row-major - the dequantized + Hadamard-
+    // folded lm_head quad) and the bf16 twin of the f16 embed staging (the DF2 round's
+    // embed_gather_b / gemm_binv_b read bf16; the EXL3 forward stages f16). Both are built
+    // lazily ONCE by `df2_boot_ptrs` - which takes &self per the interface contract, hence
+    // the interior mutability; the locks are only ever taken at boot.
+    // (Type deviation from the brief's plain `Option<...>`: documented in the report.)
+    df2_head_bf16: std::sync::Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    df2_embed_bf16: std::sync::Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
 }
 // CUstream is an opaque handle; the stream is created by this model, used only from
 // the owning scheduler thread, and destroyed with the device. Same contract as
@@ -2647,22 +2792,27 @@ impl Scratch {
         let lr = cfg.hc_lowrank;
         let v = cfg.vocab_size;
         let emax = w * cfg.num_experts_per_tok;
+        // EXL27B: a dense pack (MoeLayer::dense) — its widths for the buffers the FN constants below
+        // cannot hold (27B: h 5120, 4 KV heads x 256, MLP 17408); every other model: the FN constants.
+        let dense = cfg.num_experts == 1;
+        let (kvw, hh, mlpw) = (cfg.num_kv_heads * cfg.head_dim, h, cfg.moe_intermediate_size);
         Ok(Self {
             resid: dev.alloc_zeros::<f32>(w * rw)?,
             hn: dev.alloc_zeros::<u16>(w * rw)?,
             dd: dev.alloc_zeros::<u16>(w * lr)?,
             uu: dev.alloc_zeros::<u16>(w * rw)?,
-            inj: dev.alloc_zeros::<f32>(w * hc)?,
+            // EXL27B: plain residual — the inject gate must be 1.0 (the inject multiplies the layer output by it)
+            inj: if lr == 0 { dev.htod_sync_copy(&vec![1.0f32; w * hc])? } else { dev.alloc_zeros::<f32>(w * hc)? },
             x: dev.alloc_zeros::<u16>(w * h)?,
             // S-A3-f-b FIX: must hold w * max_chain_K (out_proj K=6144; the old
             // w*2560 made every K>2560 chain read OOB for rows >= w*2560/K —
             // the "corrupt band [213,426)" — adjacent-buffer garbage).
-            chain_xh: dev.alloc_zeros::<u16>(w * 12288)?,
+            chain_xh: dev.alloc_zeros::<u16>(w * if dense { 12288usize.max(hh).max(mlpw) } else { 12288 })?,
             chain_yraw: dev.alloc_zeros::<u16>(w * v)?,
             qkv: dev.alloc_zeros::<u16>(w * 10240)?,
             qg: dev.alloc_zeros::<u16>(w * 12288)?,
-            kp: dev.alloc_zeros::<u16>(w * 512)?,
-            vp: dev.alloc_zeros::<u16>(w * 512)?,
+            kp: dev.alloc_zeros::<u16>(w * if dense { kvw } else { 512 })?,
+            vp: dev.alloc_zeros::<u16>(w * if dense { kvw } else { 512 })?,
             zbuf: dev.alloc_zeros::<u16>(w * 6144)?,
             a_out: dev.alloc_zeros::<u16>(w * 48)?,
             b_out: dev.alloc_zeros::<u16>(w * 48)?,
@@ -2687,10 +2837,10 @@ impl Scratch {
             xhd: dev.alloc_zeros::<u16>(emax * w * 640)?,
             yd_raw: dev.alloc_zeros::<u16>(emax * w * 2560)?,
             yd: dev.alloc_zeros::<u16>(emax * w * 2560)?,
-            sh1: dev.alloc_zeros::<u16>(w * 640)?,
-            sh2: dev.alloc_zeros::<u16>(w * 640)?,
-            ysh_raw: dev.alloc_zeros::<u16>(w * 2560)?,
-            ysh: dev.alloc_zeros::<u16>(w * 2560)?,
+            sh1: dev.alloc_zeros::<u16>(w * if dense { mlpw } else { 640 })?,
+            sh2: dev.alloc_zeros::<u16>(w * if dense { mlpw } else { 640 })?,
+            ysh_raw: dev.alloc_zeros::<u16>(w * if dense { hh } else { 2560 })?,
+            ysh: dev.alloc_zeros::<u16>(w * if dense { hh } else { 2560 })?,
             moe_out: dev.alloc_zeros::<u16>(w * h)?,
             cos: dev.alloc_zeros::<f32>(w * 2 * rdim)?,
             sin: dev.alloc_zeros::<f32>(w * rdim)?,
@@ -2780,7 +2930,7 @@ impl Scratch {
             draft_meta: dev.htod_sync_copy(&[0i32; 4])?,
             rp: match RpRt::new(dev, RP_ACCEPT_WORDS) {
                 Ok(r) => Some(r),
-                Err(e) => { println!("REPRIME: device re-prime runtime unavailable ({e:#}) — eager re-prime"); None }
+                Err(e) => { crate::dprintln!("REPRIME: device re-prime runtime unavailable ({e:#}) — eager re-prime"); None }
             },
             // a REAL zero (alloc_zeros does not zero, AGENTS §2.2): zero rows = greedy.
             samp: dev.htod_sync_copy(&vec![0u32; w.max(1) * 8])?,
@@ -2809,12 +2959,12 @@ impl Scratch {
             hc_bar: dev.htod_sync_copy(&[0i32])?,
             // 2M floats (8 MB): worst chain needs ks*m*n <= ~400K (asserted at launch).
             chain_ws: dev.alloc_zeros::<f32>(2_000_000)?,
-            pair_xh: dev.alloc_zeros::<u16>(w * 2560)?,
-            pair_yraw: dev.alloc_zeros::<u16>(w * 2560)?,
+            pair_xh: dev.alloc_zeros::<u16>(w * if dense { hh } else { 2560 })?,
+            pair_yraw: dev.alloc_zeros::<u16>(w * if dense { kvw.max(mlpw).max(2560) } else { 2560 })?,
             pair_ws: dev.alloc_zeros::<f32>(2_000_000)?,
             wp05: match Wp05Stage::new(dev, w) {
                 Ok(s) => Some(s),
-                Err(e) => { println!("WP05: pinned decode staging unavailable ({e:#}) — pageable path"); None }
+                Err(e) => { crate::dprintln!("WP05: pinned decode staging unavailable ({e:#}) — pageable path"); None }
             },
             // a REAL zero (alloc_zeros does not zero, AGENTS §2.2); outside any capture.
             moe_cnt: dev.htod_sync_copy(&vec![0u32; emax * (cfg.moe_intermediate_size / 128).max(1) + h / 128 + 1])?,
@@ -3089,7 +3239,7 @@ fn wp09_diff_u16(tag: &str, m: usize, new: &[u16], old: &[u16]) {
             if d.is_nan() || d > maxd { maxd = d; }
         }
     }
-    println!("WP09_XCHECK {tag} m={m} n={} mism={mism} max_abs_diff={maxd:e} first(idx,new,old)={first:?}",
+    crate::dprintln!("WP09_XCHECK {tag} m={m} n={} mism={mism} max_abs_diff={maxd:e} first(idx,new,old)={first:?}",
              new.len().min(old.len()));
 }
 
@@ -3473,8 +3623,8 @@ fn r16_emit(force: bool) {
     if R16_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
     let r = R16_ROUTER.get().map(String::as_str).unwrap_or("(router fold not reached)");
     match reason {
-        Some(rr) => println!("EXL3-R16: fallback router={r} hc={hc} (reason: {rr})"),
-        None => println!("EXL3-R16: live router={r} hc={hc}"),
+        Some(rr) => crate::dprintln!("EXL3-R16: fallback router={r} hc={hc} (reason: {rr})"),
+        None => crate::dprintln!("EXL3-R16: live router={r} hc={hc}"),
     }
 }
 
@@ -3719,7 +3869,7 @@ pub(crate) fn r16_smem_optin(dev: &Arc<CudaDevice>, name: &str, bytes: i32) -> b
     use cudarc::driver::sys;
     // xq_raw_fn already hands back the raw CUfunction cuFuncSetAttribute wants.
     let Some(f) = xq_raw_fn(name) else {
-        eprintln!("EXL3-R16: {name} not in the module (stale PTX?)");
+        crate::deprintln!("EXL3-R16: {name} not in the module (stale PTX?)");
         return false;
     };
     let r = unsafe {
@@ -3740,7 +3890,7 @@ pub(crate) fn r16_smem_optin(dev: &Arc<CudaDevice>, name: &str, bytes: i32) -> b
 pub(crate) fn r16_hc_smem_optin() -> bool {
     use cudarc::driver::sys;
     let Some(f) = xq_raw_fn("xq_hc_fuse_i8_rbk_r16") else {
-        eprintln!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 not in the module (stale PTX?)");
+        crate::deprintln!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 not in the module (stale PTX?)");
         return false;
     };
     for (attr, val) in [
@@ -3955,7 +4105,7 @@ fn pfx1_mask() -> u8 {
                     "ltplans" => m &= !PFX1_LTPLANS,
                     "w16" => m &= !PFX1_W16,
                     "" | "0" => {}
-                    other => println!("PFX1: unknown --pfx1-off part '{other}' ignored"),
+                    other => crate::dprintln!("PFX1: unknown --pfx1-off part '{other}' ignored"),
                 }
             }
         }
@@ -3972,7 +4122,7 @@ fn wide_mt_override() -> Option<usize> {
         let v = crate::opts::var(crate::opt!("exl3-wide-mt")).ok()?;
         match v.trim().parse::<usize>() {
             Ok(mt @ (1 | 2 | 4 | 8)) => Some(mt),
-            _ => { println!("--exl3-wide-mt='{v}' ignored (must be 1, 2, 4 or 8)"); None }
+            _ => { crate::dprintln!("--exl3-wide-mt='{v}' ignored (must be 1, 2, 4 or 8)"); None }
         }
     })
 }
@@ -4025,7 +4175,7 @@ fn pfx1_rows8_max_override() -> Option<usize> {
         let v = crate::opts::var(crate::opt!("pfx1-rows8-max")).ok()?;
         match v.trim().parse::<usize>() {
             Ok(n) => Some(n),
-            Err(_) => { println!("--pfx1-rows8-max='{v}' ignored (must be a row count)"); None }
+            Err(_) => { crate::dprintln!("--pfx1-rows8-max='{v}' ignored (must be a row count)"); None }
         }
     })
 }
@@ -4109,7 +4259,7 @@ fn pfx1_headkv_poison() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = crate::opts::var(crate::opt!("pfx1-headkv-poison")).is_ok_and(|v| !v.is_empty() && v != "0");
-        if on { println!("PFX1: --pfx1-headkv-poison — head KV NaN-poisoned at every fresh-prompt admit (gate)"); }
+        if on { crate::dprintln!("PFX1: --pfx1-headkv-poison — head KV NaN-poisoned at every fresh-prompt admit (gate)"); }
         on
     })
 }
@@ -4131,7 +4281,7 @@ fn pfx1_announce() {
         } else {
             format!("rows8 when c <= {PFX1_ROWS8_MAX} and ceil(c/32)*(ne/128) < 2*{} SMs", dev_sms())
         };
-        println!("PFX1: parts on = {m:#04x} (mt 1, headkv 2, yraw 4, rows8 8, ltplans 16, w16 32{}); \
+        crate::dprintln!("PFX1: parts on = {m:#04x} (mt 1, headkv 2, yraw 4, rows8 8, ltplans 16, w16 32{}); \
                   MoE prefill expert GEMM: {rule}; router: {router}",
                  crate::opts::var(crate::opt!("pfx1-off")).map(|v| format!("; --pfx1-off={v}")).unwrap_or_default());
     });
@@ -4464,7 +4614,7 @@ pub fn probe_sp_pinned(cs: &[usize], world: usize) -> Result<()> {
             if let Err(e) = lt_pin_ready(k, n, c, world, true, ws_len) {
                 s_unready.push(c);
                 n_unready += 1;
-                if s_unready.len() <= 8 { println!("  {name} c {c:>5}: pinned plans NOT READY ({e:#})"); }
+                if s_unready.len() <= 8 { crate::dprintln!("  {name} c {c:>5}: pinned plans NOT READY ({e:#})"); }
                 continue;
             }
             for r in 0..world {
@@ -4488,10 +4638,10 @@ pub fn probe_sp_pinned(cs: &[usize], world: usize) -> Result<()> {
             if nd > 0 {
                 n_bad += 1;
                 s_bad.push(c);
-                if s_bad.len() <= 8 { println!("  {name} c {c:>5}: {nd} of {live} f16 DIFFER (first row {first:?})"); }
+                if s_bad.len() <= 8 { crate::dprintln!("  {name} c {c:>5}: {nd} of {live} f16 DIFFER (first row {first:?})"); }
             }
         }
-        println!("EXL3-SP-PIN {name} (k {k} n {n}): {s_n} c values at world {world}; bitwise differ at {} (c {:?}); \
+        crate::dprintln!("EXL3-SP-PIN {name} (k {k} n {n}): {s_n} c values at world {world}; bitwise differ at {} (c {:?}); \
                   pinned plans not ready at {} (c {:?})", s_bad.len(), &s_bad[..s_bad.len().min(20)],
                  s_unready.len(), &s_unready[..s_unready.len().min(20)]);
     }
@@ -4532,7 +4682,7 @@ pub fn probe_sp_pinned(cs: &[usize], world: usize) -> Result<()> {
         let d8 = tm(&|| r8(2048))?;
         let e = tm(&|| router_rows_launch(&l, plr, pw, px, 4095, 4095, ne, h, true))?;
         let f = tm(&|| router_rows_launch(&l, pls, pw, px, 2048, 4095, ne, h, true))?;
-        println!("EXL3-SP-ROUTER timing (standalone, L2-warm, us/launch; a ranking only): rows32 m=2048 {a:.1} | rows32 m=1024 \
+        crate::dprintln!("EXL3-SP-ROUTER timing (standalone, L2-warm, us/launch; a ranking only): rows32 m=2048 {a:.1} | rows32 m=1024 \
                   {b:.1} | rows8 m=1024 {c8:.1} | rows8 m=2048 {d8:.1} | rows32 m=4095 {e:.1} | rows32 m=2048 (of 4095) {f:.1}");
     }
     for rows_on in [true, false] {
@@ -4573,15 +4723,15 @@ pub fn probe_sp_pinned(cs: &[usize], world: usize) -> Result<()> {
             if dl + di + dw > 0 {
                 n_bad += 1;
                 s_bad.push(c);
-                if s_bad.len() <= 8 { println!("  router rows={} c {c:>5}: logits {dl} / ids {di} / weights {dw} DIFFER", rows_on as u8); }
+                if s_bad.len() <= 8 { crate::dprintln!("  router rows={} c {c:>5}: logits {dl} / ids {di} / weights {dw} DIFFER", rows_on as u8); }
             }
         }
-        println!("EXL3-SP-ROUTER (x -> {ne} experts, top-{topk}, prefill.router_rows {}): {s_n} c values at world {world}; \
+        crate::dprintln!("EXL3-SP-ROUTER (x -> {ne} experts, top-{topk}, prefill.router_rows {}): {s_n} c values at world {world}; \
                   bitwise differ at {} (c {:?})", rows_on as u8, s_bad.len(), &s_bad[..s_bad.len().min(20)]);
     }
     let range = format!("c in {}..={}", cs.iter().min().copied().unwrap_or(0), cmax);
     if n_bad == 0 && n_unready == 0 {
-        println!("EXL3-SP-PIN: PASS ({n_cases} (shape, c) cases, {range}, world {world}: every rank block through the served \
+        crate::dprintln!("EXL3-SP-PIN: PASS ({n_cases} (shape, c) cases, {range}, world {world}: every rank block through the served \
                   pinned-plan call is bit-identical to the replicated m = c call; incl. {n_router} router cases: logits / ids / \
                   weights of every block == the replicated router; {:.1} s)", t0.elapsed().as_secs_f64());
         Ok(())
@@ -4649,7 +4799,7 @@ pub fn probe_lt_rows(cs: &[usize], shapes_sel: &str) -> Result<()> {
         let mut d_h = dev.alloc_zeros::<u16>(cmax * n)?;
         let mut d_p = dev.alloc_zeros::<u16>(cmax * n)?;
         let (pa, pb) = (*d_a.device_ptr() as u64, *d_b.device_ptr() as u64);
-        println!("LTROWS {name}: k {k} n {n}");
+        crate::dprintln!("LTROWS {name}: k {k} n {n}");
         let (mut s_fail_p, mut s_fail_h, mut s_fail_r, mut s_n) = (Vec::<usize>::new(), 0usize, Vec::<usize>::new(), 0usize);
         for &c in cs {
             let c0 = c.div_ceil(2);
@@ -4720,7 +4870,7 @@ pub fn probe_lt_rows(cs: &[usize], shapes_sel: &str) -> Result<()> {
             if !p_ok { p_invalid += 1; s_fail_p.push(c); } else if np > 0 { bad_p += 1; s_fail_p.push(c); }
             if sweep {
                 if nr > 0 || !p_ok || np > 0 {
-                    println!("  c {c:>5}: (P) pinned {} | (R) ref re-run {} | ref [{}]",
+                    crate::dprintln!("  c {c:>5}: (P) pinned {} | (R) ref re-run {} | ref [{}]",
                              if !p_ok { format!("INVALID ({p_desc})") } else { format!("differ {np} (first row {fp:?})") },
                              if nr == 0 { "identical".to_string() } else { format!("DIFFER {nr}") }, lt_algo_desc(&ref_algo));
                 }
@@ -4741,7 +4891,7 @@ pub fn probe_lt_rows(cs: &[usize], shapes_sel: &str) -> Result<()> {
             };
             let t_ref = time(&mut || exl3_lt_matmul(&l, pa, pb, pref_, k, n, c, true, ws, ws_len))?;
             let t_h0 = time(&mut || exl3_lt_matmul(&l, pa, pb, ph, k, n, c0, true, ws, ws_len))?;
-            println!("  c {c:>5} = {c0} + {c1}: (H) own-heuristic halves {} | (P) pinned {} | (R) ref re-run {} | ref [{}] | half0 [{ah}] \
+            crate::dprintln!("  c {c:>5} = {c0} + {c1}: (H) own-heuristic halves {} | (P) pinned {} | (R) ref re-run {} | ref [{}] | half0 [{ah}] \
                       | half1 [{bh}] | us: ref {t_ref:.1} half0(H) {t_h0:.1}",
                      if nh == 0 { "BIT-IDENTICAL".to_string() } else { format!("DIFFER {nh} of {live} (first row {fh:?})") },
                      if !p_ok { format!("INVALID ({p_desc})") } else if np == 0 { "BIT-IDENTICAL".to_string() }
@@ -4749,7 +4899,7 @@ pub fn probe_lt_rows(cs: &[usize], shapes_sel: &str) -> Result<()> {
                      if nr == 0 { "identical".to_string() } else { format!("DIFFER {nr}") },
                      lt_algo_desc(&ref_algo));
         }
-        println!("LTROWS {name} summary: {s_n} c values; own-heuristic halves differ at {s_fail_h}; pinned halves differ/invalid at {} \
+        crate::dprintln!("LTROWS {name} summary: {s_n} c values; own-heuristic halves differ at {s_fail_h}; pinned halves differ/invalid at {} \
                   (largest {:?}); served plan non-deterministic at {} (c {:?})",
                  s_fail_p.len(), s_fail_p.iter().max(), s_fail_r.len(), &s_fail_r[..s_fail_r.len().min(20)]);
     }
@@ -4837,7 +4987,7 @@ fn wp12_env_mask() -> Option<u8> {
     *M.get_or_init(|| {
         let v = crate::opts::var(crate::opt!("wp12-off")).ok()?;
         let m = wp12_mask_of(&v);
-        println!("WP12: parts on = {m:#x} (step 1, diet 2, conv 4, ab 8; --wp12-off={v})");
+        crate::dprintln!("WP12: parts on = {m:#x} (step 1, diet 2, conv 4, ab 8; --wp12-off={v})");
         Some(m)
     })
 }
@@ -4852,7 +5002,7 @@ pub(crate) fn wp12_mask_of(v: &str) -> u8 {
             "conv" => m &= !WP12_CONV,
             "ab" => m &= !WP12_AB,
             "" | "0" => {}
-            other => println!("WP12: unknown --wp12-off part '{other}' ignored"),
+            other => crate::dprintln!("WP12: unknown --wp12-off part '{other}' ignored"),
         }
     }
     m
@@ -4911,7 +5061,7 @@ fn wp12_report(site: &str, new: &[f32], old: &[f32]) {
     if mism > 0 { BAD.fetch_add(1, Ordering::SeqCst); }
     if mism > 0 || k % 360 == 0 {
         let fi = first.map_or(String::from("-"), |i| format!("{i} (new {:e} old {:e})", new[i], old[i]));
-        println!("WP12_XCHECK {site}: checks {k} bad {} | this: n {n} mism {mism} max|d| {maxd:e} first {fi}",
+        crate::dprintln!("WP12_XCHECK {site}: checks {k} bad {} | this: n {n} mism {mism} max|d| {maxd:e} first {fi}",
                  BAD.load(Ordering::SeqCst));
     }
 }
@@ -4919,7 +5069,7 @@ fn wp12_report_f16(site: &str, new: &[u16], old: &[u16]) {
     let w = |v: &[u16]| v.iter().map(|&b| f16::from_bits(b).to_f32()).collect::<Vec<f32>>();
     // f16 -> f32 widening is exact and injective except NaN payloads; compare raw bits too
     let raw_bad = new.iter().zip(old.iter()).filter(|(a, b)| a != b).count();
-    if raw_bad > 0 { println!("WP12_XCHECK {site}: raw f16 mismatches {raw_bad}"); }
+    if raw_bad > 0 { crate::dprintln!("WP12_XCHECK {site}: raw f16 mismatches {raw_bad}"); }
     wp12_report(site, &w(new), &w(old));
 }
 
@@ -5055,7 +5205,7 @@ fn wp20_log_once(key: (u8, usize, usize), msg: impl FnOnce() -> String) {
         Ok(mut v) => if v.contains(&key) { false } else { v.push(key); true },
         Err(_) => true,
     };
-    if first { println!("{}", msg()); }
+    if first { crate::dprintln!("{}", msg()); }
 }
 
 /// Rung 1 in the old launch sequence: the diet twin behind the a1b3 entry's exact contract
@@ -5089,7 +5239,7 @@ static WP20_CONV: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
 fn wp20_calibrated(dev: &Arc<CudaDevice>) -> Option<u32> {
     *WP20_CONV.get_or_init(|| match crate::exl3_bench::wp20_calibrate(dev) {
         Ok(Some(c)) => {
-            println!("WP20: suh sequence 0x{c:02x} VERIFIED (the epilogue's pinned FMUL/FFMA suh stage == the JIT'd \
+            crate::dprintln!("WP20: suh sequence 0x{c:02x} VERIFIED (the epilogue's pinned FMUL/FFMA suh stage == the JIT'd \
                       xq_had_suh_multi, bitwise on realistic + f16 edge-case rows)");
             Some(c)
         }
@@ -5113,20 +5263,20 @@ fn wp20_announce(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config) {
     let topk = cfg.num_experts_per_tok;
     let diet = wp20_diet_on();
     match wp20_mode() {
-        0 => println!("WP20: OFF (--wp20-off=1) — pre-WP20 expert path (SHFL decode, 5 glue launches per MoE layer)"),
-        1 => println!("WP20: mode 1 (--wp20-epi=0) — rung 1 only (word-diet twin {}), no MoE epilogues",
+        0 => crate::dprintln!("WP20: OFF (--wp20-off=1) — pre-WP20 expert path (SHFL decode, 5 glue launches per MoE layer)"),
+        1 => crate::dprintln!("WP20: mode 1 (--wp20-epi=0) — rung 1 only (word-diet twin {}), no MoE epilogues",
                       if diet { "on" } else { "OFF: --wp20-diet=0" }),
         _ => {
             match wp20_dn_fn(topk, diet) {
                 Some(dn) => {
                     let (gu, have_gu, have_dn) = (wp20_gu_fn(diet), xq_raw_fn(wp20_gu_fn(diet)).is_some(), xq_raw_fn(dn).is_some());
-                    println!("WP20: mode 2 — rungs 1+2 planned for top-k {topk}: {gu} + {dn} (decode body {}){}",
+                    crate::dprintln!("WP20: mode 2 — rungs 1+2 planned for top-k {topk}: {gu} + {dn} (decode body {}){}",
                              if diet { "diet" } else { "SHFL: --wp20-diet=0" },
                              if have_gu && have_dn { String::new() }
                              else { format!(" — KERNEL MISSING (gu {have_gu}, dn {have_dn}; stale PTX?) -> rung 2 will fall back") });
                     let _ = wp20_calibrated(dev);
                 }
-                None => println!("WP20 FALLBACK: mode 2 requested but top-k {topk} has no down-epilogue instance \
+                None => crate::dprintln!("WP20 FALLBACK: mode 2 requested but top-k {topk} has no down-epilogue instance \
                                   (compiled: {WP20_TOPKS:?}) — rung 2 OFF for this model; rung 1 still applies"),
             }
         }
@@ -5226,7 +5376,7 @@ pub(crate) fn w4moe_parts_of(opt_in: Option<&str>, off: Option<&str>) -> u8 {
                 "dn" => p &= !MPK_DN,
                 "fold" => p &= !MPK_FOLD,
                 "" | "0" => {}
-                other => println!("W4/MOE: unknown --w4moe-off part '{other}' ignored"),
+                other => crate::dprintln!("W4/MOE: unknown --w4moe-off part '{other}' ignored"),
             }
         }
     }
@@ -5380,7 +5530,7 @@ pub(crate) fn mpk_fn(name: &'static str, smem: u32) -> Option<(cudarc::driver::s
     let mut nb: i32 = 0;
     let r = unsafe { sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut nb, f, 256, smem as usize) };
     if r != sys::CUresult::CUDA_SUCCESS || nb < 1 {
-        eprintln!("[w4moe] {name}: not resident at {smem} B smem (occupancy {nb}, {r:?})");
+        crate::deprintln!("[w4moe] {name}: not resident at {smem} B smem (occupancy {nb}, {r:?})");
         return None;
     }
     for e in c.iter_mut().filter(|e| e.0 == name) { e.4 = optin; }
@@ -5497,7 +5647,7 @@ fn w4moe_announce(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, width: usize
         };
         let knobs: Vec<String> = [crate::opt!("w4moe-order"), crate::opt!("w4moe-nst"), crate::opt!("w4moe-g"), crate::opt!("w4moe-minm"), crate::opt!("w4moe-shovl")]
             .into_iter().filter(|k| crate::opts::var_os(*k).is_some()).map(|k| k.to_string()).collect();
-        println!("W4/MOE: OFF ({why}) — WP20 rung-2 kernels (xq_had_suh_multi + xq_moe_gu_epi + xq_moe_dn_epi); \
+        crate::dprintln!("W4/MOE: OFF ({why}) — WP20 rung-2 kernels (xq_had_suh_multi + xq_moe_gu_epi + xq_moe_dn_epi); \
                   --w4moe=1 = persistent grouped experts{}",
                  if knobs.is_empty() { String::new() } else { format!(" ({} ignored while OFF)", knobs.join("/")) });
         w4moe_prewarm(dev, cfg, width, parts);
@@ -5515,7 +5665,7 @@ fn w4moe_announce(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config, width: usize
         let f = |p: Option<MpkPlan>| p.map_or("WP20".to_string(), |p| format!("s{}xG{}({}/SM)", p.nst, p.grid, p.cps));
         rows.push(format!("m{m} gu {} dn {}", f(gu), f(dn)));
     }
-    println!("W4/MOE: persistent grouped experts ON (opt-in --w4moe=1) — parts gu {} dn {} fold {}, order {}, \
+    crate::dprintln!("W4/MOE: persistent grouped experts ON (opt-in --w4moe=1) — parts gu {} dn {} fold {}, order {}, \
               shared-expert overlap {}, top-k {topk}; plans [{}] (default OFF / --w4moe-off=1 = WP20 rung-2 kernels)",
              (parts & MPK_GU != 0) as u8, (parts & MPK_DN != 0) as u8, fold as u8,
              if w4moe_order_il() { "interleaved" } else { "contiguous" },
@@ -5605,6 +5755,8 @@ fn lmh_entry(bits: usize, mrows: usize, nst: usize) -> Option<&'static str> {
         (4, 16, 6) => "exl3_lmh_b4_m16_s6",
         (3, 8, 6) => "exl3_lmh_b3_m8_s6",
         (3, 16, 6) => "exl3_lmh_b3_m16_s6",
+        (6, 8, 6) => "exl3_lmh_b6_m8_s6",
+        (6, 16, 6) => "exl3_lmh_b6_m16_s6",
         _ => return None,
     })
 }
@@ -5625,7 +5777,7 @@ fn lmh_fn(name: &'static str, smem: u32) -> Option<cudarc::driver::sys::CUfuncti
     }
     let f = xq_raw_fn(name)?;
     if smem as usize > crate::gpu::SMEM_OPTIN_CAP as usize {
-        eprintln!("[lmh] {name}: {smem} B over the {} B opt-in cap", crate::gpu::SMEM_OPTIN_CAP);
+        crate::deprintln!("[lmh] {name}: {smem} B over the {} B opt-in cap", crate::gpu::SMEM_OPTIN_CAP);
         return None;
     }
     let r = unsafe { sys::cuFuncSetAttribute(f,
@@ -5634,16 +5786,16 @@ fn lmh_fn(name: &'static str, smem: u32) -> Option<cudarc::driver::sys::CUfuncti
     let mut nb: i32 = 0;
     let r = unsafe { sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut nb, f, 256, smem as usize) };
     if r != sys::CUresult::CUDA_SUCCESS || nb < 1 {
-        eprintln!("[lmh] {name}: not resident at {smem} B smem (occupancy {nb}, {r:?})");
+        crate::deprintln!("[lmh] {name}: not resident at {smem} B smem (occupancy {nb}, {r:?})");
         return None;
     }
-    println!("W3/LMH: {name} ready (dynamic smem {smem} B, {nb} CTA/SM; --lmh-off=1 = old exl3_hmma_gemm)");
+    crate::dprintln!("W3/LMH: {name} ready (dynamic smem {smem} B, {nb} CTA/SM; --lmh-off=1 = old exl3_hmma_gemm)");
     c.retain(|e| e.0 != name);
     c.push((name, FnH(f), smem));
     Some(f)
 }
 
-/// Ring depths instantiated per rate: 5-bit 4/6/8, 3/4-bit 6 (kernels/exl3_bench.cu LMH_ENTRY).
+/// Ring depths instantiated per rate: 5-bit 4/6/8, 3/4/6-bit 6 (kernels/exl3_bench.cu LMH_ENTRY).
 fn lmh_nst_for(bits: usize, nst: usize) -> usize {
     if bits == 5 && matches!(nst, 4 | 6 | 8) { nst } else { 6 }
 }
@@ -5652,14 +5804,14 @@ fn lmh_nst_for(bits: usize, nst: usize) -> usize {
 /// (the lazy first use could otherwise land inside a verify capture). Prints the feature marker.
 fn lmh_prewarm(bits: usize, k: usize) {
     if lmh_off() {
-        println!("W3/LMH: OFF (--lmh-off=1) — lm_head runs exl3_hmma_gemm + exl3_had_svh");
+        crate::dprintln!("W3/LMH: OFF (--lmh-off=1) — lm_head runs exl3_hmma_gemm + exl3_had_svh");
         return;
     }
     let nst = lmh_nst_for(bits, lmh_nst());
     for mrows in [8usize, 16] {
         match lmh_entry(bits, mrows, nst) {
             Some(name) if lmh_fn(name, lmh_smem_bytes(bits, mrows, nst, k) as u32).is_some() => {}
-            _ => println!("W3/LMH: no usable entry for bits {bits} mrows {mrows} nst {nst} K {k} — \
+            _ => crate::dprintln!("W3/LMH: no usable entry for bits {bits} mrows {mrows} nst {nst} K {k} — \
                            those widths keep exl3_hmma_gemm"),
         }
     }
@@ -5674,7 +5826,7 @@ fn lmh_prewarm(bits: usize, k: usize) {
             }
         }
     }
-    println!("W3/LMH: lm_head persistent GEMM ON (nst {nst}, fused had_svh {}, xcheck {})",
+    crate::dprintln!("W3/LMH: lm_head persistent GEMM ON (nst {nst}, fused had_svh {}, xcheck {})",
              lmh_had() as u8, lmh_xcheck() as u8);
 }
 
@@ -5758,7 +5910,7 @@ fn lmh_xcheck_run(l: &Launcher, q: &Quad, xh: &CudaSlice<u16>, got: &CudaSlice<u
     let c = N.fetch_add(1, Ordering::SeqCst) + 1;
     if mism > 0 { BAD.fetch_add(1, Ordering::SeqCst); }
     if mism > 0 || c == 1 || c % 100 == 0 {
-        println!("LMH_XCHECK: checks {c} bad {} | this: m {m} n {n} fused {} mism {mism} max|d| {maxd:e} \
+        crate::dprintln!("LMH_XCHECK: checks {c} bad {} | this: m {m} n {n} fused {} mism {mism} max|d| {maxd:e} \
                   ref_nonzero {nz} first(row,col,new,old) {first:?}",
                  BAD.load(Ordering::SeqCst), fused as u8);
     }
@@ -5808,7 +5960,7 @@ fn wp21_on(ks: u32) -> bool {
         let v: Vec<u32> = crate::opts::var(crate::opt!("wp21-ks-off")).ok()
             .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
             .unwrap_or_default();
-        if !v.is_empty() { println!("WP21: --wp21-ks-off -> 3-launch tail for ks in {v:?}"); }
+        if !v.is_empty() { crate::dprintln!("WP21: --wp21-ks-off -> 3-launch tail for ks in {v:?}"); }
         v
     });
     !off.contains(&ks)
@@ -5829,7 +5981,7 @@ fn wp21_pair_ok(q0: &Quad, q1: &Quad, n: i32) -> bool {
 /// Load-time feature marker: which split-K chain tail this process runs (AGENTS §1a.4).
 fn wp21_log_boot() {
     if !wp21_enabled() {
-        println!("EXL3-FWD WP21: OFF (--wp21-off=1) — split-K chains run the 3-launch tail \
+        crate::dprintln!("EXL3-FWD WP21: OFF (--wp21-off=1) — split-K chains run the 3-launch tail \
                   (exl3_hmma_gemm_ks + exl3_ks_combine + exl3_had_svh)");
         return;
     }
@@ -5838,7 +5990,7 @@ fn wp21_log_boot() {
     if !psk_off() { notes.push("PSK ON: PSK grids keep the combine + svh tail"); }
     if crate::opts::var_os(crate::opt!("wp21-ks-off")).is_some() { notes.push("--wp21-ks-off set: listed ks keep the 3-launch tail"); }
     if wp21_xcheck() { notes.push("--wp21-xcheck: eager fused calls diffed vs the 3-launch tail"); }
-    println!("EXL3-FWD WP21: split-K fixup epilogue ON — ks > 1 chains (single / pair / REPRIME slabs) = had_suh + ONE \
+    crate::dprintln!("EXL3-FWD WP21: split-K fixup epilogue ON — ks > 1 chains (single / pair / REPRIME slabs) = had_suh + ONE \
               exl3_hmma_gemm_ks_fx(_x2) launch (last CTA per N-tile: ascending combine + H128 svh){}; \
               --wp21-off=1 = the 3-launch tail",
              if notes.is_empty() { String::new() } else { format!(" [{}]", notes.join("; ")) });
@@ -5856,7 +6008,7 @@ fn wp21_occupancy_once(l: &Launcher) {
         use cudarc::driver::sys;
         for name in ["exl3_hmma_gemm_ks_fx", "exl3_hmma_gemm_ks_fx_x2", "exl3_hmma_gemm_ks"] {
             let Some(f) = xq_raw_fn(name) else {
-                println!("WP21_OCC: {name} raw fn unavailable");
+                crate::dprintln!("WP21_OCC: {name} raw fn unavailable");
                 continue;
             };
             let (mut regs, mut bps): (std::ffi::c_int, std::ffi::c_int) = (-1, -1);
@@ -5902,7 +6054,7 @@ fn wp21_report(kind: &str, m: usize, k: i32, n: i32, d: (usize, Option<usize>, f
     let fail = d.0 > 0 || cnt_nz > 0;
     if fail { BAD.fetch_add(1, Ordering::SeqCst); }
     if fail || c == 1 || c % 500 == 0 {
-        println!("WP21_XCHECK: calls {c} bad {} (this: {kind} m {m} K {k} N {n} mism {} first {:?} maxdiff {:e} cnt_nonzero {cnt_nz})",
+        crate::dprintln!("WP21_XCHECK: calls {c} bad {} (this: {kind} m {m} K {k} N {n} mism {} first {:?} maxdiff {:e} cnt_nonzero {cnt_nz})",
                  BAD.load(Ordering::SeqCst), d.0, d.1, d.2);
     }
 }
@@ -6252,7 +6404,7 @@ fn psk_g_env() -> &'static (Option<u32>, Vec<(i32, i32, bool, u32)>) {
             })();
             match parsed {
                 Some(e) => v.push(e),
-                None => println!("EXL3-FWD PSK: ignoring malformed --psk-g entry {ent:?} (want KxN=G or KxNp=G)"),
+                None => crate::dprintln!("EXL3-FWD PSK: ignoring malformed --psk-g entry {ent:?} (want KxN=G or KxNp=G)"),
             }
         }
         (None, v)
@@ -6309,7 +6461,7 @@ fn psk_xcheck_report(site: &str, new: &[f32], old: &[f32]) {
     if mism > 0 { BAD.fetch_add(1, Ordering::SeqCst); }
     if mism > 0 || k % 500 == 0 || k == 1 {
         let fi = first.map_or(String::from("-"), |i| format!("{i} (new {:e} old {:e})", new[i], old[i]));
-        println!("PSK_XCHECK {site}: checks {k} bad {} | this: n {n} mism {mism} first {fi}",
+        crate::dprintln!("PSK_XCHECK {site}: checks {k} bad {} | this: n {n} mism {mism} first {fi}",
                  BAD.load(Ordering::SeqCst));
     }
 }
@@ -6321,7 +6473,7 @@ fn psk_xcheck_single(l: &Launcher, q: &Quad, xh: u64, ws: &CudaSlice<f32>, m: us
                      g: u32) -> Result<()> {
     if stream_capturing(l) {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("PSK_XCHECK: skipped inside graph capture (run eager: --exl3-no-graph=1)"));
+        ONCE.call_once(|| crate::dprintln!("PSK_XCHECK: skipped inside graph capture (run eager: --exl3-no-graph=1)"));
         return Ok(());
     }
     let need = q.ks as usize * m * q.n as usize;
@@ -6341,7 +6493,7 @@ fn psk_xcheck_pair(l: &Launcher, q0: &Quad, q1: &Quad, xh0: &CudaSlice<u16>, xh1
                    ws0: &CudaSlice<f32>, ws1: &CudaSlice<f32>, m: usize, g: u32) -> Result<()> {
     if stream_capturing(l) {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("PSK_XCHECK: skipped inside graph capture (run eager: --exl3-no-graph=1)"));
+        ONCE.call_once(|| crate::dprintln!("PSK_XCHECK: skipped inside graph capture (run eager: --exl3-no-graph=1)"));
         return Ok(());
     }
     let need = q0.ks as usize * m * q0.n as usize;
@@ -6369,7 +6521,7 @@ fn psk_log_shapes(dev: &Arc<CudaDevice>, layers: &[LayerDev], mtp: Option<&Draft
         } else { "default" };
         let knobs: Vec<String> = [crate::opt!("psk-g"), crate::opt!("psk-pf"), crate::opt!("psk-xcheck")].into_iter()
             .filter(|k| crate::opts::var_os(*k).is_some()).map(|k| k.to_string()).collect();
-        println!("EXL3-FWD PSK: OFF ({why}) — split-K chains run the old (N/128, ks) grids; \
+        crate::dprintln!("EXL3-FWD PSK: OFF ({why}) — split-K chains run the old (N/128, ks) grids; \
                   --psk=1 = persistent split-K ON{}",
                  if knobs.is_empty() { String::new() } else { format!(" ({} ignored while OFF)", knobs.join("/")) });
         // TUNE T0c: a table value or the --autotune overlay can turn PSK on at some width — measure
@@ -6406,7 +6558,7 @@ fn psk_log_shapes(dev: &Arc<CudaDevice>, layers: &[LayerDev], mtp: Option<&Draft
         visit(Some(&h.attn), None, &h.moe);
         for q in [&h.fc_hidden, &h.fc_embed] { if q.ks > 1 { singles.insert((q.k, q.n, q.bits, q.ks)); } }
     }
-    println!("EXL3-FWD PSK: persistent split-K ON (--psk=1; default OFF) — slots single {s1} / pair {s2} \
+    crate::dprintln!("EXL3-FWD PSK: persistent split-K ON (--psk=1; default OFF) — slots single {s1} / pair {s2} \
               (occupancy x SMs), trellis prefetch {} block(s) ahead; --psk-off=1 = old grids", psk_pf());
     for (set, pair) in [(&singles, false), (&pairs, true)] {
         for &(k, n, bits, ks) in set.iter() {
@@ -6414,7 +6566,7 @@ fn psk_log_shapes(dev: &Arc<CudaDevice>, layers: &[LayerDev], mtp: Option<&Draft
             let g = psk_grid(dev, k, n, bits, ks, pair);
             let slots = if pair { s2 } else { s1 };
             let rounds = if g > 0 { (items + g - 1) / g } else { 0 };
-            println!("  PSK {} K={k:<5} N={n:<6} b{bits} ks={ks:<3} items {items:>4} -> G {g:>4}{}",
+            crate::dprintln!("  PSK {} K={k:<5} N={n:<6} b{bits} ks={ks:<3} items {items:>4} -> G {g:>4}{}",
                      if pair { "pair  " } else { "single" },
                      if g == 0 { format!(" (old grid: capacity {slots})") }
                      else { format!(" ({rounds} item(s)/CTA max, {:.2} waves of {slots})", items as f32 / slots.max(1) as f32) });
@@ -6506,7 +6658,7 @@ fn exl3_chain_pair(l: &Launcher, q0: &Quad, q1: &Quad, x: &CudaSlice<u16>,
         let c = N.fetch_add(1, Ordering::SeqCst) + 1;
         if bad > 0 { BAD.fetch_add(1, Ordering::SeqCst); }
         if bad > 0 || c % 500 == 0 {
-            crate::rprintln!("CHAIN_PAIR_CHECK: calls {c} bad {} (this: m {m} K {k} N {n} mism {bad})", BAD.load(Ordering::SeqCst));
+            crate::drprintln!("CHAIN_PAIR_CHECK: calls {c} bad {} (this: m {m} K {k} N {n} mism {bad})", BAD.load(Ordering::SeqCst));
         }
     }
     Ok(())
@@ -6724,6 +6876,15 @@ fn pf_chain_check(q: &Quad, m: usize, xh: &CudaSlice<u16>, yraw: &CudaSlice<u16>
     Ok(())
 }
 
+/// EXL27B: exl3_chain_rb for a dense pack's MLP chains (a copy): their N (27B: 17408) is wider than
+/// PF_CHAIN_NMAX, so only the capacity check applies (the dense chain_yraw is sized for it).
+fn exl3_chain_rb_dense(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlice<u16>,
+                       yraw: &mut CudaSlice<u16>, y: &mut CudaSlice<u16>, m: usize,
+                       ws: &CudaSlice<f32>, rb: &ReconBufs) -> Result<()> {
+    pf_chain_check(q, m, xh, yraw)?;
+    exl3_chain_impl(l, q, x, xh, yraw, y, m, ws, Some(rb))
+}
+
 /// PFX1 (c): pf_chain_check + N <= PF_CHAIN_NMAX — every m = c (or 4c) prefill chain site.
 fn pf_chain_check_n(q: &Quad, m: usize, xh: &CudaSlice<u16>, yraw: &CudaSlice<u16>) -> Result<()> {
     anyhow::ensure!(q.n as usize <= PF_CHAIN_NMAX,
@@ -6839,7 +7000,7 @@ fn chain_wide_gemm(l: &Launcher, q: &Quad, xh: &mut CudaSlice<u16>, yraw: &mut C
         let recon = match rb {
             Some(r) if !wide_trellis_supports_bits(q.bits as usize) => {
                 if WIDE_FALLBACK_NOTE.set(()).is_ok() {
-                    crate::rprintln!("[exl3] --exl3-recon-min {rmin}: this pack has {}-bit modules the wide trellis kernel \
+                    crate::drprintln!("[exl3] --exl3-recon-min {rmin}: this pack has {}-bit modules the wide trellis kernel \
 cannot decode (3-, 4- and 5-bit only); those modules serve through the reconstruct + cuBLASLt arm, whatever the option says",
                                      q.bits);
                 }
@@ -6880,6 +7041,10 @@ cannot decode (3-, 4- and 5-bit only); those modules serve through the reconstru
 // Load
 // ---------------------------------------------------------------------------
 
+/// EXL27C-DF2: --df2-trace (CLI flag, serve side parses): stage syncs + prints inside
+/// df2_round, to localize async faults to draft / verify / staging / inject.
+pub static DF2_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl FwdModel {
     pub fn load(pack_dir: &str, width: usize, max_pos: usize) -> Result<Arc<FwdModel>> {
         Self::load_tp(pack_dir, width, max_pos, None)
@@ -6906,7 +7071,18 @@ impl FwdModel {
                 .transpose()?,
         };
         let shard_tag = shard_info.as_ref().map(|i| format!(" (B32 shard dir: exl3 rank {} of world {}, deal {} — the head's shipped plan omitted it)", i.rank, i.world, i.deal)).unwrap_or_default();
-        let cfg = pack.cfg.clone();
+        let mut cfg = pack.cfg.clone();
+        // EXL27B (Qwen3.5-class dense packs): the MLP is one dense projection triple. The config
+        // carries it as ONE expert (num_experts 1, top-1, moe_intermediate = intermediate) so the
+        // shared sizing code sees its width; the layer itself is MoeLayer::dense (no MoE code runs).
+        let dense_mlp = cfg.num_experts == 0 && cfg.intermediate_size > 0;
+        // EXL27B: a Qwen3.5-class MoE pack (plain residual, routed experts): MoeLayer::split
+        let split_moe = cfg.num_experts > 1 && cfg.hc_lowrank == 0;
+        if dense_mlp {
+            cfg.num_experts = 1;
+            cfg.num_experts_per_tok = 1;
+            cfg.moe_intermediate_size = cfg.intermediate_size;
+        }
         let kv_fmt = kv_fmt_from_opts();
         let dev = CudaDevice::new(0).context("CudaDevice::new(0)")?;
         crate::exl3_bench::load_module_pub(&dev)?;
@@ -6925,10 +7101,7 @@ impl FwdModel {
         // gpu.rs has already loaded the module; in bench/probe mode nothing else does, so
         // load it here with just the four names (idempotent guard via get_func).
         if dev.get_func("gpu_batch", "qsa_key_write_b").is_none() {
-            let ptx = cudarc::nvrtc::Ptx::from_src(
-                std::fs::read_to_string("src/ptx/gpu_batch.ptx")
-                    .context("src/ptx/gpu_batch.ptx missing — run cargo build --release")?,
-            );
+            let ptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_BATCH);
             dev.load_ptx(ptx, "gpu_batch", &["qsa_key_write_b", "qsa_score_b", "qsa_block_keys_b", "qsa_score_prefill_b",
                                             "qsa_pool_update_b", "qsa_pool_range_b", "qsa_score_pooled_b",
                                             "qsa_score_pooled_mr"])
@@ -6961,7 +7134,7 @@ impl FwdModel {
             pack.modules.iter().map(|m| (m.name.as_str(), m)).collect();
 
         let t_load = std::time::Instant::now();
-        println!(
+        crate::dprintln!(
             "EXL3-FWD load: {} layers ({} gdn / {} attn), {} experts, hc={} hidden={} vocab={}",
             cfg.layer_types.len(),
             cfg.layer_types.iter().filter(|l| matches!(l, crate::qwen::LayerType::LinearAttention)).count(),
@@ -6977,9 +7150,16 @@ impl FwdModel {
             let bits = to_f16_bits(&t.read(pack_dir)?, &t.dtype)?;
             Ok(dev.htod_sync_copy(&bits)?)
         };
+        // EXL27B: a plain-residual (hc_lowrank == 0) slot: the layer's RMSNorm weight; down/up are
+        // never read (the hc wrappers take the plain-residual dispatch before any mixer).
+        let plain_hc = |norm: &str| -> Result<HcDev> {
+            Ok(HcDev { norm: get_plain_f16(norm)?, down: dev.alloc_zeros::<u16>(1)?, up: dev.alloc_zeros::<u16>(1)?,
+                       winj: None, q8: None })
+        };
         let get_f32_bf16 = |name: &str| -> Result<CudaSlice<f32>> {
             let t = plain.get(name).with_context(|| format!("missing plain tensor {name}"))?;
-            Ok(dev.htod_sync_copy(&bf16_to_f32(&t.read(pack_dir)?))?)
+            let raw = t.read(pack_dir)?;
+            Ok(dev.htod_sync_copy(&if t.dtype == "BF16" { bf16_to_f32(&raw) } else { plain_to_f32(&raw, &t.dtype)? })?)
         };
         let get_quad = |name: &str| -> Result<Quad> {
             let m = modules.get(name).with_context(|| format!("missing quad module {name}"))?;
@@ -7052,7 +7232,8 @@ impl FwdModel {
         };
         let plain_f32_bf16 = |name: &str| -> Result<Vec<f32>> {
             let t = plain.get(name).with_context(|| format!("missing plain tensor {name}"))?;
-            Ok(bf16_to_f32(&t.read(pack_dir)?))
+            let raw = t.read(pack_dir)?;
+            if t.dtype == "BF16" { Ok(bf16_to_f32(&raw)) } else { plain_to_f32(&raw, &t.dtype) }
         };
 
         let emb_name = plain
@@ -7079,6 +7260,139 @@ impl FwdModel {
             // TP-A: this rank's routed experts in LOCAL stacked order (all of them when replicated).
             // TP-I #6: the deal may be per layer (--ep-deal=freq); the MTP head is never EP.
             let li: usize = tag.strip_prefix('L').and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+            if dense_mlp {
+                // EXL27B: the dense MLP as three plain quads (MoeLayer::dense), each with its own suh /
+                // svh / bit width. EXL27C TP-B: under a rank pair the quads are rank-sliced TRUE
+                // partials — gate/up along n (this rank's intermediate columns), down along k with
+                // rowpar (its partial of the full h; chain_rowpar sums the ranks in FP32, one f16
+                // rounding + svh after the reduce). At TP=1 nothing is sliced: every path unchanged.
+                let (mut g, mut u, mut d, mi_r) = match ep_rank {
+                    Some((rank, world)) => {
+                        anyhow::ensure!(mi % world == 0 && (mi / world) % 128 == 0,
+                                        "dense MLP TP slice @{tag}{shard_tag}: intermediate {mi} not \
+                                         divisible into 128-aligned {world}-way slices");
+                        let span = mi / world;
+                        let r0 = rank * span;
+                        static DTP_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !DTP_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("[exl3-load] dense MLP TP-sharded: gate/up n-slice + down k-slice \
+                                       rowpar partials (world={world})");
+                        }
+                        (get_quad_sl(&format!("{p}.gate_proj"), None, Some(&[(r0, r0 + span)]), false)?,
+                         get_quad_sl(&format!("{p}.up_proj"), None, Some(&[(r0, r0 + span)]), false)?,
+                         get_quad_sl(&format!("{p}.down_proj"), Some(&[(r0, r0 + span)]), None, true)?, span)
+                    }
+                    None => (get_quad(&format!("{p}.gate_proj"))?, get_quad(&format!("{p}.up_proj"))?,
+                             get_quad(&format!("{p}.down_proj"))?, mi),
+                };
+                anyhow::ensure!(g.n as usize == mi_r && u.n as usize == mi_r && d.k as usize == mi_r
+                                && g.k == u.k && d.n == g.k, "dense MLP geometry mismatch @{tag}{shard_tag}");
+                for q in [&mut g, &mut u, &mut d] { q.ks = dense_chain_ks(q.k, q.n); }
+                let one = || -> Result<CudaSlice<u16>> { Ok(dev.htod_sync_copy(&[0u16])?) };
+                let bits = g.bits as usize;
+                return Ok(MoeLayer {
+                    router: one()?, sg: one()?, gu_tr: one()?, d_tr: one()?,
+                    suh_gu: one()?, svh_gu: one()?, suh_d: one()?, svh_d: one()?,
+                    sh_gate: g, sh_up: u, sh_down: d, gu_words: 0, d_words: 0, bits, ep: None, li, dense: true,
+                    split: None,
+                });
+            }
+            if split_moe {
+                // EXL27B: Qwen3.5-class routed experts — gate, up and down each keep their own suh / svh
+                // (the FN loader below fuses gate|up under the gate's suh). EP (2026-10-16, EXL27C):
+                // each rank stacks only its LOCAL experts (xtp::ep_local_experts, deal from `li`);
+                // the shared expert is dealt like the FN branch (gate/up col-slice, down row-slice;
+                // its partial folds into the EP combine). The MTP head loads with ep_rank=None
+                // (replicated on every rank — never EP). TP=1: local == 0..ne, bit-identical.
+                let local: Vec<usize> = match ep_rank {
+                    Some((r, w)) => xtp::ep_local_experts(ne, r, w, li)?,
+                    None => (0..ne).collect(),
+                };
+                let sh_split: Option<(usize, usize)> = match ep_rank {
+                    Some((r, w)) if crate::opts::var(crate::opt!("tp-shared-repl")).is_err() =>
+                        Some(xtp::TrunkSplit { rank: r, world: w }.shared(mi)?),
+                    _ => None,
+                };
+                {
+                    static EP_SPLIT_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if ep_rank.is_some() && !EP_SPLIT_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[exl3-load] split-MoE EP deal: {} of {} experts on this rank (shared expert split: {})",
+                                  local.len(), ne, sh_split.is_some());
+                    }
+                }
+                let h = cfg.hidden_size;
+                let rd16 = |b: Vec<u8>| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+                let (mut g_tr, mut u_tr, mut d_tr) = (Vec::new(), Vec::new(), Vec::new());
+                let (mut suh_g, mut suh_u, mut suh_d) = (Vec::with_capacity(ne * h), Vec::with_capacity(ne * h), Vec::with_capacity(ne * mi));
+                let (mut svh_g, mut svh_u, mut svh_d) = (Vec::with_capacity(ne * mi), Vec::with_capacity(ne * mi), Vec::with_capacity(ne * h));
+                let (mut g_words, mut d_words, mut ebits) = (0u64, 0u64, 0usize);
+                for &e in &local {
+                    let q = |w: &str| -> Result<&ModuleMeta> {
+                        modules.get(format!("{p}.experts.{e}.{w}").as_str()).copied()
+                            .with_context(|| format!("expert {e} {w} missing @{tag}"))
+                    };
+                    let (g, u, d) = (q("gate_proj")?, q("up_proj")?, q("down_proj")?);
+                    anyhow::ensure!(g.k == h && u.k == h && g.n == mi && u.n == mi && d.k == mi && d.n == h,
+                                    "expert geometry mismatch @{tag} e{e}");
+                    anyhow::ensure!(g.bits == u.bits && g.bits == d.bits && (ebits == 0 || ebits == g.bits),
+                                    "expert bit widths differ within a layer @{tag} e{e}");
+                    ebits = g.bits;
+                    g_tr.extend(rd16(g.trellis.read_bytes(pack_dir)?));
+                    u_tr.extend(rd16(u.trellis.read_bytes(pack_dir)?));
+                    d_tr.extend(rd16(d.trellis.read_bytes(pack_dir)?));
+                    suh_g.extend(le_f16_bits(&g.suh.read_bytes(pack_dir)?));
+                    suh_u.extend(le_f16_bits(&u.suh.read_bytes(pack_dir)?));
+                    suh_d.extend(le_f16_bits(&d.suh.read_bytes(pack_dir)?));
+                    svh_g.extend(le_f16_bits(&g.svh.read_bytes(pack_dir)?));
+                    svh_u.extend(le_f16_bits(&u.svh.read_bytes(pack_dir)?));
+                    svh_d.extend(le_f16_bits(&d.svh.read_bytes(pack_dir)?));
+                    g_words = ((h / 16) * (mi / 16) * 16 * g.bits) as u64;
+                    d_words = ((mi / 16) * (h / 16) * 16 * d.bits) as u64;
+                }
+                let nl = local.len();
+                anyhow::ensure!(g_tr.len() == nl * g_words as usize && u_tr.len() == g_tr.len()
+                                && d_tr.len() == nl * d_words as usize, "expert trellis sizes @{tag}");
+                let offs_e: Vec<u64> = (0..nl as u64).map(|i| i * g_words).collect();
+                let offs_d: Vec<u64> = (0..nl as u64).map(|i| i * d_words).collect();
+                return Ok(MoeLayer {
+                    router: get_plain_f16(&format!("{p}.gate.weight"))?,
+                    sg: get_plain_f16(&format!("{p}.shared_expert_gate.weight"))?,
+                    gu_tr: dev.htod_sync_copy(&g_tr)?,
+                    d_tr: dev.htod_sync_copy(&d_tr)?,
+                    suh_gu: dev.htod_sync_copy(&suh_g)?,
+                    svh_gu: dev.htod_sync_copy(&svh_g)?,
+                    suh_d: dev.htod_sync_copy(&suh_d)?,
+                    svh_d: dev.htod_sync_copy(&svh_d)?,
+                    // TP-B: shared expert dealt on EP layers (gate/up col-slice, down row-slice);
+                    // its partial needs NO extra reduce — each rank adds sgv * its own partial
+                    // inside the EP combine (xtp::EpShard::shared_split; the FN pattern).
+                    sh_gate: match sh_split { Some(r) => get_quad_sl(&format!("{p}.shared_expert.gate_proj"), None, Some(&[r]), false)?,
+                                              None => get_quad(&format!("{p}.shared_expert.gate_proj"))? },
+                    sh_up: match sh_split { Some(r) => get_quad_sl(&format!("{p}.shared_expert.up_proj"), None, Some(&[r]), false)?,
+                                            None => get_quad(&format!("{p}.shared_expert.up_proj"))? },
+                    sh_down: match sh_split { Some(r) => get_quad_sl(&format!("{p}.shared_expert.down_proj"), Some(&[r]), None, false)?,
+                                              None => get_quad(&format!("{p}.shared_expert.down_proj"))? },
+                    gu_words: g_words, d_words, bits: ebits, li, dense: false,
+                    ep: match ep_rank {
+                        Some((r, w)) => {
+                            let mut e = xtp::EpShard::new(&dev, ne, r, w, &local, &tag,
+                                                          g_tr.len(), d_tr.len(), suh_g.len(), svh_g.len(),
+                                                          suh_d.len(), svh_d.len(), g_words, d_words,
+                                                          cfg.hidden_size, mi, true)?;
+                            e.shared_split = sh_split.is_some();
+                            Some(e)
+                        }
+                        None => None,
+                    },
+                    split: Some(SplitGu {
+                        up_tr: dev.htod_sync_copy(&u_tr)?,
+                        suh_u: dev.htod_sync_copy(&suh_u)?,
+                        svh_u: dev.htod_sync_copy(&svh_u)?,
+                        offs_e: dev.htod_sync_copy(&offs_e)?,
+                        offs_d: dev.htod_sync_copy(&offs_d)?,
+                    }),
+                });
+            }
             let local: Vec<usize> = match ep_rank {
                 Some((r, w)) => xtp::ep_local_experts(ne, r, w, li)?,
                 None => (0..ne).collect(),
@@ -7169,12 +7483,14 @@ impl FwdModel {
                 d_words,
                 bits: ebits,
                 li,
+                dense: false,
+                split: None,
                 ep: match ep_rank {
                     Some((r, w)) => {
                         let mut e = xtp::EpShard::new(&dev, ne, r, w, &local, &tag,
                                                       gu_tr_h.len(), d_tr_h.len(), suh_gu_h.len(), svh_gu_h.len(),
                                                       suh_d_h.len(), svh_d_h.len(), gu_words, d_words,
-                                                      cfg.hidden_size, mi)?;
+                                                      cfg.hidden_size, mi, false)?;
                         e.shared_split = sh_split.is_some();
                         Some(e)
                     }
@@ -7198,8 +7514,12 @@ impl FwdModel {
                     q8: None,
                 })
             };
-            let hc_attn = mk_hc(format!("{p}.attn_hyper_connection"), true)?;
-            let hc_mlp = mk_hc(format!("{p}.mlp_hyper_connection"), true)?;
+            let (hc_attn, hc_mlp) = if cfg.hc_lowrank == 0 {
+                // EXL27B: plain residual (Qwen3.5-class) — the slots carry the layer's RMSNorms
+                (plain_hc(&format!("{p}.input_layernorm.weight"))?, plain_hc(&format!("{p}.post_attention_layernorm.weight"))?)
+            } else {
+                (mk_hc(format!("{p}.attn_hyper_connection"), true)?, mk_hc(format!("{p}.mlp_hyper_connection"), true)?)
+            };
 
             let mixer = match lt {
                 crate::qwen::LayerType::LinearAttention if tsplit.is_some() => {
@@ -7347,11 +7667,14 @@ impl FwdModel {
             if let Some(k) = qsa_pool_plane.take() { qsa_pool_vec.push(k); }
             layers.push(LayerDev { hc_attn, hc_mlp, mixer, moe });
             if li % 12 == 0 {
-                println!("  layer {li} ({lt:?}) loaded ({:.0}s)", t_load.elapsed().as_secs_f32());
+                crate::dprintln!("  layer {li} ({lt:?}) loaded ({:.0}s)", t_load.elapsed().as_secs_f32());
             }
         }
 
-        let hc_mixer = {
+        let hc_mixer = if cfg.hc_lowrank == 0 {
+            // EXL27B: plain residual — the final norm is the trunk's model.language_model.norm
+            plain_hc("model.language_model.norm.weight")?
+        } else {
             let names: Vec<String> = plain
                 .keys()
                 .filter(|k| k.contains("hyper_connection_mixer") && !k.contains(".layers.") && !k.contains("mtp"))
@@ -7384,7 +7707,10 @@ impl FwdModel {
         bytes_round += (2560 * cfg.vocab_size) as u64 * 5 / 8;
 
         // ---- MTP draft head (S-A3-e M1): load mtp.* as EXL3 through the same weight path. ----
-        let mut mtp = if modules.contains_key("mtp.fc_hidden") {
+        // EXL27B: Qwen3.5-class packs carry the standard head — ONE `mtp.fc` over
+        // cat[norm_e(embed), norm_h(hidden)] (K = 2h) — instead of FN's fc_hidden + fc_embedding.
+        let mtp_fc_cat = !modules.contains_key("mtp.fc_hidden") && modules.contains_key("mtp.fc");
+        let mut mtp = if modules.contains_key("mtp.fc_hidden") || mtp_fc_cat {
             let t0h = std::time::Instant::now();
             let hcn = cfg.hc_count.max(1);
             let hp = "mtp.layers.0";
@@ -7401,8 +7727,13 @@ impl FwdModel {
                     q8: None,
                 })
             };
-            let hc_attn = mk_hc(format!("{hp}.attn_hyper_connection"), true)?;
-            let hc_mlp = mk_hc(format!("{hp}.mlp_hyper_connection"), true)?;
+            let (hc_attn, hc_mlp) = if cfg.hc_lowrank == 0 {
+                // EXL27B: the head block is a standard pre-norm decoder layer (its input_layernorm
+                // normalizes the fc output, which is also the residual)
+                (plain_hc(&format!("{hp}.input_layernorm.weight"))?, plain_hc(&format!("{hp}.post_attention_layernorm.weight"))?)
+            } else {
+                (mk_hc(format!("{hp}.attn_hyper_connection"), true)?, mk_hc(format!("{hp}.mlp_hyper_connection"), true)?)
+            };
             let qn_t = plain.get(&format!("{hp}.self_attn.q_norm.weight")).context("mtp q_norm")?;
             let kn_t = plain.get(&format!("{hp}.self_attn.k_norm.weight")).context("mtp k_norm")?;
             let qnkn: Vec<u16> = to_f16_bits(&qn_t.read(pack_dir)?, &qn_t.dtype)?
@@ -7446,8 +7777,16 @@ impl FwdModel {
             } else { None };
             // TP-A (T1): the MTP head is REPLICATED on every rank — no EP shard, no reduce sites.
             let moe = mk_moe(format!("{hp}.mlp"), "mtp".to_string(), None)?;
-            let fc_hidden = get_quad("mtp.fc_hidden")?;
-            let fc_embed = get_quad("mtp.fc_embedding")?;
+            let (fc_hidden, fc_embed) = if mtp_fc_cat {
+                // EXL27B: split the K = 2h fc at h (128-aligned: the input Hadamard blocks never straddle
+                // it; the output svh/Hadamard is linear) into the embed half [0, h) and the hidden half
+                // [h, 2h) — fc(cat[e, x]) = W_e e + W_x x, the FN head's two-projection sum.
+                let h = cfg.hidden_size;
+                (get_quad_sl("mtp.fc", Some(&[(h, 2 * h)]), None, false)?,
+                 get_quad_sl("mtp.fc", Some(&[(0, h)]), None, false)?)
+            } else {
+                (get_quad("mtp.fc_hidden")?, get_quad("mtp.fc_embedding")?)
+            };
             let pre_fc_norm_hidden = get_plain_f16("mtp.pre_fc_norm_hidden.weight")?;
             let pre_e = get_plain_f16("mtp.pre_fc_norm_embedding.weight")?;
             let pre_e_h: Vec<u16> = dev.dtoh_sync_copy(&pre_e)?;
@@ -7456,18 +7795,18 @@ impl FwdModel {
                 tiled.extend_from_slice(&pre_e_h);
             }
             let pre_fc_norm_embedding = dev.htod_sync_copy(&tiled)?;
-            let mixer = HcDev {
+            let mixer = if cfg.hc_lowrank == 0 { plain_hc("mtp.norm.weight")? } else { HcDev {
                 norm: get_plain_f16("mtp.hyper_connection_mixer.hc_norm.weight")?,
                 down: get_plain_f16("mtp.hyper_connection_mixer.input_mix_weight_down.weight")?,
                 up: get_plain_f16("mtp.hyper_connection_mixer.input_mix_weight_up.weight")?,
                 winj: None,
                 q8: None,
-            };
+            } };
             let nkv = cfg.num_kv_heads;
             let hd = cfg.head_dim;
             let kv = dev.alloc_zeros::<u8>(width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd))?;
             crate::metrics::kv_pool_add_bytes(2, (width * 2 * nkv * max_pos * kv_rowbytes(kv_fmt, hd)) as u64); // issue #24
-            println!(
+            crate::dprintln!(
                 "  MTP draft head (mtp.*) loaded as EXL3 (M1 decision): fc 4bpw, attn 5bpw, experts 3bpw ({:.0}s)",
                 t0h.elapsed().as_secs_f32()
             );
@@ -7517,7 +7856,7 @@ impl FwdModel {
             crate::metrics::kv_pool_add_bytes(0, (width * 2 * tc.num_kv_heads * max_pos * kv_rowbytes(kv_fmt, tc.head_dim)) as u64); // issue #24
         }
 
-        println!(
+        crate::dprintln!(
             "EXL3-FWD loaded in {:.1}s; W={width} max_pos={max_pos}; byte model ~{:.2} GB/round (W=1)",
             t_load.elapsed().as_secs_f32(),
             bytes_round as f64 / 1e9
@@ -7670,16 +8009,16 @@ impl FwdModel {
                     // REL-NGRAM: once-per-boot line naming which n-gram layout served the pack
                     // (the single-tensor / via-index / via-sidecar distinction).
                     if single_loaded {
-                        println!("  PLE n-gram table: single trellis tensor, K={}, rows/shard {} (128 virtual shards)",
+                        crate::dprintln!("  PLE n-gram table: single trellis tensor, K={}, rows/shard {} (128 virtual shards)",
                                  (row_words - 1) / 10, rows_per_shard);
                     } else if n_via_index == 128 {
-                        println!("  PLE n-gram table: 128 shards via model index, K={}, rows/shard {}",
+                        crate::dprintln!("  PLE n-gram table: 128 shards via model index, K={}, rows/shard {}",
                                  (row_words - 1) / 10, rows_per_shard);
                     } else if n_via_index == 0 {
-                        println!("  PLE n-gram table: 128 shards via sidecar header (exllamav3 1.5.x layout, issue #9), K={}, rows/shard {}",
+                        crate::dprintln!("  PLE n-gram table: 128 shards via sidecar header (exllamav3 1.5.x layout, issue #9), K={}, rows/shard {}",
                                  (row_words - 1) / 10, rows_per_shard);
                     } else {
-                        println!("  PLE n-gram table: {n_via_index} shards via model index + {} via sidecar header, K={}, rows/shard {}",
+                        crate::dprintln!("  PLE n-gram table: {n_via_index} shards via model index + {} via sidecar header, K={}, rows/shard {}",
                                  128 - n_via_index, (row_words - 1) / 10, rows_per_shard);
                     }
                     let ram = std::sync::OnceLock::new();
@@ -7710,7 +8049,7 @@ impl FwdModel {
                     };
                     if let Ok(path) = crate::opts::var(crate::opt!("exl3-ple-dump")) {
                         pd.dump_oracle(&path)?;
-                        println!("[exl3] --exl3-ple-dump: wrote {path}; exiting");
+                        crate::dprintln!("[exl3] --exl3-ple-dump: wrote {path}; exiting");
                         std::process::exit(0);
                     }
                     Some(pd)
@@ -7724,20 +8063,16 @@ impl FwdModel {
         // code the per-step loop used (bitwise-identical bits, paid once at load),
         // and ONE blocking compute stream for the model's lifetime.
         let rdim_t = cfg.rotary_dim;
-        let theta_t = cfg.rope_theta;
+        // YARN1: ONE rope source for the whole EXL3 trunk — decode cos_tab, the prefill host
+        // loop, the QSA indexer tables and the vision mrope rows all take this RopeFreqs.
+        // Factor 1.0 (no flag, no shipped TpConfig value, no config rope_scaling) reproduces
+        // the legacy tables bit-for-bit; a factor > 1 prints the boot line naming factor+source.
+        let fr = RopeFreqs::for_opts(rdim_t, cfg.rope_theta, cfg.yarn_native_window, &cfg);
         let mut cos_tab_h: Vec<f32> = Vec::with_capacity(max_pos * 2 * rdim_t);
         for p in 0..max_pos {
-            for i in 0..rdim_t / 2 {
-                let inv = theta_t.powf(-(2.0 * i as f32) / rdim_t as f32);
-                let f = p as f32 * inv;
-                cos_tab_h.push(f.cos());
-            }
+            for i in 0..rdim_t / 2 { cos_tab_h.push(fr.cos_sin(p, i).0); }
             for _ in 0..rdim_t / 2 { cos_tab_h.push(0.0); }
-            for i in 0..rdim_t / 2 {
-                let inv = theta_t.powf(-(2.0 * i as f32) / rdim_t as f32);
-                let f = p as f32 * inv;
-                cos_tab_h.push(f.sin());
-            }
+            for i in 0..rdim_t / 2 { cos_tab_h.push(fr.cos_sin(p, i).1); }
             for _ in 0..rdim_t / 2 { cos_tab_h.push(0.0); }
         }
         let cos_tab = dev.htod_sync_copy(&cos_tab_h)?;
@@ -7757,14 +8092,14 @@ impl FwdModel {
             ps.extend(max_pos.saturating_sub(128).max(2048)..max_pos);
             let mut bad = 0usize;
             for &p in &ps {
-                let hrow = prefill_cossin_host(theta_t, rdim_t, p, 1);
+                let hrow = prefill_cossin_host(&fr, rdim_t, p, 1);
                 let trow = &cos_tab_h[p * row..(p + 1) * row];
                 bad += hrow.iter().zip(trow).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             }
             if bad > 0 {
-                println!("WP05: cos_tab differs from the prefill host RoPE loop in {bad} values over {} sampled rows — prefill keeps the host loop", ps.len());
+                crate::dprintln!("WP05: cos_tab differs from the prefill host RoPE loop in {bad} values over {} sampled rows — prefill keeps the host loop", ps.len());
             } else {
-                println!("WP05: prefill RoPE gather armed — cos_tab == prefill host loop bit-for-bit on {} sampled rows", ps.len());
+                crate::dprintln!("WP05: prefill RoPE gather armed — cos_tab == prefill host loop bit-for-bit on {} sampled rows", ps.len());
             }
             bad == 0
         };
@@ -7779,13 +8114,12 @@ impl FwdModel {
             qsa_cos_h.resize(qsa_cos_h.len() + rdim_t, 0.0);
             qsa_sin_h.resize(qsa_sin_h.len() + rdim_t, 0.0);
             for i in 0..rdim_t / 2 {
-                let inv = theta_t.powf(-(2.0 * i as f32) / rdim_t as f32);
-                let f = p as f32 * inv;
-                qsa_cos_h[p * rdim_t + i] = f.cos();
-                qsa_sin_h[p * rdim_t + i] = f.sin();
+                let (c, s) = fr.cos_sin(p, i);
+                qsa_cos_h[p * rdim_t + i] = c;
+                qsa_sin_h[p * rdim_t + i] = s;
                 if qsa_full {
-                    qsa_cos_h[p * rdim_t + i + rdim_t / 2] = f.cos();
-                    qsa_sin_h[p * rdim_t + i + rdim_t / 2] = f.sin();
+                    qsa_cos_h[p * rdim_t + i + rdim_t / 2] = c;
+                    qsa_sin_h[p * rdim_t + i + rdim_t / 2] = s;
                 }
             }
         }
@@ -7826,7 +8160,7 @@ impl FwdModel {
                 b.extend_from_slice(&(*qsa_mrope.device_ptr() as u64).to_le_bytes()); // VIS-3 QsaParams.mr
                 ix.params = Some(dev.htod_sync_copy(&b)?);
             }
-            println!("  QSA indexer loaded: budget {} ratio {} sel_max {} (dense <= {} visible); pooled-key rope {}",
+            crate::dprintln!("  QSA indexer loaded: budget {} ratio {} sel_max {} (dense <= {} visible); pooled-key rope {}",
                      cfg.indexer_budget, ratio, cfg.indexer_budget + ratio - 1,
                      cfg.indexer_budget + ratio - 1,
                      if qsa_full { "full (the reference)" } else { "HALF (--qsa-key-rope half: the pre-v0.7.1 table, dims rdim/2..rdim zero)" });
@@ -7836,7 +8170,7 @@ impl FwdModel {
         // S-A3-f-f ITEM 1: grid-barrier co-residency must be MEASURED, not assumed
         // (a deadlock here would hang the graph). 0 disables the fused mixer entirely.
         let hc_fuse_cap = hc_fuse_co_residency(&dev);
-        println!(
+        crate::dprintln!(
             "EXL3-FWD hc_fuse co-residency: {} blocks (256t){}",
             hc_fuse_cap,
             if hc_fuse_cap > 0 { "" } else { " -> fused hc mixer DISABLED (old path, all m)" }
@@ -7848,7 +8182,7 @@ impl FwdModel {
             let c = (wp11_capacity(&dev, "xq_hc_fuse_i8k"), wp11_capacity(&dev, "xq_hc_fuse_i8_rbk"));
             if (hc_fuse_cap.min(c.0) * 5) / 6 >= 64 { c } else { (0, 0) }
         } else { (0, 0) };
-        println!(
+        crate::dprintln!(
             "EXL3-FWD WP11 hc rungs: {} (caps i8k {} rbk {}; R1 pf={} R2={} R4={} cvt={}; --wp11-off=1 = old path)",
             if wp11_off() { "OFF" } else if wp11_cap.0 > 0 { "R3 k-major twins" } else { "R3 off (old fuse kernels)" },
             wp11_cap.0, wp11_cap.1, wp11_pf_mode(), wp11_r2_on() as u8, wp11_r4_on() as u8,
@@ -7867,14 +8201,14 @@ impl FwdModel {
             if fuse_reachable && !wp11_off() && wp11_cap.0 > 0 && hc_fuse_cap > 0 && shape_ok {
                 let cap = w4hc_capacity();
                 let g = w4hc_default_grid(cap, h);
-                println!("EXL3-FWD HC-W4 mixer: xq_hc_w4 co-residency {cap} blocks (256t, carveout max) -> grid {g}{}",
+                crate::dprintln!("EXL3-FWD HC-W4 mixer: xq_hc_w4 co-residency {cap} blocks (256t, carveout max) -> grid {g}{}",
                          if g > 0 { "" } else { " -> OFF (fewer co-resident CTAs than the phase-B minimum ceil(h/32))" });
                 (g, cap)
             } else {
                 (0, 0)
             }
         };
-        println!(
+        crate::dprintln!(
             "EXL3-FWD HC-W4: fuse {} (grid {w4hc_grid}, m=1 {}, mix-fused {}, geom flags {:#x}), inject+norm fusion {}{}; \
              --w4hc-off=1 = p4c hc path",
             if w4hc_grid > 0 { "ON" } else { "OFF" }, if w4hc_m1_on() { "on" } else { "off" },
@@ -7908,7 +8242,7 @@ impl FwdModel {
         let route_log = match crate::opts::var(crate::opt!("exl3-route-log")) {
             Ok(dir) if !dir.is_empty() && dir != "0" => {
                 std::fs::create_dir_all(&dir).with_context(|| format!("--exl3-route-log {dir}"))?;
-                println!("[exl3] --exl3-route-log diagnostic: per-call expert ids -> {dir}/route_NNNN.bin (one file per request)");
+                crate::dprintln!("[exl3] --exl3-route-log diagnostic: per-call expert ids -> {dir}/route_NNNN.bin (one file per request)");
                 Some((dev.alloc_zeros::<i32>(ROUTE_LOG_CAP * ROUTE_REC)?, dev.htod_sync_copy(&[0u32])?, dir,
                       std::sync::atomic::AtomicUsize::new(0)))
             }
@@ -7916,7 +8250,7 @@ impl FwdModel {
         };
         let expert_hist = match crate::opts::var(crate::opt!("tp-ep-hist")) {
             Ok(path) if !path.is_empty() && path != "0" => {
-                println!("[exl3] --tp-ep-hist diagnostic: per-(layer, expert) routing histogram -> {path} (cumulative, at every request finish)");
+                crate::dprintln!("[exl3] --tp-ep-hist diagnostic: per-(layer, expert) routing histogram -> {path} (cumulative, at every request finish)");
                 Some((dev.htod_sync_copy(&vec![0i32; cfg.num_layers * 2 * cfg.num_experts])?, path))
             }
             _ => None,
@@ -7961,11 +8295,11 @@ impl FwdModel {
                     cnt: dev.htod_sync_copy(&vec![0u32; ((n2.max(0) as usize) / 128).max(1)])?, // W4/DENSE, explicit zero
                     rowpar: false,
                 };
-                println!("EXL3-MTP pruned draft head: n {n_full} -> {n2} (trellis {:.0} MB -> {:.0} MB)",
+                crate::dprintln!("EXL3-MTP pruned draft head: n {n_full} -> {n2} (trellis {:.0} MB -> {:.0} MB)",
                          (lm_head.tr.len() * 2) as f64 / 1e6, (words * 2) as f64 / 1e6);
                 Some(draft)
             } else {
-                if env_n == 0 { println!("EXL3-MTP pruned draft head disabled (--exl3-mtp-head-n=0)"); }
+                if env_n == 0 { crate::dprintln!("EXL3-MTP pruned draft head disabled (--exl3-mtp-head-n=0)"); }
                 None
             }
         } else { None };
@@ -7973,9 +8307,9 @@ impl FwdModel {
         let dhead: Option<dhead::DHead> = match lm_head_draft.as_ref() {
             Some(qd) if !dhead::dhead_off() => match dhead::DHead::build(&dev, &stream, qd) {
                 Ok(d) => Some(d),
-                Err(e) => { println!("DHEAD: NOT built ({e:#}) — the old draft head serves"); None }
+                Err(e) => { crate::dprintln!("DHEAD: NOT built ({e:#}) — the old draft head serves"); None }
             },
-            Some(_) => { println!("DHEAD: off (--dhead-off=1) — the old draft head serves"); None }
+            Some(_) => { crate::dprintln!("DHEAD: off (--dhead-off=1) — the old draft head serves"); None }
             None => None,
         };
 
@@ -7983,7 +8317,7 @@ impl FwdModel {
         let mut layers = layers;
         let mut hc_mixer = hc_mixer;
         let mut mtp = mtp;
-        if hc_int8_enabled() {
+        if hc_int8_enabled() && cfg.hc_lowrank > 0 { // EXL27B: plain-residual packs have no mixer to quantize
             let t0q = std::time::Instant::now();
             let (lr, rw) = (cfg.hc_lowrank, cfg.hidden_size * cfg.hc_count.max(1));
             let mut n = 0usize;
@@ -8000,7 +8334,7 @@ impl FwdModel {
                 hc_quantize_i8(&dev, &mut h.mixer, lr, rw, wp11_cap.0 > 0)?;
                 n += 3;
             }
-            println!("EXL3 hc mixers: {n} quantized to int8 (per-row fp32 scales) in {:.1}s — DEFAULT; --hc-fp16 = bit-exact fp16 mixer",
+            crate::dprintln!("EXL3 hc mixers: {n} quantized to int8 (per-row fp32 scales) in {:.1}s — DEFAULT; --hc-fp16 = bit-exact fp16 mixer",
                      t0q.elapsed().as_secs_f32());
         }
 
@@ -8017,7 +8351,7 @@ impl FwdModel {
                 hist: std::sync::Mutex::new(vec![248046i32; width * 2]),
             };
             let mb: usize = ps.s.iter().map(|b| b.len() * 4).sum::<usize>() + ps.conv.iter().map(|b| b.len() * 4).sum::<usize>();
-            println!("  prefix cache: per-slot recurrent-state snapshots ({:.0} MB for {width} slot(s))", mb as f64 / 1e6);
+            crate::dprintln!("  prefix cache: per-slot recurrent-state snapshots ({:.0} MB for {width} slot(s))", mb as f64 / 1e6);
             Some(ps)
         } else { None };
 
@@ -8068,13 +8402,13 @@ impl FwdModel {
                     rowpar: false,
                 };
                 anyhow::ensure!(q.ks == 1, "vocab shard chain ks {} != 1 (the replicated head's reduction order)", q.ks);
-                println!("TP-H vocab-parallel lm_head: rank {rank}/{world} shard columns [{}, {}) ({:.0} MB trellis) — \
+                crate::dprintln!("TP-H vocab-parallel lm_head: rank {rank}/{world} shard columns [{}, {}) ({:.0} MB trellis) — \
                           greedy verify/step tail = shard GEMM + argmax + {} key exchange(s) (--tp-vp-head=0 = replicated)",
                          rank * n_sh, (rank + 1) * n_sh, (words * 2) as f64 / 1e6, world.trailing_zeros());
                 if world == 2 {
                     // TP-H2: the sampled / penalized / ratio-rule rows' tail (row all-gather of the shard rows)
                     xtp::set_vp_rows_cols(n_sh as usize);
-                    println!("TP-H2 vocab-parallel sampled rows: {} — sampled / penalized / ratio-rule step+verify tail = shard GEMM + \
+                    crate::dprintln!("TP-H2 vocab-parallel sampled rows: {} — sampled / penalized / ratio-rule step+verify tail = shard GEMM + \
                               row all-gather ({} rows per 1 MiB epoch, {:.0} KB per row per rank) + the unchanged sampler \
                               (--tp-vp-sampled {})",
                              if xtp::vp_sampled_on() { "ON" } else { "OFF (the replicated head)" }, xtp::VP_GATHER_ROWS,
@@ -8084,7 +8418,7 @@ impl FwdModel {
                     // <= 4 rows: the own shard, then the two shards held), default ON (D-TP4-3). The state printed
                     // is the RESOLVED code (the head's flag, installed on every rank before the model load).
                     xtp::set_vp_rows_cols(n_sh as usize);
-                    println!("TP-4H2 vocab-parallel sampled rows (world 4): {} — sampled / penalized / ratio-rule step+verify tail = \
+                    crate::dprintln!("TP-4H2 vocab-parallel sampled rows (world 4): {} — sampled / penalized / ratio-rule step+verify tail = \
                               shard GEMM + 2-round recursive-doubling row all-gather ({} rows per group = 2 epochs of <= {:.0} KB, \
                               {:.0} KB per row per rank) + the unchanged sampler (--tp-vp-sampled {})",
                              if xtp::vp_sampled_on() { "ON" } else { "OFF (the replicated head)" }, xtp::VP_GATHER_ROWS,
@@ -8093,7 +8427,7 @@ impl FwdModel {
                 } else {
                     // any other world: no row all-gather kernels — the replicated head (still resident) serves the
                     // sampled rows; vp_rows keeps its 1-element placeholder
-                    println!("TP-H2 vocab-parallel sampled rows: OFF at world {world} (the row all-gather has kernels at world 2 and 4 \
+                    crate::dprintln!("TP-H2 vocab-parallel sampled rows: OFF at world {world} (the row all-gather has kernels at world 2 and 4 \
                               only; sampled / penalized / ratio-rule rows take the replicated head)");
                 }
                 Some(VpHead { q, base: rank * n_sh, n_sh })
@@ -8107,7 +8441,7 @@ impl FwdModel {
             if xtp::dh_shard_on() && (world == 2 || world == 4) && xtp::dec_xport_mode() == 1 {
                 dh.enable_shard(&dev, rank as usize, world as usize)?;
                 if let Some((a, b, nblk)) = dh.shard_span() {
-                    println!("TP-H sharded MTP-head screen: rank {rank}/{world} screens blocks [{a}, {b}) of {nblk} \
+                    crate::dprintln!("TP-H sharded MTP-head screen: rank {rank}/{world} screens blocks [{a}, {b}) of {nblk} \
                               (1/{world} of the screen bytes per draft pass; bmax reassembled through the doorbell, \
                               bitwise the replicated screen; --tp-dh-shard=0 = replicated)");
                 }
@@ -8123,6 +8457,7 @@ impl FwdModel {
             tc,
             dev,
             cfg,
+            rope: fr,
             embed,
             layers,
             hc_mixer,
@@ -8170,6 +8505,12 @@ impl FwdModel {
             qsa_dbg,
             qsa_rowdbg,
             tp: tp_state,
+            // EXL27C-DF2 (fwd): capture disarmed at construction (zero-cost until the serve
+            // agent calls set_df2_capture); the boot buffers build lazily in df2_boot_ptrs.
+            df2_sink: None,
+            df2_prime: None,
+            df2_head_bf16: std::sync::Mutex::new(None),
+            df2_embed_bf16: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -8341,7 +8682,15 @@ impl FwdModel {
         dump_u(&d, &sc.x, "lmheadin", 0)?;
         dump_u(&d, &sc.logits, "press0logits", 0)?;
         let amh = self.dev.dtoh_sync_copy(&sc.argmax)?;
-        println!("PLAIN_DIAG argmax[:{}]= {:?}  v={}", m, &amh[..m], self.cfg.vocab_size);
+        crate::dprintln!("PLAIN_DIAG argmax[:{}]= {:?}  v={}", m, &amh[..m], self.cfg.vocab_size);
+        Ok(())
+    }
+
+    /// EXL27B: plain residual (hc_lowrank == 0): the normed stream IS the mixer input — hn -> x.
+    fn plain_publish(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
+        let n = (self.cfg.hidden_size * self.cfg.hc_count.max(1) * m) as i64;
+        xqlaunch!(l, "xq_copy_u16", (((n + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut sc.x, &sc.hn, n, 0i64, 0i64))?;
         Ok(())
     }
 
@@ -8358,6 +8707,7 @@ impl FwdModel {
             return self.w4hc_xcheck_run(l, sc, hc, m, pend);
         }
         self.hc_norm_p(l, sc, hc, m, pend)?;
+        if self.cfg.hc_lowrank == 0 { return self.plain_publish(l, sc, m); } // EXL27B: plain residual
         // WP11 --hc-step-check: eager old-vs-new bit-diff (never inside a graph capture).
         if hc_step_check_on() && !wp11_off() && !stream_capturing(l) {
             return self.hc_step_check(l, sc, hc, m);
@@ -8467,7 +8817,7 @@ impl FwdModel {
         g.0 += 1;
         if bad > 0 { g.1 += 1; }
         if (bad > 0 && g.1 <= 20) || g.0 % 500 == 1 {
-            println!("W4HC_XCHECK: call {} m={m} inj-fused {} w4 {} gates {} | mismatches resid {}/{} hn {}/{} dd {}/{} uu {}/{} \
+            crate::dprintln!("W4HC_XCHECK: call {} m={m} inj-fused {} w4 {} gates {} | mismatches resid {}/{} hn {}/{} dd {}/{} uu {}/{} \
                       x {}/{} inj {}/{} (first {:?} {:?} {:?} {:?} {:?} {:?}) | ref x nonzero {nz} | calls-with-mismatch {}/{}",
                      g.0, fused_inj as u8, w4 as u8, hc.winj.is_some() as u8, dr.0, m * rw, dh.0, m * rw, dd.0, m * lr,
                      du.0, m * rw, dx.0, m * h, di.0, m * hcn, dr.1, dh.1, dd.1, du.1, dx.1, di.1, g.1, g.0);
@@ -8538,7 +8888,7 @@ impl FwdModel {
         g.0 += 1;
         if bad > 0 { g.1 += 1; }
         if (bad > 0 && g.1 <= 20) || g.0 % 500 == 1 {
-            println!("HC_STEP_CHECK: call {} m={} mismatches dd {}/{} uu {}/{} x {}/{} inj {}/{} \
+            crate::dprintln!("HC_STEP_CHECK: call {} m={} mismatches dd {}/{} uu {}/{} x {}/{} inj {}/{} \
                       (first dd {:?} uu {:?} x {:?} inj {:?}; max|d| {:.3e} {:.3e} {:.3e} {:.3e}) \
                       calls-with-mismatch {}/{}",
                      g.0, m, dd.0, m * lr, uu.0, m * rw, xx.0, m * h, ni, m * hcn,
@@ -8633,7 +8983,7 @@ impl FwdModel {
                             };
                             if exl3_r16_on() && c < 4 {
                                 static R16NC: std::sync::Once = std::sync::Once::new();
-                                R16NC.call_once(|| println!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 not co-resident \
+                                R16NC.call_once(|| crate::dprintln!("EXL3-R16: xq_hc_fuse_i8_rbk_r16 not co-resident \
                                                        ({c} CTAs); m > 8 keeps the m-grid path"));
                             }
                             c
@@ -8818,7 +9168,7 @@ impl FwdModel {
                 ple.embed_row_ref(&uids, &mut refr)?;
                 let (n, first) = wp05_diff_u16(&emb_bits[q * 2560..(q + 1) * 2560], &refr);
                 if n > 0 || q == 0 {
-                    println!("PLE_XCHECK step row {q}/{m} slot {s}: {n} mismatching f16 of 2560 (first (idx, new, old) {first:?})");
+                    crate::dprintln!("PLE_XCHECK step row {q}/{m} slot {s}: {n} mismatching f16 of 2560 (first (idx, new, old) {first:?})");
                 }
             }
             hist[s * 2] = hist[s * 2 + 1];
@@ -8954,7 +9304,7 @@ impl FwdModel {
             let a = self.dev.dtoh_sync_copy(&sc.argmax)?;
             let b = self.dev.dtoh_sync_copy(&old)?;
             let mism: Vec<(usize, i32, i32)> = (0..m).filter(|&i| a[i] != b[i]).map(|i| (i, a[i], b[i])).collect();
-            println!("WP09_XCHECK argmax m={m} v={v} nb={nb} mism={} first={:?} ids={:?}",
+            crate::dprintln!("WP09_XCHECK argmax m={m} v={v} nb={nb} mism={} first={:?} ids={:?}",
                      mism.len(), mism.first(), &a[..m]);
         }
         Ok(())
@@ -8974,6 +9324,8 @@ impl FwdModel {
     /// on its LOCAL route tables (the filter inside moe_inner) and then turns the rank's routed
     /// (+ rank-0 shared) contribution into the full-rank moe_out with one FP32 all-reduce.
     fn moe(&self, l: &Launcher, sc: &mut Scratch, moe: &MoeLayer, m: usize) -> Result<()> {
+        if moe.dense { return self.dense_mlp(l, sc, moe, m); } // EXL27B
+        if moe.split.is_some() { return self.moe_split(l, sc, moe, m); } // EXL27B
         self.moe_inner(l, sc, moe, m)?;
         if let Some(ep) = moe.ep.as_ref() {
             self.ep_combine_reduce(l, sc, moe, ep, m)?;
@@ -8982,6 +9334,87 @@ impl FwdModel {
         if xtp::moe_ulp_armed() && moe.ep.is_none() && self.tp.is_none() && !stream_capturing(l) {
             self.moe_ulp_perturb(sc, m)?;
         }
+        Ok(())
+    }
+
+    /// EXL27B: a dense pack's MLP (MoeLayer::dense) at the decode / verify widths — gate|up as one
+    /// chain pair (each quad its own suh/svh/bits; split-K, batch-invariant), silu(g)*u + down, into
+    /// moe_out. A copy of the shared-expert sequence of moe_inner (shared_down reused as is).
+    fn dense_mlp(&self, l: &Launcher, sc: &mut Scratch, moe: &MoeLayer, m: usize) -> Result<()> {
+        exl3_chain_pair(l, &moe.sh_gate, &moe.sh_up, &sc.x,
+                        &mut sc.chain_xh, &mut sc.chain_yraw, &sc.chain_ws,
+                        &mut sc.pair_xh, &mut sc.pair_yraw, &sc.pair_ws,
+                        &mut sc.sh1, &mut sc.sh2, m)?;
+        self.shared_down(l, sc, moe, m)?;
+        let n = (m * self.cfg.hidden_size) as i64;
+        xqlaunch!(l, "xq_copy_u16", (((n + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut sc.moe_out, &sc.ysh, n, 0i64, 0i64))?;
+        Ok(())
+    }
+
+    /// EXL27B: a Qwen3.5-class MoE layer (MoeLayer::split) at the decode / verify widths — a copy of
+    /// moe_inner's plain launch sequence with gate and up as two grouped GEMMs (each its own suh / svh):
+    /// router GEMV (bit-exact twin) + softmax / top-k / renorm + device routing; xh_e = H(x*suh_g),
+    /// yd_raw = H(x*suh_u) (dead until the down GEMM); gate -> ygu_raw -> svh -> ygu, up -> yd -> svh
+    /// -> ygu_raw; din = silu(g)*u; down; shared expert; combine.
+    fn moe_split(&self, l: &Launcher, sc: &mut Scratch, moe: &MoeLayer, m: usize) -> Result<()> {
+        let sp = moe.split.as_ref().expect("moe_split on a non-split layer");
+        let (h, ne, topk, mi) = (self.cfg.hidden_size, self.cfg.num_experts, self.cfg.num_experts_per_tok,
+                                 self.cfg.moe_intermediate_size);
+        let bits = moe.bits as i32;
+        xqlaunch!(l, "xq_gemm_f16_f32_v", (((ne as u32) + 255) / 256, m as u32, 1), (256, 1, 1), 0,
+                 (&mut sc.logits_r, &moe.router, &sc.x, m as i32, ne as i32, h as i32))?;
+        xqlaunch!(l, "xq_router_topk", (m as u32, 1, 1), (256, 1, 1), ((256 + ne + 512) * 4) as u32,
+                 (&mut sc.ids, &mut sc.wts, &sc.logits_r, ne as i32, topk as i32, m as i32))?;
+        // TP-A: under EP the route tables are rebuilt over THIS rank's local experts (the
+        // router/top-k above ran replicated; global ids/wts stay global for the combine).
+        if let Some(ep) = moe.ep.as_ref() {
+            xqlaunch!(l, "xq_moe_route_ep", (1, 1, 1), (256, 1, 1), 0,
+                     (&sc.ids, m as i32, topk as i32, ne as i32, &ep.lut, &mut sc.slotmap, &mut sc.idxmap,
+                      &mut sc.esel, &mut sc.offs_gu, &mut sc.offs_d, moe.gu_words, moe.d_words))?;
+        } else {
+            xqlaunch!(l, "xq_moe_route", (1, 1, 1), (256, 1, 1), 0,
+                     (&sc.ids, m as i32, topk as i32, ne as i32, &mut sc.slotmap, &mut sc.idxmap,
+                      &mut sc.esel, &mut sc.offs_gu, &mut sc.offs_d, moe.gu_words, moe.d_words))?;
+        }
+        let emax = sc.idxmap.len() as i32;
+        let mi_ = mi as i32;
+        let h_ = h as i32;
+        let m_ = m as i32;
+        xqlaunch!(l, "xq_had_suh_multi", ((emax * m_ * (h_ / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&sc.x, &moe.suh_gu, &sc.idxmap, &mut sc.xh_e, m_, h_, &sc.esel, 0i32))?;
+        xqlaunch!(l, "xq_had_suh_multi", ((emax * m_ * (h_ / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&sc.x, &sp.suh_u, &sc.idxmap, &mut sc.yd_raw, m_, h_, &sc.esel, 0i32))?;
+        let gk = grouped_fn(m, h, moe.bits);
+        xqlaunch!(l, gk, ((emax * (mi_ / 128)) as u32, 1, 1), (256, 1, 1), a1_smem(m, h),
+                 (&moe.gu_tr, &sc.offs_gu, &sc.xh_e, &mut sc.ygu_raw, m_, h_, mi_, bits, &sc.esel))?;
+        xqlaunch!(l, gk, ((emax * (mi_ / 128)) as u32, 1, 1), (256, 1, 1), a1_smem(m, h),
+                 (&sp.up_tr, &sc.offs_gu, &sc.yd_raw, &mut sc.yd, m_, h_, mi_, bits, &sc.esel))?;
+        xqlaunch!(l, "xq_had_svh_multi", ((emax * m_ * (mi_ / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&sc.ygu_raw, &moe.svh_gu, &sc.idxmap, &mut sc.ygu, m_, mi_, &sc.esel))?;
+        xqlaunch!(l, "xq_had_svh_multi", ((emax * m_ * (mi_ / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&sc.yd, &sp.svh_u, &sc.idxmap, &mut sc.ygu_raw, m_, mi_, &sc.esel))?;
+        let n = (emax as usize) * m * mi;
+        xqlaunch!(l, "xq_silu_mul", (((n as u32) + 255) / 256, 1, 1), (256, 1, 1), 0,
+                 (&mut sc.din, &sc.ygu, &sc.ygu_raw, n as i64))?;
+        xqlaunch!(l, "xq_had_suh_multi", ((emax * m_ * (mi_ / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&sc.din, &moe.suh_d, &sc.idxmap, &mut sc.xhd, m_, mi_, &sc.esel, 1i32))?;
+        xqlaunch!(l, grouped_fn(m, mi, moe.bits), ((emax * (h_ / 128)) as u32, 1, 1), (256, 1, 1), a1_smem(m, mi),
+                 (&moe.d_tr, &sc.offs_d, &sc.xhd, &mut sc.yd_raw, m_, mi_, h_, bits, &sc.esel))?;
+        xqlaunch!(l, "xq_had_svh_multi", ((emax * m_ * (h_ / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&sc.yd_raw, &moe.svh_d, &sc.idxmap, &mut sc.yd, m_, h_, &sc.esel))?;
+        exl3_chain_pair(l, &moe.sh_gate, &moe.sh_up, &sc.x,
+                        &mut sc.chain_xh, &mut sc.chain_yraw, &sc.chain_ws,
+                        &mut sc.pair_xh, &mut sc.pair_yraw, &sc.pair_ws,
+                        &mut sc.sh1, &mut sc.sh2, m)?;
+        self.shared_down(l, sc, moe, m)?;
+        if let Some(ep) = moe.ep.as_ref() {
+            // TP-A: local picks + this rank's shared partial -> one FP32 all-reduce -> moe_out
+            return self.ep_combine_reduce(l, sc, moe, ep, m);
+        }
+        xqlaunch!(l, "xq_moe_combine", (m as u32, 1, 1), (1024, 1, 1), 4096,
+                 (&mut sc.moe_out, &sc.yd, &sc.ysh, &sc.ids, &sc.wts, &sc.slotmap, &moe.sg, &sc.x,
+                  topk as i32, h_, m_))?;
         Ok(())
     }
 
@@ -9129,7 +9562,7 @@ impl FwdModel {
                 static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let c = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if c < 4 || dl + di + dw + dr > 0 {
-                    println!("ROUTER_XCHECK m={m}: logits bit-diff {dl}/{nl}, ids {di}/{nk}, wts {dw}/{nk}, route tables {dr}/5 (esel {})", e1[0]);
+                    crate::dprintln!("ROUTER_XCHECK m={m}: logits bit-diff {dl}/{nl}, ids {di}/{nk}, wts {dw}/{nk}, route tables {dr}/5 (esel {})", e1[0]);
                 }
                 if dl + di + dw + dr > 0 { anyhow::bail!("fused routing diverges from the reference path"); }
             }
@@ -9176,14 +9609,14 @@ impl FwdModel {
             };
             if coal {
                 static K2_ONCE: std::sync::Once = std::sync::Once::new();
-                K2_ONCE.call_once(|| println!("A5-K2: router fold COAL ON (xq_router_fold_c, grid {} x 256, smem {RFC_SMEM}; \
+                K2_ONCE.call_once(|| crate::dprintln!("A5-K2: router fold COAL ON (xq_router_fold_c, grid {} x 256, smem {RFC_SMEM}; \
                                                --router-coal=0 = the previous fold)", ne / 4));
             }
             if !w4r {
             let f = xq_raw_fn(fname)
                 .ok_or_else(|| anyhow::anyhow!("{fname} raw fn unavailable (stale PTX?)"))?;
             static WP10_ONCE: std::sync::Once = std::sync::Once::new();
-            WP10_ONCE.call_once(|| println!("WP10: routing fold ON ({fname}; --wp10-off=1 = S-A3-z pair, \
+            WP10_ONCE.call_once(|| crate::dprintln!("WP10: routing fold ON ({fname}; --wp10-off=1 = S-A3-z pair, \
                                               --wp10-gemv=0 = legacy GEMV lane map)"));
             if m > 8 {
                 // S-B9-CF-R16B: record the router entry actually serving a 9..16-row group
@@ -9213,7 +9646,7 @@ impl FwdModel {
             ];
             if matches!(entry, RouterEntry::FoldEp) {
                 static EPF_ONCE: std::sync::Once = std::sync::Once::new();
-                EPF_ONCE.call_once(|| println!("TP-G: EP route folded into the router fold (xq_router_fold_c_ep; \
+                EPF_ONCE.call_once(|| crate::dprintln!("TP-G: EP route folded into the router fold (xq_router_fold_c_ep; \
                                                 --tp-route-fold=0 = fold + xq_moe_route_ep)"));
             }
             let grid = ((ne / 4) as u32, 1u32, 1u32);
@@ -9248,7 +9681,7 @@ impl FwdModel {
                 static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let c = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if c < 4 || dl + di + dw + dr > 0 {
-                    println!("WP10_XCHECK {fname} vs {} m={m}: logits bit-diff {dl}/{nl}, ids {di}/{nk}, wts {dw}/{nk}, route tables {dr}/5 (esel {}){first}",
+                    crate::dprintln!("WP10_XCHECK {fname} vs {} m={m}: logits bit-diff {dl}/{nl}, ids {di}/{nk}, wts {dw}/{nk}, route tables {dr}/5 (esel {}){first}",
                              if fxc { "S-A3-z pair" } else { "ks path" }, e1[0]);
                 }
                 if dl + di + dw + dr > 0 { anyhow::bail!("WP10 routing fold diverges from the reference path"); }
@@ -9278,7 +9711,7 @@ impl FwdModel {
             static ROUTE_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             use std::sync::atomic::Ordering;
             if ROUTE_ONCE.swap(false, Ordering::SeqCst) || !ok {
-                println!("EXL3_ROUTE_CHECK: {} (esel device {:?} vs host {})",
+                crate::dprintln!("EXL3_ROUTE_CHECK: {} (esel device {:?} vs host {})",
                          if ok { "PASS" } else { "FAIL" }, es_h.first(), uniq.len());
             }
             if !ok { anyhow::bail!("device MoE routing diverges from host grouping"); }
@@ -9697,7 +10130,7 @@ impl FwdModel {
             let g = |p: &Option<MpkPlan>| p.map_or(String::new(), |p| format!(" G{}", p.grid));
             let gu = if gu_pk.is_none() && moe_gu_fold(l, m) && sel.gu == wp20_gu_fn(true) {
                 WP20_GU_FOLD_FN } else { gu };
-            println!("MOE_EPI_CHECK m={m} esel={es} topk={} {gu}{}+{dnn}{} fold {} suh seq 0x{conv:02x}: bit-diff ygu {dg}/{ng}, \
+            crate::dprintln!("MOE_EPI_CHECK m={m} esel={es} topk={} {gu}{}+{dnn}{} fold {} suh seq 0x{conv:02x}: bit-diff ygu {dg}/{ng}, \
                       xhd {dx}/{nx}, yd {dy}/{ny}, moe_out {dn}/{no} (outputs NaN-poisoned first); counters {}{}",
                      sel.topk, g(&gu_pk), g(&dn_pk), fold_live as u8, if armed { "re-armed" } else { "NOT re-armed" },
                      if first.is_empty() { String::new() } else { format!(" (first mismatches:{first})") });
@@ -9724,10 +10157,10 @@ impl FwdModel {
                     let mean = row.iter().enumerate().map(|(e, &c)| e as f64 * c as f64).sum::<f64>() / n as f64;
                     let nz: Vec<String> = row.iter().enumerate().filter(|(_, &c)| c > 0)
                         .map(|(e, &c)| format!("{e}:{c}")).collect();
-                    println!("ESEL_HIST m={m} calls={n} mean={mean:.2} [{}]", nz.join(" "));
+                    crate::dprintln!("ESEL_HIST m={m} calls={n} mean={mean:.2} [{}]", nz.join(" "));
                 }
             }
-            Err(e) => eprintln!("[exl3] --exl3-esel-hist dtoh: {e}"),
+            Err(e) => crate::deprintln!("[exl3] --exl3-esel-hist dtoh: {e}"),
         }
     }
 
@@ -9749,7 +10182,7 @@ impl FwdModel {
             anyhow::ensure!(rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "route-log counter reset ({rc:?})");
             Ok(())
         })();
-        if let Err(e) = res { eprintln!("[exl3] --exl3-route-log dump: {e}"); }
+        if let Err(e) = res { crate::deprintln!("[exl3] --exl3-route-log dump: {e}"); }
     }
 
     /// TP-I #6 diagnostic: write the cumulative --tp-ep-hist routing histogram (no-op when off).
@@ -9762,9 +10195,9 @@ impl FwdModel {
                 let picks: Vec<&[i32]> = (0..nl).map(|l| &v[l * 2 * ne + ne..(l + 1) * 2 * ne]).collect();
                 let j = serde_json::json!({"ne": ne, "layers": nl, "topk": self.cfg.num_experts_per_tok,
                                            "live": live, "picks": picks});
-                if let Err(e) = std::fs::write(path, j.to_string()) { eprintln!("[exl3] --tp-ep-hist write {path}: {e}"); }
+                if let Err(e) = std::fs::write(path, j.to_string()) { crate::deprintln!("[exl3] --tp-ep-hist write {path}: {e}"); }
             }
-            Err(e) => eprintln!("[exl3] --tp-ep-hist dtoh: {e}"),
+            Err(e) => crate::deprintln!("[exl3] --tp-ep-hist dtoh: {e}"),
         }
     }
 
@@ -9901,7 +10334,7 @@ impl FwdModel {
     /// into sh1) + the down chain. Bitwise either way (xq_silu_mul's element expression verbatim).
     fn shared_down(&self, l: &Launcher, sc: &mut Scratch, moe: &MoeLayer, m: usize) -> Result<()> {
         let mi = moe.sh_down.k as usize; // TP-B: the rank's shared-expert intermediate slice (640 at TP=1)
-        if dense::silu_on() && m <= 16 {
+        if dense::silu_on() && m <= 16 && !(moe.dense && moe.sh_down.rowpar) {
             use dense::{dptr, DOut};
             let o = DOut { y: dptr(&sc.ysh), y_len: sc.ysh.len(), yraw: dptr(&sc.chain_yraw), yraw_len: sc.chain_yraw.len(),
                            xh: 0, xh_len: 0 };
@@ -9914,7 +10347,11 @@ impl FwdModel {
         let sh1p = *sc.sh1.device_ptr() as u64;
         xqlaunch!(l, "xq_silu_mul", (((m * mi) as u32) / 256 + 1, 1, 1), (256, 1, 1), 0,
                  (&mut sc.sh1, sh1p, &sc.sh2, (m * mi) as i64))?;
-        exl3_chain(l, &moe.sh_down, &sc.sh1, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.ysh, m, &sc.chain_ws)
+        if moe.dense && moe.sh_down.rowpar {
+            self.chain_o(l, &moe.sh_down, &sc.sh1, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.ysh, m, &sc.chain_ws)
+        } else {
+            exl3_chain(l, &moe.sh_down, &sc.sh1, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.ysh, m, &sc.chain_ws)
+        }
     }
 
     /// `idx_pre`: sc.qsa_qk already holds this step's indexer projection (W4/DENSE attention group,
@@ -10062,7 +10499,7 @@ impl FwdModel {
                      else { "xq_qsa_topk_asc" };
         if qsa_select_on() {
             static K3_ONCE: std::sync::Once = std::sync::Once::new();
-            K3_ONCE.call_once(|| println!("A5-K3: QSA top-k select asc3 ON (xq_qsa_topk_asc3, grid m x 1024; \
+            K3_ONCE.call_once(|| crate::dprintln!("A5-K3: QSA top-k select asc3 ON (xq_qsa_topk_asc3, grid m x 1024; \
                                            --qsa-select=0 = xq_qsa_topk_asc2)"));
         }
         xqlaunch!(l, topk_k, (m as u32, 1, 1), (1024, 1, 1), 0,
@@ -10216,7 +10653,7 @@ impl FwdModel {
             let first = (0..np).find(|&i| tm[i].to_bits() != rm[i].to_bits() || tl[i].to_bits() != rl[i].to_bits())
                 .map(|i| format!(" first partial {i}: m {:e}/{:e} l {:e}/{:e}", tm[i], rm[i], tl[i], rl[i]))
                 .unwrap_or_default();
-            println!("W4QSA_XCHECK #{c} layer {lay} m={m} kv_fmt={}: xq_attn_sel_union vs {kname} bit-differ pm {dm} pl {dl} \
+            crate::dprintln!("W4QSA_XCHECK #{c} layer {lay} m={m} kv_fmt={}: xq_attn_sel_union vs {kname} bit-differ pm {dm} pl {dl} \
                       pacc {da} of {np} / {} (live splits {live}, poison left {left}; mismatching calls so far {}){first}",
                      self.kv_fmt, np * hd, BAD.load(std::sync::atomic::Ordering::Relaxed));
         }
@@ -10246,7 +10683,7 @@ impl FwdModel {
         let (a, b) = (self.dev.dtoh_sync_copy(&sc.qsa_scores)?, self.dev.dtoh_sync_copy(&xs)?);
         let pos = self.dev.dtoh_sync_copy(&sc.pos)?;
         if a.len() < m * nblk_stride {
-            println!("SCORE_XCHECK skipped: score scratch {} < {m} x {nblk_stride}", a.len());
+            crate::dprintln!("SCORE_XCHECK skipped: score scratch {} < {m} x {nblk_stride}", a.len());
             return Ok(());
         }
         let ratio = self.cfg.indexer_compress_ratio.max(1);
@@ -10266,7 +10703,7 @@ impl FwdModel {
         let c = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if c < 4 || nd > 0 || c.is_power_of_two() {
             let lay = if att_i == HEAD_ATT { "head".to_string() } else { att_i.to_string() };
-            println!("SCORE_XCHECK #{c} layer {lay} m={m} pos0={}: qsa_score_pooled_mr vs pooled_b bit-differ {nd}/{tot}{first}",
+            crate::dprintln!("SCORE_XCHECK #{c} layer {lay} m={m} pos0={}: qsa_score_pooled_mr vs pooled_b bit-differ {nd}/{tot}{first}",
                      pos[0]);
         }
         Ok(())
@@ -10305,7 +10742,7 @@ impl FwdModel {
         let c = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if c < 4 || nd > 0 || c.is_power_of_two() {
             let lay = if att_i == HEAD_ATT { "head".to_string() } else { att_i.to_string() };
-            println!("TOPK_XCHECK #{c} layer {lay} m={m} pos_sel0={}: {kname} vs asc differ {nd}/{tot}{first}", p1[0]);
+            crate::dprintln!("TOPK_XCHECK #{c} layer {lay} m={m} pos_sel0={}: {kname} vs asc differ {nd}/{tot}{first}", p1[0]);
         }
         Ok(())
     }
@@ -10335,7 +10772,7 @@ impl FwdModel {
             let first = (0..np).find(|&i| tm[i].to_bits() != rm[i].to_bits() || tl[i].to_bits() != rl[i].to_bits())
                 .map(|i| format!(" first partial {i}: m {:e}/{:e} l {:e}/{:e}", tm[i], rm[i], tl[i], rl[i]))
                 .unwrap_or_default();
-            println!("GATHER_XCHECK #{c} layer {lay} m={m}: {kname} vs xq_attn_sel_splitk4 bit-differ pm {dm} pl {dl} pacc {da} of {np} / {}{first}",
+            crate::dprintln!("GATHER_XCHECK #{c} layer {lay} m={m}: {kname} vs xq_attn_sel_splitk4 bit-differ pm {dm} pl {dl} pacc {da} of {np} / {}{first}",
                      np * hd);
         }
         Ok(())
@@ -10757,8 +11194,13 @@ impl FwdModel {
                         }
                     }
                     wp27.join(&wp27_z)?; // WP27: the gate reads zbuf
+                    if cfg.gdn_gate_sigmoid {
                     xqlaunch!(l, "xq_gdn_gate", ((m * nh) as u32, 1, 1), (vd as u32, 1, 1), (vd * 4) as u32,
                              (&mut sc.normed, &sc.core, &sc.zbuf, &g.norm, vd as i32, nh as i32, m as i32, cfg.rms_eps))?;
+                    } else { // EXL27B: Qwen3.5-class gated norm, silu(z) (a kernel copy)
+                    xqlaunch!(l, "xq_gdn_gate_silu", ((m * nh) as u32, 1, 1), (vd as u32, 1, 1), (vd * 4) as u32,
+                             (&mut sc.normed, &sc.core, &sc.zbuf, &g.norm, vd as i32, nh as i32, m as i32, cfg.rms_eps))?;
+                    }
                     if li == 0 {
                         if let Some(d) = pd.as_ref() {
                             self.dev.synchronize()?;
@@ -10869,6 +11311,26 @@ impl FwdModel {
             }
             let ymlp_p = *sc.moe_out.device_ptr() as u64;
             self.hc_post_d(&l, sc, ymlp_p, m, hc_def, &mut hc_pend)?; // mlp site: inject moe_out (was stale mixer_out — root cause)
+            // EXL27C-DF2 (fwd): the DFlash2 tap - hidden_states[li+1] (the post-MLP-inject
+            // residual, sc.resid's stream-0 slice) into the round's 8-column sink, mirroring
+            // the NVFP4 trunk's S4F hook (gpu.rs forward_batch_dev: `n <= block()` gate,
+            // TAP_LAYERS position, cols [0, m)). The 27B never defers the inject (hc_defer()
+            // needs hidden <= 4096) but flush anyway so the tap reads the materialized
+            // residual under any config - the flush is bitwise the fused path (w4 note).
+            // Graph-safe: the sink staging and sc.resid addresses are fixed per graph key.
+            // Zero-cost when the sink is unarmed. Under TP every rank holds the full token
+            // rows, so the taps are rank-identical (the trunk captures on all ranks too).
+            if self.df2_sink.is_some() && m <= crate::dflash2::block()
+                && self.cfg.hidden_size == crate::dflash2::HIDDEN {
+                if let Some(kk) = crate::dflash2::TAP_LAYERS.iter().position(|&x| x == li) {
+                    if hc_pend.is_some() { self.hc_flush(&l, sc, m, &mut hc_pend)?; }
+                    crate::dflash2::capture::capture_cols_f32(
+                        &self.dev, l.stream, self.df2_sink.as_ref().unwrap(),
+                        *sc.resid.device_ptr() as u64,
+                        self.cfg.hc_count.max(1) * self.cfg.hidden_size,
+                        self.cfg.hidden_size, m, kk)?;
+                }
+            }
             if li == 0 {
                 if let Some(d) = pd.as_ref() {
                     self.dev.synchronize()?;
@@ -10949,7 +11411,7 @@ impl FwdModel {
         unsafe {
             let r = sys::cuStreamBeginCapture_v2(raw, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             if r != sys::CUresult::CUDA_SUCCESS {
-                crate::rprintln!("EXL3_GRAPH: BeginCapture failed ({r:?}) at width {m} — staying eager");
+                crate::drprintln!("EXL3_GRAPH: BeginCapture failed ({r:?}) at width {m} — staying eager");
                 crate::metrics::graph_capture_lost("step", &format!("width {m}, qsa={qsa}, mixed rows={md}"), &format!("{r:?}"));
                 return;
             }
@@ -10958,7 +11420,7 @@ impl FwdModel {
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let r2 = unsafe { sys::cuStreamEndCapture(raw, &mut graph) };
         if r2 != sys::CUresult::CUDA_SUCCESS || cap.is_err() {
-            crate::rprintln!("EXL3_GRAPH: capture failed (end={r2:?}, body={:?}) at width {m} — staying eager", cap.err());
+            crate::drprintln!("EXL3_GRAPH: capture failed (end={r2:?}, body={:?}) at width {m} — staying eager", cap.err());
             crate::metrics::graph_capture_lost("step", &format!("width {m}, qsa={qsa}, mixed rows={md}"), &capture_lost_status(r2));
             return;
         }
@@ -10974,14 +11436,14 @@ impl FwdModel {
                 // S-B9-REL-SMALLFIXES 9a(iii): the mixed-step graphs are lazy and uncapped — count
                 // them (gauge + the scheduler's idle line) and say so once, at the first capture.
                 if md > 0 && crate::metrics::mixed_step_graph_captured() == 1 {
-                    crate::rprintln!("[exl3] per-row attention regime: first mixed-step graph captured (width {m}, {md} dense row(s)). \
+                    crate::drprintln!("[exl3] per-row attention regime: first mixed-step graph captured (width {m}, {md} dense row(s)). \
 One is captured lazily per step shape seen (width, dense rows, sparse grid bucket); they are not capped. Count: \
 velogb10_graph_cache_mixed_step_entries on /metrics and the scheduler's idle line");
                 }
-                if graph_log_on() { crate::rprintln!("EXL3_GRAPH: captured decode step at width {m}{}",
+                if graph_log_on() { crate::drprintln!("EXL3_GRAPH: captured decode step at width {m}{}",
                                                       if md > 0 { format!(" (mixed regime: {md} dense rows)") } else { String::new() }); }
             } else {
-                crate::rprintln!("EXL3_GRAPH: instantiate failed ({r3:?}) at width {m} — staying eager");
+                crate::drprintln!("EXL3_GRAPH: instantiate failed ({r3:?}) at width {m} — staying eager");
                 crate::metrics::graph_capture_lost("step", &format!("width {m}, qsa={qsa}, mixed rows={md}"), &format!("instantiate {r3:?}"));
             }
         }
@@ -11240,7 +11702,7 @@ pub fn run(a: &FwdArgs) -> Result<()> {
             tok.encode(&text, false)?
         }
     };
-    println!("prompt: {} tokens (first 8: {:?})", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(8)]);
+    crate::dprintln!("prompt: {} tokens (first 8: {:?})", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(8)]);
 
     let mut ladder = a.ladder_dir.as_ref().map(|d| {
         std::fs::create_dir_all(d).ok();
@@ -11275,7 +11737,7 @@ pub fn run(a: &FwdArgs) -> Result<()> {
                 p2 = end;
             }
             let dt = tr.elapsed().as_secs_f32();
-            println!("prefill rep {rep}: {} tokens in {:.2}s ({:.0} tok/s)", prompt_ids.len(), dt, prompt_ids.len() as f32 / dt);
+            crate::dprintln!("prefill rep {rep}: {} tokens in {:.2}s ({:.0} tok/s)", prompt_ids.len(), dt, prompt_ids.len() as f32 / dt);
             model.reset_slot(0)?;
         }
         if reps > 1 || crate::opts::var(crate::opt!("prefill-warmup")).is_ok() {
@@ -11302,11 +11764,11 @@ pub fn run(a: &FwdArgs) -> Result<()> {
     last = *prompt_ids.last().context("empty prompt")? as i32;
     let prefill_s = t0.elapsed().as_secs_f32();
     if a.prefill_chunk.is_some() {
-        println!("prefill: {} tokens in {:.1}s ({:.0} tok/s, chunked wide-M prefill, C={})",
+        crate::dprintln!("prefill: {} tokens in {:.1}s ({:.0} tok/s, chunked wide-M prefill, C={})",
                  prompt_ids.len(), prefill_s, prompt_ids.len() as f32 / prefill_s.max(1e-9),
                  a.prefill_chunk.unwrap_or(0));
     } else {
-        println!("prefill: {} tokens in {:.1}s ({:.0} tok/s, sequential decode-step prefill)",
+        crate::dprintln!("prefill: {} tokens in {:.1}s ({:.0} tok/s, sequential decode-step prefill)",
                  prompt_ids.len(), prefill_s, prompt_ids.len() as f32 / prefill_s.max(1e-9));
     }
 
@@ -11342,7 +11804,7 @@ pub fn run(a: &FwdArgs) -> Result<()> {
         let id = ids[0];
         pos += 1;
         if EOS_IDS.contains(&id) {
-            println!("EOS at step {step} (id {id})");
+            crate::dprintln!("EOS at step {step} (id {id})");
             break;
         }
         out_ids.push(id as u32);
@@ -11354,16 +11816,16 @@ pub fn run(a: &FwdArgs) -> Result<()> {
     let text = tok.decode(&out_ids, true)?;
     round_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let med = round_ms.get(round_ms.len() / 2).copied().unwrap_or(0.0);
-    println!("generated {} tokens; round ms: median {:.1} p10 {:.1} p90 {:.1}",
+    crate::dprintln!("generated {} tokens; round ms: median {:.1} p10 {:.1} p90 {:.1}",
              out_ids.len(), med,
              round_ms.get(round_ms.len() / 10).copied().unwrap_or(0.0),
              round_ms.get(round_ms.len() * 9 / 10).copied().unwrap_or(0.0));
-    println!("effective GB/s (byte model / median round): {:.1}",
+    crate::dprintln!("effective GB/s (byte model / median round): {:.1}",
              model.bytes_per_round as f64 / 1e9 / (med / 1000.0));
-    println!("---- TEXT ----");
-    println!("{text}");
-    println!("---- IDS ----");
-    println!("{out_ids:?}");
+    crate::dprintln!("---- TEXT ----");
+    crate::dprintln!("{text}");
+    crate::dprintln!("---- IDS ----");
+    crate::dprintln!("{out_ids:?}");
 
     // width sweep (bench mode): flatness through the assembled model
     if a.widths.len() > 1 || a.bench_steps > 0 {
@@ -11395,7 +11857,7 @@ pub fn run(a: &FwdArgs) -> Result<()> {
             }
             ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let med = ms.get(ms.len() / 2).copied().unwrap_or(0.0);
-            println!("W={w}: median round {:.1} ms over {} steps (byte model {:.2} GB/round → {:.1} GB/s)",
+            crate::dprintln!("W={w}: median round {:.1} ms over {} steps (byte model {:.2} GB/round → {:.1} GB/s)",
                      med, ms.len(), m2.bytes_per_round as f64 / 1e9,
                      m2.bytes_per_round as f64 / 1e9 / (med / 1000.0));
         }
@@ -11445,7 +11907,7 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
         }
     };
     let plen = prompt_ids.len();
-    println!("MTP-BENCH depth={depth} prompt={plen} tokens max_new={} model={}", a.max_new, a.dir);
+    crate::dprintln!("MTP-BENCH depth={depth} prompt={plen} tokens max_new={} model={}", a.max_new, a.dir);
 
     // ---- prefill (trunk only; the SERVE primes the head ONCE — the chain-verify
     // round mirrors that; the S-A3-e per-position priming is the OLD arm's) ----
@@ -11467,14 +11929,14 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
         last = *prompt_ids.last().unwrap() as i32;
         model.forward_step(&mut sc, &[last], &[pos], &[0], None)?;
         pos += 1;
-        println!("prefill: {:.1} s (chunked C={cw}, served posture)", t0.elapsed().as_secs_f32());
+        crate::dprintln!("prefill: {:.1} s (chunked C={cw}, served posture)", t0.elapsed().as_secs_f32());
     } else {
     for (i, t) in prompt_ids.iter().enumerate() {
         last = *t as i32;
         model.forward_step(&mut sc, &[last], &[pos], &[0], None)?;
         pos += 1;
     }
-    println!("prefill: {:.1} s", t0.elapsed().as_secs_f32());
+    crate::dprintln!("prefill: {:.1} s", t0.elapsed().as_secs_f32());
     }
 
     // The trunk's argmax after the last prompt token IS t_plen — the first generated token
@@ -11531,13 +11993,13 @@ pub fn run_mtp_bench(a: &FwdArgs, depth: usize) -> Result<()> {
     let acc_pct = if drafted > 0 { 100.0 * accepted as f64 / drafted as f64 } else { 0.0 };
     let e_per_round = if rounds.is_empty() { 0.0 } else { actual.len() as f64 / rounds.len() as f64 };
     let mtp_decode_s = round_ms.iter().sum::<f64>() / 1e3;
-    println!("MTP-BENCH RESULT depth={depth} (chain-verify, the wired serve path)");
-    println!("  generated {} tokens vs plain greedy ground truth", actual.len());
-    println!("  acceptance {accepted}/{drafted} = {acc_pct:.2}%   mean accepted prefix {mean_prefix:.3}   emitted/round {e_per_round:.2}");
-    println!("  round (median) {rms:.1} ms   decode-only tok/s {:.1}",
+    crate::dprintln!("MTP-BENCH RESULT depth={depth} (chain-verify, the wired serve path)");
+    crate::dprintln!("  generated {} tokens vs plain greedy ground truth", actual.len());
+    crate::dprintln!("  acceptance {accepted}/{drafted} = {acc_pct:.2}%   mean accepted prefix {mean_prefix:.3}   emitted/round {e_per_round:.2}");
+    crate::dprintln!("  round (median) {rms:.1} ms   decode-only tok/s {:.1}",
              if mtp_decode_s > 0.0 { (actual.len() - 1) as f64 / mtp_decode_s } else { 0.0 });
     let plain = if rms > 0.0 { 1e3 * e_per_round / rms } else { 0.0 };
-    println!("  effective served tok/s (emitted/round / round) {plain:.1}");
+    crate::dprintln!("  effective served tok/s (emitted/round / round) {plain:.1}");
     Ok(())
 }
 
@@ -11621,7 +12083,7 @@ pub fn probe_state_exl3(a: &FwdArgs) -> Result<()> {
     let mut sc = Scratch::new(&model.dev, &model.cfg, w, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let v = model.cfg.vocab_size as i32;
-    println!("EXL3 GDN state-equivalence probe: prompt={} tokens, K={} continuations, N=1..={w}",
+    crate::dprintln!("EXL3 GDN state-equivalence probe: prompt={} tokens, K={} continuations, N=1..={w}",
              ids.len(), k_steps);
 
     // ---- N=1 reference: slot 0 alone, m=1 sweeps ----
@@ -11675,7 +12137,7 @@ pub fn probe_state_exl3(a: &FwdArgs) -> Result<()> {
         let amiss = lane0.iter().zip(ref_toks.iter()).filter(|(a, b)| a != b).count();
         let exact = maxd == 0.0 && neq == 0 && amiss == 0;
         all_exact &= exact;
-        println!("N={n}: max |s_state(lane0@m={n}) - s_state(@m=1)| = {maxd:.7}  \
+        crate::dprintln!("N={n}: max |s_state(lane0@m={n}) - s_state(@m=1)| = {maxd:.7}  \
                   bit-neq={neq}  argmax-mismatch={amiss}  {}",
                  if exact { "EXACT MATCH" } else { "DIVERGES" });
         if !exact { first_bad = first_bad.or(Some(n)); }
@@ -11730,12 +12192,12 @@ pub fn probe_state_exl3(a: &FwdArgs) -> Result<()> {
                 max_ulp = max_ulp.max((b as i32) - (a as i32)).max((a as i32) - (b as i32));
             }
         }
-        println!("LOGITS row0 @m={nbad} vs @m=1 (first cont step): {ndiff}/{v} entries differ, \
+        crate::dprintln!("LOGITS row0 @m={nbad} vs @m=1 (first cont step): {ndiff}/{v} entries differ, \
                   max ulp {max_ulp}, argmax m=1={arg_ref} (p={:.5}) vs m={nbad}={arg_bad} (p={:.5})",
                  half::f16::from_bits(nref[arg_ref]).to_f32(),
                  half::f16::from_bits(nbad_lg[arg_bad]).to_f32());
     }
-    println!("RESULT: {} (exl3 probe_state N=2..={w}, K={k_steps})",
+    crate::dprintln!("RESULT: {} (exl3 probe_state N=2..={w}, K={k_steps})",
              if all_exact { "EXACT" } else { "DIVERGES" });
     if !all_exact { std::process::exit(1); }
     Ok(())
@@ -11794,13 +12256,13 @@ fn prefillx_rel_report(tag: &str, sr: &(Vec<Vec<u32>>, Vec<Vec<u32>>), sc: &(Vec
     for (i, ((cr, cc), (ssr, ssc))) in sr.0.iter().zip(sc.0.iter()).zip(sr.1.iter().zip(sc.1.iter())).enumerate() {
         let (a, _, _) = rel_stats(&f(cr), &f(cc));
         let (b, md, mr) = rel_stats(&f(ssr), &f(ssc));
-        if verbose { println!("PFX_REL[{tag}] gdn {i:>2}: conv relL2 {a:.3e} | S relL2 {b:.3e} max|d| {md:.4e} max|ref| {mr:.4e}"); }
+        if verbose { crate::dprintln!("PFX_REL[{tag}] gdn {i:>2}: conv relL2 {a:.3e} | S relL2 {b:.3e} max|d| {md:.4e} max|ref| {mr:.4e}"); }
         c_rel.push(a); s_rel.push(b);
         s_md = s_md.max(md); s_mr = s_mr.max(mr); s_md_over_mr = s_md_over_mr.max(md / mr.max(1e-30));
     }
     for (i, (a, b)) in kr.iter().zip(kc.iter()).enumerate() {
         let (r, md, mr) = rel_stats(a, b);
-        if verbose { println!("PFX_REL[{tag}] attn {i:>2}: K|V relL2 {r:.3e} max|d| {md:.4e} max|ref| {mr:.4e}"); }
+        if verbose { crate::dprintln!("PFX_REL[{tag}] attn {i:>2}: K|V relL2 {r:.3e} max|d| {md:.4e} max|ref| {mr:.4e}"); }
         kv_rel.push(r);
     }
     let summ = |v: &mut Vec<f64>| -> String {
@@ -11808,7 +12270,7 @@ fn prefillx_rel_report(tag: &str, sr: &(Vec<Vec<u32>>, Vec<Vec<u32>>), sc: &(Vec
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         format!("med {:.3e} max {:.3e}", v[v.len() / 2], v[v.len() - 1])
     };
-    println!("PFX_RELSUM[{tag}] S relL2 {} (layer-max |d|/max|ref| {:.3e}; max|d| {:.4e} of max|ref| {:.4e}) | conv relL2 {} | KV relL2 {}",
+    crate::dprintln!("PFX_RELSUM[{tag}] S relL2 {} (layer-max |d|/max|ref| {:.3e}; max|d| {:.4e} of max|ref| {:.4e}) | conv relL2 {} | KV relL2 {}",
              summ(&mut s_rel), s_md_over_mr, s_md, s_mr, summ(&mut c_rel), summ(&mut kv_rel));
     // summ sorted both in place
     let med = |v: &Vec<f64>| if v.is_empty() { None } else { Some(v[v.len() / 2]) };
@@ -11911,7 +12373,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
     let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let n = ids.len();
-    println!("EXL3 prefill-equivalence probe: prompt={n} tokens");
+    crate::dprintln!("EXL3 prefill-equivalence probe: prompt={n} tokens");
 
     // S-A3-r: with --prefillx-qsa-keys the indexer key planes are zeroed before each arm, so
     // each arm's dump shows only its own writes (the planes are otherwise never reset).
@@ -11952,7 +12414,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
     top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     let line = format!("reference (token-by-token forward_step): first={arg_ref}  top3 logits {:?}",
                        &top[..3.min(top.len())]);
-    println!("{line}");
+    crate::dprintln!("{line}");
     sig_text += &line; sig_text.push('\n');
     // S-A3-r diagnostic --prefillx-qsa-keys=1: which positions of QSA layer 0's raw indexer
     // key plane (slot 0) each arm has written (non-zero rows), and key diffs where both wrote.
@@ -11974,7 +12436,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
             }
             msg += &format!("; vs reference: both {both} (bit-differ {differ}), only-this {only_this}, only-ref {only_ref}");
         }
-        println!("{msg}");
+        crate::dprintln!("{msg}");
         Ok(Some(v))
     };
     let keys_ref = qsa_keys_dump("reference", None)?;
@@ -12000,7 +12462,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
     // S-A3-s: an entry "A+B" = irregular split (first chunk A, then B-token chunks).
     // TP-4X1: an entry "g<C>" / "g<C>a" runs the SERVED chunk grid of this prompt (the real
     // plan_grid: tail checkpoint at message boundary - 8 = n - 14, merge cap as under TP; trailing
-    // 'a' = --prefill-absorb-tail), so the old / steady-4095 / absorbed grids are probed as served.
+    // 'a' = the removed --prefill-absorb-tail), so the old / steady-4095 / absorbed grids are probed as served.
     let served_grid = |c: usize, absorb: bool| -> Vec<usize> {
         let tail = wp16::tail_point(Some(n.saturating_sub(6)), 0, n, c, tail_ckpt_extra_chunk());
         wp16::plan_grid(0, n, c, true, tail, wp16::merge_cap(c, true), absorb.then(recon_min_rows), true)
@@ -12014,7 +12476,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
                 let ends = served_grid(c.min(n), absorb);
                 let mut prev = 0usize;
                 let rows: Vec<usize> = ends.iter().map(|&e| { let r = e - prev; prev = e; r }).collect();
-                println!("served grid {x} (n={n}): {} chunk(s) rows {:?}", rows.len(), rows);
+                crate::dprintln!("served grid {x} (n={n}): {} chunk(s) rows {:?}", rows.len(), rows);
                 return Some((rows[0], rows.iter().copied().max().unwrap_or(1), Some((x.to_string(), ends))));
             }
             match x.split_once('+') {
@@ -12067,7 +12529,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
                 let e = per_chunk.entry(ch).or_insert((0, 0)); e.0 += 1;
                 if d > 0 { ndiff += 1; tot += d; e.1 += 1; if first.is_none() { first = Some((p, d)); } }
             }
-            println!("QSA_ROWS[C={c_first}+{c}] layer {k}: sparse rows compared {nrows}, rows with different selection {ndiff} (first {:?}, total sym-diff {tot}); per chunk (rows, differing): {:?}",
+            crate::dprintln!("QSA_ROWS[C={c_first}+{c}] layer {k}: sparse rows compared {nrows}, rows with different selection {ndiff} (first {:?}, total sym-diff {tot}); per chunk (rows, differing): {:?}",
                      first, per_chunk);
         }
         if let (Some((sr, scr)), Some((k, _, _, ps, pcs))) = (dbg_ref.as_ref(), model.qsa_dbg.as_ref()) {
@@ -12082,7 +12544,7 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
             let kth = model.cfg.indexer_budget / model.cfg.indexer_compress_ratio;
             let (mut md, mut mean) = (0f32, 0f64);
             for i in 0..nb { let d = (scr[i] - srow[i]).abs(); md = md.max(d); mean += d as f64; }
-            println!("QSA_DUMP[C={c}] QSA layer {k} final row: sel sym-diff {} positions; score |diff| max {:.4} mean {:.4}; ref score @rank {kth} {:.4} vs @rank {} {:.4} (selection margin {:.4})",
+            crate::dprintln!("QSA_DUMP[C={c}] QSA layer {k} final row: sel sym-diff {} positions; score |diff| max {:.4} mean {:.4}; ref score @rank {kth} {:.4} vs @rank {} {:.4} (selection margin {:.4})",
                      a.symmetric_difference(&b).count(), md, mean / nb as f64,
                      sorted[kth - 1], kth + 1, sorted[kth], sorted[kth - 1] - sorted[kth]);
         }
@@ -12130,10 +12592,10 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
                     let d = (dsc[i] - scc[i]).abs();
                     if d.is_finite() { if d > md { md = d; ai = i; } if d > 1e-2 { cnt_big += 1; } }
                 }
-                println!("QSA_SCORER_TWIN[C={c}] identical inputs (pos {}, {} blocks): decode-vs-prefill max|diff| {:.5} @blk {} (decode {:.4} prefill {:.4}); blocks with |diff|>1e-2: {}",
+                crate::dprintln!("QSA_SCORER_TWIN[C={c}] identical inputs (pos {}, {} blocks): decode-vs-prefill max|diff| {:.5} @blk {} (decode {:.4} prefill {:.4}); blocks with |diff|>1e-2: {}",
                          n - 1, nb, md, ai, dsc[ai], scc[ai], cnt_big);
             }
-            println!("QSA_SEL[C={c}] final row, last QSA layer: ref {} entries, chunk {} entries; sym-diff {} (only-ref {:?}, only-chunk {:?}); block-score max|diff| {:.4} @blk {} (ref {:.4} chunk {:.4}); ref first/last {:?}/{:?} chunk first/last {:?}/{:?}",
+            crate::dprintln!("QSA_SEL[C={c}] final row, last QSA layer: ref {} entries, chunk {} entries; sym-diff {} (only-ref {:?}, only-chunk {:?}); block-score max|diff| {:.4} @blk {} (ref {:.4} chunk {:.4}); ref first/last {:?}/{:?} chunk first/last {:?}/{:?}",
                      sr.len(), sc_.len(), a.symmetric_difference(&b).count(), only_ref, only_chk, maxd, arg,
                      scr[arg], scc[arg], sr.first(), sr.last(), sc_.first(), sc_.last());
         }
@@ -12151,14 +12613,14 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
         // S-A3-s: where the chunked first token sits in the REFERENCE's logits (rank, gap to top-1).
         let rk = top.iter().position(|&(_, i)| i as u32 == arg_c);
         if let Some(rk) = rk {
-            println!("  chunked first={arg_c}: reference rank {} logit {:.4} (gap to ref top-1 {:.4})",
+            crate::dprintln!("  chunked first={arg_c}: reference rank {} logit {:.4} (gap to ref top-1 {:.4})",
                      rk + 1, top[rk].0, top[0].0 - top[rk].0);
         }
         let (rank, gap) = rk.map_or((usize::MAX, f32::INFINITY), |r| (r + 1, top[0].0 - top[r].0));
         tier_arms.push((format!("C={}", label.trim()), rel_meds.0, rel_meds.1, rank, gap));
         let line = format!("chunk C={label}: first={arg_c} ({}), state maxd={maxd:.7} bit-neq={neq}  {}",
                            if am { "MISMATCH" } else { "match" }, if ok { "OK" } else { "DIVERGES" });
-        println!("{line}");
+        crate::dprintln!("{line}");
         sig_text += &line; sig_text.push('\n');
     }
     // Q1 noise floor (--prefillx-ulp=none,0,13,...): re-run the token-by-token REFERENCE,
@@ -12209,34 +12671,34 @@ pub fn probe_prefill_x(a: &FwdArgs) -> Result<()> {
                 let m = prefillx_rel_report(&format!("ULP bit={ent}"), &st_ref, &st_u, &kv_ref, &kv_u);
                 if bit == Some(0) { floor0 = Some(m); }
             }
-            println!("ULP-FLOOR bit={ent}: first={arg_u} ({}), state maxd={maxd:.7} bit-neq={neq}",
+            crate::dprintln!("ULP-FLOOR bit={ent}: first={arg_u} ({}), state maxd={maxd:.7} bit-neq={neq}",
                      if arg_u == arg_ref { "match" } else { "MISMATCH" });
         }
     }
     anyhow::ensure!(arms > 0, "probe_prefill_x compared no chunked arm (empty width list)");
     let line = format!("RESULT: {} (exl3 probe_prefill_x, {arms} arm(s) compared)", if all_ok { "EXACT" } else { "DIVERGES" });
-    println!("{line}");
+    crate::dprintln!("{line}");
     sig_text += &line; sig_text.push('\n');
     // L10 (a) the pinned signature: md5 of the reference / chunk C= / absolute RESULT lines, first
     // 12 hex = exactly the historical `grep -E "^chunk C=|^RESULT|^reference" | md5sum | cut -c1-12`
     // (this line and the verdicts below match none of those patterns except the new RESULT lines,
     // which come AFTER — scripts that grep the log see extra ^RESULT lines only when they opt in).
     let sig = md5_hex(sig_text.as_bytes())[..12].to_string();
-    println!("PREFILLX_SIG {sig} (md5[:12] of the reference/chunk/RESULT lines; {arms} arm(s))");
+    crate::dprintln!("PREFILLX_SIG {sig} (md5[:12] of the reference/chunk/RESULT lines; {arms} arm(s))");
     let mut new_ok = true;
     if let Some(want) = expect_sig.as_ref() {
         let ok = *want == sig;
         new_ok &= ok;
-        println!("RESULT: {} (signature {sig}, expected {want})", if ok { "PREFILLX_SIG_OK" } else { "PREFILLX_SIG_MISMATCH" });
+        crate::dprintln!("RESULT: {} (signature {sig}, expected {want})", if ok { "PREFILLX_SIG_OK" } else { "PREFILLX_SIG_MISMATCH" });
     }
     // L10 (b) the Q1 tolerance tier
     if tier_on {
         let mut ok = true;
         match floor0 {
-            None => { ok = false; println!("PREFILLX_TIER no bit-0 floor measured (relL2 report unavailable)"); }
+            None => { ok = false; crate::dprintln!("PREFILLX_TIER no bit-0 floor measured (relL2 report unavailable)"); }
             Some((fs, fkv)) => {
                 let fkv_s = fkv.map_or("n/a".to_string(), |v| format!("{v:.3e}"));
-                println!("PREFILLX_TIER floor (bit 0): S relL2 med {fs:.3e} | KV relL2 med {fkv_s}");
+                crate::dprintln!("PREFILLX_TIER floor (bit 0): S relL2 med {fs:.3e} | KV relL2 med {fkv_s}");
                 for (tag, s_m, kv_m, rank, gap) in &tier_arms {
                     let fails = prefillx_tier_fails(*s_m, *kv_m, fs, fkv, *rank, *gap);
                     let kv_x = match (kv_m, fkv) { (Some(a), Some(b)) => format!("{:.2}x", a / b), _ => "n/a".into() };
@@ -12276,7 +12738,7 @@ pub fn probe_pfx_trace(a: &FwdArgs) -> Result<()> {
     let mut sc = Scratch::new(&model.dev, &model.cfg, 1, model.cfg.rotary_dim, model.max_pos)?;
     let ids = gate_prompt_ids(a)?;
     let nl = model.layers.len();
-    println!("EXL3 prefill TRACE: {} tokens, {nl} layers; stage diff @ token 0 + first-divergent-token sweep", ids.len());
+    crate::dprintln!("EXL3 prefill TRACE: {} tokens, {nl} layers; stage diff @ token 0 + first-divergent-token sweep", ids.len());
 
     // ---- Arm R: token-by-token reference (decode kernels), dumps at token 0.
     model.reset_slot(0)?;
@@ -12311,9 +12773,9 @@ pub fn probe_pfx_trace(a: &FwdArgs) -> Result<()> {
     let mut first_tok: Option<usize> = None;
     for i in 0..snaps_r.len().min(snaps_c.len()) {
         let neq = snaps_r[i].iter().zip(snaps_c[i].iter()).filter(|(a, b)| a != b).count();
-        if neq > 0 { first_tok = Some(i); println!("state bits diverge at token {i} (of compared {}): neq={neq}", snaps_r[i].len()); break; }
+        if neq > 0 { first_tok = Some(i); crate::dprintln!("state bits diverge at token {i} (of compared {}): neq={neq}", snaps_r[i].len()); break; }
     }
-    if first_tok.is_none() { println!("state bits EXACT for first {} token(s)", snaps_r.len().min(snaps_c.len())); }
+    if first_tok.is_none() { crate::dprintln!("state bits EXACT for first {} token(s)", snaps_r.len().min(snaps_c.len())); }
 
     // ---- Stage diff at token 0, execution order.
     let mut names: Vec<String> = std::fs::read_dir(&dir_r)?
@@ -12322,18 +12784,18 @@ pub fn probe_pfx_trace(a: &FwdArgs) -> Result<()> {
         .map(|f| f.trim_end_matches("_s000.f32").to_string())
         .collect();
     names.sort_by_key(|n| stage_key(n));
-    println!("{:<14} {:>4} {:>12} {:>10} {:>10}", "stage", "n", "max|d|", "@idx", "rel");
+    crate::dprintln!("{:<14} {:>4} {:>12} {:>10} {:>10}", "stage", "n", "max|d|", "@idx", "rel");
     let (mut first_any, mut first_sem): (Option<String>, Option<String>) = (None, None);
     for name in &names {
         let cf = format!("{dir_c}/{name}_s000.f32");
         if !std::path::Path::new(&cf).exists() {
-            println!("{name:<14} present in reference only");
+            crate::dprintln!("{name:<14} present in reference only");
             continue;
         }
         let rv = read_f32_le(&format!("{dir_r}/{name}_s000.f32"))?;
         let cv = read_f32_le(&cf)?;
         let n = rv.len().min(cv.len());
-        if rv.len() != cv.len() { println!("{name:<14} LENGTH MISMATCH {} vs {}", rv.len(), cv.len()); }
+        if rv.len() != cv.len() { crate::dprintln!("{name:<14} LENGTH MISMATCH {} vs {}", rv.len(), cv.len()); }
         let (mut md, mut mi, mut mg) = (0.0f64, 0usize, 0.0f64);
         for i in 0..n {
             let d = (rv[i] as f64 - cv[i] as f64).abs();
@@ -12343,17 +12805,17 @@ pub fn probe_pfx_trace(a: &FwdArgs) -> Result<()> {
         let rel = if mg > 1e-9 { md / mg } else { md };
         if md == 0.0 { continue; }
         let tag = if rel > 1e-2 && md > 1e-3 { "  <== SEMANTIC" } else { "" };
-        println!("{name:<14} {n:>9} {md:>12.4e} {mi:>10} {rel:>10.2e}{tag}");
+        crate::dprintln!("{name:<14} {n:>9} {md:>12.4e} {mi:>10} {rel:>10.2e}{tag}");
         if first_any.is_none() { first_any = Some(name.clone()); }
         if first_sem.is_none() && rel > 1e-2 && md > 1e-3 { first_sem = Some(name.clone()); }
     }
     match (&first_any, &first_sem) {
         (a, s) => {
-            println!("FIRST DIFF: {}", a.clone().unwrap_or_else(|| "(none — bitwise identical)".into()));
-            println!("FIRST SEMANTIC: {}", s.clone().unwrap_or_else(|| "(none above threshold)".into()));
+            crate::dprintln!("FIRST DIFF: {}", a.clone().unwrap_or_else(|| "(none — bitwise identical)".into()));
+            crate::dprintln!("FIRST SEMANTIC: {}", s.clone().unwrap_or_else(|| "(none above threshold)".into()));
         }
     }
-    println!("first token: ref={arg_ref} chk={arg_chk} ({})",
+    crate::dprintln!("first token: ref={arg_ref} chk={arg_chk} ({})",
              if arg_ref == arg_chk { "match" } else { "MISMATCH" });
     Ok(())
 }
@@ -12471,7 +12933,7 @@ pub(crate) fn fnv64_i32(v: &[i32]) -> u64 {
 /// scheduler, no flag; the served path is untouched (new kernel entries only).
 pub fn pack2_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
     let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: the packed probe primes 0 and 1
-    println!("PACK2: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
+    crate::dprintln!("PACK2: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
     model.probe_pack2()
 }
 
@@ -12481,7 +12943,7 @@ pub fn pack2_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
 /// rounds run serially (lone verify per request through the served verify_block).
 pub fn packstate_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
     let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: the probe primes 0 and 1
-    println!("PACKSTATE: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
+    crate::dprintln!("PACKSTATE: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
     model.probe_packstate()
 }
 
@@ -12492,7 +12954,7 @@ pub fn packstate_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
 /// table and round_pair_ratio.
 pub fn pack3_probe_exl3(dir: &str, max_pos: usize) -> Result<()> {
     let model = FwdModel::load(dir, 2, max_pos)?; // 2 slots: slots 0 and 1 pack
-    println!("PACK3: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
+    crate::dprintln!("PACK3: model {} loaded (vocab {}, max_pos {max_pos})", dir, model.cfg.vocab_size);
     model.probe_pack3()
 }
 
@@ -12516,7 +12978,7 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
     let mut sc = Scratch::new(&model.dev, &model.cfg, (depth + 1).max(2), model.cfg.rotary_dim, model.max_pos)?;
     let prompt_ids = gate_prompt_ids(a)?;
     let plen = prompt_ids.len();
-    println!("MTP end-to-end probe (exl3): prompt={plen} tokens, depth={depth}, max_new={} model={}",
+    crate::dprintln!("MTP end-to-end probe (exl3): prompt={plen} tokens, depth={depth}, max_new={} model={}",
              a.max_new, a.dir);
 
     // ---- Arm M: REAL chain-verify rounds (mtp_round) — the path the serve runs.
@@ -12544,7 +13006,7 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
             truth.push(model.dev.dtoh_sync_copy(&sc.argmax)?[0] as u32);
         }
         model.reset_slot(0)?;
-        println!("MTP_COVER: truth {} tokens, levels 1..={cover_l}", truth.len());
+        crate::dprintln!("MTP_COVER: truth {} tokens, levels 1..={cover_l}", truth.len());
     }
     let mut actual: Vec<u32> = Vec::with_capacity(a.max_new);
     let t0 = std::time::Instant::now();
@@ -12558,7 +13020,7 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
     // print its argmax — the col-0 ground truth — then restore state via reset+reprefill.
     if crate::opts::var(crate::opt!("bmtp-diag")).as_deref() == Ok("plain") {
         model.forward_step(&mut sc, &[pred0 as i32], &[plen], &[0], None)?;
-        println!("DIAG plain-step argmax after pred0: {}",
+        crate::dprintln!("DIAG plain-step argmax after pred0: {}",
                  model.dev.dtoh_sync_copy(&sc.argmax)?[0]);
         model.reset_slot(0)?;
         let mut pos = 0usize;
@@ -12574,7 +13036,7 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
         model.mtp_seam_prime(&mut sc, psc_opt.as_ref(), head, last_prompt, plen, 0)?; // WP03
     } else {
         model.tap_snapshot(&mut sc, 0)?;
-        println!("DIAG prime SKIPPED (noprime)");
+        crate::dprintln!("DIAG prime SKIPPED (noprime)");
     }
     let mut rounds: Vec<DraftRound> = Vec::new();
     let mut trunk_ms: Vec<f64> = Vec::new();
@@ -12647,12 +13109,12 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
     let mean_prefix = if rounds.is_empty() { 0.0 } else { prefix_sum as f64 / rounds.len() as f64 };
     let mtp_tok_s = if mtp_s > 0.0 { actual.len() as f64 / mtp_s } else { 0.0 };
     let seq_tok_s = if seq_s > 0.0 { seq_tokens.len() as f64 / seq_s } else { 0.0 };
-    println!("MTP tokens : {:?}", &actual[..actual.len().min(20)]);
-    println!("SEQ tokens : {:?}", &seq_tokens[..seq_tokens.len().min(20)]);
-    println!("acceptance rate: {:.1}%  (drafts accepted / total drafts, 1-ahead)  mean matched prefix {:.3}",
+    crate::dprintln!("MTP tokens : {:?}", &actual[..actual.len().min(20)]);
+    crate::dprintln!("SEQ tokens : {:?}", &seq_tokens[..seq_tokens.len().min(20)]);
+    crate::dprintln!("acceptance rate: {:.1}%  (drafts accepted / total drafts, 1-ahead)  mean matched prefix {:.3}",
              acc_pct, mean_prefix);
-    println!("trunk round (median) {tms:.1} ms   head draft x{depth} (median) {hms:.1} ms");
-    println!("throughput: MTP {:.1} tok/s   sequential {:.1} tok/s", mtp_tok_s, seq_tok_s);
+    crate::dprintln!("trunk round (median) {tms:.1} ms   head draft x{depth} (median) {hms:.1} ms");
+    crate::dprintln!("throughput: MTP {:.1} tok/s   sequential {:.1} tok/s", mtp_tok_s, seq_tok_s);
 
     if cover_l > 0 && !cover_rows.is_empty() {
         let path = crate::opts::var(crate::opt!("mtp-cover-out")).unwrap_or_else(|_| "/tmp/mtp_cover.csv".into());
@@ -12670,24 +13132,24 @@ pub fn bench_mtp_exl3(a: &FwdArgs, depth: usize) -> Result<()> {
         for lv in 0..cover_l {
             let hit = |j: usize| cover_rows.iter().filter(|(_, r, _)| r[lv] != usize::MAX && r[lv] < j).count() as f64 / n;
             let chain = cover_rows.iter().filter(|(_, r, _)| r[..=lv].iter().all(|&x| x == 0)).count() as f64 / n;
-            println!("MTP_COVER level {}: top1 {:.3} top2 {:.3} top3 {:.3} top4 {:.3} | chain-prefix(all top1 to here) {:.3}",
+            crate::dprintln!("MTP_COVER level {}: top1 {:.3} top2 {:.3} top3 {:.3} top4 {:.3} | chain-prefix(all top1 to here) {:.3}",
                      lv + 1, hit(1), hit(2), hit(3), hit(4), chain);
         }
-        println!("MTP_COVER: {} rounds -> {path}", cover_rows.len());
+        crate::dprintln!("MTP_COVER: {} rounds -> {path}", cover_rows.len());
     }
     let lossless = actual == seq_tokens;
     if lossless {
-        println!("RESULT: LOSSLESS_OK (MTP-primed output == plain greedy, {} tokens; exl3 path)",
+        crate::dprintln!("RESULT: LOSSLESS_OK (MTP-primed output == plain greedy, {} tokens; exl3 path)",
                  actual.len());
         Ok(())
     } else {
         let div = actual.iter().zip(seq_tokens.iter()).position(|(a, b)| a != b);
-        println!("RESULT: MISMATCH at token {:?} — head priming PERTURBS the trunk", div);
+        crate::dprintln!("RESULT: MISMATCH at token {:?} — head priming PERTURBS the trunk", div);
         if let Some(d) = div {
             let lo = d.saturating_sub(6);
             let hi = (d + 6).min(actual.len()).min(seq_tokens.len());
-            println!("  ctx MTP[{}..{}]: {:?}", lo, hi, &actual[lo..hi]);
-            println!("  ctx SEQ[{}..{}]: {:?}", lo, hi, &seq_tokens[lo..hi]);
+            crate::dprintln!("  ctx MTP[{}..{}]: {:?}", lo, hi, &actual[lo..hi]);
+            crate::dprintln!("  ctx SEQ[{}..{}]: {:?}", lo, hi, &seq_tokens[lo..hi]);
         }
         std::process::exit(1);
     }
@@ -12921,6 +13383,141 @@ impl FwdModel {
         self.copy_slot_state(slot, psc, false)
     }
     pub fn prefix_snapshots(&self) -> bool { self.snap.is_some() }
+    // ---------------------------------------------------------- LANERES2: --kv-spill
+    /// The per-slot spill regions in capture order: (device ptr, byte len). Every plane here is
+    /// [width × rest], so the slot stride is len()/width — no layout knowledge beyond that. The
+    /// position planes (trunk KV, QSA keys/pool) are read from the LIVE buffers (rows 0..tokens
+    /// of this slot are the conversation's own); the recurrent state is read from the snapshot
+    /// buffers snapshot_slot filled at the end of the last prefill — and restored the same way,
+    /// so the existing restore_slot path keeps working unchanged.
+    fn spill_regions(&self, slot: usize) -> Result<Vec<(u64, usize)>> {
+        let snap = self.snap.as_ref().context("prefix snapshots not allocated (--prefix-cache off)")?;
+        let w = self.width;
+        anyhow::ensure!(slot < w, "spill: slot {slot} >= width {w}");
+        let mut v: Vec<(u64, usize)> = Vec::new();
+        let stride = |len: usize| len / w;
+        for l in &self.k_cache {
+            let s = stride(l.len());
+            anyhow::ensure!(s > 0, "spill: empty k_cache plane");
+            v.push((*l.device_ptr() as u64 + (slot * s) as u64, s));
+        }
+        for l in &self.qsa_keys {
+            let s = stride(l.len());
+            if s > 0 { v.push((*l.device_ptr() as u64 + (slot * s) as u64, s)); }
+        }
+        for l in &self.qsa_pool {
+            let s = stride(l.len());
+            if s > 0 { v.push((*l.device_ptr() as u64 + (slot * s) as u64, s)); }
+        }
+        for sn in &snap.conv {
+            let s = stride(sn.len());
+            v.push((*sn.device_ptr() as u64 + (slot * s) as u64, s));
+        }
+        for sn in &snap.s {
+            let s = stride(sn.len());
+            v.push((*sn.device_ptr() as u64 + (slot * s) as u64, s));
+        }
+        {
+            let s = stride(snap.ple.len());
+            v.push((*snap.ple.device_ptr() as u64 + (slot * s) as u64, s));
+        }
+        {
+            let s = stride(snap.carry.len());
+            v.push((*snap.carry.device_ptr() as u64 + (slot * s) as u64, s));
+        }
+        Ok(v)
+    }
+
+    /// LANERES2 (`--kv-spill`): serialize slot's prefix snapshot into `out` (GB10SPIL v1):
+    /// 8B magic, u32 version, u64 tokens, u64 region count, u64 payload bytes, the raw regions
+    /// in spill_regions order, then the 2 host PLE ring ids. Bit-exact by construction: every
+    /// region is a memcpy of the exact device words the serving path reads. TEXT-ONLY: the
+    /// per-slot VIS rope rows are not spilled — an image-slot restore re-prefills (counted on
+    /// /metrics); agent traces are text. D2H runs on the NULL stream through a reused pinned
+    /// staging chunk (the PinnedHost pattern, WP05): the compute stream is synchronized first
+    /// so the planes' writers retire, then chunked copies run (~5 GB/s on .13, ~0.1 s per
+    /// 0.5-GiB snapshot). Evictions are rare and the admission round is dominated by the next
+    /// conversation's prefill; the DISK write is the async part (kv_spill::Store writer thread).
+    pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>) -> Result<()> {
+        let snap = self.snap.as_ref().context("prefix snapshots not allocated")?;
+        anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
+        let regions = self.spill_regions(slot)?;
+        let total: usize = regions.iter().map(|(_, b)| *b).sum();
+        out.clear();
+        out.resize(36, 0); // reserved: kv_spill::finalize_header fills it (single-copy capture)
+        // order: retire ALL device work (the planes' writers run on the compute stream) before
+        // the NULL-stream DtoH reads them; device-wide is stronger than stream sync and this
+        // path is rare + dominated by the next prefill.
+        self.dev.synchronize()?;
+        const CHUNK: usize = 64 << 20;
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(16)))?;
+        for (src, bytes) in &regions {
+            let mut left = *bytes;
+            let mut at = *src;
+            while left > 0 {
+                let n = left.min(CHUNK);
+                pin.dtoh(0, at, n)?;
+                self.dev.synchronize()?;
+                out.extend_from_slice(pin.as_bytes(0, n));
+                at += n as u64;
+                left -= n;
+            }
+        }
+        let h = snap.hist.lock().unwrap();
+        out.extend_from_slice(&h[slot * 2].to_le_bytes());
+        out.extend_from_slice(&h[slot * 2 + 1].to_le_bytes());
+        Ok(())
+    }
+
+    /// LANERES2: restore a spill_capture payload into `slot`. The position planes go to the
+    /// LIVE planes (rows 0..tokens), the recurrent snapshot into the snapshot buffers (the
+    /// caller then runs restore_slot, exactly like a prefix-cache hit), the PLE ring ids into
+    /// the snapshot's hist. Any mismatch (magic/version/shape — a different model or flag set
+    /// captured the file) is an Err: the caller falls back to re-prefill and counts it; the
+    /// server never refuses a request over a spilled snapshot.
+    pub fn spill_restore(&self, slot: usize, file: &[u8]) -> Result<usize> {
+        // file = the finalize_header layout: outer 36B header, then the capture body (its own
+        // reserved 36B header: MAGIC, ver, tokens, nreg, total, regions..., hist 8B).
+        anyhow::ensure!(file.len() >= 72, "spill: file too short");
+        let bytes = &file[36..];
+        anyhow::ensure!(bytes.len() >= 44 && &bytes[0..8] == b"GB10SPIL", "spill: bad magic/length");
+        let ver = u32::from_le_bytes(bytes[8..12].try_into()?);
+        anyhow::ensure!(ver == 1, "spill: payload version {ver}");
+        let tokens = u64::from_le_bytes(bytes[12..20].try_into()?) as usize;
+        let nreg = u64::from_le_bytes(bytes[20..28].try_into()?) as usize;
+        let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
+        anyhow::ensure!(bytes.len() == 36 + total + 8, "spill: payload length mismatch");
+        anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
+        let regions = self.spill_regions(slot)?;
+        anyhow::ensure!(regions.len() == nreg, "spill: region count {} != {nreg}", regions.len());
+        anyhow::ensure!(total == regions.iter().map(|(_, b)| *b).sum::<usize>(),
+                        "spill: payload bytes {total} != this model's regions (flags/model changed since capture)");
+        self.dev.synchronize()?;
+        const CHUNK: usize = 64 << 20;
+        let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(16)))?;
+        let mut off = 36usize;
+        for (dst, dbytes) in &regions {
+            let mut left = *dbytes;
+            let mut at = *dst;
+            while left > 0 {
+                let n = left.min(CHUNK);
+                pin.copy_from_slice(0, &bytes[off..off + n]);
+                pin.htod(0, at, n)?;
+                self.dev.synchronize()?;
+                at += n as u64;
+                left -= n;
+                off += n;
+            }
+        }
+        let snap = self.snap.as_ref().unwrap();
+        let h0 = i32::from_le_bytes(bytes[off..off + 4].try_into()?);
+        let h1 = i32::from_le_bytes(bytes[off + 4..off + 8].try_into()?);
+        let mut h = snap.hist.lock().unwrap();
+        h[slot * 2] = h0;
+        h[slot * 2 + 1] = h1;
+        Ok(tokens)
+    }
+
     fn copy_slot_state(&self, slot: usize, psc: &PrefillScratch, save: bool) -> Result<()> {
         let snap = self.snap.as_ref().context("prefix snapshots not allocated")?;
         let cfg = &self.tc; // TP-B: the trunk's per-rank geometry
@@ -12990,16 +13587,16 @@ impl FwdModel {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let headroom = ple_auto_headroom(self.width);
         if avail < need + headroom {
-            println!("  PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + {:.1} GiB headroom; \
+            crate::boot_report::notice(&format!("PLE n-gram table: stays on SSD (--ple-ram auto: after the boot {:.1} GiB are free, the table needs {:.1} GiB + {:.1} GiB headroom; \
                       output is identical, decode ~1-2% slower; fewer lanes / a shorter --max-seq-len would let it move to RAM)",
-                     gib(avail), gib(need), headroom as f64 / (1u64 << 30) as f64);
+                     gib(avail), gib(need), headroom as f64 / (1u64 << 30) as f64));
             return Ok(());
         }
         let t0 = std::time::Instant::now();
         let t = ple_read_table(&p.shards, &p.shard_data_off, per)?;
         let _ = p.ram.set(t);
-        println!("  PLE n-gram table moved to RAM: {:.1} GiB in {:.1}s (--ple-ram auto; {:.1} GiB were free after the boot)",
-                 gib(need), t0.elapsed().as_secs_f32(), gib(avail));
+        crate::boot_report::notice(&format!("PLE n-gram table moved to RAM: {:.1} GiB in {:.1}s (--ple-ram auto; {:.1} GiB were free after the boot)",
+                 gib(need), t0.elapsed().as_secs_f32(), gib(avail)));
         Ok(())
     }
 
@@ -13028,10 +13625,247 @@ impl FwdModel {
             scan(&l.moe.sh_up);
             scan(&l.moe.sh_down);
         }
+        // TP4 boot fix (2026-10-17): the MTP head is REPLICATED at every world, so its
+        // full-width quads (dense-MLP sh_* at h x mi, fc_*, draft attn) exceed the trunk
+        // scan's max once the trunk slices shrink at world >= 4 — the node's boot recon
+        // dry-run then trips "recon staging too small: need 16777216 have 12582912"
+        // (9B pack, world=4). Scan the draft head's chain quads with the same rule.
+        if let Some(mtp) = &self.mtp {
+            scan(&mtp.moe.sh_gate);
+            scan(&mtp.moe.sh_up);
+            scan(&mtp.moe.sh_down);
+            scan(&mtp.fc_hidden);
+            scan(&mtp.fc_embed);
+            scan(&mtp.attn.q_proj); scan(&mtp.attn.k_proj); scan(&mtp.attn.v_proj); scan(&mtp.attn.o_proj);
+        }
         mx
     }
 
     /// S-A3-f-g: build the reconstruct-path buffer handles for this prefill scratch.
+    // ================= EXL27C-DF2 (fwd): the DFlash2 interface ========================
+    // The serve-side agent (src/exl3_serve.rs) drives these; the signatures are the agreed
+    // interface contract - DO NOT change them unilaterally.
+
+    /// EXL27C-DF2: arm/disarm the DFlash2 tap + prime capture. The serve agent calls this at
+    /// boot with the sinks it created for the Df2Round (mirroring main.rs's trunk wiring,
+    /// `load_df2_round_dir` -> `gpu.set_df2_capture`). `None` disarms - every tap hook is
+    /// then a dead `Option` check (zero-cost, the R1 rule).
+    pub fn set_df2_capture(&mut self,
+                           sink: Option<std::sync::Arc<crate::dflash2::capture::Df2TapSink>>,
+                           prime: Option<std::sync::Arc<crate::dflash2::capture::Df2PrimeSink>>) {
+        self.df2_sink = sink;
+        self.df2_prime = prime;
+    }
+
+    /// EXL27C-DF2: one DFlash2 draft round - the EXL3 mirror of the trunk's `df2_lane_step`
+    /// core (batch.rs ~5760): (1) `draft_round` with anchor = the committed token `b`,
+    /// window = k; (2) `mtp_verify` - UNTOUCHED - on the k drafts; (3) `sync_staging_from_sink`
+    /// BEFORE `inject_dev` (batch.rs:4974: the round must re-base its staging on THIS round's
+    /// taps before the ring advances, or later drafts condition on stale features); (4)
+    /// `inject_dev(out.a + 1)` advances the drafter's ring over the accepted span.
+    pub fn df2_round(&self, sc: &mut Scratch, round: &mut crate::dflash2::round::Df2Round,
+                     slot: usize, k: usize, b: i32, p: usize,
+                     rq: Option<(&[u32], f32)>,
+                     t: [std::time::Instant; 3]) -> Result<MtpRoundOut> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tr = DF2_TRACE.load(Relaxed);
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] draft begin k={k} b={b} p={p}"); }
+        // EXL27C-Fix4: the trunk refreshes pos_blk before EVERY draft (batch.rs x5;
+        // round.rs:1450 'Callers must refresh_block_pos() first'). Without it pos_blk holds
+        // stale/garbage absolute positions and the ring attention (gqa_attn_band_ring_b)
+        // maps wild rows: sanitizer OOB __shared__ scores writes + CUDA_ERROR_ILLEGAL_ADDRESS
+        // (2026-10-16, .14, block 8 and 16 alike).
+        round.refresh_block_pos()?;
+        // EXL27D-RQ (item 1, 2026-10-21): a SAMPLED lane (sc.rq_mode 2 — --spec-sampling
+        // ratio, the default) drafts through the S5F2 sampled selector walk (the vendor
+        // CandidateSelector.sample_path multinomial at tau) and stages the walk's candidate
+        // table into sc.rq_list below, so the verify's ratio rows (xq_sample_rows_rq) judge
+        // every draft under the real-q criterion u·q' < p with the exact relu(p−q) residual.
+        // The greedy chain never writes list rows: the kernel's q' lookup missed, rewrote
+        // the proposal to the delta law q'=1 and accepted iff u < p(draft) — E[p(argmax)]
+        // ≈ 12% at temp 1.0 on thinking/code content. That delta law was the −37.3%
+        // signature (.14, 2026-10-21: 414 rounds, 0.85 accepted/round vs the vendor's
+        // 4.1–5.5 acceptance length at the same sampling parameters).
+        let (drafts, samp_out) = match rq {
+            Some((seeds, tau)) => {
+                let out = round.draft_round_dev_sample(b as u32, seeds, tau)?;
+                let drafts: Vec<i32> = out.tokens.iter().take(k).map(|&tk| tk as i32).collect();
+                (drafts, Some(out))
+            }
+            None => {
+                let dr = round.draft_round(b as u32, k, false, false, false)?;
+                if DF2_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    static D2N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if D2N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                        let t: Vec<u32> = dr.tokens.iter().take(6).copied().collect();
+                        eprintln!("[df2trace] drafts={t:?} nprev={}", round.nprev());
+                    }
+                }
+                if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] draft done ntok={}", dr.tokens.len()); }
+                let drafts: Vec<i32> = dr.tokens.iter().take(k).map(|&tk| tk as i32).collect();
+                (drafts, None)
+            }
+        };
+        // EXL27C-Fix5: xq_accept compares the verify argmax rows against sc.d_dev — the
+        // adaptive MTP path fills it device-side from its draft kernels; the DF2 chain
+        // drafts in its OWN buffers, so the drafts must be uploaded here or the accept
+        // compares against stale bytes and rejects every round (324 rounds, 0 accepted,
+        // drafts[0] matched the target's argmax every round — 2026-10-16, .14).
+        // Layout: d_vec[0..k-1] plain draft ids (kernel loop bounds a < k; pad is never read).
+        {
+            let mut d_w = drafts.clone();
+            d_w.resize(sc.d_dev.len(), 0);
+            self.dev.htod_copy_into(d_w, &mut sc.d_dev)?;
+        }
+        // EXL27D-RQ: the candidate table rows the ratio rows read (RQ_ROW=96 layout, the
+        // one xq_rq_draft writes for the pack-MTP path): [0..32) candidate ids (u32::MAX
+        // pads trail), [32..64) their logits (ln q; the ratio path reads only ids+q), [64..96)
+        // the proposal q' — the SAME law the walk sampled from (cand_q sums to 1 per
+        // position), so the accept and the residual are exact for this proposal.
+        if let Some(out) = &samp_out {
+            let l_ = crate::dflash2::levels();
+            let mut rows = vec![u32::MAX; sc.rq_list.len()];
+            for j in 0..k.min(l_) {
+                for t in 0..16usize {
+                    let q = out.cand_q[j * 16 + t];
+                    rows[j * crate::wp24::RQ_ROW + t] = out.cand_tok[j * 16 + t];
+                    rows[j * crate::wp24::RQ_ROW + 32 + t] = if q > 0.0 { q.ln().to_bits() } else { 0 };
+                    rows[j * crate::wp24::RQ_ROW + 64 + t] = q.to_bits();
+                }
+            }
+            self.dev.htod_copy_into(rows, &mut sc.rq_list)?;
+        }
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] verify begin (d_dev uploaded)"); }
+        let out = self.mtp_verify(sc, slot, k, b, p, drafts, t)?;
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] verify done a={}", out.a); }
+        if DF2_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            static V2N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if V2N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                eprintln!("[df2trace] verify: a={} emitted0..2={:?}", out.a,
+                          out.emitted.iter().take(3).collect::<Vec<_>>());
+            }
+        }
+        round.sync_staging_from_sink()?;
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] staging synced"); }
+        round.inject_dev(out.a + 1, None)?;
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] injected {}", out.a + 1); }
+        Ok(out)
+    }
+
+    /// EXL27C-DF2: prime the drafter's ring over one prefill window's taps. The serve agent
+    /// calls this per prefill chunk, after `prefill_chunk`'s tap hook captured the chunk's
+    /// rows into the prime sink; `pos_start` = the chunk's first absolute position.
+    pub fn df2_prime_window(&self, round: &mut crate::dflash2::round::Df2Round,
+                            pos_start: usize, n: usize) -> Result<()> {
+        let prime = self.df2_prime.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("df2_prime_window: no prime sink armed (set_df2_capture first)")
+        })?;
+        round.prime_window(&prime.taps, n, pos_start)
+    }
+
+    /// EXL27C-DF2-Fix2: re-prime the drafter's ring from the taps the LAST target forward
+    /// captured (the sink is attached for the whole boot; every solo forward - plain step,
+    /// control round, MTP fallback round - writes its columns into the staging). Call after
+    /// any NON-DF2 solo round with n = that round's committed span, so the next solo round
+    /// is DF2 again instead of falling back forever (`df2_round` advances the ring itself).
+    pub fn df2_reprime(&self, round: &mut crate::dflash2::round::Df2Round, n: usize) -> Result<()> {
+        round.sync_staging_from_sink()?;
+        round.inject_dev(n, None)?;
+        Ok(())
+    }
+
+    /// EXL27C-DF2: the (embed, head) device pointers the Df2Round borrows - the EXL3 analog
+    /// of the trunk's `gpu.df2_borrow()`. BOOT-TIME ONLY (one-shot, ~5 GB of transients +
+    /// ~5 GB persistent on the 27B; logged via drprintln). Idempotent: a second call
+    /// returns the same pointers.
+    ///
+    /// * embed: the pack stages embed_tokens as **f16** (`get_plain_f16`; the xq stack is
+    ///   f16), while the DF2 round's `embed_gather_b` reads **bf16** - so we materialize a
+    ///   bf16 twin ONCE (`xq_qsa_h2b`). [vocab, hidden] row-major, dense.
+    /// * head: the 6-bit EXL3 lm_head quad dequantized ONCE into [vocab, hidden] bf16
+    ///   row-major with the pack's block-Hadamard algebra FOLDED into the matrix. The serve
+    ///   logits are y = B_N(W_dec^T(A_K x)) with A_K = H128*diag(suh)/sqrt(128)
+    ///   (exl3_had_suh: pre-scale, butterfly) and B_N = diag(svh)*H128/sqrt(128)
+    ///   (exl3_had_svh: butterfly, post-scale), so the equivalent plain matrix is
+    ///   W_eq = B_N W_dec^T A_K, built as:
+    ///   (a) exl3_reconstruct -> W_dec [k, n] f16 (the oracle-validated dequant);
+    ///   (b) fold B_N over W_dec's ROWS = exl3_had_svh in place (butterfly-then-svh);
+    ///   (c) transpose [k, n] -> [n, k] (`xq_df2_transpose_f16`, f16 bits);
+    ///   (d) fold A_K^T over the rows = exl3_had_svh with svh:=suh in place
+    ///       (A_K^T = diag(suh)*H128/sqrt(128) - butterfly FIRST then suh, that kernel);
+    ///   (e) f16 -> bf16 in place (`xq_qsa_h2b`).
+    /// All steps reuse serving-path kernels; raw device pointers are passed for the
+    /// in-place steps (no &mut aliasing). Numerics note: the composition carries 2-3 f16
+    /// roundings vs the serve path's interleaved roundings (rel ~1e-3) - acceptable for
+    /// the DRAFTER's scoring; acceptance is judged by the target's own logits in
+    /// mtp_verify.
+    pub fn df2_boot_ptrs(&self) -> Result<(u64, u64)> {
+        let t0 = std::time::Instant::now();
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let h = self.cfg.hidden_size;
+
+        // ---- embed twin (f16 staging -> bf16) ------------------------------------
+        let embed_ptr = {
+            let mut g = self.df2_embed_bf16.lock().unwrap();
+            if g.is_none() {
+                let n = self.embed.len();
+                anyhow::ensure!(n % h == 0, "df2 embed twin: len {n} not a multiple of h {h}");
+                let twin = self.dev.alloc_zeros::<half::bf16>(n)
+                    .map_err(|e| anyhow::anyhow!("df2 embed twin alloc: {e:?}"))?;
+                let total = n as i64;
+                let blocks = (((total + 255) / 256).min(65535)) as u32;
+                xqlaunch!(l, "xq_qsa_h2b", (blocks, 1, 1), (256, 1, 1), 0,
+                          (*twin.device_ptr() as u64, *self.embed.device_ptr() as u64, total))?;
+                *g = Some(twin);
+            }
+            *g.as_ref().unwrap().device_ptr() as u64
+        };
+
+        // ---- head: dequant + fold the Hadamard algebra -----------------------------
+        let head_ptr = {
+            let mut g = self.df2_head_bf16.lock().unwrap();
+            if g.is_none() {
+                let q = &self.lm_head;
+                let (kk, nn) = (q.k as usize, q.n as usize);
+                anyhow::ensure!(kk == h, "df2 head: quad k {kk} != hidden {h}");
+                anyhow::ensure!(kk % 128 == 0 && nn % 128 == 0,
+                                "df2 head: quad {kk}x{nn} not 128-aligned (had_svh blocks)");
+                // (a) the dequant: W_dec [K, N] f16 row-major into ws.
+                let ws = self.dev.alloc_zeros::<u16>(kk * nn)
+                    .map_err(|e| anyhow::anyhow!("df2 head ws alloc: {e:?}"))?;
+                let ws_ptr = *ws.device_ptr() as u64;
+                exl3_reconstruct(&l, *q.tr.device_ptr() as u64,
+                                 *self.rc_lut.device_ptr() as u64, ws_ptr, q.k, q.n, q.bits)?;
+                // (b) fold B_N over W_dec's rows (in place; each thread owns its 4 elements).
+                xqlaunch!(l, "exl3_had_svh", ((kk * (nn / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                          (ws_ptr, &q.svh, ws_ptr, q.n))?;
+                // (c)+(d)+(e): transpose to [N, K], fold A_K^T (butterfly-then-suh) over the
+                // rows, and swap f16 -> bf16 - the head buffer is allocated with its final
+                // bf16 type and its raw pointer is bit-reinterpreted for the f16 passes.
+                let mut head = self.dev.alloc_zeros::<half::bf16>(nn * kk)
+                    .map_err(|e| anyhow::anyhow!("df2 head alloc: {e:?}"))?;
+                let head_ptr = *head.device_ptr() as u64;
+                xqlaunch!(l, "xq_df2_transpose_f16",
+                          (((kk + 31) / 32) as u32, ((nn + 31) / 32) as u32, 1), (32, 32, 1), 0,
+                          (head_ptr, ws_ptr, q.k, q.n))?;
+                xqlaunch!(l, "exl3_had_svh", ((nn * (kk / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                          (head_ptr, &q.suh, head_ptr, q.k))?;
+                let total = (nn * kk) as i64;
+                let blocks = (((total + 255) / 256).min(65535)) as u32;
+                xqlaunch!(l, "xq_qsa_h2b", (blocks, 1, 1), (256, 1, 1), 0,
+                          (head_ptr, head_ptr, total))?;
+                drop(ws); // free the transient before parking the persistent buffer
+                crate::drprintln!(
+                    "df2_boot_ptrs: head [{nn}x{kk}] dequant+fold+transpose, embed twin, {:.2} s (one-time)",
+                    t0.elapsed().as_secs_f64());
+                *g = Some(head);
+            }
+            *g.as_ref().unwrap().device_ptr() as u64
+        };
+
+        Ok((embed_ptr, head_ptr))
+    }
+
     fn recon_bufs(&self, psc: &PrefillScratch) -> ReconBufs {
         ReconBufs {
             ws: *psc.recon_ws.device_ptr() as u64,
@@ -13195,7 +14029,7 @@ impl Wp18Scratch {
         let nblk_stride = (m.max_pos / ratio.max(1)).max(1);
         static ONCE: std::sync::Once = std::sync::Once::new();
         if let Some(w) = why_not {
-            ONCE.call_once(|| println!("WP18: bounded prefill selection OFF ({w}) — [c][max_pos/ratio] score matrix"));
+            ONCE.call_once(|| crate::dprintln!("WP18: bounded prefill selection OFF ({w}) — [c][max_pos/ratio] score matrix"));
             return Ok(None);
         }
         let rows = wp18_rows().min(c.max(1));
@@ -13204,7 +14038,7 @@ impl Wp18Scratch {
             Some((dev.alloc_zeros::<i32>(c * (cfg.indexer_budget + ratio))?, dev.alloc_zeros::<i32>(c)?,
                   dev.alloc_zeros::<i32>(4)?))
         } else { None };
-        ONCE.call_once(|| println!("WP18: bounded prefill selection ON — slab {rows} x {WP18_T} f32 ({:.1} MB) + carried \
+        ONCE.call_once(|| crate::dprintln!("WP18: bounded prefill selection ON — slab {rows} x {WP18_T} f32 ({:.1} MB) + carried \
                                     top-{topk} lists ({:.1} MB) replace the [c][{nblk_stride}] matrix ({:.1} MB at c = {c}){}",
                                    (rows * WP18_T * 4) as f64 / 1e6, (rows * topk * 8) as f64 / 1e6,
                                    (c * nblk_stride * 4) as f64 / 1e6,
@@ -13354,6 +14188,9 @@ impl FwdModel {
         let lr = cfg.hc_lowrank;
         let rw = h * hc;
         let v = cfg.vocab_size;
+        // EXL27B: dense packs' widths (see Scratch::new); every other model: the FN constants
+        let dense = cfg.num_experts == 1;
+        let (kvw, mlpw) = (cfg.num_kv_heads * cfg.head_dim, cfg.moe_intermediate_size);
         let topk = cfg.num_experts_per_tok;
         let r = c * topk;
         let qsa_on = cfg.has_indexer();
@@ -13363,11 +14200,14 @@ impl FwdModel {
         let ne = cfg.num_experts;
         let (gu_w, d_w) = self.layers.first().map(|ly| (ly.moe.gu_words, ly.moe.d_words)).unwrap_or((0, 0));
         let pf_same = gu_w > 0 && self.layers.iter().all(|ly| ly.moe.gu_words == gu_w && ly.moe.d_words == d_w);
+        // EXL27B: Qwen3.5-class MoE layers carry their own offset tables (mixed 3/4-bit layers) and
+        // need the tile lists whatever pf_same says (FN: split_moe is false, pf_same decides as before)
+        let split_moe = self.layers.iter().any(|ly| ly.moe.split.is_some());
         let max_tiles = r / 16 + ne;
         let wp18 = if qsa_on { Wp18Scratch::new(self, c)? } else { None };
         Ok(PrefillScratch {
             c,
-            pf_tiles: dev.alloc_zeros::<i32>(if pf_same { 2 * max_tiles } else { 1 })?,
+            pf_tiles: dev.alloc_zeros::<i32>(if pf_same || split_moe { 2 * max_tiles } else { 1 })?,
             pf_ntiles: dev.alloc_zeros::<i32>(1)?,
             pf_tiles4: dev.alloc_zeros::<i32>(if pf_same { 8 * max_tiles } else { 1 })?,
             pf_ntiles4: dev.alloc_zeros::<i32>(4)?,
@@ -13403,16 +14243,16 @@ impl FwdModel {
             hn: dev.alloc_zeros::<u16>(c * rw)?,
             dd: dev.alloc_zeros::<u16>(c * lr)?,
             uu: dev.alloc_zeros::<u16>(c * rw)?,
-            inj: dev.alloc_zeros::<f32>(c * hc)?,
+            inj: if lr == 0 { dev.htod_sync_copy(&vec![1.0f32; c * hc])? } else { dev.alloc_zeros::<f32>(c * hc)? }, // EXL27B: plain residual
             x: dev.alloc_zeros::<u16>(c * h)?,
             x_last: dev.alloc_zeros::<u16>(h)?,
             // S-A3-f-b FIX: same as Scratch — must hold c * max_chain_K
             // (out_proj K=6144; c*2560 caused OOB reads from row c*2560/K).
-            chain_xh: dev.alloc_zeros::<u16>(c * 12288)?,
+            chain_xh: dev.alloc_zeros::<u16>(c * if dense { 12288usize.max(h).max(mlpw) } else { 12288 })?,
             // PFX1 (c): every m = c chain has N <= PF_CHAIN_NMAX (asserted in exl3_chain_rb /
             // pf_chain_check), the head fc chains are 4c x 2560, and the vocab-wide lm_head runs
             // at m = 1 — c*vocab (1.02 GB at C = 2048) was never needed; max(c*12288, vocab) is.
-            chain_yraw: dev.alloc_zeros::<u16>(if pfx1_on(PFX1_YRAW) { (c * PF_CHAIN_NMAX).max(v) } else { c * v })?,
+            chain_yraw: dev.alloc_zeros::<u16>(if pfx1_on(PFX1_YRAW) { (c * if dense { PF_CHAIN_NMAX.max(mlpw) } else { PF_CHAIN_NMAX }).max(v) } else { c * v })?,
             // S-A3-f-d step 0b FIX (serve smoke, both boxes): this ws is NOT dummy —
             // a final chunk with <= 16 rows runs the decode branch of exl3_chain_impl,
             // where ks>1 chains write split-K partials here ("prefill is m>16" was a
@@ -13426,8 +14266,8 @@ impl FwdModel {
             lt_ws: unsafe { dev.alloc::<u8>(32 * 1024 * 1024) }?,
             qkv: dev.alloc_zeros::<u16>(c * 10240)?,
             qg: dev.alloc_zeros::<u16>(c * 12288)?,
-            kp: dev.alloc_zeros::<u16>(c * 512)?,
-            vp: dev.alloc_zeros::<u16>(c * 512)?,
+            kp: dev.alloc_zeros::<u16>(c * if dense { kvw } else { 512 })?,
+            vp: dev.alloc_zeros::<u16>(c * if dense { kvw } else { 512 })?,
             zbuf: dev.alloc_zeros::<u16>(c * 6144)?,
             a_out: dev.alloc_zeros::<u16>(c * 48)?,
             b_out: dev.alloc_zeros::<u16>(c * 48)?,
@@ -13471,7 +14311,7 @@ impl FwdModel {
             argmax: dev.alloc_zeros::<i32>(1)?,
             wp05: match Wp05PfStage::new(dev, c, self.ple.is_some()) {
                 Ok(s) => Some(s),
-                Err(e) => { println!("WP05: pinned prefill staging unavailable ({e:#}) — pageable path"); None }
+                Err(e) => { crate::dprintln!("WP05: pinned prefill staging unavailable ({e:#}) — pageable path"); None }
             },
             pf_hook: None,
             pf_hooked: false,
@@ -13515,7 +14355,7 @@ impl FwdModel {
                 let mut refr = vec![0u16; c * 2560];
                 ple.rows_par(&h3s, &mut refr, true)?;
                 let (n, first) = wp05_diff_u16(rows, &refr);
-                println!("PLE_XCHECK prefill slot {slot} rows {c}: {n} mismatching f16 of {} (first (idx, new, old) {first:?})",
+                crate::dprintln!("PLE_XCHECK prefill slot {slot} rows {c}: {n} mismatching f16 of {} (first (idx, new, old) {first:?})",
                          c * 2560);
             }
             st.pin.htod(off, *psc.ple_emb.device_ptr() as u64, c * 2560 * 2)?;
@@ -13569,8 +14409,99 @@ impl FwdModel {
 
     /// Compact per-expert MoE over C chunk rows (deterministic: experts in
     /// ascending id, rows in ascending token order, combine in ascending j).
+    /// EXL27B: a dense pack's MLP over a prefill chunk — the three quads as prefill chains (the trunk's
+    /// arm: wide trellis, or reconstruct + cuBLASLt from --exl3-recon-min rows), each with its own
+    /// suh/svh/bits, silu(g)*u between, the down chain straight into moe_out.
+    fn dense_mlp_prefill(&self, l: &Launcher, psc: &mut PrefillScratch, moe: &MoeLayer, c: usize,
+                         rb: &ReconBufs) -> Result<()> {
+        let mi = moe.sh_down.k as usize; // EXL27C TP-B: the rank's intermediate slice (full at TP=1)
+        exl3_chain_rb_dense(l, &moe.sh_gate, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.sh1, c, &psc.chain_ws, rb)?;
+        exl3_chain_rb_dense(l, &moe.sh_up, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.sh2, c, &psc.chain_ws, rb)?;
+        let sh1p = *psc.sh1.device_ptr() as u64;
+        xqlaunch!(l, "xq_silu_mul", (((c * mi) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
+                 (&mut psc.sh1, sh1p, &psc.sh2, (c * mi) as i64))?;
+        if moe.sh_down.rowpar {
+            self.chain_o_rb(l, &moe.sh_down, &psc.sh1, &mut psc.chain_xh, &mut psc.chain_yraw,
+                            &mut psc.moe_out, c, &psc.chain_ws, rb, None, None).map(|_| ())?;
+        } else {
+            exl3_chain_rb_dense(l, &moe.sh_down, &psc.sh1, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.moe_out, c, &psc.chain_ws, rb)?;
+        }
+        Ok(())
+    }
+
+    /// EXL27B: a Qwen3.5-class MoE layer (MoeLayer::split) over a prefill chunk — a copy of
+    /// moe_prefill's device-routed arm on the wide-tiles kernel, gate and up as two GEMMs (each its own
+    /// suh / svh) over the per-layer offset tables; xh_e = gate input, yd_raw = up input (dead until the
+    /// down GEMM); ygu_raw / ygu hold [gate rows | up rows]. Then the shared FN tail (shared expert +
+    /// combine, generic in h / mi).
+    fn moe_split_prefill(&self, l: &Launcher, psc: &mut PrefillScratch, moe: &MoeLayer, c: usize,
+                         rb: &ReconBufs) -> Result<()> {
+        let sp = moe.split.as_ref().expect("moe_split_prefill on a non-split layer");
+        let (h, ne, topk, mi) = (self.cfg.hidden_size, self.cfg.num_experts, self.cfg.num_experts_per_tok,
+                                 self.cfg.moe_intermediate_size);
+        anyhow::ensure!(wide_trellis_supports_bits(moe.bits), "EXL3 prefill MoE: {}-bit routed experts", moe.bits);
+        anyhow::ensure!(psc.pf_tiles.len() > 1, "EXL3 prefill MoE: no tile lists in the prefill scratch");
+        let r = c * topk;
+        let mt = pfx1_moe_mt(c);
+        xqlaunch!(l, "xq_gemm_f16_f32_rows32", ((ne as u32) / 128, ((c + 31) / 32) as u32, 1), (128, 1, 1), 0,
+                 (&mut psc.logits_r, &moe.router, &psc.x, c as i32, ne as i32, h as i32))?;
+        xqlaunch!(l, "xq_router_topk", (c as u32, 1, 1), (256, 1, 1), ((256 + ne + 512) * 4) as u32,
+                 (&mut psc.ids, &mut psc.wts, &psc.logits_r, ne as i32, topk as i32, c as i32))?;
+        // TP-A: under EP, count/place run over THIS rank's local expert space (ids_ep: stacked
+        // local id or -1; cand = -1 marks remote picks for the combine), tiles sized to ne_eff —
+        // the stacked tables are local, so pf_ident / sp.offs_* address them unchanged.
+        let ep = moe.ep.as_ref();
+        if let Some(e) = ep {
+            xqlaunch!(l, "xq_moe_ids_ep", (r.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0,
+                     (&psc.ids, &mut psc.ids_ep, &mut psc.cand, &e.lut, r as i32, ne as i32))?;
+        }
+        let ids_route = if ep.is_some() { *psc.ids_ep.device_ptr() as u64 } else { *psc.ids.device_ptr() as u64 };
+        let ne = ep.map_or(ne, |e| e.n_local);
+        let max_tiles = (r / 16 + ne) as u32;
+        xqlaunch!(l, "xq_moe_pf_count", (1, 1, 1), (1024, 1, 1), 0,
+                 (ids_route, r as i32, ne as i32, &mut psc.cnt, &mut psc.offs_row, &mut psc.pf_tiles,
+                  &mut psc.pf_ntiles, (16 * mt) as i32))?;
+        xqlaunch!(l, "xq_moe_pf_place", (ne as u32, 1, 1), (256, 1, 1), 0,
+                 (ids_route, r as i32, topk as i32, &psc.offs_row, &mut psc.row_tok, &mut psc.row_eidx, &mut psc.cand))?;
+        if ep.is_some() {
+            // rows [offs_row[ne_eff], r) hold no local pick: give them a valid index (see kernel)
+            xqlaunch!(l, "xq_moe_pf_ep_fill", (r.div_ceil(256).min(1024) as u32, 1, 1), (256, 1, 1), 0,
+                     (&psc.offs_row, ne as i32, r as i32, &mut psc.row_tok, &mut psc.row_eidx))?;
+        }
+        xqlaunch!(l, "xq_had_suh_rows", ((r * (h / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&psc.x, &moe.suh_gu, &psc.pf_ident, &psc.row_tok, &psc.row_eidx, &mut psc.xh_e, r as i32, h as i32))?;
+        xqlaunch!(l, "xq_had_suh_rows", ((r * (h / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&psc.x, &sp.suh_u, &psc.pf_ident, &psc.row_tok, &psc.row_eidx, &mut psc.yd_raw, r as i32, h as i32))?;
+        let ygr = *psc.ygu_raw.device_ptr() as u64;
+        let yur = ygr + (r * mi * 2) as u64;
+        let yg = *psc.ygu.device_ptr() as u64;
+        let yu = yg + (r * mi * 2) as u64;
+        xqlaunch!(l, "exl3_hmma_gemm_wide_tiles", ((mi as u32) / 128, max_tiles, 1), (256, 1, 1), 0,
+                 (&moe.gu_tr, &sp.offs_e, &psc.xh_e, ygr, &psc.pf_tiles, &psc.pf_ntiles,
+                  &psc.offs_row, &psc.cnt, h as i32, mi as i32, moe.bits as i32, mt as i32))?;
+        xqlaunch!(l, "exl3_hmma_gemm_wide_tiles", ((mi as u32) / 128, max_tiles, 1), (256, 1, 1), 0,
+                 (&sp.up_tr, &sp.offs_e, &psc.yd_raw, yur, &psc.pf_tiles, &psc.pf_ntiles,
+                  &psc.offs_row, &psc.cnt, h as i32, mi as i32, moe.bits as i32, mt as i32))?;
+        xqlaunch!(l, "xq_had_svh_rows", ((r * (mi / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (ygr, &moe.svh_gu, &psc.pf_ident, &psc.row_eidx, yg, r as i32, mi as i32))?;
+        xqlaunch!(l, "xq_had_svh_rows", ((r * (mi / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (yur, &sp.svh_u, &psc.pf_ident, &psc.row_eidx, yu, r as i32, mi as i32))?;
+        xqlaunch!(l, "xq_silu_mul", (((r * mi) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
+                 (&mut psc.din, yg, yu, (r * mi) as i64))?;
+        xqlaunch!(l, "xq_had_suh_rows", ((r * (mi / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&psc.din, &moe.suh_d, &psc.pf_ident, &psc.pf_dident, &psc.row_eidx, &mut psc.xhd, r as i32, mi as i32))?;
+        xqlaunch!(l, "exl3_hmma_gemm_wide_tiles", ((h as u32) / 128, max_tiles, 1), (256, 1, 1), 0,
+                 (&moe.d_tr, &sp.offs_d, &psc.xhd, &mut psc.yd_raw, &psc.pf_tiles, &psc.pf_ntiles,
+                  &psc.offs_row, &psc.cnt, mi as i32, h as i32, moe.bits as i32, mt as i32))?;
+        xqlaunch!(l, "xq_had_svh_rows", ((r * (h / 128)) as u32, 1, 1), (32, 1, 1), 0,
+                 (&psc.yd_raw, &moe.svh_d, &psc.pf_ident, &psc.row_eidx, &mut psc.yd, r as i32, h as i32))?;
+        self.moe_prefill_tail(l, psc, moe, c, rb)
+    }
+
     fn moe_prefill(&self, l: &Launcher, psc: &mut PrefillScratch, moe: &MoeLayer, c: usize,
                    rb: &ReconBufs) -> Result<()> {
+        if moe.dense { return self.dense_mlp_prefill(l, psc, moe, c, rb); } // EXL27B
+        if moe.split.is_some() { return self.moe_split_prefill(l, psc, moe, c, rb); } // EXL27B
         let h = self.cfg.hidden_size;
         let ne = self.cfg.num_experts;
         let topk = self.cfg.num_experts_per_tok;
@@ -13662,13 +14593,13 @@ would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200
                 static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
                 let key = 1u8 | (pk as u8) << 1 | (pe as u8) << 2 | (fold as u8) << 3;
                 if SEEN.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
-                    println!("A5-P1 prefill MoE: kernel={} mt={} fold={} (c {c}, rule mt {mt})",
+                    crate::dprintln!("A5-P1 prefill MoE: kernel={} mt={} fold={} (c {c}, rule mt {mt})",
                              if pk { "xq_moe_pf (pipelined)" } else { "exl3_hmma_gemm_wide_tiles" },
                              if pe { "per-expert (WP19)" } else { "chunk rule" }, fold as u8);
                 }
                 static SEEN2: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
                 if SEEN2.swap(pf2, std::sync::atomic::Ordering::Relaxed) != pf2 {
-                    println!("A5-L2 prefill MoE: pf2 mask={pf2} (xq_moe_pf2 smem trellis ring for MT classes {:?})",
+                    crate::dprintln!("A5-L2 prefill MoE: pf2 mask={pf2} (xq_moe_pf2 smem trellis ring for MT classes {:?})",
                              (0..4).filter(|k| pf2 & (1 << k) != 0).map(|k| 1 << k).collect::<Vec<i32>>());
                 }
             }
@@ -14070,7 +15001,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         let (ct, cs) = (SC_TOT.fetch_add(stot, Relaxed) + stot, SC_BAD.fetch_add(sd, Relaxed) + sd);
         if k < 4 || bad > 0 || sd > 0 || k.is_power_of_two() || (k + 1) % 64 == 0 {
             let sfirst = if sd > 0 { format!(" (first score diff at row {} block {})", cnt[1] >> 16, cnt[1] & 0xFFFF) } else { String::new() };
-            println!("WP18_XCHECK #{k} layer {att_i} pos0 {pos0} rows {rows} (t0 {t0}): lists differ {bad}/{rows} rows \
+            crate::dprintln!("WP18_XCHECK #{k} layer {att_i} pos0 {pos0} rows {rows} (t0 {t0}): lists differ {bad}/{rows} rows \
                       ({entries} entries compared){first}; scores bit-differ {sd}/{stot}{sfirst} | cumulative: rows {cb}/{cr} \
                       differ, scores {cs}/{ct}{}", if bad + sd > 0 { "  <-- MISMATCH" } else { "" });
         }
@@ -14271,7 +15202,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                 let hd = cfg.head_dim;
                 let (dm, dl, da) = (nd(&rpm[a0..a1], &tpm[a0..a1]), nd(&rpl[a0..a1], &tpl[a0..a1]),
                                     nd(&racc[a0 * hd..a1 * hd], &tacc[a0 * hd..a1 * hd]));
-                println!("PQ8_XCHECK gather layer {att_i} pos0 {pos0} rows {rows} (t0 {t0}) fmt {}: pq8 vs splitk4 bit-differ pm {dm} pl {dl} pacc {da} of {} / {}{}",
+                crate::dprintln!("PQ8_XCHECK gather layer {att_i} pos0 {pos0} rows {rows} (t0 {t0}) fmt {}: pq8 vs splitk4 bit-differ pm {dm} pl {dl} pacc {da} of {} / {}{}",
                          kv_fmt_name(self.kv_fmt), a1 - a0, (a1 - a0) * hd,
                          if dm + dl + da == 0 { "" } else { "  <-- MISMATCH" });
             }
@@ -14305,7 +15236,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             let nd = |x: &[f32], y: &[f32]| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
             let (dm, dl) = (nd(&rpm[a..b], &tpm[a..b]), nd(&rpl[a..b], &tpl[a..b]));
             let da = nd(&racc[a * cfg.head_dim..b * cfg.head_dim], &tacc[a * cfg.head_dim..b * cfg.head_dim]);
-            println!("SEL_XCHECK layer {att_i} rows {rows} (t0 {t0}): splitk4 vs splitk bit-differ pm {dm} pl {dl} pacc {da} of {} / {}",
+            crate::dprintln!("SEL_XCHECK layer {att_i} rows {rows} (t0 {t0}): splitk4 vs splitk bit-differ pm {dm} pl {dl} pacc {da} of {} / {}",
                      b - a, (b - a) * cfg.head_dim);
         }
         xqlaunch!(l, "xq_attn_sel_combine", ((rows * cfg.num_heads) as u32, 1, 1), (cfg.head_dim as u32, 1, 1), 0,
@@ -14376,7 +15307,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             snap(&mut got)?;
             nd[pi] = want.iter().zip(&got).filter(|(a, b)| a != b).count();
         }
-        println!("PQ8_XCHECK kvw {tag} pos0 {pos0} c {c} fmt {}: rows-twin vs serial bytes differ {} (poison 0x00) / {} (poison 0xFF) of {}{}",
+        crate::dprintln!("PQ8_XCHECK kvw {tag} pos0 {pos0} c {c} fmt {}: rows-twin vs serial bytes differ {} (poison 0x00) / {} (poison 0xFF) of {}{}",
                  kv_fmt_name(self.kv_fmt), nd[0], nd[1], want.len(),
                  if nd == [0, 0] { "" } else { "  <-- MISMATCH" });
         Ok(())
@@ -14422,7 +15353,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             self.dev.synchronize()?;
             let got = self.dev.dtoh_sync_copy(&psc.normed)?;
             let nd = want.iter().zip(&got[..n16]).filter(|(x, y)| x != y).count();
-            println!("PQ8_XCHECK flash layer {att_i} pos0 {} rows {t} fmt {}: {} vs flash256 f16 differ {nd} of {n16}{}",
+            crate::dprintln!("PQ8_XCHECK flash layer {att_i} pos0 {} rows {t} fmt {}: {} vs flash256 f16 differ {nd} of {n16}{}",
                      ((slot_pos0 as u32) >> 12), kv_fmt_name(self.kv_fmt), twin.trim_start_matches("xq_attn_prefill_"),
                      if causal { "  (causal staging: differs by design)" } else if nd == 0 { "" } else { "  <-- MISMATCH" });
         }
@@ -14449,7 +15380,6 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         let nk = cfg.lin_num_k_heads;
         let conv_dim = cfg.key_dim() * 2 + cfg.value_dim();
         let ck = cfg.conv_kernel;
-        let theta = cfg.rope_theta;
         let rdim = cfg.rotary_dim;
 
         let pro = wp05_on("pro") && self.cos_gather_ok && pos0 + c <= self.max_pos
@@ -14488,16 +15418,16 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             if ple_xcheck_on() {
                 self.dev.synchronize()?;
                 let got = self.dev.dtoh_sync_copy(&psc.cos)?;
-                let want = prefill_cossin_host(theta, rdim, pos0, c);
+                let want = prefill_cossin_host(&self.rope, rdim, pos0, c);
                 let nd = got[..want.len()].iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                println!("PLE_XCHECK prefill-rope pos0 {pos0} rows {c}: {nd} mismatching f32 of {}", want.len());
+                crate::dprintln!("PLE_XCHECK prefill-rope pos0 {pos0} rows {c}: {nd} mismatching f32 of {}", want.len());
             }
         } else {
         psc.toks = self.dev.htod_sync_copy(toks)?;
         // S-A3-u D: the MoE row count is a per-chunk constant (c * topk) — one upload per chunk.
         self.dev.htod_copy_into(vec![(c * cfg.num_experts_per_tok) as i32], &mut psc.moerows)?;
         // cossin rows for pos0..pos0+c (same layout contract as forward_step)
-        let cossin = prefill_cossin_host(theta, rdim, pos0, c);
+        let cossin = prefill_cossin_host(&self.rope, rdim, pos0, c);
         psc.cos = self.dev.htod_sync_copy(&cossin)?;
         // S-A3-i: per-row (pos, slot, slot|pos) tables for the bf16 selection kernels
         // (they read LOGICAL positions; the prefill slot is uniform per chunk).
@@ -14609,7 +15539,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                         let v2 = tune::get(&T_PF_GDN_SCAN, &l.cx()) != 0;
                         static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
                         if SEEN.swap(1 + v2 as u8, std::sync::atomic::Ordering::Relaxed) != 1 + v2 as u8 {
-                            println!("A5-L1 prefill gdn: scan={} ({})", v2 as u8,
+                            crate::dprintln!("A5-L1 prefill gdn: scan={} ({})", v2 as u8,
                                      if v2 { "xq_gdn_chunk_tc2 wavefront solve + prefetch" } else { "xq_gdn_chunk_tc" });
                         }
                         gdn_chunk_tc_fn(v2)
@@ -14669,7 +15599,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                             let (sr, sm) = stat(&mut sa.iter().zip(&sb[slot * ns..(slot + 1) * ns]).map(|(p, q)| (*p, *q)));
                             let (cr, cm) = stat(&mut ca.iter().zip(&cb[..c * nh * vd])
                                 .map(|(p, q)| (half::f16::from_bits(*p).to_f32(), half::f16::from_bits(*q).to_f32())));
-                            println!("GDN_XCHECK layer {li} pos0 {pos0} C {c}: core relL2 {cr:.3e} max {cm:.3e} | state relL2 {sr:.3e} max {sm:.3e}");
+                            crate::dprintln!("GDN_XCHECK layer {li} pos0 {pos0} C {c}: core relL2 {cr:.3e} max {cm:.3e} | state relL2 {sr:.3e} max {sm:.3e}");
                         }
                     } else {
                     let nchunk = vd / 32;
@@ -14682,8 +15612,13 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                               &g.a_log, &g.dt_bias, slot_c, 0u64))?;
                     }
                     self.tr_u16(ld, true, li, &psc.core, &format!("g{li}_core"), c * vd)?;
+                    if cfg.gdn_gate_sigmoid {
                     xqlaunch!(l, "xq_gdn_gate", ((c * nh) as u32, 1, 1), (vd as u32, 1, 1), (vd * 4) as u32,
                              (&mut psc.normed, &psc.core, &psc.zbuf, &g.norm, vd as i32, nh as i32, c as i32, cfg.rms_eps))?;
+                    } else { // EXL27B: Qwen3.5-class gated norm, silu(z) (a kernel copy)
+                    xqlaunch!(l, "xq_gdn_gate_silu", ((c * nh) as u32, 1, 1), (vd as u32, 1, 1), (vd * 4) as u32,
+                             (&mut psc.normed, &psc.core, &psc.zbuf, &g.norm, vd as i32, nh as i32, c as i32, cfg.rms_eps))?;
+                    }
                     self.tr_u16(ld, true, li, &psc.normed, &format!("g{li}_gate"), c * vd)?;
                     let hk = self.pf_hook(psc, &layer.hc_mlp, *psc.mixer_out.device_ptr() as u64, ov_rows);
                     normed = self.chain_o_rb(&l, &g.out_proj, &psc.normed, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.mixer_out, c, &psc.chain_ws, &rb, hk, spl(li))?; // TP-B: row-parallel -> all-reduce (TP-SP: reduce-scatter)
@@ -14796,6 +15731,26 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             self.tr_u16(ld, false, li, &psc.yd, &format!("yd{li}"), c * cfg.num_experts_per_tok * h)?;
             let ymlp_p = *psc.moe_out.device_ptr() as u64;
             if pf_defer { pend = Some(ymlp_p); } else { self.hc_post_rows_sp(&l, psc, ymlp_p, c, spl(li))?; }
+            // EXL27C-DF2 (fwd): the DFlash2 PROMPT-PRIME tap - the same post-MLP-inject
+            // residual into the PRIME sink's rows [0, c) (trunk-identical: gpu.rs's S5F
+            // prefill capture writes rows [0, n); the serve agent then calls
+            // df2_prime_window(round, pos_start, c) per chunk). Flushing a deferred inject
+            // before the tap is bitwise the fused path. TODO-TP: under TP sequence-parallel
+            // prefill psc.resid holds only this rank's OWN rows (hc_post_rows_sp's
+            // lo*h*hcn offset) - gated off until the DF2 TP port lands.
+            if self.df2_prime.is_some() && self.tp.is_none()
+                && self.cfg.hidden_size == crate::dflash2::HIDDEN {
+                if let Some(kk) = crate::dflash2::TAP_LAYERS.iter().position(|&x| x == li) {
+                    if let Some(y) = pend.take() {
+                        self.hc_post_rows_sp(&l, psc, y, c, spl(li))?;
+                    }
+                    crate::dflash2::capture::capture_prime_f32(
+                        &self.dev, l.stream, self.df2_prime.as_ref().unwrap(),
+                        *psc.resid.device_ptr() as u64,
+                        self.cfg.hc_count.max(1) * self.cfg.hidden_size,
+                        self.cfg.hidden_size, c, kk)?;
+                }
+            }
             // TP-SP2 G-T1-b fault injection (--xtp-sp-fault, the xtp probe's sequence-parallel run on ONE
             // rank only): perturb one OWN row of the streams by one ulp — the redesigned gate must fire
             if let (Some(s), Some(spd)) = (spl(li), ld.and_then(|x| x.sp.as_ref())) {
@@ -14983,7 +15938,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             per_ms.push(tw.elapsed().as_millis().min(u32::MAX as u128) as u32);
         }
         self.dev.synchronize()?;
-        println!("EXL3 prefill warm-up: widths {:?} in {:.2} s (cuBLASLt kernels + plans loaded before the first request; \
+        crate::dprintln!("EXL3 prefill warm-up: widths {:?} in {:.2} s (cuBLASLt kernels + plans loaded before the first request; \
                   per-chunk ms {:?})", all, t0.elapsed().as_secs_f32(), per_ms);
         Ok(())
     }
@@ -15077,7 +16032,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                             }
                         }
                         Err(s) => {
-                            println!("PFX1: ltplans stopped at c={c}: {s} — the remaining shapes stay lazy");
+                            crate::dprintln!("PFX1: ltplans stopped at c={c}: {s} — the remaining shapes stay lazy");
                             break 'rows;
                         }
                     }
@@ -15090,7 +16045,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             // finishes at an arbitrary time after boot while the scheduler captures lazily. One handle
             // per boot stays allocated for the life of the process (host objects only).
             let _ = handle;
-            println!("PFX1: cuBLASLt prefill plans pre-populated in {:.1} s (background): {built} built, \
+            crate::dprintln!("PFX1: cuBLASLt prefill plans pre-populated in {:.1} s (background): {built} built, \
                       {had} already cached, {lost} raced the prefill; {nf} shape families x chunk rows 1..={cmax} (m >= {rmin})",
                      t0.elapsed().as_secs_f32());
         });
@@ -15126,7 +16081,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
     pub fn precapture_decode_graphs(&self, sc: &mut Scratch, lanes: usize, mtp_k: usize, dds: bool) -> Result<()> {
         if crate::opts::var(crate::opt!("exl3-no-graph")).is_ok()
             || crate::opts::var(crate::opt!("mtp-dump")).map_or(false, |s| !s.is_empty()) {
-            println!("EXL3_GRAPH: precapture skipped (graphs off: --exl3-no-graph / --mtp-dump)");
+            crate::dprintln!("EXL3_GRAPH: precapture skipped (graphs off: --exl3-no-graph / --mtp-dump)");
             return Ok(());
         }
         let t0 = std::time::Instant::now();
@@ -15166,7 +16121,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             && !dhead::dhead_xcheck(); // (p2 merge) DHEAD's XCHECK turns the draft graphs off at the replay sites
         let bf = self.qsa_bucket_free();
         if [crate::opt!("exl3-score-xcheck"), crate::opt!("exl3-topk-xcheck"), crate::opt!("exl3-gather-xcheck")].iter().any(|v| wp14_xcheck(*v)) {
-            println!("EXL3_GRAPH: note — WP04/WP14 XCHECK modes check EAGER calls only; graphed replays are \
+            crate::dprintln!("EXL3_GRAPH: note — WP04/WP14 XCHECK modes check EAGER calls only; graphed replays are \
                       not checked (run with --exl3-no-graph=1 for full coverage)");
         }
         // Host-side one-time init the eager first launch would otherwise do INSIDE a capture: the
@@ -15271,7 +16226,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
         let key = 1u8 | (norm as u8) << 1 | (mix as u8) << 2;
         if SEEN.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
-            println!("A5-P2 prefill hc: fuse={} (inj_norm {} mix {}; h {h} hc {hcn})", on as u8,
+            crate::dprintln!("A5-P2 prefill hc: fuse={} (inj_norm {} mix {}; h {h} hc {hcn})", on as u8,
                      if norm { "xq_pf_hc_inj_norm (deferred inject)" } else { "xq_hc_inject+xq_hc_norm" },
                      if mix { "xq_pf_hc_mix_2560x4" } else { "xq_hc_mix4" });
         }
@@ -15319,6 +16274,13 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             if let Some(y) = pend { self.hc_post_rows(l, psc, y, c)?; }
             xqlaunch!(l, "xq_hc_norm", ((hcn * c) as u32, 1, 1), (1024, 1, 1), 4096,
                      (&mut psc.hn, &psc.resid, &hc.norm, h as i32, hcn as i32, c as i32, self.cfg.rms_eps))?;
+        }
+        if lr == 0 {
+            // EXL27B: plain residual — the normed stream IS the mixer input (hn -> x)
+            let n = (rw * c) as i64;
+            xqlaunch!(l, "xq_copy_u16", (((n + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                      (&mut psc.x, &psc.hn, n, 0i64, 0i64))?;
+            return Ok(());
         }
         // S-A3-f-g: the hc down/up projections are the bulk of the prefill
         // xq_gemm_f16 cost (nsys: ~216 launches/chunk, same per-row K-serial
@@ -15371,7 +16333,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         static WHY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let once = |w: String| {
             let mut v = WHY.lock().unwrap();
-            if !v.contains(&w) { println!("[exl3-tp] TP-SP: {w}"); v.push(w); }
+            if !v.contains(&w) { crate::dprintln!("[exl3-tp] TP-SP: {w}"); v.push(w); }
         };
         if xtp::pf_overlap_fold() {
             once("sequence-parallel prefill is not composed with --tp-prefill-overlap fold: chunks run replicated".into());
@@ -15391,7 +16353,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         }
         let sp = xtp::SpRows::new(c, rank, world);
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("[exl3-tp] TP-SP sequence-parallel prefill ACTIVE at world {world} (first chunk c {c}: rank {rank} owns rows {:?}, \
+        ONCE.call_once(|| crate::dprintln!("[exl3-tp] TP-SP sequence-parallel prefill ACTIVE at world {world} (first chunk c {c}: rank {rank} owns rows {:?}, \
                                     row blocks {:?}; chunks of {}..={} rows split, hc GEMM plans pinned to the full chunk's)",
                                    sp.own, &sp.blocks[..world.min(4)], xtp::SP_MIN_ROWS, xtp::SP_MAX_ROWS));
         Some(sp)
@@ -15477,7 +16439,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         xqlaunch!(l, "xq_copy_f32", (1, 1, 1), (256, 1, 1), 0, (&mut psc.resid, &tmp, 1i64, i as i64, 0i64))?;
         self.dev.synchronize()?;
         let rank = self.tp.as_ref().map_or(0, |t| t.rank);
-        println!("[exl3-tp] rank {rank}: TP-SP2 FAULT INJECTION (--xtp-sp-fault {li}): layer {li} streams row {row} element 0 \
+        crate::dprintln!("[exl3-tp] rank {rank}: TP-SP2 FAULT INJECTION (--xtp-sp-fault {li}): layer {li} streams row {row} element 0 \
                   {:e} -> {:e} (one ulp, this rank's own row only)", v[0], f);
         Ok(())
     }
@@ -15593,7 +16555,7 @@ pub struct PackDraft {
 /// dispatch path names the entry that served it — identical hashes are not a liveness receipt).
 fn pack_live_note(r: usize, qsa: bool) {
     static LIVE: std::sync::Once = std::sync::Once::new();
-    LIVE.call_once(|| crate::rprintln!("[exl3] lane-pack LIVE: a packed speculative verify replayed ONE graph for two requests (the readback and the per-segment tripwires follow; first at R = {r} rows, {} regime; seg kernels xq_gdn_step_chunk_seg / xq_conv1d_chunk_seg_ns / xq_ple_conv_chunk_seg, accept xq_accept_seg, commit xq_conv_commit_seg / xq_gdn_commit_ring_seg / xq_ple_ring_commit_seg)",
+    LIVE.call_once(|| crate::drprintln!("[exl3] lane-pack LIVE: a packed speculative verify replayed ONE graph for two requests (the readback and the per-segment tripwires follow; first at R = {r} rows, {} regime; seg kernels xq_gdn_step_chunk_seg / xq_conv1d_chunk_seg_ns / xq_ple_conv_chunk_seg, accept xq_accept_seg, commit xq_conv_commit_seg / xq_gdn_commit_ring_seg / xq_ple_ring_commit_seg)",
                                        if qsa { "sparse" } else { "dense" }));
 }
 
@@ -15604,9 +16566,9 @@ fn pack_sampled_live_note(r: usize, rq: bool, kinds: [&str; 2]) {
     static RQ: std::sync::Once = std::sync::Once::new();
     static MATCH: std::sync::Once = std::sync::Once::new();
     if rq {
-        RQ.call_once(|| crate::rprintln!("[exl3] lane-pack LIVE (sampled, real-q): a packed verify of R = {r} rows replayed the rq graph family (xq_sample_rows_rq; segment 0 = a {} lane, segment 1 = a {} lane; per-row sampler blocks with each lane's own seed and counters, draft lists at each segment's row offset)", kinds[0], kinds[1]));
+        RQ.call_once(|| crate::drprintln!("[exl3] lane-pack LIVE (sampled, real-q): a packed verify of R = {r} rows replayed the rq graph family (xq_sample_rows_rq; segment 0 = a {} lane, segment 1 = a {} lane; per-row sampler blocks with each lane's own seed and counters, draft lists at each segment's row offset)", kinds[0], kinds[1]));
     } else {
-        MATCH.call_once(|| crate::rprintln!("[exl3] lane-pack LIVE (sampled, match rule): a packed verify of R = {r} rows sampled its rows with xq_sample_rows (segment 0 = a {} lane, segment 1 = a {} lane; the greedy graph family)", kinds[0], kinds[1]));
+        MATCH.call_once(|| crate::drprintln!("[exl3] lane-pack LIVE (sampled, match rule): a packed verify of R = {r} rows sampled its rows with xq_sample_rows (segment 0 = a {} lane, segment 1 = a {} lane; the greedy graph family)", kinds[0], kinds[1]));
     }
 }
 
@@ -15945,7 +16907,7 @@ pub fn kv_fmt_from_opts() -> u32 {
         Ok("q4x") => KV_Q4X,
         Ok("") | Err(_) => KV_FMT_DEFAULT,
         Ok(other) => {
-            eprintln!("[exl3] [kv-cache]={other} is not f32|f16|fp8|q8; using the default {}",
+            crate::deprintln!("[exl3] [kv-cache]={other} is not f32|f16|fp8|q8; using the default {}",
                       kv_fmt_name(KV_FMT_DEFAULT));
             KV_FMT_DEFAULT
         }
@@ -16192,7 +17154,7 @@ mod qsaregime_tests {
         assert_eq!((n(kvnll, &direct), n(kvnll, &clamped)), (0, 1), "the KV-NLL acceptance probe goes through the clamp");
         assert_eq!(n(regime, &direct), 0);
         assert_eq!(n(serve, &direct), 1, "exl3_serve.rs: step_mtp, which clamps k_eff itself");
-        let mtp = &serve[serve.find("fn step_mtp(&mut self, s: usize)").expect("step_mtp")..];
+        let mtp = &serve[serve.find("fn step_mtp(&mut self, s: usize, solo: bool)").expect("step_mtp")..];
         // S-B9-CF-PACK4: the clamps moved into `round_depth` (one definition for step_mtp and the packed
         // arm's plan): step_mtp must take its depth from it before the round, and it must hold the switch clamp
         assert!(mtp.find("self.round_depth(p, remaining)").expect("step_mtp's clamp") < mtp.find(direct.as_str()).expect("step_mtp's round"),
@@ -16262,7 +17224,7 @@ mod qsaregime_tests {
         assert!(o < st && o < body.find("mtp_plain_prime").unwrap(), "the order must be fixed before any row is staged");
         let sh = body.find("let slots: &[usize] = &ordered;").expect("step_plain must USE the ordered list (shadow `slots`)");
         assert!(o < sh && sh < st && sh < body.find("mtp_plain_prime").unwrap(), "every row of the step must come from the ordered list");
-        let mtp = &s[s.find("fn step_mtp(&mut self, s: usize)").expect("step_mtp")..];
+        let mtp = &s[s.find("fn step_mtp(&mut self, s: usize, solo: bool)").expect("step_mtp")..];
         let (c, r) = (mtp.find("self.round_depth(p, remaining)").expect("step_mtp clamps the round at the switch (round_depth)"),
                       mtp.find("let plain_step = control || k_eff == 0;").expect("step_mtp's plain-step rule"));
         assert!(c < r, "the switch clamp must precede the plain-step decision");
@@ -16601,7 +17563,7 @@ fn w4qsa_announce() {
     ONCE.call_once(|| {
         let (on, why) = w4qsa_env_rule();
         let xc = w4qsa_xcheck();
-        println!("[w4qsa] QSA verify gather: {why}{}",
+        crate::dprintln!("[w4qsa] QSA verify gather: {why}{}",
                  if on && xc { " | XCHECK on (eager bitwise new-vs-old per call)" }
                  else if xc { " (--w4qsa-xcheck ignored while OFF)" } else { "" });
     });
@@ -16714,7 +17676,7 @@ fn pq8_announce() {
         let v = [pq8_env_item(0), pq8_env_item(1), pq8_env_item(2)];
         let s = |b: bool| if b { "on" } else { "OFF" };
         let explicit = crate::opts::var_os(crate::opt!("pq8-flash")).is_some();
-        eprintln!("[pq8] prefill: kv writer rows {} | flash256v {} ({}){} | q8 gather {} (8-bit KV only){}", s(v[0]), s(v[1]),
+        crate::deprintln!("[pq8] prefill: kv writer rows {} | flash256v {} ({}){} | q8 gather {} (8-bit KV only){}", s(v[0]), s(v[1]),
                   if off { "--pq8-off=1" } else if !v[1] { "--pq8-flash=0 = flash256" }
                   else if pq8_flash_causal() { if explicit { "--pq8-flash=causal" } else { "DEFAULT causal (owner 2026-09-27); --pq8-flash=1 = bitwise twin" } }
                   else if explicit { "--pq8-flash set; bitwise flash256 twin (old bytes)" }
@@ -16744,7 +17706,7 @@ fn pq8_flash_causal() -> bool {
         Ok("1") | Ok("true") | Ok("flash256v") => false,
         Ok("0") | Ok("off") | Ok("false") => false, // handled by pq8_item as item-off (flash256)
         Ok(other) => {
-            eprintln!("[pq8] --pq8-flash='{other}' is not a known value — using the BITWISE flash256v twin (old bytes), not causal");
+            crate::deprintln!("[pq8] --pq8-flash='{other}' is not a known value — using the BITWISE flash256v twin (old bytes), not causal");
             false
         }
     })
@@ -16953,7 +17915,7 @@ mod flash256_stage_tests {
             assert_eq!(nd, 0, "pos0 {pos0} c {c}: v2 staging != scalar staging in {nd} of {} outputs", c * sh.hd);
             assert!(sc.iter().flatten().all(|x| x.is_finite()), "pos0 {pos0}: scalar read an unstaged element");
             let (e_sc, e_ca) = (max_err(&sc, &rf), max_err(&ca, &rf));
-            println!("pos0 {pos0:5} c {c:3}: v1 vs scalar differ {:6} of {:6} | max |err| vs f64 ref: scalar {e_sc:.3e} \
+            crate::dprintln!("pos0 {pos0:5} c {c:3}: v1 vs scalar differ {:6} of {:6} | max |err| vs f64 ref: scalar {e_sc:.3e} \
                       v1 {:.3e} causal {e_ca:.3e}", differ(&v1, &sc), c * sh.hd, max_err(&v1, &rf));
             assert!(e_ca < 1e-4, "pos0 {pos0}: the fully staged image must match the reference ({e_ca:.3e})");
             assert!(e_sc > 1e-3, "pos0 {pos0}: the scalar image's diagonal-tile defect must show ({e_sc:.3e})");
@@ -16977,7 +17939,7 @@ mod flash256_stage_tests {
             assert!(sc.iter().flatten().all(|x| x.is_finite()), "pos0 {pos0}: scalar read an unstaged element");
             assert!(ca.iter().flatten().all(|x| x.is_finite()), "pos0 {pos0}: causal read an unstaged element");
             let (e_sc, e_ca) = (max_err(&sc, &rf), max_err(&ca, &rf));
-            println!("hd128 pos0 {pos0:5} c {c:3}: causal vs scalar differ {:6} of {:6} | max |err| vs f64 ref: \
+            crate::dprintln!("hd128 pos0 {pos0:5} c {c:3}: causal vs scalar differ {:6} of {:6} | max |err| vs f64 ref: \
                       scalar {e_sc:.3e} causal {e_ca:.3e}", differ(&ca, &sc), c * sh.hd);
             assert!(e_ca < 1e-4, "pos0 {pos0}: the causal image must match the reference ({e_ca:.3e})");
             assert!(e_sc > 1e-3, "pos0 {pos0}: the scalar image's diagonal-tile defect must show ({e_sc:.3e})");
@@ -17096,11 +18058,11 @@ fn row_regime_note(md: usize, long: usize, late: usize) {
     static LIVE: std::sync::Once = std::sync::Once::new();
     static LATE: std::sync::Once = std::sync::Once::new();
     if md > 0 {
-        LIVE.call_once(|| crate::rprintln!("[exl3] per-row attention regime LIVE: a decode step with {md} row(s) at/below the sparse \
+        LIVE.call_once(|| crate::drprintln!("[exl3] per-row attention regime LIVE: a decode step with {md} row(s) at/below the sparse \
 switch and {long} past it keeps the short row(s) on the dense kernels (--qsa-row-regime 0 = one regime per step)"));
     }
     if late > 0 {
-        LATE.call_once(|| crate::rprintln!("[exl3] per-row attention regime: {late} row(s) at/below the sparse switch sit BEHIND a \
+        LATE.call_once(|| crate::drprintln!("[exl3] per-row attention regime: {late} row(s) at/below the sparse switch sit BEHIND a \
 longer row in a decode step and stay on the sparse kernels (the caller did not order short rows first)"));
     }
 }
@@ -17318,7 +18280,7 @@ pub fn a_flags() -> AFlags {
             rem_clamp: !(all_off || v(crate::opt!("a-remclamp")).as_deref() == Some("0")),
         };
         if f != (AFlags { taps_shared: false, seam: 0, ctrl: 0, rem_clamp: true }) {
-            eprintln!("[wp-a] DIAGNOSTIC ESCAPE active: {f:?} (GB10_A_* — not a serving default)");
+            crate::deprintln!("[wp-a] DIAGNOSTIC ESCAPE active: {f:?} (GB10_A_* — not a serving default)");
         }
         f
     })
@@ -17434,6 +18396,95 @@ impl FwdModel {
         self.head_kv_rows(sc, head, slot, p, &[b])
     }
 
+    /// S-C4PRIMEA: the BATCHED shared-step prime. All lanes' tap-row copies
+    /// (ONE xq_gather_tap_rows launch) and the whole re-prime sequence (ONE
+    /// pass at m = lanes.len() with per-row (slot,pos,tok) addressing, final
+    /// write xq_attn_kv_prefill_pairs) replace the per-lane mtp_plain_prime
+    /// calls of a shared plain step. Per-row bytes are bit-identical to the
+    /// per-lane path (same kernels, per-row math unchanged; the one-time GPU
+    /// identity xcheck at the call site proves it on the real path). The
+    /// CONTROL site (single-lane rounds) keeps mtp_plain_prime untouched.
+    /// lanes[i] = (slot, token b, pos p, tap_row).
+    pub fn mtp_plain_prime_batched(&self, sc: &mut Scratch, head: &DraftHead,
+                                   lanes: &[(usize, i32, usize, usize)]) -> Result<()> {
+        let m = lanes.len();
+        anyhow::ensure!(m >= 2 && m <= sc.toks.len(),
+                        "mtp_plain_prime_batched: {m} lanes on a width-{} scratch", sc.toks.len());
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let hcn = self.cfg.hc_count.max(1);
+        let he = hcn * self.cfg.hidden_size;
+        let shared = a_flags().taps_shared;
+        let win = (MTP_MAX_K + 1) * he;
+        let mut meta: Vec<i32> = Vec::with_capacity(m);
+        for &(slot, _b, p, tr) in lanes {
+            anyhow::ensure!(tr != usize::MAX && tr <= MTP_MAX_K, "batched prime: tap_row {tr} out of range");
+            anyhow::ensure!(p < self.max_pos, "batched prime: pos {p} past max_pos {}", self.max_pos);
+            if !shared {
+                let base = self.tap_base(sc, slot)?;
+                anyhow::ensure!(base + (tr + 1) * he <= sc.taps_keep.len(),
+                                "batched prime: tap window OOB (slot {slot})");
+            }
+            // taps_shared windows alias slot 0 (tap_base's contract); the pack keeps the row.
+            meta.push(if shared { (tr as i32) << 12 } else { (slot as i32) | ((tr as i32) << 12) });
+        }
+        // ONE gather of all lanes' tap rows into the lane-major resid rows. meta rides
+        // sc.toks stream-ordered (the gather consumes it before the token overwrite below).
+        // cudarc htod_copy_into asserts src.len() == dst.len(): pad to the scratch width.
+        let w_pad = sc.toks.len();
+        meta.resize(w_pad, 0);
+        self.dev.htod_copy_into(meta, &mut sc.toks)?;
+        xqlaunch!(l, "xq_gather_tap_rows", (m as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut sc.resid, &sc.taps_keep, &sc.toks, win as i64, he as i32, m as i32))?;
+        // per-row payloads: the same device fills head_kv_rows does, but per-row slot/pos.
+        let w = sc.toks.len();
+        let mut toks_v: Vec<i32> = lanes.iter().map(|&(_, b, _, _)| b).collect();
+        toks_v.resize(w, 0);
+        self.dev.htod_copy_into(toks_v, &mut sc.toks)?;
+        let mut pos_v: Vec<i32> = lanes.iter().map(|&(_, _, p, _)| p as i32).collect();
+        pos_v.resize(w, 0);
+        self.dev.htod_copy_into(pos_v, &mut sc.pos)?;
+        let mut slotpos: Vec<i32> = vec![0; w * 2];
+        let mut sids: Vec<i32> = vec![0; sc.slot_ids.len()];
+        for (i, &(sl, _, p, _)) in lanes.iter().enumerate() {
+            slotpos[i * 2] = sl as i32;
+            slotpos[i * 2 + 1] = p as i32;
+            if i < sids.len() { sids[i] = sl as i32; }
+        }
+        self.dev.htod_copy_into(slotpos, &mut sc.slots)?;
+        self.dev.htod_copy_into(sids, &mut sc.slot_ids)?;
+        self.head_reprime_launches_inner(&l, sc, head, m, lanes[0].0, lanes[0].2,
+                                         Some(*sc.slots.device_ptr() as u64))
+    }
+
+    /// S-C4PRIMEA identity gate: compact grab of the raw head-KV bytes of the given
+    /// (slot,pos) rows (all 2*nkv planes, rb bytes each) via xq_copy_u16 launches on
+    /// the compute stream, then one host readback. Used by the one-time-per-boot
+    /// legacy-vs-batched xcheck at the call site.
+    pub fn head_kv_row_bytes(&self, sc: &mut Scratch, head: &DraftHead,
+                             lanes: &[(usize, i32, usize, usize)]) -> Result<Vec<u8>> {
+        let _ = sc;
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        let nkv = self.cfg.num_kv_heads;
+        let seg = 2 * nkv;
+        let rb = kv_rowbytes(self.kv_fmt, self.cfg.head_dim);
+        anyhow::ensure!(rb % 2 == 0, "kv row grab: odd row bytes ({rb})");
+        let total = lanes.len() * seg * rb;
+        let mut d = unsafe { self.dev.alloc::<u8>(total)? };
+        let mut off = 0usize;
+        for &(sl, _b, p, _tr) in lanes {
+            anyhow::ensure!(p < self.max_pos, "kv row grab: pos {p} past max_pos");
+            for r in 0..seg {
+                let so = (sl * seg * self.max_pos + r * self.max_pos + p) * rb;
+                anyhow::ensure!(so % 2 == 0, "kv row grab: odd source offset");
+                xqlaunch!(l, "xq_copy_u16", (((rb / 2 + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                          (&mut d, &head.kv, (rb / 2) as i64, (off / 2) as i64, (so / 2) as i64))?;
+                off += rb;
+            }
+        }
+        self.dev.synchronize()?;
+        Ok(self.dev.dtoh_sync_copy(&d)?)
+    }
+
     /// --a-xcheck: host copy of `slot`'s taps row `tap_row` (bits), for tap_xcheck_verify.
     fn tap_row_bits(&self, sc: &Scratch, slot: usize, tap_row: usize) -> Result<Vec<u32>> {
         let he = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
@@ -17463,13 +18514,13 @@ impl FwdModel {
         let Some((row, want)) = rec else { return Ok(()) };
         let n = TAP_XCHECK_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let bad = if row != tap_row || tap_row == usize::MAX {
-            eprintln!("[a-xcheck] slot {slot}: tap row {row} recorded, round restores row {tap_row}");
+            crate::deprintln!("[a-xcheck] slot {slot}: tap row {row} recorded, round restores row {tap_row}");
             true
         } else {
             let got = self.tap_row_bits(sc, slot, tap_row)?;
             let diff: Vec<usize> = (0..want.len()).filter(|&i| want[i] != got[i]).collect();
             if let Some(&i) = diff.first() {
-                eprintln!("[a-xcheck] slot {slot}: tap row {row} CLOBBERED since its round — {} of {} floats \
+                crate::deprintln!("[a-xcheck] slot {slot}: tap row {row} CLOBBERED since its round — {} of {} floats \
                            differ, first at {i}: {} (recorded) vs {} (now)", diff.len(), want.len(),
                           f32::from_bits(want[i]), f32::from_bits(got[i]));
             }
@@ -17477,7 +18528,7 @@ impl FwdModel {
         };
         let nb = TAP_XCHECK_BAD.fetch_add(bad as usize, std::sync::atomic::Ordering::Relaxed) + bad as usize;
         if n % 256 == 0 {
-            eprintln!("[a-xcheck] taps: {n} round starts checked, {nb} clobbered");
+            crate::deprintln!("[a-xcheck] taps: {n} round starts checked, {nb} clobbered");
         }
         Ok(())
     }
@@ -17941,8 +18992,13 @@ impl FwdModel {
                     }
                     if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.core, "l0core", 0)?; } }
                     wp27.join(&wp27_z)?; // WP27: the gate reads zbuf
+                    if cfg.gdn_gate_sigmoid {
                     xqlaunch!(l, "xq_gdn_gate", ((m * nh) as u32, 1, 1), (vd as u32, 1, 1), (vd * 4) as u32,
                              (&mut sc.normed, &sc.core, &sc.zbuf, &g.norm, vd as i32, nh as i32, m as i32, eps))?;
+                    } else { // EXL27B: Qwen3.5-class gated norm, silu(z) (a kernel copy)
+                    xqlaunch!(l, "xq_gdn_gate_silu", ((m * nh) as u32, 1, 1), (vd as u32, 1, 1), (vd * 4) as u32,
+                             (&mut sc.normed, &sc.core, &sc.zbuf, &g.norm, vd as i32, nh as i32, m as i32, eps))?;
+                    }
                     if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.normed, "l0gate", 0)?; } }
                     self.chain_o(l, &g.out_proj, &sc.normed, &mut sc.chain_xh, &mut sc.chain_yraw, &mut sc.mixer_out, m, &sc.chain_ws)?; // TP-B: row-parallel -> all-reduce
                     if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.mixer_out, "l0yatt", 0)?; } }
@@ -18004,6 +19060,22 @@ impl FwdModel {
             if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_u(&d, &sc.moe_out, "l0ymlp", 0)?; } }
             let ymlp_p = *sc.moe_out.device_ptr() as u64;
             self.hc_post_d(l, sc, ymlp_p, m, hc_def, &mut hc_pend)?;
+            // EXL27C-DF2 (fwd): the DFlash2 tap on the VERIFY pass (this shared kernel
+            // sequence serves verify_block and every packed variant - one hook covers them
+            // all; m = the k+1-wide round, cols [0, m) land in the sink exactly as the
+            // trunk's graphed verify tap does). Same guards as the decode hook in
+            // forward_step_kernels; flush-before-tap so the residual is materialized.
+            if self.df2_sink.is_some() && m <= crate::dflash2::block()
+                && self.cfg.hidden_size == crate::dflash2::HIDDEN {
+                if let Some(kk) = crate::dflash2::TAP_LAYERS.iter().position(|&x| x == lk) {
+                    if hc_pend.is_some() { self.hc_flush(l, sc, m, &mut hc_pend)?; }
+                    crate::dflash2::capture::capture_cols_f32(
+                        &self.dev, l.stream, self.df2_sink.as_ref().unwrap(),
+                        *sc.resid.device_ptr() as u64,
+                        self.cfg.hc_count.max(1) * self.cfg.hidden_size,
+                        self.cfg.hidden_size, m, kk)?;
+                }
+            }
             if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_f(&d, &sc.resid, "l0rmlp", 0)?; } }
         }
         // final mixer -> hidden; lm_head (FULL head — never the pruned slice);
@@ -18046,7 +19118,7 @@ impl FwdModel {
         if let Some(d) = bmtd.as_ref() {
             dump_u(&d, &sc.logits, "press0logits", 0)?;
             let amh = self.dev.dtoh_sync_copy(&sc.argmax)?;
-            println!("MTP_DIAG argmax[:{}]= {:?}  v={}", m, &amh[..m], v);
+            crate::dprintln!("MTP_DIAG argmax[:{}]= {:?}  v={}", m, &amh[..m], v);
         }
         Ok(())
     }
@@ -18140,7 +19212,7 @@ impl FwdModel {
                     let k = CHK_N.fetch_add(1, Ordering::SeqCst) + 1;
                     if mism > 0 { CHK_BAD.fetch_add(1, Ordering::SeqCst); }
                     if mism > 0 || k % 360 == 0 {
-                        println!("GDN_RING_CHECK: layer-commits {} bad {} (this: gdn {} a {} mism {})",
+                        crate::dprintln!("GDN_RING_CHECK: layer-commits {} bad {} (this: gdn {} a {} mism {})",
                                  k, CHK_BAD.load(Ordering::SeqCst), gdn_i, acc.get(1).copied().unwrap_or(-1), mism);
                     }
                 }
@@ -18314,7 +19386,7 @@ impl FwdModel {
         out.push(rows as u64);
         {
             let nkv_layers = self.k_cache.len();
-            eprintln!(
+            crate::deprintln!(
                 "SNAPMAP rows {rows} s_e {s_e} c_e {c_e} ple {p_e} taps {} kv_layers {nkv_layers} kv_w {kv_w} slots {}",
                 (MTP_MAX_K + 1) * he, slots.len());
         }
@@ -18509,7 +19581,7 @@ impl FwdModel {
             }
             // rel/cutb (v0.7.3): per-round anomaly marker moved to logq — a direct println! on the
             // scheduler thread blocks on a full stdout pipe (GATES1/FIXC direct-print rule).
-            crate::rprintln!("EXL3_GRAPH: packed graph missing at rpad={r} — eager fallback this round");
+            crate::drprintln!("EXL3_GRAPH: packed graph missing at rpad={r} — eager fallback this round");
         }
         self.verify_block_packed_full(l, sc, &segs, r, 2, qsa)?;
         self.dev.synchronize()?;
@@ -18686,7 +19758,7 @@ impl FwdModel {
                 stash.push(self.dev.dtoh_sync_copy(&t)?);
             }
             *Self::r13_stash_borrow() = Some(stash);
-            println!("QKVDIFF: stashed {} LONE B raw rows (layer 0)", nrows.min(5));
+            crate::dprintln!("QKVDIFF: stashed {} LONE B raw rows (layer 0)", nrows.min(5));
         }
         if tag == "PACK" {
             if let Some(stash) = Self::r13_stash_borrow().clone() {
@@ -18702,7 +19774,7 @@ impl FwdModel {
                     let diffs: Vec<usize> = (0..cd * 2).filter(|&i| vp[i] != vl[i]).collect();
                     let mut buckets = [0usize; 10];
                     for &i in diffs.iter() { buckets[(i / 1024).min(9)] += 1; }
-                    println!("QKVDIFF2 PACK r{rp} vs LONE r{rl} ({label}): {} differ; buckets {:?}; first {:?} (p,l) {:?}",
+                    crate::dprintln!("QKVDIFF2 PACK r{rp} vs LONE r{rl} ({label}): {} differ; buckets {:?}; first {:?} (p,l) {:?}",
                              diffs.len(), buckets, &diffs[..diffs.len().min(6)],
                              diffs.iter().take(6).map(|&i| (vp[i], vl[i])).collect::<Vec<_>>());
                 }
@@ -18720,7 +19792,7 @@ impl FwdModel {
                 let mut bytes = Vec::with_capacity((he * 4) as usize);
                 for &x in hb.iter() { bytes.extend_from_slice(&x.to_bits().to_le_bytes()); }
                 let h = fnv64_u16(bytemuck::cast_slice::<u8, u16>(&bytes));
-                println!("INP {tag} resid r{r} {h:016x}");
+                crate::dprintln!("INP {tag} resid r{r} {h:016x}");
             }
         }
         for &li in layers {
@@ -18775,13 +19847,13 @@ impl FwdModel {
             let off = (*self.s_state[li].device_ptr()) as u64 + ((slot as u64) * (s_e as u64) * 4);
             xqlaunch!(l, "xq_copy_u16", grid(s_e * 2), (256, 1, 1), 0, (&mut f_tmp, off, s_e * 2, 0i64, 0i64))?;
             let h = fnv64_u16(&self.dev.dtoh_sync_copy(&f_tmp)?[..]);
-            println!("ST {tag} s{slot}.l{li} {h:016x}");
+            crate::dprintln!("ST {tag} s{slot}.l{li} {h:016x}");
         }
         for li in 0..self.conv_state.len() {
             let off = (*self.conv_state[li].device_ptr()) as u64 + ((slot as u64) * (c_e as u64) * 4);
             xqlaunch!(l, "xq_copy_u16", grid(c_e * 2), (256, 1, 1), 0, (&mut c_tmp, off, c_e * 2, 0i64, 0i64))?;
             let h = fnv64_u16(&self.dev.dtoh_sync_copy(&c_tmp)?[..]);
-            println!("ST {tag} c{slot}.l{li} {h:016x}");
+            crate::dprintln!("ST {tag} c{slot}.l{li} {h:016x}");
         }
         Ok(())
     }
@@ -18792,7 +19864,7 @@ impl FwdModel {
         let toks = self.dev.dtoh_sync_copy(&sc.toks)?;
         let pos = self.dev.dtoh_sync_copy(&sc.pos)?;
         let emb = self.dev.dtoh_sync_copy(&sc.ple_emb)?;
-        println!("STAGE {tag} toks {:?} pos {:?}", &toks[..nrows], &pos[..nrows]);
+        crate::dprintln!("STAGE {tag} toks {:?} pos {:?}", &toks[..nrows], &pos[..nrows]);
         let grid = (1u32, 1, 1);
         let mut tmp = self.dev.alloc_zeros::<u16>(10240)?;
         for r in 0..nrows {
@@ -18800,7 +19872,7 @@ impl FwdModel {
                       (&mut tmp, ((*sc.ple_emb.device_ptr()) as u64) + ((r * 10240) * 2) as u64,
                        (10240 * 2) as i64, 0i64, 0i64))?;
             let h = fnv64_u16(&self.dev.dtoh_sync_copy(&tmp)?);
-            println!("STAGE {tag} emb r{r} {h:016x}");
+            crate::dprintln!("STAGE {tag} emb r{r} {h:016x}");
         }
         Ok(())
     }
@@ -18826,7 +19898,7 @@ impl FwdModel {
         let rounds = 20usize;
         let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         anyhow::ensure!(sc.d_dev.len() >= m + k, "packstate: d_dev narrower than 2 x k");
-        println!("PACKSTATE: packed ROUND probe (2 requests, k={k}, {rounds} rounds x 3 pairs; \
+        crate::dprintln!("PACKSTATE: packed ROUND probe (2 requests, k={k}, {rounds} rounds x 3 pairs; \
                   serial = lone verify per request through the served verify_block; \
                   packed = one R_pad verify, per-segment accept/commit/re-prime)");
         let pairs = [(97usize, 89usize), (513usize, 523usize), (2201usize, 2201usize)];
@@ -18876,7 +19948,7 @@ impl FwdModel {
                     let (b, p, tr) = st[j];
                     self.packstate_tap_restore(&l, &mut sc, j, tr)?;
                     let drafts = self.packstate_draft(&l, &mut sc, head, j, k, b, p)?;
-                    if r >= 12 { println!("DRAFTS LONE r{r} j{j}: {drafts:?}"); }
+                    if r >= 12 { crate::dprintln!("DRAFTS LONE r{r} j{j}: {drafts:?}"); }
                     let hist_pre = { let h = self.ple_hist.lock().unwrap(); (h[j * 2], h[j * 2 + 1]) };
                     let toks_v: Vec<i32> = std::iter::once(b).chain(drafts.iter().cloned()).collect();
                     let t0 = std::time::Instant::now();
@@ -18888,7 +19960,7 @@ impl FwdModel {
                         let seg = 5 * nh * GDN_RS;
                         let mut h: u64 = 0xcbf29ce484222325;
                         for &f in &ring_h[base..base + seg] { h = (h ^ (f.to_bits() as u64)).wrapping_mul(0x100000001b3); }
-                        eprintln!("RINGHASH L2 serial j{j}: {h:016x}");
+                        crate::deprintln!("RINGHASH L2 serial j{j}: {h:016x}");
                     }
                     vms += t0.elapsed().as_secs_f64() * 1e3;
                     let a = out[k + 2] as usize;
@@ -18903,7 +19975,7 @@ impl FwdModel {
                 ms_s.push(vms);
                 if r <= 5 { snaps_s.push(self.packstate_snap(&l, &sc, &[0, 1], st[0].1.max(st[1].1) + 8)?); }
                 if r == 0 || r + 1 == rounds {
-                    println!("PACKSTATE SERIAL pair {pi} round {r}: a=({},{}) pos=({},{})",
+                    crate::dprintln!("PACKSTATE SERIAL pair {pi} round {r}: a=({},{}) pos=({},{})",
                              acc_s[0][r], acc_s[1][r], st[0].1, st[1].1);
                 }
             }
@@ -18913,7 +19985,7 @@ impl FwdModel {
             self.packstate_restore(&l, &shadow)?;
             let snap0r = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
             let rdiff = snap0.iter().zip(snap0r.iter()).filter(|(x, y)| x != y).count();
-            println!("PACKSTATE PAIR {pi}: save/restore diff = {rdiff} words (must be 0)");
+            crate::dprintln!("PACKSTATE PAIR {pi}: save/restore diff = {rdiff} words (must be 0)");
             anyhow::ensure!(rdiff == 0, "PACKSTATE pair {pi}: device save/restore not bitwise ({rdiff} words)");
             let mut st = [(b0, p0, 0usize), (b1, p1, 0usize)];
             let mut tok_p = [Vec::<i32>::new(), Vec::<i32>::new()];
@@ -18922,7 +19994,7 @@ impl FwdModel {
             let mut uneq_pair = 0usize;
             let mut uneq_fb = 0usize; // unequal accepts in FALLBACK rounds (not packed evidence)
             for r in 0..rounds {
-                eprintln!("PR2 r{r} begin pos {}/{}", st[0].1, st[1].1);
+                crate::deprintln!("PR2 r{r} begin pos {}/{}", st[0].1, st[1].1);
                 // One regime AND grid bucket per packed verify (design §3.5/R7: lanes
                 // disagreeing on the QSA regime fall back to serial for that round).
                 let qa = self.qsa_live(st[0].1 + k);
@@ -18930,7 +20002,7 @@ impl FwdModel {
                 let (ga, ba) = self.qsa_grid_bucket_key(st[0].1 + k);
                 let (gb, bb) = self.qsa_grid_bucket_key(st[1].1 + k);
                 if qa != qb || ga != gb || ba != bb {
-                    println!("[exl3-serve] lane-pack skip: mixed regime (pair {pi} round {r}, pos {}/{}, bucket {ga}/{gb}) — serial fallback",
+                    crate::dprintln!("[exl3-serve] lane-pack skip: mixed regime (pair {pi} round {r}, pos {}/{}, bucket {ga}/{gb}) — serial fallback",
                              st[0].1, st[1].1);
                     let mut vms = 0f64;
                     let mut a2 = [0usize; 2];
@@ -18961,7 +20033,7 @@ impl FwdModel {
                     if a2[0] != a2[1] { uneq_fb += 1; }
                     ms_p.push(vms);
                     if r == 0 || r + 1 == rounds {
-                        println!("PACKSTATE PACKED pair {pi} round {r}: a=({},{}) pos=({},{}) [serial-fb]",
+                        crate::dprintln!("PACKSTATE PACKED pair {pi} round {r}: a=({},{}) pos=({},{}) [serial-fb]",
                                  a2[0], a2[1], st[0].1, st[1].1);
                     }
                     continue;
@@ -18972,9 +20044,9 @@ impl FwdModel {
                     let (b, p, tr) = st[j];
                     self.packstate_tap_restore(&l, &mut sc, j, tr)?;
                     dss[j] = self.packstate_draft(&l, &mut sc, head, j, k, b, p)?;
-                    if r >= 12 { println!("DRAFTS PACK r{r} j{j}: {:?}", dss[j]); }
+                    if r >= 12 { crate::dprintln!("DRAFTS PACK r{r} j{j}: {:?}", dss[j]); }
                 }
-                eprintln!("PR2 r{r} drafts ok");
+                crate::deprintln!("PR2 r{r} drafts ok");
                 // (ii) ONE packed verify over both chains
                 let mut rows: Vec<(usize, i32, usize)> =
                     (0..m).map(|i| (0usize, if i == 0 { st[0].0 } else { dss[0][i - 1] }, st[0].1 + i)).collect();
@@ -18984,7 +20056,7 @@ impl FwdModel {
                 let t0 = std::time::Instant::now();
                 let (out, accf) = self.packstate_verify_packed(&l, &mut sc, &rows, &dss[0], &dss[1],
                                                                k, st[0].1.max(st[1].1))?;
-                eprintln!("PR2 r{r} verify ok {}ms", t0.elapsed().as_millis());
+                crate::deprintln!("PR2 r{r} verify ok {}ms", t0.elapsed().as_millis());
                 if r == 0 {
                     let ring_h = self.dev.dtoh_sync_copy(&sc.gdn_ring_p)?;
                     let nh = self.tc.lin_num_v_heads as usize;
@@ -18993,7 +20065,7 @@ impl FwdModel {
                     for half in 0..2usize {
                         let mut h: u64 = 0xcbf29ce484222325;
                         for &f in &ring_h[base + half * seg..base + (half + 1) * seg] { h = (h ^ (f.to_bits() as u64)).wrapping_mul(0x100000001b3); }
-                        eprintln!("RINGHASH L2 packed half{half}: {h:016x}");
+                        crate::deprintln!("RINGHASH L2 packed half{half}: {h:016x}");
                     }
                 }
                 let vms = t0.elapsed().as_secs_f64() * 1e3;
@@ -19004,37 +20076,37 @@ impl FwdModel {
                 let mut a2 = [0usize; 2];
                 for j in 0..2usize {
                     let a = accf[j * 2 + 1] as usize;
-                    eprintln!("PR3 r{r} j{j} a={a} begin");
+                    crate::deprintln!("PR3 r{r} j{j} a={a} begin");
                     anyhow::ensure!(a <= k, "packstate: packed accept out of range (seg {j})");
                     let row0 = j * m;
                     let toks_v: Vec<i32> =
                         std::iter::once(st[j].0).chain(dss[j].iter().cloned()).collect();
-                    eprintln!("PR3 r{r} j{j} hist_restore begin");
+                    crate::deprintln!("PR3 r{r} j{j} hist_restore begin");
                     self.packstate_hist_restore(j, if j == 0 { hp0 } else { hp1 }, &toks_v, a, st[j].0);
-                    eprintln!("PR3 r{r} j{j} hist ok");
-                    eprintln!("PR3 r{r} j{j} head_reprime begin n={}", &dss[j][..a].len());
+                    crate::deprintln!("PR3 r{r} j{j} hist ok");
+                    crate::deprintln!("PR3 r{r} j{j} head_reprime begin n={}", &dss[j][..a].len());
                     self.head_reprime(&mut sc, head, j, st[j].1, &dss[j][..a])?;
-                    eprintln!("PR3 r{r} j{j} reprime ok");
+                    crate::deprintln!("PR3 r{r} j{j} reprime ok");
                     let emitted = out[row0..=row0 + a].to_vec();
                     tok_p[j].extend(emitted.iter().cloned());
                     acc_p[j].push(a);
                     a2[j] = a;
                     st[j] = (emitted[a], st[j].1 + a + 1, a);
                 }
-                eprintln!("PR2 r{r} reprime ok");
+                crate::deprintln!("PR2 r{r} reprime ok");
                 if r <= 5 {
                     let sp = self.packstate_snap(&l, &sc, &[0, 1], st[0].1.max(st[1].1) + 8)?;
                     let n = sp.iter().zip(snaps_s[r].iter()).filter(|(x, y)| x != y).count();
                     let lmis = sp.len() != snaps_s[r].len();
                     let didx: Vec<usize> = sp.iter().zip(snaps_s[r].iter()).enumerate()
                         .filter(|(_, (x, y))| x != y).map(|(i, _)| i).take(12).collect();
-                    eprintln!("PR4 r{r} snapdiff {n} lenmatch {} first {didx:?}", !lmis);
+                    crate::deprintln!("PR4 r{r} snapdiff {n} lenmatch {} first {didx:?}", !lmis);
                     if r == 0 {
                         for &i in didx.iter().take(4) {
                             let a = sp.get(i).copied().unwrap_or(0xDEAD);
                             let b = snaps_s[r].get(i).copied().unwrap_or(0xDEAD);
                             let (af, bf) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
-                            eprintln!("PR4V idx {i}: packed {a:#018x} ({af:.6e}) serial {b:#018x} ({bf:.6e})");
+                            crate::deprintln!("PR4V idx {i}: packed {a:#018x} ({af:.6e}) serial {b:#018x} ({bf:.6e})");
                         }
                     }
                 }
@@ -19042,7 +20114,7 @@ impl FwdModel {
                 if a2[0] != a2[1] { unequal_rounds += 1; uneq_pair += 1; }
                 ms_p.push(vms);
                 if r == 0 || r + 1 == rounds || a2[0] != a2[1] {
-                    println!("PACKSTATE PACKED pair {pi} round {r}: a=({},{}){} pos=({},{})",
+                    crate::dprintln!("PACKSTATE PACKED pair {pi} round {r}: a=({},{}){} pos=({},{})",
                              a2[0], a2[1], if a2[0] != a2[1] { " UNEQUAL" } else { "" }, st[0].1, st[1].1);
                 }
             }
@@ -19056,13 +20128,13 @@ impl FwdModel {
                 if n > 0 {
                     let didx: Vec<usize> = snap_s.iter().zip(snap_p.iter()).enumerate()
                         .filter(|(_, (x, y))| x != y).map(|(i, _)| i).take(12).collect();
-                    println!("PACKSTATE DIAG pair {pi}: snap diff {n} first_idx {didx:?}");
+                    crate::dprintln!("PACKSTATE DIAG pair {pi}: snap diff {n} first_idx {didx:?}");
                 }
                 n
             } else { usize::MAX };
             let ms_s_mean = ms_s.iter().sum::<f64>() / ms_s.len().max(1) as f64;
             let ms_p_mean = ms_p.iter().sum::<f64>() / ms_p.len().max(1) as f64;
-            println!("PACKSTATE PAIR {pi} verdict: tokens {tok_ok} accepts {acc_ok} snap_diff {snap_diff} \
+            crate::dprintln!("PACKSTATE PAIR {pi} verdict: tokens {tok_ok} accepts {acc_ok} snap_diff {snap_diff} \
                       unequal_rounds {uneq_pair} (fb {uneq_fb}) | serial {ms_s_mean:.2} ms/round, packed {ms_p_mean:.2} ms/round \
                       (verify only, eager) | accS0 {:?} accP0 {:?} accS1 {:?} accP1 {:?}",
                      &acc_s[0][..], &acc_p[0][..], &acc_s[1][..], &acc_p[1][..]);
@@ -19070,7 +20142,7 @@ impl FwdModel {
             anyhow::ensure!(acc_ok, "PACKSTATE pair {pi}: accepted counts diverged");
             anyhow::ensure!(snap_diff == 0, "PACKSTATE pair {pi}: state snapshot differs in {snap_diff} words");
         }
-        println!("PACKSTATE SUMMARY: {rounds} rounds x {} pairs OK; unequal-accept rounds observed: {unequal_rounds} \
+        crate::dprintln!("PACKSTATE SUMMARY: {rounds} rounds x {} pairs OK; unequal-accept rounds observed: {unequal_rounds} \
                   (must be > 0 for the per-segment commit to be exercised)", pairs.len());
         anyhow::ensure!(unequal_rounds > 0, "PACKSTATE: no unequal-accept round observed — \
                         the per-segment commit was never exercised with a0 != a1");
@@ -19099,7 +20171,7 @@ impl FwdModel {
         let m0 = 6usize; // the 6+4 split's first segment length
         let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
         anyhow::ensure!(sc.d_dev.len() >= 2 * (k + 1), "pack3: d_dev narrower than 2 x (k+1)");
-        println!("PACK3A: graphed round-pair A/B (k={k}, m={m}, R_pad={rpad}; graph = seg trunk + accept_seg + commit_seg; \
+        crate::dprintln!("PACK3A: graphed round-pair A/B (k={k}, m={m}, R_pad={rpad}; graph = seg trunk + accept_seg + commit_seg; \
                   eager tail = PLE shadow + per-segment taps)");
         // ---- prime two slots (the PACKSTATE probe pattern) ----
         let synth = |n: usize, salt: usize| -> Vec<u32> {
@@ -19137,7 +20209,7 @@ impl FwdModel {
         let qsa = self.qsa_live(pmax);
         let (qg, qb) = self.qsa_grid_bucket_key(pmax);
         sc.qsa_grid_nblk = qg;
-        println!("PACK3A: regime qsa={qsa} qb={qb} (frozen for every arm); b=({b0},{b1}) p=({p0},{p1})");
+        crate::dprintln!("PACK3A: regime qsa={qsa} qb={qb} (frozen for every arm); b=({b0},{b1}) p=({p0},{p1})");
         // ---- staging helpers ----
         let stage_lone = |sc: &mut Scratch, rows: &[(usize, i32, usize)], dv: &[i32]| -> Result<()> {
             self.pack2_stage(sc, rows)?;
@@ -19228,7 +20300,7 @@ impl FwdModel {
             anyhow::ensure!(g_state == e_state,
                             "pack3: packed graph post-commit state differs from eager (5+5, rep {rep})");
         }
-        println!("PACK3A: P10 graph-vs-eager identity (5+5): PASS x3 (outputs + full post-commit state)");
+        crate::dprintln!("PACK3A: P10 graph-vs-eager identity (5+5): PASS x3 (outputs + full post-commit state)");
         // ============ V5: served-style lone graph on slot 0 ============
         let rows0: Vec<(usize, i32, usize)> =
             (0..m).map(|r| (0usize, if r == 0 { b0 } else { d0[r - 1] }, p0 + r)).collect();
@@ -19260,7 +20332,7 @@ impl FwdModel {
             anyhow::ensure!(g_state == ev_state,
                             "pack3: lone graph post-commit state differs from eager (rep {rep})");
         }
-        println!("PACK3A: V5 graph-vs-eager identity: PASS x3");
+        crate::dprintln!("PACK3A: V5 graph-vs-eager identity: PASS x3");
         // ============ P(6+4): SAME graph, different split ============
         stage_packed(&mut sc, &segs64, &rows64, &dv64)?;
         let shadow64 = self.packstate_save(&l, &sc, &[0, 1], cap)?;
@@ -19277,7 +20349,7 @@ impl FwdModel {
         let g64s = self.packstate_snap(&l, &sc, &[0, 1], cap)?;
         anyhow::ensure!(outs_eq(&g64, &e64), "pack3: 6+4 replay outputs differ from eager");
         anyhow::ensure!(g64s == e64s, "pack3: 6+4 replay post-state differs from eager");
-        println!("PACK3A: P(6+4) SAME-graph replay (key is R_pad-only): PASS (outputs + post-commit state)");
+        crate::dprintln!("PACK3A: P(6+4) SAME-graph replay (key is R_pad-only): PASS (outputs + post-commit state)");
         // ============ timing: CUDA events around the replay ============
         let mut ev: [cudarc::driver::sys::CUevent; 2] = [std::ptr::null_mut(); 2];
         for e in ev.iter_mut() {
@@ -19304,7 +20376,7 @@ impl FwdModel {
                 v.push(ms as f64);
             }
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!("PACK3A TIME {title}: median {:.3} ms (min {:.3}, max {:.3})",
+            crate::dprintln!("PACK3A TIME {title}: median {:.3} ms (min {:.3}, max {:.3})",
                      v[reps / 2], v[0], v[reps - 1]);
             Ok(v[reps / 2])
         };
@@ -19318,7 +20390,7 @@ impl FwdModel {
                 v.push(t0.elapsed().as_secs_f64() * 1e3);
             }
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!("PACK3A TIME {title}: median {:.3} ms (host wall, min {:.3}, max {:.3})",
+            crate::dprintln!("PACK3A TIME {title}: median {:.3} ms (host wall, min {:.3}, max {:.3})",
                      v[reps / 2], v[0], v[reps - 1]);
             Ok(v[reps / 2])
         };
@@ -19383,21 +20455,21 @@ impl FwdModel {
         let serial_pair = 2.0 * (draft_ms + v5_g + tapr_ms + reprime_ms + readb_ms);
         let packed_round = 2.0 * (draft_ms + tapr_ms) + p10_eff + 2.0 * reprime_ms + readb_ms;
         let rpr = serial_pair / packed_round;
-        println!("PACK3A: verify_ratio = 2*V5_graph / P10_eff = {verify_ratio:.3}");
-        println!("PACK3A: round_pair_ratio (probe-eager stages) = {rpr:.3} \
+        crate::dprintln!("PACK3A: verify_ratio = 2*V5_graph / P10_eff = {verify_ratio:.3}");
+        crate::dprintln!("PACK3A: round_pair_ratio (probe-eager stages) = {rpr:.3} \
                   (serial {serial_pair:.2} ms vs packed {packed_round:.2} ms; staging {staging_ms:.3} ms extra, not counted)");
         // served-graphed draft/reprime sensitivity: 0.77 ms per draft pass, 0.24 ms re-prime
         let draft_g = 0.77 * k as f64;
         let reprime_g = 0.24f64;
         let serial_g = 2.0 * (draft_g + v5_g + reprime_g + tapr_ms + readb_ms);
         let packed_g = 2.0 * (draft_g + tapr_ms) + p10_eff + 2.0 * reprime_g + readb_ms;
-        println!("PACK3A: round_pair_ratio (served-graphed draft {draft_g:.2} ms/req, re-prime {reprime_g:.2} ms) = {:.3} \
+        crate::dprintln!("PACK3A: round_pair_ratio (served-graphed draft {draft_g:.2} ms/req, re-prime {reprime_g:.2} ms) = {:.3} \
                   (serial {serial_g:.2} ms vs packed {packed_g:.2} ms)",
                  serial_g / packed_g);
         let d_v5 = v5_e - v5_g;
         let d_p10 = p10_e - p10_g;
         let tail_cost = p10_eff - p10_g;
-        println!("PACK3A: launch-gap recovery: V5 {v5_e:.2} -> {v5_g:.2} ms ({d_v5:.2} ms saved); \
+        crate::dprintln!("PACK3A: launch-gap recovery: V5 {v5_e:.2} -> {v5_g:.2} ms ({d_v5:.2} ms saved); \
                   P10 {p10_e:.2} -> {p10_g:.2} ms ({d_p10:.2} ms saved); tail cost {tail_cost:.3} ms; \
                   shadow {shadow_ms:.3} taps {taps_ms:.3} tapr {tapr_ms:.3} draft {draft_ms:.3} \
                   reprime {reprime_ms:.3} readback {readb_ms:.3} staging {staging_ms:.3}");
@@ -19407,7 +20479,7 @@ impl FwdModel {
         // state), cuMemGetInfo accounting with the 1 GB cap.
         if crate::opts::on(crate::opt!("pack3-family")) {
             use cudarc::driver::sys;
-            println!("PACK3B: family capture begins (R_pad {{2..16}} x k_seg=2, qsa={qsa} qb={qb})");
+            crate::dprintln!("PACK3B: family capture begins (R_pad {{2..16}} x k_seg=2, qsa={qsa} qb={qb})");
             let k7 = 7usize; // MTP_MAX_K: drafts for the widest family member
             self.packstate_tap_restore(&l, &mut sc, 0, 0)?;
             let d0f = self.packstate_draft(&l, &mut sc, head, 0, k7, b0, p0)?;
@@ -19420,13 +20492,13 @@ impl FwdModel {
                 anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "pack3b: cuMemGetInfo ({r:?})");
                 free0 = fr;
             }
-            println!("PACK3B: free0 = {:.3} GiB", free0 as f64 / (1 << 30) as f64);
+            crate::dprintln!("PACK3B: free0 = {:.3} GiB", free0 as f64 / (1 << 30) as f64);
             let mut cap_bytes = 0usize;
             let mut capped_at: Option<usize> = None;
             for rpad_f in [2usize, 4, 6, 8, 10, 12, 14, 16] {
                 if cap_bytes > (1 << 30) {
                     capped_at = Some(rpad_f);
-                    println!("PACK3B: stopped at the 1 GB cap before R_pad={rpad_f} (captured {cap_bytes} bytes)");
+                    crate::dprintln!("PACK3B: stopped at the 1 GB cap before R_pad={rpad_f} (captured {cap_bytes} bytes)");
                     break;
                 }
                 let mm = rpad_f / 2;
@@ -19474,12 +20546,12 @@ impl FwdModel {
                 }
                 let used = free0.saturating_sub(fr).saturating_sub(cap_bytes);
                 cap_bytes = free0.saturating_sub(fr);
-                println!("PACK3B: R_pad={rpad_f:2} identity x3 PASS, graph ~{:.1} MiB (family total {:.1} MiB)",
+                crate::dprintln!("PACK3B: R_pad={rpad_f:2} identity x3 PASS, graph ~{:.1} MiB (family total {:.1} MiB)",
                          used as f64 / (1 << 20) as f64, cap_bytes as f64 / (1 << 20) as f64);
             }
             let n_family = self.graphs.lock().unwrap().keys()
                 .filter(|k| (**k >> 30) & 0x7 == 4).count();
-            println!("PACK3B: family verdict: {n_family} packed graphs, {:.3} GiB captured{}",
+            crate::dprintln!("PACK3B: family verdict: {n_family} packed graphs, {:.3} GiB captured{}",
                      cap_bytes as f64 / (1 << 30) as f64,
                      if let Some(at) = capped_at { format!(" (CAPPED before R_pad={at})") } else { String::new() });
             // the qsa=true axis at the shipping width (R_pad=10), best-effort:
@@ -19514,21 +20586,21 @@ impl FwdModel {
                 Ok(()) => qsa_note = format!("qsa=true at R_pad={rpad}: identity x3 PASS"),
                 Err(e) => qsa_note = format!("qsa=true at R_pad={rpad}: SKIPPED ({e:#})"),
             }
-            println!("PACK3B: QSA axis: {qsa_note} (full 8x2 enumeration belongs to LEG 4 boot precapture; capture is staging-value-independent)");
+            crate::dprintln!("PACK3B: QSA axis: {qsa_note} (full 8x2 enumeration belongs to LEG 4 boot precapture; capture is staging-value-independent)");
         }
         // ---- nsys receipt window: 5 isolated packed replays ----
         stage_packed(&mut sc, &segs55, &rows55, &dv55)?;
         self.dev.synchronize()?;
-        println!("PACK3A: NSYS-WINDOW-BEGIN (5 packed graph replays + tails)");
+        crate::dprintln!("PACK3A: NSYS-WINDOW-BEGIN (5 packed graph replays + tails)");
         for _ in 0..5usize {
             self.pack_eager_tail_pre(&l, &mut sc, &segs55)?;
             self.graphs.lock().unwrap().get(&pkey).unwrap().launch();
             self.pack_eager_tail_post(&l, &mut sc, &segs55)?;
         }
         self.dev.synchronize()?;
-        println!("PACK3A: NSYS-WINDOW-END");
+        crate::dprintln!("PACK3A: NSYS-WINDOW-END");
         for e in ev.iter() { unsafe { cudarc::driver::sys::cuEventDestroy_v2(*e); } }
-        println!("PACK3A: done (V5 + P10 identity x3, 6+4 same-graph PASS; timings above)");
+        crate::dprintln!("PACK3A: done (V5 + P10 identity x3, 6+4 same-graph PASS; timings above)");
         Ok(())
     }
 
@@ -19715,7 +20787,7 @@ impl FwdModel {
         let m = k + 1;
         let v = self.cfg.vocab_size;
         let mut sc = Scratch::new(&self.dev, &self.cfg, 16, self.cfg.rotary_dim, self.max_pos)?;
-        println!("PACK2: eager packed-verify probe (2 requests x {m} rows, scratch w=16, nostore, eager)");
+        crate::dprintln!("PACK2: eager packed-verify probe (2 requests x {m} rows, scratch w=16, nostore, eager)");
         let pairs = [(97usize, 89usize), (513usize, 523usize), (2201usize, 2201usize)];
         let mut ratios: Vec<f64> = Vec::new();
         let mut all_id_ok = true;
@@ -19748,7 +20820,7 @@ impl FwdModel {
             let (b1, p1) = prime(1, &pb, &mut sc, &mut psc)?;
             let qa = self.qsa_live(p0 + k);
             let qb = self.qsa_live(p1 + k);
-            println!("PACK2 PAIR {pi}: len {la}/{lb} pos {p0}/{p1} b {b0}/{b1} qsa {qa}/{qb} agree={}",
+            crate::dprintln!("PACK2 PAIR {pi}: len {la}/{lb} pos {p0}/{p1} b {b0}/{b1} qsa {qa}/{qb} agree={}",
                      qa == qb);
             anyhow::ensure!(qa == qb, "PACK2: mixed QSA regimes in pair {pi} (design: fall back to serial)");
             let drafts0: Vec<i32> =
@@ -19786,7 +20858,7 @@ impl FwdModel {
                 let b_out = lb_out.out[..=lb_out.a] == pk.out_b[..=pk.a_b];
                 let a_lg = la_out.logits == pk.logits_a;
                 let a_am = la_out.argmax == pk.argmax_a;
-                println!("PACK2 IDENT pair {pi} rep {rep}: segA {seg_a_ok} segB {seg_b_ok} drift {drift} | \
+                crate::dprintln!("PACK2 IDENT pair {pi} rep {rep}: segA {seg_a_ok} segB {seg_b_ok} drift {drift} | \
 segB bufs core {b_core} x {b_x} lg {b_lg} am {b_am} out {b_out} | segA lg {a_lg} am {a_am} | \
 A(core {:016x} x {:016x} lg {:016x} am {:016x}) B(core {:016x} x {:016x} lg {:016x} am {:016x}) | \
 P(coreA {:016x} coreB {:016x} xA {:016x} xB {:016x} lgA {:016x} lgB {:016x} amB {:016x}) | \
@@ -19799,7 +20871,7 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
                          fnv64_i32(&pk.argmax_b), la_out.acc, lb_out.acc, pk.acc_a, pk.acc_b);
                 let r = a_ms / b_ms;
                 ratios.push(r);
-                println!("PACK2 TIME pair {pi} rep {rep}: a {a_ms:.2} ms  b {b_ms:.2} ms  c {c_ms:.2} ms  r {r:.3}");
+                crate::dprintln!("PACK2 TIME pair {pi} rep {rep}: a {a_ms:.2} ms  b {b_ms:.2} ms  c {c_ms:.2} ms  r {r:.3}");
                 // G3: live state must be untouched after a + b + c
                 let snap_post = self.pack2_snap_state(&l, &[0, 1])?;
                 let diffs = snap_pre.iter().zip(snap_post.iter()).filter(|(x, y)| x != y).count();
@@ -19825,12 +20897,12 @@ acc A {:?} B {:?} packedA {:?} packedB {:?}",
         let eq32 = r3 == r2;
         let eq42 = r4 == r2;
         let pad_ok = eq32 && eq42;
-        println!("PACK2 PADROUTE: pas={}(rows 3,4 must equal row 2) eq32 {eq32} eq42 {eq42}", pad_ok);
-        println!("PACK2 PADR2 {r2:?}");
-        println!("PACK2 PADR3 {r3:?}");
-        println!("PACK2 PADR4 {r4:?}");
+        crate::dprintln!("PACK2 PADROUTE: pas={}(rows 3,4 must equal row 2) eq32 {eq32} eq42 {eq42}", pad_ok);
+        crate::dprintln!("PACK2 PADR2 {r2:?}");
+        crate::dprintln!("PACK2 PADR3 {r3:?}");
+        crate::dprintln!("PACK2 PADR4 {r4:?}");
         let raw_out = self.dev.dtoh_sync_copy(&sc.accept_out)?;
-        println!("PACK2 OUTCHK: last packed accept_out = {:?} (lone B had {:?})", &raw_out[..10], lone_b_debug);
+        crate::dprintln!("PACK2 OUTCHK: last packed accept_out = {:?} (lone B had {:?})", &raw_out[..10], lone_b_debug);
         let r_mean = ratios.iter().sum::<f64>() / ratios.len().max(1) as f64;
         let r_min = ratios.iter().cloned().fold(f64::INFINITY, f64::min);
         println!("PACK2 SUMMARY: r_mean {r_mean:.3} r_min {r_min:.3} over {} reps \
@@ -20246,7 +21318,7 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
             });
             let n = SEGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n == 1 || n % 64 == 0 {
-                crate::rprintln!("WP24_XCHECK lane-pack: {n} real-q segments of PACKED verifies re-derived on the host so far (latest: slot {} rows {row0}..{} of R = {})",
+                crate::drprintln!("WP24_XCHECK lane-pack: {n} real-q segments of PACKED verifies re-derived on the host so far (latest: slot {} rows {row0}..{} of R = {})",
                          d.slot, row0 + m - 1, meta.r);
             }
         }
@@ -20644,17 +21716,30 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
     /// contiguous positions pos0..pos0+m of one slot (xq_attn_kv_prefill's contract).
     fn head_reprime_launches(&self, l: &Launcher, sc: &mut Scratch, head: &DraftHead, m: usize,
                              slot: usize, pos0: usize) -> Result<()> {
+        self.head_reprime_launches_inner(l, sc, head, m, slot, pos0, None)
+    }
+
+    /// S-C4PRIMEA: `pairs = Some(ptr)` switches the two slot-addressed points to per-row
+    /// addressing (cos_gather via SlotSrc::Pairs, final KV write via xq_attn_kv_prefill_pairs).
+    /// `pairs = None` is EXACTLY the legacy sequence (same kernels, args, order) — the control
+    /// site and every existing caller pass None.
+    fn head_reprime_launches_inner(&self, l: &Launcher, sc: &mut Scratch, head: &DraftHead, m: usize,
+                                   slot: usize, pos0: usize, pairs: Option<u64>) -> Result<()> {
         let _tc = tune::enter(tune::Ctx::fam(tune::Fam::Reprime, m)); // TUNE family scope
         let cfg = &self.cfg;
-        // WP02: rows pos0..pos0+m must lie inside the head KV / key-plane / cos_tab windows
-        anyhow::ensure!(pos0 + m <= self.max_pos,
-                        "head re-prime rows {pos0}..{} past the KV window (max_pos {})", pos0 + m, self.max_pos);
+        // WP02: rows pos0..pos0+m must lie inside the head KV / key-plane / cos_tab windows.
+        // (Per-row callers check their own p < max_pos; the contiguous window check is a
+        // legacy-path statement about pos0..pos0+m of ONE slot.)
+        if pairs.is_none() {
+            anyhow::ensure!(pos0 + m <= self.max_pos,
+                            "head re-prime rows {pos0}..{} past the KV window (max_pos {})", pos0 + m, self.max_pos);
+        }
         let h = cfg.hidden_size;
         let hcn = cfg.hc_count.max(1);
         let rdim = cfg.rotary_dim;
         let cs_stride = (2 * rdim) as i32;
         { let _ = cs_stride; // VIS-2: the mrope-aware gather (text-only slots: cos_tab[pos], unchanged)
-        let slots_src = SlotSrc::Const(slot);
+        let slots_src = match pairs { None => SlotSrc::Const(slot), Some(p) => SlotSrc::Pairs(p) };
         self.cos_gather(&l, &mut sc.cos, *sc.pos.device_ptr() as u64, slots_src, m)?; }
         // entry — head_launches' exact sequence
         xqlaunch!(l, "xq_hc_norm", ((hcn * m) as u32, 1, 1), (1024, 1, 1), 4096,
@@ -20673,12 +21758,24 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
         let idx_pre = self.attn_in_chains(l, sc, a, m, false)?;
         // indexer keys + pooled-plane refresh (spec state on every forward, S-A3-r rule)
         self.qsa_keys_append_dense(l, sc, a, HEAD_ATT, m, idx_pre)?;
-        let slot_pos0: i32 = (slot as i32) | ((pos0 as i32) << 12);
-        xqlaunch!(l, "xq_attn_kv_prefill", (cfg.num_kv_heads as u32, 1, 1), (cfg.head_dim as u32, 1, 1), 0,
-                 (&mut sc.kp, &mut sc.vp, (*head.kv.device_ptr()) as u64,
-                  &a.qnkn, &sc.cos, (cfg.num_kv_heads as i32) | ((cfg.head_dim as i32) << 16),
-                  (rdim as i32) | ((self.max_pos as i32) << 8) | ((self.kv_fmt as i32) << 28),
-                  slot_pos0, m as i32, cfg.rms_eps))?;
+        match pairs {
+            None => {
+                let slot_pos0: i32 = (slot as i32) | ((pos0 as i32) << 12);
+                xqlaunch!(l, "xq_attn_kv_prefill", (cfg.num_kv_heads as u32, 1, 1), (cfg.head_dim as u32, 1, 1), 0,
+                         (&mut sc.kp, &mut sc.vp, (*head.kv.device_ptr()) as u64,
+                          &a.qnkn, &sc.cos, (cfg.num_kv_heads as i32) | ((cfg.head_dim as i32) << 16),
+                          (rdim as i32) | ((self.max_pos as i32) << 8) | ((self.kv_fmt as i32) << 28),
+                          slot_pos0, m as i32, cfg.rms_eps))?;
+            }
+            Some(pp) => {
+                xqlaunch!(l, "xq_attn_kv_prefill_pairs", ((m * cfg.num_kv_heads) as u32, 1, 1), (cfg.head_dim as u32, 1, 1), 0,
+                         (&mut sc.kp, &mut sc.vp, (*head.kv.device_ptr()) as u64,
+                          &a.qnkn, &sc.cos, pp,
+                          (cfg.num_kv_heads as i32) | ((cfg.head_dim as i32) << 16),
+                          (rdim as i32) | ((self.max_pos as i32) << 8) | ((self.kv_fmt as i32) << 28),
+                          m as i32, cfg.rms_eps))?;
+            }
+        }
         Ok(())
     }
 
@@ -20922,7 +22019,7 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
         let tb = match self.tap_base(sc, slot) {
             Ok(t) => t,
             Err(e) => {
-                crate::rprintln!("EXL3_GRAPH: re-prime capture skipped ({e:#}) at rows={rows} — staying eager");
+                crate::drprintln!("EXL3_GRAPH: re-prime capture skipped ({e:#}) at rows={rows} — staying eager");
                 return;
             }
         };
@@ -21018,7 +22115,7 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
         static N: AtomicUsize = AtomicUsize::new(0);
         static BAD: AtomicUsize = AtomicUsize::new(0);
         let Some(s0) = sc.rp.as_mut().and_then(|r| r.snap0.take()) else {
-            println!("REPRIME_XCHECK: no pre-snapshot for slot {slot} p {p} — skipped");
+            crate::dprintln!("REPRIME_XCHECK: no pre-snapshot for slot {slot} p {p} — skipped");
             return Ok(());
         };
         self.dev.synchronize()?;
@@ -21070,7 +22167,7 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
         let n = N.fetch_add(1, Ordering::SeqCst) + 1;
         if bad > 0 { BAD.fetch_add(1, Ordering::SeqCst); }
         if bad > 0 || n == 1 || n % 256 == 0 {
-            println!("REPRIME_XCHECK: rounds {n} bad {} | this: slot {slot} p {p} a {a} rows {rows} \
+            crate::dprintln!("REPRIME_XCHECK: rounds {n} bad {} | this: slot {slot} p {p} a {a} rows {rows} \
                       kv rows (accepted new!=eager {}, others touched {}) key rows ({}, {}) pooled blocks \
                       (refreshed new!=eager {}, others changed {}) over positions {}..={}",
                      BAD.load(Ordering::SeqCst), kv_bad[0], kv_bad[1], key_bad[0], key_bad[1],
@@ -21096,14 +22193,14 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
             Some(d) => {
                 if d < k {
                     static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| crate::rprintln!("[exl3] per-row attention regime: a bench/probe round at position {p} stops at the \
+                    ONCE.call_once(|| crate::drprintln!("[exl3] per-row attention regime: a bench/probe round at position {p} stops at the \
 sparse switch (depth {k} -> {d}; --qsa-row-regime 0 = rounds may straddle it)"));
                 }
                 self.mtp_round(sc, head, slot, d, b, p, tap_row)
             }
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| crate::rprintln!("[exl3] per-row attention regime: a bench/probe round at position {p} is a plain \
+                ONCE.call_once(|| crate::drprintln!("[exl3] per-row attention regime: a bench/probe round at position {p} is a plain \
 step (no draft fits before the sparse switch)"));
                 self.mtp_plain_prime(sc, head, slot, b, p, tap_row)?;
                 let ids = self.forward_step(sc, &[b], &[p], &[slot], None)?;
@@ -21198,7 +22295,7 @@ step (no draft fits before the sparse switch)"));
                 static BAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let n = BAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 8 || n.is_power_of_two() {
-                    eprintln!("[exl3-mtp] draft id {} out of range (vocab {v}) — clamped, verify rejects (#{})", *d, n + 1);
+                    crate::deprintln!("[exl3-mtp] draft id {} out of range (vocab {v}) — clamped, verify rejects (#{})", *d, n + 1);
                 }
                 *d = 0;
             }
@@ -21352,7 +22449,7 @@ step (no draft fits before the sparse switch)"));
             let bytes = 2 * cfg.num_kv_heads * kv_rowbytes(self.kv_fmt, cfg.head_dim) + 2 * (2 * cfg.indexer_head_dim);
             match SpecPass::new(&self.dev, bytes, self.width) {
                 Ok(s) => {
-                    println!("[spec-pass] ON (--spec-pass={}: continuation threshold {:.3}, EMA 1/32 per (slot, pass); \
+                    crate::dprintln!("[spec-pass] ON (--spec-pass={}: continuation threshold {:.3}, EMA 1/32 per (slot, pass); \
                               graphed passes only; a wasted pass's head rows are restored) — --spec-pass=0 = the pre-HOST loop",
                              if mode == SpecMode::Always { "always" } else { "auto" }, spec_pass_q());
                     st.spec = Some(s);
@@ -21365,7 +22462,7 @@ step (no draft fits before the sparse switch)"));
                                        speculation-off (--spec-pass=0 on both ranks is the explicit escape)");
                     }
                     BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-                    println!("[spec-pass] OFF: state creation failed ({e:#}) — the pre-HOST loop runs");
+                    crate::dprintln!("[spec-pass] OFF: state creation failed ({e:#}) — the pre-HOST loop runs");
                     return Ok(false);
                 }
             }
@@ -21384,7 +22481,7 @@ step (no draft fits before the sparse switch)"));
         if r % 128 == 0 { // cumulative; >= 1 line per 1,024-token code request (~180 rounds)
             let (la, wa) = (SPEC_LAUNCHED.load(std::sync::atomic::Ordering::Relaxed),
                             SPEC_WASTED.load(std::sync::atomic::Ordering::Relaxed));
-            crate::rprintln!("[spec-pass] rounds {r} launched {la} ({:.2}/round) wasted {wa} ({:.1}% of launched)",
+            crate::drprintln!("[spec-pass] rounds {r} launched {la} ({:.2}/round) wasted {wa} ({:.1}% of launched)",
                      la as f64 / r as f64, 100.0 * wa as f64 / la.max(1) as f64);
         }
         Ok(true)
@@ -21462,7 +22559,7 @@ step (no draft fits before the sparse switch)"));
                 // the save buffer holds only the rows that exist (an absent row is never saved)
                 let bad_s: usize = present.iter()
                     .map(|&(o, n)| saved[o..o + n].iter().zip(&snap[o..o + n]).filter(|(a, b)| a != b).count()).sum();
-                println!("SPEC_XCHECK slot {slot} pos {x} (snap pos {sx}) key/pool slot {ks} (snap {sks}{}): head rows after restore: \
+                crate::dprintln!("SPEC_XCHECK slot {slot} pos {x} (snap pos {sx}) key/pool slot {ks} (snap {sks}{}): head rows after restore: \
                           {bad} of {} bytes differ from the pre-speculation snapshot (K|V {}x{} B, key {} B, plane {} B); \
                           save buffer {bad_s} differ — {}",
                          if ks >= 0 && ks as usize != slot { ", cross-slot: device slot_ids[0] != lane slot" } else { "" },
@@ -21617,7 +22714,7 @@ step (no draft fits before the sparse switch)"));
                 if ple_xcheck_on() {
                     let (oc, od) = (self.dev.dtoh_sync_copy(&sc.dconf)?[i], self.dev.dtoh_sync_copy(&sc.d_dev)?[i]);
                     if oc.to_bits() != cb || od != d {
-                        println!("PLE_XCHECK dds pass {i}: readback MISMATCH conf {:08x} vs {:08x}, d {d} vs {od}", cb, oc.to_bits());
+                        crate::dprintln!("PLE_XCHECK dds pass {i}: readback MISMATCH conf {:08x} vs {:08x}, d {d} vs {od}", cb, oc.to_bits());
                     }
                 }
                 f32::from_bits(cb)
@@ -21954,7 +23051,7 @@ step (no draft fits before the sparse switch)"));
                 + (st.pin.i32s(osl, 2 * w) != &slotpos[..]) as usize
                 + st.pin.i32s(osi, w).iter().filter(|&&x| x != slot as i32).count().min(1);
             let (n, first) = wp05_diff_u16(st.pin.u16s(op, w * 2560), &emb);
-            println!("PLE_XCHECK verify slot {slot} m {m} (rows prebuilt during the passes: {have}): ple {n} mismatching f16 of {} (first (idx, new, old) {first:?}); tables differing {tab_bad} of 4",
+            crate::dprintln!("PLE_XCHECK verify slot {slot} m {m} (rows prebuilt during the passes: {have}): ple {n} mismatching f16 of {} (first (idx, new, old) {first:?}); tables differing {tab_bad} of 4",
                      w * 2560);
         }
         st.pin.htod(st.off_toks(), d_toks, w * 4)?;
@@ -22011,7 +23108,6 @@ impl FwdModel {
         let len = pos3.len();
         anyhow::ensure!(len <= self.max_pos, "VIS-2: {len}-token prompt past max_pos {}", self.max_pos);
         let rdim = self.cfg.rotary_dim;
-        let theta = self.cfg.rope_theta;
         let stride = 2 * rdim;
         let mut map = Vec::with_capacity(len);
         let mut rows: Vec<f32> = Vec::new();
@@ -22025,7 +23121,7 @@ impl FwdModel {
             let k = rows.len() / stride;
             anyhow::ensure!(k < VIS_MROPE_ROWS, "VIS-2: more than {VIS_MROPE_ROWS} image tokens in one request");
             map.push((self.max_pos + slot * VIS_MROPE_ROWS + k) as i32);
-            let row = mrope_cos_row(*p, rdim, theta, sec);
+            let row = mrope_cos_row(&self.rope, *p, sec);
             // VIS-3: the indexer's row for the same position, in qsa_cos/qsa_sin's layout
             let h = rdim / 2;
             let mut qc = vec![0f32; rdim];
@@ -22067,22 +23163,22 @@ impl FwdModel {
 }
 
 /// VIS-2: one RoPE row [cos(rdim/2) | 0 (rdim/2) | sin(rdim/2) | 0 (rdim/2)] for a 3-axis position,
-/// in cos_tab's layout and with cos_tab's own f32 formula (load-time loop), each frequency i taking
-/// the axis HF apply_interleaved_mrope gives it: H when i % 3 == 1 and i < 3 * sec[1], W when
-/// i % 3 == 2 and i < 3 * sec[2], else T. For t == h == w this is cos_tab's row t, bit for bit.
-pub fn mrope_cos_row(p: [i64; 3], rdim: usize, theta: f32, sec: [usize; 3]) -> Vec<f32> {
+/// in cos_tab's layout and from the model's own `RopeFreqs` (cos_tab's source; YARN1), each
+/// frequency i taking the axis HF apply_interleaved_mrope gives it: H when i % 3 == 1 and
+/// i < 3 * sec[1], W when i % 3 == 2 and i < 3 * sec[2], else T. For t == h == w this is
+/// cos_tab's row t, bit for bit.
+pub(crate) fn mrope_cos_row(fr: &RopeFreqs, p: [i64; 3], sec: [usize; 3]) -> Vec<f32> {
+    let rdim = fr.half() * 2;
     let axis = |i: usize| -> usize {
         if i % 3 == 1 && i < 3 * sec[1] { 1 } else if i % 3 == 2 && i < 3 * sec[2] { 2 } else { 0 }
     };
     let mut row = Vec::with_capacity(2 * rdim);
     for i in 0..rdim / 2 {
-        let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-        row.push((p[axis(i)] as f32 * inv).cos());
+        row.push(fr.cos_sin(p[axis(i)] as usize, i).0);
     }
     row.extend(std::iter::repeat(0.0).take(rdim / 2));
     for i in 0..rdim / 2 {
-        let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
-        row.push((p[axis(i)] as f32 * inv).sin());
+        row.push(fr.cos_sin(p[axis(i)] as usize, i).1);
     }
     row.extend(std::iter::repeat(0.0).take(rdim / 2));
     row
@@ -22128,9 +23224,10 @@ mod vis2_tests {
         let rdim = v["rotary_dim"].as_u64().unwrap() as usize;
         let theta = v["rope_theta"].as_f64().unwrap() as f32;
         let s: Vec<usize> = v["mrope_section"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
+        let fr_t = RopeFreqs::native(rdim, theta);
         let mut worst = 0f32;
         for (t, p) in pos.iter().enumerate() {
-            let row = mrope_cos_row(*p, rdim, theta, [s[0], s[1], s[2]]);
+            let row = mrope_cos_row(&fr_t, *p, [s[0], s[1], s[2]]);
             for i in 0..rdim / 2 {
                 let c = v["cos"][t][i].as_f64().unwrap() as f32;
                 let sn = v["sin"][t][i].as_f64().unwrap() as f32;
@@ -22139,7 +23236,7 @@ mod vis2_tests {
         }
         assert!(worst < 2e-5, "cos/sin differ from HF by {worst}");
         // a text position's row is cos_tab's row exactly (t == h == w)
-        assert_eq!(mrope_cos_row([7, 7, 7], rdim, theta, [11, 11, 10]), mrope_cos_row([7, 7, 7], rdim, theta, [32, 0, 0]));
+        assert_eq!(mrope_cos_row(&fr_t, [7, 7, 7], [11, 11, 10]), mrope_cos_row(&fr_t, [7, 7, 7], [32, 0, 0]));
     }
 }
 
@@ -22263,5 +23360,106 @@ mod wide_bits_guard_tests {
                            m.find("wide_trellis_supports_bits(moe.bits)").expect("tiles guard"),
                            m.find("\"xq_moe_pf_count").expect("first launch"));
         assert!(g1 < l && g2 < l, "the MoE guards must come before the first MoE launch");
+    }
+}
+
+/// YARN1 rope unit tests (host-only): the EXL3 tables' freqs/mscale against an INDEPENDENTLY
+/// derived reference (the YaRN formula computed in this module, not a call into the dspark
+/// oracle — AGENTS §3: same-class consistency proves nothing), the factor-1.0 bit-identity
+/// with the legacy native loop, and the mscale formula.
+#[cfg(test)]
+mod rope_tests {
+    use super::*;
+
+    /// The spec's ramp, computed HERE: HF/vLLM YaRN blends each dim's inverse frequency from
+    /// pure interpolation (inv/factor) at the low-frequency end to pure extrapolation (inv,
+    /// unchanged) at the high-frequency end; the python-f64 correction range (beta_fast = 32
+    /// rotations, beta_slow = 1) locates the ramp. Returns (inv, ramp) per dim.
+    fn reference_yarn(rdim: usize, theta: f32, factor: f32, native_max: usize) -> Vec<(f32, f32)> {
+        let find = |rotations: f64| -> f64 {
+            (native_max as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                * (rdim as f64) / (2.0 * (theta as f64).ln())
+        };
+        let low = find(32.0).floor().max(0.0);
+        let high = find(1.0).ceil().min(rdim as f64 - 1.0);
+        let (min_r, max_r) = if (high - low).abs() < 1e-12 {
+            (low as f32, low as f32 + 0.001)
+        } else { (low as f32, high as f32) };
+        (0..rdim / 2).map(|i| {
+            // HF-canonical inv_freq = 1 / base^(2i/rdim) - the ramp spec's own form; the EXL3
+            // legacy loop's theta.powf(-e) is an equivalent expression that differs by 1 ulp.
+            let inv = 1.0f32 / theta.powf((2 * i) as f32 / rdim as f32);
+            let ramp = ((i as f32 - min_r) / (max_r - min_r)).clamp(0.0, 1.0);
+            let yarn = inv / factor * ramp + inv * (1.0 - ramp);
+            (yarn, ramp)
+        }).collect()
+    }
+
+    /// The tables' YaRN freqs match the independent reference: the ramp's extremes are
+    /// bit-exact (ramp 0 = pure extrapolation, ramp 1 = pure interpolation), the blend
+    /// region within 1e-6 relative (a different but equivalent op order).
+    #[test]
+    fn yarn_freqs_match_an_independently_derived_ramp() {
+        let (rdim, theta, native, factor) = (256usize, 1e7f32, 262_144usize, 4.0f32);
+        let fr = RopeFreqs::yarn(rdim, theta, factor, native);
+        let want = reference_yarn(rdim, theta, factor, native);
+        assert_eq!(fr.half(), want.len());
+        let mut worst = 0f32;
+        let mut extremes = 0usize;
+        for (i, (w, ramp)) in want.iter().enumerate() {
+            let g = fr.inv(i);
+            if *ramp == 0.0 || *ramp == 1.0 {
+                assert_eq!(g.to_bits(), w.to_bits(), "dim {i}: the ramp extreme must be exact");
+                extremes += 1;
+            } else {
+                worst = worst.max((g - w).abs() / g.abs().max(1e-30));
+            }
+        }
+        assert!(extremes >= 2, "the reference must pin both ramp extremes");
+        assert!(worst < 1e-6, "the blend region deviates by {worst} relative");
+    }
+
+    /// Factor 1.0 IS native: same bits as the legacy load-time loop, mscale exactly 1.0
+    /// (so the cos_sin multiply is the f32 identity and no table byte changes).
+    #[test]
+    fn factor_one_is_the_native_table_bit_for_bit() {
+        let (rdim, theta) = (64usize, 1e7f32);
+        let fr = RopeFreqs::native(rdim, theta);
+        for p in [0usize, 1, 7, 2048, 262_143] {
+            for i in 0..rdim / 2 {
+                let inv = theta.powf(-(2.0 * i as f32) / rdim as f32);
+                let f = p as f32 * inv;
+                assert_eq!(fr.cos_sin(p, i).0.to_bits(), f.cos().to_bits(), "p {p} dim {i} cos");
+                assert_eq!(fr.cos_sin(p, i).1.to_bits(), f.sin().to_bits(), "p {p} dim {i} sin");
+            }
+        }
+        assert_eq!(fr.mscale().to_bits(), 1.0f32.to_bits());
+    }
+
+    /// mscale: the vLLM formula 0.1·ln(f)+1, derived here; exactly 1.0 at f <= 1.
+    #[test]
+    fn mscale_is_the_vllm_formula() {
+        for f in [2.0f32, 4.0, 8.0, 16.0] {
+            let want = 0.1f32 * f.ln() + 1.0;
+            assert_eq!(crate::dspark::oracle::yaarn_mscale(f).to_bits(), want.to_bits(), "factor {f}");
+        }
+        for f in [1.0f32, 0.5] {
+            assert_eq!(crate::dspark::oracle::yaarn_mscale(f).to_bits(), 1.0f32.to_bits(), "factor {f}");
+        }
+    }
+
+    /// The ramp's shape: the highest-frequency dim keeps its native frequency (pure
+    /// extrapolation at ramp 0), the lowest-frequency dim interpolates by 1/factor
+    /// (ramp 1) — the PR's own consistency check, restated against the independent math.
+    #[test]
+    fn yarn_interpolates_low_freq_dims_and_keeps_high_freq_dims() {
+        let (rdim, theta, native) = (64usize, 1e7f32, 262_144usize);
+        let native_fr = RopeFreqs::native(rdim, theta);
+        let yarn_fr = RopeFreqs::yarn(rdim, theta, 4.0, native);
+        assert_eq!(yarn_fr.inv(0).to_bits(), native_fr.inv(0).to_bits(), "dim 0 keeps its native frequency");
+        let last = rdim / 2 - 1;
+        assert!((yarn_fr.inv(last) - native_fr.inv(last) / 4.0).abs()
+                <= native_fr.inv(last) / 4.0 * 1e-5,
+                "the lowest-frequency dim interpolates by 1/factor");
     }
 }

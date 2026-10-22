@@ -138,7 +138,7 @@ fn g_env() -> &'static (Option<usize>, Vec<(String, usize)>) {
         for ent in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             match ent.split_once('=').and_then(|(s, g)| g.trim().parse::<usize>().ok().map(|g| (s.trim().to_string(), g.max(1)))) {
                 Some(e) => v.push(e),
-                None => println!("W4/DENSE: ignoring malformed --w4dense-g entry {ent:?} (want <sig>=<G>)"),
+                None => crate::dprintln!("W4/DENSE: ignoring malformed --w4dense-g entry {ent:?} (want <sig>=<G>)"),
             }
         }
         (None, v)
@@ -304,7 +304,7 @@ fn dks_grid_at(dev: &Arc<CudaDevice>, k: usize, bits: usize, mem: &[(usize, usiz
         Some(w) => {
             let w = w.min(dks_plan(mem, kb, 1, 1).n_items.max(1));
             if plan_feasible(mem, kb, bits, nst, w, mcls).is_some() { Some(w) } else {
-                println!("W4/DENSE: --w4dense-g={w} for {sig} (m <= {mcls}) exceeds the smem / A-entry budget — built-in rule");
+                crate::dprintln!("W4/DENSE: --w4dense-g={w} for {sig} (m <= {mcls}) exceeds the smem / A-entry budget — built-in rule");
                 dks_pick_g(mem, kb, bits, nst, sms, gsat, mcls).map(|x| x.0)
             }
         }
@@ -347,16 +347,16 @@ fn dks_fn(name: &'static str, smem: u32) -> Option<cudarc::driver::sys::CUfuncti
     }
     let f = xq_raw_fn(name)?;
     if smem as usize > smem_cap() {
-        eprintln!("[w4dense] {name}: {smem} B over the dynamic budget {} B", smem_cap());
+        crate::deprintln!("[w4dense] {name}: {smem} B over the dynamic budget {} B", smem_cap());
         return None;
     }
     let r = unsafe { sys::cuFuncSetAttribute(f,
         sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32) };
-    if r != sys::CUresult::CUDA_SUCCESS { eprintln!("[w4dense] {name}: smem opt-in {smem} B failed ({r:?})"); return None; }
+    if r != sys::CUresult::CUDA_SUCCESS { crate::deprintln!("[w4dense] {name}: smem opt-in {smem} B failed ({r:?})"); return None; }
     let mut nb: i32 = 0;
     let r = unsafe { sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut nb, f, 256, smem as usize) };
     if r != sys::CUresult::CUDA_SUCCESS || nb < 1 {
-        eprintln!("[w4dense] {name}: not resident at {smem} B smem (occupancy {nb}, {r:?})");
+        crate::deprintln!("[w4dense] {name}: not resident at {smem} B smem (occupancy {nb}, {r:?})");
         return None;
     }
     let (mut regs, mut lmem) = (0i32, 0i32);
@@ -365,7 +365,7 @@ fn dks_fn(name: &'static str, smem: u32) -> Option<cudarc::driver::sys::CUfuncti
         let _ = sys::cuFuncGetAttribute(&mut lmem, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f);
     }
     if c.iter().all(|e| e.0 != name) {
-        println!("W4/DENSE: {name} ready (dynamic smem {smem} B, {nb} CTA/SM, JIT {regs} regs, local {lmem} B)");
+        crate::dprintln!("W4/DENSE: {name} ready (dynamic smem {smem} B, {nb} CTA/SM, JIT {regs} regs, local {lmem} B)");
     }
     c.retain(|e| e.0 != name);
     c.push((name, FnH(f), smem));
@@ -519,7 +519,7 @@ fn xcheck(l: &Launcher, qs: &[&Quad], job: &DksJobH, x: (u64, usize), x2: (u64, 
     static BAD: AtomicUsize = AtomicUsize::new(0);
     if stream_capturing(l) {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("DENSE_XCHECK: skipped inside graph capture (run eager: --exl3-no-graph=1)"));
+        ONCE.call_once(|| crate::dprintln!("DENSE_XCHECK: skipped inside graph capture (run eager: --exl3-no-graph=1)"));
         return Ok(());
     }
     let k = job.k as usize;
@@ -560,7 +560,7 @@ fn xcheck(l: &Launcher, qs: &[&Quad], job: &DksJobH, x: (u64, usize), x2: (u64, 
     let c = N.fetch_add(1, Ordering::SeqCst) + 1;
     if fail { BAD.fetch_add(1, Ordering::SeqCst); }
     if fail || c == 1 || c % 500 == 0 {
-        println!("DENSE_XCHECK: checks {c} bad {} | this: m {m} G {g} flags {} members {} | {}",
+        crate::dprintln!("DENSE_XCHECK: checks {c} bad {} | this: m {m} G {g} flags {} members {} | {}",
                  BAD.load(Ordering::SeqCst), job.flags, qs.len(), lines.join(" | "));
     }
     Ok(())
@@ -619,7 +619,7 @@ pub(super) fn log_and_prewarm(dev: &Arc<CudaDevice>, layers: &[LayerDev], mtp: O
         let knobs: Vec<String> = [crate::opt!("w4dense-fix"), crate::opt!("w4dense-suh"), crate::opt!("w4dense-multi"), crate::opt!("w4dense-silu"),
                                 crate::opt!("w4dense-nst"), crate::opt!("w4dense-g"), crate::opt!("w4dense-gsat"), crate::opt!("w4dense-xcheck")]
             .into_iter().filter(|k| crate::opts::var_os(*k).is_some()).map(|k| k.to_string()).collect();
-        println!("W4/DENSE: OFF ({why}) — the p3 chain dispatch serves (old (N/128, ks) grids; PSK v1 only with \
+        crate::dprintln!("W4/DENSE: OFF ({why}) — the p3 chain dispatch serves (old (N/128, ks) grids; PSK v1 only with \
                   --psk=1 — see the EXL3-FWD PSK line); --w4dense=1 = one-launch dense split-K chains{}",
                  if knobs.is_empty() { String::new() } else { format!(" ({} ignored while OFF)", knobs.join("/")) });
         // TUNE T0c: a table value or the --autotune overlay can still turn the package on at some
@@ -628,7 +628,7 @@ pub(super) fn log_and_prewarm(dev: &Arc<CudaDevice>, layers: &[LayerDev], mtp: O
     }
     let nst = dense_nst();
     if on_now {
-        println!("W4/DENSE: dense split-K chains ON (opt-in --w4dense=1) — ring nst {nst}, fixup {}, fused suh {}, \
+        crate::dprintln!("W4/DENSE: dense split-K chains ON (opt-in --w4dense=1) — ring nst {nst}, fixup {}, fused suh {}, \
                   attn multi {}, silu-down {}, gsat {}, xcheck {} (default OFF = the p3 dispatch; --w4dense-off=1 wins)",
                  fix_on() as u8, suh_on() as u8, multi_on() as u8, silu_on() as u8, gsat(), xcheck_on() as u8);
     }
@@ -705,14 +705,14 @@ pub(super) fn log_and_prewarm(dev: &Arc<CudaDevice>, layers: &[LayerDev], mtp: O
                     None => cells.push(format!("m<={mcls}: no feasible grid (p4c path)")),
                 }
             }
-            println!("  DENSE b{bits} {sig:<44} ks {:<11} items {:>4} | {}",
+            crate::dprintln!("  DENSE b{bits} {sig:<44} ks {:<11} items {:>4} | {}",
                      mem.iter().map(|x| x.1.to_string()).collect::<Vec<_>>().join("+"),
                      dks_plan(mem, kb, 1, 1).n_items, cells.join(" | "));
         }
         for (bits, smem) in need {
             let name = dks_entry(bits, entry_nst(bits, nst));
             if !name.is_some_and(|nm| dks_fn(nm, smem as u32).is_some()) {
-                println!("W4/DENSE: no usable entry for bits {bits} nst {nst} at {smem} B — those chains keep the p4c path");
+                crate::dprintln!("W4/DENSE: no usable entry for bits {bits} nst {nst} at {smem} B — those chains keep the p4c path");
             }
         }
     }

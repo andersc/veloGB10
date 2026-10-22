@@ -56,6 +56,7 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     "xq_conv1d",
     "xq_gdn_step",
     "xq_gdn_gate",
+    "xq_gdn_gate_silu", // EXL27B: the Qwen3.5-class gated norm (silu), a copy of xq_gdn_gate
     "xq_router_topk",
     "xq_moe_gate_mul",
     "xq_silu_mul",
@@ -136,6 +137,8 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     "xq_conv1d_chunk",
     "xq_gdn_step_chunk",
     "xq_attn_kv_prefill",
+    "xq_attn_kv_prefill_pairs",
+    "xq_gather_tap_rows",
     // PQ8 item 1: row-parallel twin of xq_attn_kv_prefill (grid c*nkv, bit-identical bytes)
     "xq_attn_kv_prefill_rows",
     "xq_attn_prefill_q",
@@ -212,6 +215,7 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     // WP21: split-K fixup epilogue (ks GEMM + ascending combine + H128 svh in one launch)
     "exl3_hmma_gemm_ks_fx",
     "exl3_hmma_gemm_ks_fx_x2",
+    "exl3_hmma_gemm_ks_fx_probe",
     // S-A3-d Phase 0b: PLE injection
     "xq_ple_norm_f16",
     "xq_ple_norm_f32",
@@ -317,6 +321,9 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     "xq_moe_coop_b",
     // S-A3-i: QSA selection + sparse attention chain (kernels/exl3_bench.cu).
     "xq_qsa_h2b",
+    // EXL27C-DF2 (fwd): the DFlash2 EXL3 tap capture + the boot-time head transpose.
+    "xq_df2_tap_cvt",
+    "xq_df2_transpose_f16",
     "xq_qsa_qnorm_rope",
     "xq_qsa_topk_asc",
     "xq_attn_prep",
@@ -378,16 +385,14 @@ static K6_MODULE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// pack (3.05 bpw) keeps `exl3_bench.ptx`, which is instruction-identical to the pre-4.05 module.
 pub(crate) fn set_k6_module(on: bool) { K6_MODULE.store(on, std::sync::atomic::Ordering::Relaxed); }
 
-/// The path of the EXL3 kernel PTX this process loads (the standard module, or the K = 6 one).
-pub(crate) fn bench_ptx_path() -> &'static str {
-    if K6_MODULE.load(std::sync::atomic::Ordering::Relaxed) { "src/ptx/exl3_bench_k6.ptx" } else { "src/ptx/exl3_bench.ptx" }
+/// The EXL3 kernel module this process loads, from the bytes embedded at compile time
+/// (the standard module, or the K = 6 one for 4.05-bpw packs).
+pub(crate) fn bench_ptx_src() -> &'static str {
+    if K6_MODULE.load(std::sync::atomic::Ordering::Relaxed) { crate::ptx_embed::EXL3_BENCH_K6 } else { crate::ptx_embed::EXL3_BENCH }
 }
 
 fn load_module(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
-    let ptx = Ptx::from_src(
-        std::fs::read_to_string(bench_ptx_path())
-            .with_context(|| format!("{} missing — run cargo build --release", bench_ptx_path()))?,
-    );
+    let ptx = Ptx::from_src(bench_ptx_src());
     dev.load_ptx(ptx, MODULE, MODULE_FNS)
         .context("load exl3_bench module")?;
     Ok(())
@@ -2416,7 +2421,7 @@ fn probe_lmh(dev: &std::sync::Arc<CudaDevice>, d_tr: &CudaSlice<u16>, d_svh: &Cu
              k: usize, n: usize, bits: usize, ms: &[usize], nsts: &[usize], tag: &str) -> Result<()> {
     // The launcher's static eligibility (lmh_gemm_launch): shapes outside it keep the old kernel
     // by design — skip them here, so a refusal below is always a real (resource/PTX) failure.
-    if k % (16 * crate::exl3_forward::LMH_KSTEP) != 0 || k % 128 != 0 || n % 128 != 0 || !(3..=5).contains(&bits) {
+    if k % (16 * crate::exl3_forward::LMH_KSTEP) != 0 || k % 128 != 0 || n % 128 != 0 || !(3..=6).contains(&bits) {
         println!("    W3/LMH [{tag}]: skipped (K={k} N={n} b={bits} outside the persistent kernel's shape class)");
         return Ok(());
     }
@@ -4876,8 +4881,7 @@ fn probe_wp18_select(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
     const SEL_MAX: usize = BUDGET + RATIO - 1;
     const PF_QT: usize = 8;                      // gpu_batch.cu QSA_PF_QT
     if dev.get_func("wp18_gb", "qsa_score_prefill_b").is_none() {
-        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")
-            .context("src/ptx/gpu_batch.ptx missing — run cargo build --release")?);
+        let ptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         dev.load_ptx(ptx, "wp18_gb", &["qsa_score_prefill_b"]).context("load gpu_batch (qsa_score_prefill_b)")?;
     }
     let f_old = dev.get_func("wp18_gb", "qsa_score_prefill_b").context("qsa_score_prefill_b")?;
@@ -5549,6 +5553,153 @@ pub fn probe_xchain(dir: &str, x_path: &str, y_path: &str, module: &str) -> Resu
 // ---------------------------------------------------------------------------
 // 3. Standalone bench: per-class GB/s at widths, vs 238 roofline / 79-83 naive floor.
 // ---------------------------------------------------------------------------
+
+/// S-C4STEP5 — the fixed-cost ablation ladder for the DENSE ks_fx shapes
+/// (bench-harness only; probes `exl3_hmma_gemm_ks_fx_probe`, nothing served).
+/// Per (dense module shape, K as served TP1/TP2, ks, M): time the served
+/// `exl3_hmma_gemm_ks_fx` (normal) plus the two probe arms —
+///   alias (MODE 1): trellis reads wrap into a w_kb window (L2-resident)  -> DRAM arm
+///   stub  (MODE 2): load-preserving decode stub, bit math removed        -> decode-ALU arm
+/// The deltas decompose the per-launch cost; GB/s uses the full trellis bytes.
+pub fn bench_ladder(
+    dir: &str,
+    ms: &[usize],
+    kss: &[usize],
+    iters: usize,
+    window_kb: usize,
+    skip_n: usize,
+    out_json: Option<&str>,
+) -> Result<()> {
+    let pack = Exl3Pack::open(dir)?;
+    let dev = dev0()?;
+    load_module(&dev)?;
+    let stream = fork_blocking_stream(&dev);
+    let gf = |n: &str| dev.get_func(MODULE, n).ok_or_else(|| anyhow::anyhow!("fn {n} missing"));
+    let f_fx = gf("exl3_hmma_gemm_ks_fx")?;
+    let f_probe = gf("exl3_hmma_gemm_ks_fx_probe")?;
+    println!(
+        "=== EXL3 fixed-cost ladder (dense ks_fx; {} iters/rep, best of 3; alias window {} kb; roofline 238 GB/s) ===",
+        iters, window_kb
+    );
+    let mut json = String::from("[\n");
+    let mut seen = std::collections::HashSet::new();
+    let mut mods: Vec<&ModuleMeta> = pack
+        .modules
+        .iter()
+        .filter(|m| matches!(m.class, TensorClass::Dense))
+        .filter(|m| m.k >= 1024 && m.n >= 128 && seen.insert((m.k, m.n, m.bits)))
+        .collect();
+    mods.sort_by_key(|m| (m.class == TensorClass::LmHead, m.n, m.k));
+    for m in &mods {
+        if skip_n > 0 && m.n > skip_n {
+            println!("# skip {} class={:?} k={} n={} (> --exl3-ladder-skip-n)", m.name, m.class, m.k, m.n);
+            continue;
+        }
+        println!("# module {} class={:?} k={} n={} bits={}", m.name, m.class, m.k, m.n, m.bits);
+        for k in [m.k, m.k / 2] {
+            let kb = k / 16;
+            if kb == 0 || k % 16 != 0 {
+                continue;
+            }
+            // Served ks policy (exl3_forward::chain_ks_target, target 200): bench it first,
+            // then the manual sweep for context.
+            let ks_served = crate::exl3_forward::chain_ks_target(k as i32, m.n as i32, 200) as usize;
+            let mut ks_all: Vec<usize> = vec![ks_served];
+            for &kx in kss {
+                if kx != ks_served && !ks_all.contains(&kx) {
+                    ks_all.push(kx);
+                }
+            }
+            let nb = m.n / 16;
+            if nb == 0 {
+                continue;
+            }
+            let tr_bytes = (kb * nb * 8 * m.bits * 2) as f64;
+            // DRAM-cold rotation: J copies of the trellis, J*tr_bytes >= ~192 MB, so every
+            // rotated launch reads memory L2 no longer holds (a single tensor < L2 would make
+            // the plain loop measure the L2-warm rate -- the S-C4STEP5 E1 trap).
+            let j = (((192usize * 1024 * 1024) as f64 / tr_bytes).ceil() as usize)
+                .max(2)
+                .min(((1536usize * 1024 * 1024) as f64 / tr_bytes).floor() as usize)
+                .max(2);
+            let tru16: Vec<u16> = vec![0x6B8Du16; kb * nb * 8 * m.bits];
+            let d_trs: Vec<_> = (0..j).map(|_| dev.htod_sync_copy(&tru16).map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?;
+            for &ks in &ks_all {
+                if kb % ks != 0 || ks == 0 {
+                    continue;
+                }
+                for &mm in ms {
+                    let xh: Vec<u16> = vec![0x3C00; mm.max(1) * k];
+                    let d_xh = dev.htod_sync_copy(&xh)?;
+                    let svh: Vec<u16> = vec![0x3C00; m.n];
+                    let d_svh = dev.htod_sync_copy(&svh)?;
+                    let d_ws = unsafe { dev.alloc::<f32>(ks * mm.max(1) * m.n) }?;
+                    let d_y = unsafe { dev.alloc::<u16>(mm.max(1) * m.n) }?;
+                    let d_cnt = dev.htod_sync_copy(&vec![0u32; m.n / 128])?;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((m.n / 128) as u32, ks as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // rotate=true walks the J trellis copies (DRAM-cold); false pins buffer 0
+                    // (the L2-resident arm). The alias arm always pins (its window IS the point).
+                    let time_arm = |mode: i32, wkb: i32, rotate: bool| -> Result<f64> {
+                        let launch = |i: usize| -> Result<()> {
+                            let d_tr = &d_trs[if rotate { i % d_trs.len() } else { 0 }];
+                            unsafe {
+                                if mode == 0 {
+                                    f_fx.clone().launch_on_stream(
+                                        &stream, cfg,
+                                        (d_tr, &d_xh, &d_ws, &d_svh, &d_y, &d_cnt,
+                                         mm as i32, k as i32, m.n as i32, m.bits as i32),
+                                    )?;
+                                } else {
+                                    f_probe.clone().launch_on_stream(
+                                        &stream, cfg,
+                                        (d_tr, &d_xh, &d_ws, &d_svh, &d_y, &d_cnt,
+                                         mm as i32, k as i32, m.n as i32, m.bits as i32, mode, wkb),
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        };
+                        for i in 0..3 { launch(i)?; }
+                        dev.synchronize()?;
+                        let mut best = f64::INFINITY;
+                        for _ in 0..3 {
+                            let t0 = std::time::Instant::now();
+                            for i in 0..iters { launch(i)?; }
+                            dev.synchronize()?;
+                            best = best.min(t0.elapsed().as_secs_f64() / iters as f64);
+                        }
+                        Ok(best)
+                    };
+                    let jrot = if d_trs.len() > 1 { "rot" } else { "pin" };
+                    let t_n = time_arm(0, 0, true)?;
+                    let t_a = time_arm(1, window_kb as i32, false)?;
+                    let t_s = time_arm(2, 0, true)?;
+                    let gbs = tr_bytes / t_n / 1e9;
+                    println!(
+                        "  {:<26} {:>6} b{} k={:<5} n={:<6} ks={} gx={:<4} m={:<2} | norm {:>7.3} ms {:>6.1} GB/s | alias {:>7.3} ms ({:>5.1}%) | stub {:>7.3} ms ({:>5.1}%)",
+                        m.name, format!("{:?}/{}", m.class, jrot), m.bits, k, m.n, ks, m.n / 128, mm,
+                        t_n * 1e3, gbs, t_a * 1e3, 100.0 * (t_n - t_a) / t_n, t_s * 1e3, 100.0 * (t_n - t_s) / t_n
+                    );
+                    json.push_str(&format!(
+                        "{{\"name\":\"{}\",\"class\":\"{:?}\",\"bits\":{},\"k\":{},\"n\":{},\"ks\":{},\"gx\":{},\"m\":{},\"ms_norm\":{:.6},\"gbs_norm\":{:.2},\"ms_alias\":{:.6},\"ms_stub\":{:.6},\"tr_bytes\":{:.0}}},\n",
+                        m.name, m.class, m.bits, k, m.n, ks, m.n / 128, mm, t_n * 1e3, gbs, t_a * 1e3, t_s * 1e3, tr_bytes
+                    ));
+                }
+            }
+        }
+    }
+    json.push_str("]\n");
+    if let Some(path) = out_json {
+        std::fs::write(path, &json).context("write ladder json")?;
+        println!("ladder json -> {path}");
+    }
+    Ok(())
+}
+
 pub fn bench_gemm(
     dir: &str,
     widths: &[usize],
@@ -6467,8 +6618,7 @@ pub fn probe_flash_prefill() -> Result<()> {
 
 pub fn probe_sampler() -> Result<()> {
     let dev = dev0()?;
-    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")
-        .context("src/ptx/exl3_bench.ptx missing")?);
+    let ptx = Ptx::from_src(crate::ptx_embed::EXL3_BENCH);
     dev.load_ptx(ptx, "exl3_sampler_probe", &["xq_argmax", "xq_sample_rows"])?;
     let f = dev.get_func("exl3_sampler_probe", "xq_sample_rows").context("xq_sample_rows missing")?;
     let v: usize = 248_320;
@@ -6640,8 +6790,7 @@ fn f16_ulps(a: u16, b: u16) -> u32 {
 pub fn probe_penalties() -> Result<()> {
     use crate::exl3_forward::{PEN_RING, PEN_RING_LOG2};
     let dev = dev0()?;
-    let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/exl3_bench.ptx")
-        .context("src/ptx/exl3_bench.ptx missing")?);
+    let ptx = Ptx::from_src(crate::ptx_embed::EXL3_BENCH);
     dev.load_ptx(ptx, "exl3_pen_probe", &["xq_pen_rows", "xq_pen_draft"])?;
     let f_rows = dev.get_func("exl3_pen_probe", "xq_pen_rows").context("xq_pen_rows missing")?;
     let f_draft = dev.get_func("exl3_pen_probe", "xq_pen_draft").context("xq_pen_draft missing")?;

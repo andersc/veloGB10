@@ -379,7 +379,9 @@ mod h5_direct_print_baseline_tests {
         assert!(std::path::Path::new("src").is_dir(),
             "run from the repo root (the vision strict-load test has the same convention)");
         let baseline: &[(&str, u32)] = &[
-            ("src/batch.rs", 35),
+            // FIX1 #76 (master): +2 = the two [dspark] 1-per-50-step meters (chain + sampled lanes).
+            // OUT1: -1 = the graphs-skipped boot line became boot_report::notice(). 35+2-1 = 36.
+            ("src/batch.rs", 36),
             ("src/bin/dsv4_attn_replay.rs", 9),
             ("src/bin/dsv4_convert.rs", 3),
             ("src/bin/dsv4_replay.rs", 10),
@@ -392,6 +394,9 @@ mod h5_direct_print_baseline_tests {
             ("src/bin/w2_vision_cpu.rs", 10),
             ("src/bin/w2_vision_gpu.rs", 8),
             ("src/bin/w2_vision_load.rs", 6),
+            ("src/boot_report.rs", 2),
+            // OUT2 (2026-10-16): boot_report.rs = 2 — the dprintln!/deprintln! macro bodies
+            // (direct println!/eprintln! behind the --log-level debug check; zero direct prints at normal).
             ("src/cluster.rs", 56),
             ("src/dflash.rs", 2),
             ("src/dflash2/round.rs", 7),
@@ -405,8 +410,8 @@ mod h5_direct_print_baseline_tests {
             ("src/engine.rs", 1),
             ("src/exl3.rs", 17),
             ("src/exl3_autotune.rs", 15),
-            ("src/exl3_bench.rs", 123),
-            ("src/exl3_forward.rs", 317), // rel/cutb: 318 -> 317 (EXL3_GRAPH packed-missing marker -> rprintln!)
+            ("src/exl3_bench.rs", 128),
+            ("src/exl3_forward.rs", 325), // EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
             ("src/exl3_forward/dense.rs", 12),
             ("src/exl3_forward/dhead.rs", 11),
             ("src/exl3_forward/w4s.rs", 8),
@@ -428,7 +433,7 @@ mod h5_direct_print_baseline_tests {
         // (eprintln, matching the existing sibling site in finish()/xcheck drain).
         // S-B9-REL-SMALLFIXES item 1: 87 -> 86, the two MTP boot-banner println! became one
         // (the line is built by the testable mtp_banner()).
-        ("src/exl3_serve.rs", 87), // +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
+        ("src/exl3_serve.rs", 97), // EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
             ("src/exl3_tune.rs", 7),
             ("src/exl3_wp27.rs", 8),
             ("src/gptq.rs", 42),
@@ -449,7 +454,7 @@ mod h5_direct_print_baseline_tests {
             // in MODES and the entry in the second block left print_help: the tool's options are registry
             // rows now and are listed once, under PERPLEXITY TOOL), +1 pointer line in MODES, +1 the
             // legacy path's `--window < 2` refusal (a CLI exit path, like PERPLEXITY_EXL3_FAIL).
-            ("src/main.rs", 1554), // F9b: +1 the bare-tp info line (stderr, one line, once) // S-B9-REL-INTEG A1: +2 --help lines (the two TP drill flags, one line each)
+             // F9b: +1 the bare-tp info line (stderr, one line, once) // S-B9-REL-INTEG A1: +2 --help lines (the two TP drill flags, one line each)
             ("src/memwatch.rs", 3),
             ("src/model.rs", 3),
             ("src/net.rs", 14), // +1 AGREE16: the width-refusal line of agree_ext (printed once, right before the link abort)
@@ -482,6 +487,17 @@ mod h5_direct_print_baseline_tests {
             // reprintln! (they fire before the log router exists; reprintln! prints directly
             // until one does), so tp.rs returns to 12. main.rs: the --vision-fail-gemm help
             // block moved into opts_table (Cat::Diag -> --help-diag), 1554 -> 1552.
+            // CLIPRUNE1: main.rs +1, the --help-advanced dispatch print (same shape as the
+            // --help one). Conscious update, not a conversion miss.
+            // OUT1 (2026-10-12): 1555 -> 1547 — the ngram/tree/lanes EXPERIMENTAL boot lines became
+            // boot_report::notice(), the DSV4 sharded refusal became boot_report::error(), the two
+            // [vision] degradations became boot_report::warn(), the ctx clamp became
+            // boot_report::notice(); the boot_report vocabulary itself routes via logq::send.
+            // OUT1 DSV4 leg: 1547 -> 1546 — the [head] deepseek_v4 detection line became boot_report::notice()
+            // (the table kept 1547: a later +1 landed before this baseline was re-pinned).
+            // MAXBATCH1 (2026-10-21): 1547 -> 1551 — the four --max-batch EXL3 cap/clamp help
+            // lines (truthful help, same println! shape as --max-tokens').
+            ("src/main.rs", 1551),
             // Conscious updates, not conversion misses.
         ("src/tp.rs", 12),
             ("src/tp_bench.rs", 75),

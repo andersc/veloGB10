@@ -158,7 +158,7 @@ pub async fn http_listen(port: u16) -> tokio::net::TcpListener {
     // S-B9-REL-BENCHFIX2 (W3): the ranged HTTP-layer options are resolved here, before the socket
     // exists; the keep-alive in force is one boot line.
     match serve_options_boot_line() {
-        Ok(line) => println!("{line}"),
+        Ok(line) => { if crate::boot_report::debug() { println!("{line}"); } },
         Err(e) => fatal_option(&e),
     }
     let addr = match http_bind_addr(port) {
@@ -302,6 +302,8 @@ fn serve_options_boot_line() -> Result<String, String> {
                      crate::tools::SHADOW_MAX_BYTES / 1024, crate::tools::SHADOW_MAX_BLOCKS,
                      if crate::opts::choice(crate::opt!("tool-shadow-cost")) == "on" { "ALSO read in" } else { "NOT read in (--tool-shadow-cost off)" },
                      crate::tools::cost::RESPONSE_UNITS, crate::tools::cost::BLOCK_UNITS, crate::tools::cost::response_ms_nominal());
+    // TOOLSCRUB1: one line naming the scrub mode (off = the default = no served byte changes).
+    line += &format!("\n{}", crate::tool_scrub::boot_line(crate::tool_scrub::Mode::from_opt()));
     if let Some((round, secs)) = parse_stall_drill(crate::opts::get(crate::opt!("inject-stall")).as_deref())? {
         line += &format!("\n[serve] DIAGNOSTIC --inject-stall {round}:{secs}: the scheduler thread will sleep {secs} s at round {round} \
                           (a drill: never on a server that serves users)");
@@ -332,14 +334,15 @@ fn stall_drill_topology(drill_set: bool, args: &[String]) -> Result<(), String> 
 }
 
 /// The SSE response of both streaming endpoints: `stream` plus, when `every` is set, the
-/// keep-alive comment frames of `keepalive_frames` (liveness = the scheduler's work age).
-fn sse_with_keepalive<S, E>(stream: S, every: Option<std::time::Duration>) -> Response
+/// keep-alive frames of `keepalive_frames` (liveness = the scheduler's work age). The frame shape
+/// is `--sse-keepalive-frame`: the comment line (default) or a data frame (LANERES1).
+fn sse_with_keepalive<S, E>(stream: S, every: Option<std::time::Duration>, frame: SseKeepAliveFrame) -> Response
 where
     S: Stream<Item = Result<Event, E>> + Send + 'static,
     E: Into<axum::BoxError> + Send + 'static,
 {
     match every {
-        Some(d) => Sse::new(keepalive_frames(stream, d, SSE_KEEPALIVE_STALL, crate::metrics::sched_state)).into_response(),
+        Some(d) => Sse::new(keepalive_frames(stream, d, frame, SSE_KEEPALIVE_STALL, crate::metrics::sched_state)).into_response(),
         None => Sse::new(stream).into_response(),
     }
 }
@@ -355,7 +358,7 @@ fn keepalive_live(sched: crate::metrics::SchedState, stream_age: std::time::Dura
 /// the engine is alive (`sched()` = the scheduler's gauges at that moment). The data events pass
 /// through untouched, in order. This replaces axum's `KeepAlive`, which cannot be conditional
 /// and computes `Instant::now() + interval` unchecked at every event.
-fn keepalive_frames<S, E, F>(inner: S, every: std::time::Duration, stall: std::time::Duration, sched: F)
+fn keepalive_frames<S, E, F>(inner: S, every: std::time::Duration, frame: SseKeepAliveFrame, stall: std::time::Duration, sched: F)
     -> impl Stream<Item = Result<Event, E>> + Send + 'static
 where
     S: Stream<Item = Result<Event, E>> + Send + 'static,
@@ -378,13 +381,60 @@ where
                 Some(None) => break,
                 None => {
                     if keepalive_live(sched(), born.elapsed(), stall) {
-                        yield Ok(Event::default().comment(SSE_KEEPALIVE_TEXT));
+                        yield Ok(match &frame {
+                            SseKeepAliveFrame::Comment => Event::default().comment(SSE_KEEPALIVE_TEXT),
+                            SseKeepAliveFrame::Data(payload) => Event::default().data(payload.as_ref()),
+                        });
                     }
                 }
             }
             deadline = after(tokio::time::Instant::now());
         }
     }
+}
+
+/// LANERES1 `--sse-keepalive-frame`: the shape of the idle keep-alive frames. `Comment` = today:
+/// the SSE comment line `: keep-alive` (no data field; SSE clients ignore it). `Data` = an SSE
+/// data frame carrying a chat-completions chunk with an EMPTY `choices` array: SDKs whose stream
+/// guard counts only chunks with a choices entry never yield it to the caller, but client idle
+/// timers fed by received SSE data frames reset (andrei.gnezdilov: qwen-code is such a client).
+/// The house rule stands: no choices ENTRY is ever sent before the request's first real token —
+/// the keep-alive chunk's `choices` array is empty.
+#[derive(Clone, Debug)]
+pub(crate) enum SseKeepAliveFrame {
+    Comment,
+    /// The prebuilt JSON payload (this stream's id/created/model; `choices: []`).
+    Data(std::sync::Arc<str>),
+}
+
+/// The configured mode (--sse-keepalive-frame; a registry-validated Choice, default comment).
+fn sse_keepalive_frame_mode() -> &'static str {
+    static V: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    V.get_or_init(|| match crate::opts::choice(crate::opt!("sse-keepalive-frame")).as_str() {
+        "data" => "data",
+        _ => "comment",
+    })
+}
+
+/// The pure payload of a data-mode keep-alive frame (unit-tested): a chunk with an EMPTY choices
+/// array and the stream's own id/created/model.
+fn sse_keepalive_data_payload(id: &str, created: i64, model: &str, object: &str) -> String {
+    serde_json::json!({
+        "id": id, "object": object, "created": created, "model": model, "choices": [],
+    }).to_string()
+}
+
+/// Pure over the mode string (unit-tested): "data" → the data frame, anything else → comment.
+fn sse_keepalive_frame_of_mode(mode: &str, id: &str, created: i64, model: &str, object: &str) -> SseKeepAliveFrame {
+    match mode {
+        "data" => SseKeepAliveFrame::Data(sse_keepalive_data_payload(id, created, model, object).into()),
+        _ => SseKeepAliveFrame::Comment,
+    }
+}
+
+/// The frame argument of `sse_with_keepalive` for THIS stream (id/created/model at the call site).
+fn sse_keepalive_frame(id: &str, created: i64, model: &str, object: &str) -> SseKeepAliveFrame {
+    sse_keepalive_frame_of_mode(sse_keepalive_frame_mode(), id, created, model, object)
 }
 
 /// `--inject-stall ROUND:SECONDS` (diagnostic; unset = no drill): Ok(None) when unset. ROUND is
@@ -653,6 +703,9 @@ fn admit_gate_busy() -> bool {
 /// The LR-4 refusal: 503 in the engine's existing error shape plus `Retry-After: 5`.
 fn server_busy() -> Response {
     crate::metrics::reject_request();
+    // MAXBATCH1: the refused arm of the over-cap arrival class (every lane busy AND the waiting
+    // queue at --max-waiting) — paired with `velogb10_over_cap_arrivals_total{disposition="queued"}`.
+    crate::metrics::over_cap_rejected();
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [(axum::http::header::RETRY_AFTER, "5")],
@@ -1332,6 +1385,12 @@ pub(crate) struct ChatSse {
     pub t0: std::time::Instant,
     /// The `[gen]` log line's inputs (None = no log line: the unit tests have no tokenizer).
     pub gen_log: Option<GenLog>,
+    /// TOOLEVAL: the armed per-turn tool trace (None = flag off). Read once at the finalize
+    /// site; nothing in the token loop touches it.
+    pub tool_trace: Option<crate::tool_trace::Turn>,
+    /// TOOLSCRUB1: the per-request emission-side scrubber (off = passthrough that never
+    /// buffers; see src/tool_scrub.rs).
+    pub scrub: crate::tool_scrub::Scrubber,
 }
 
 pub(crate) struct GenLog {
@@ -1415,7 +1474,7 @@ where
     let ChatSse {
         mut rx, bl, mut mt, otel_req, otel_session, role_chunk, completion_id, created, model_name,
         stops, think_open, think_close, starts_in_reasoning, tool_hold, parse_as_tool_calls,
-        req_tools, include_usage, prompt_len, t0, gen_log,
+        req_tools, include_usage, prompt_len, t0, gen_log, tool_trace, mut scrub,
     } = cx;
     // B2: an empty stop string matches at offset 0 of every text (it would empty the reply); the request
     // deserializer drops it already, this keeps the stream itself safe for any caller.
@@ -1502,7 +1561,7 @@ where
                                     // a second think block must not match the first one's close.
                                     if let Some(idx) = f_close.find(&acc, reason_emitted, think_close) {
                                         if idx > reason_emitted {
-                                            let c = reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..idx]);
+                                            let c = reasoning_chunk(&completion_id, created, &model_name, &scrub.push_reasoning(&acc[reason_emitted..idx]));
                                             if let Some(r) = &otel_req { r.delta(&c); }
                                             yield Ok(Event::default().data(c));
                                         }
@@ -1524,7 +1583,7 @@ where
                                             tool_hold.and_then(|_| region.find(TOOL_OPEN).map(|i| lead + i)),
                                             acc.len(), region, &content_marks);
                                         if safe_end > lead {
-                                            let c = content_chunk(&completion_id, created, &model_name, &acc[lead..safe_end]);
+                                            let c = content_chunk(&completion_id, created, &model_name, &scrub.push_content(&acc[lead..safe_end]));
                                             if let Some(r) = &otel_req { r.delta(&c); }
                                             yield Ok(Event::default().data(c));
                                         }
@@ -1552,7 +1611,7 @@ where
                                             tool_hold.and_then(|m| f_tool_r.find(&acc[..safe], reason_emitted, m)),
                                             safe, region, &reason_marks);
                                         if safe_end > reason_emitted {
-                                            let c = reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe_end]);
+                                            let c = reasoning_chunk(&completion_id, created, &model_name, &scrub.push_reasoning(&acc[reason_emitted..safe_end]));
                                             if let Some(r) = &otel_req { r.delta(&c); }
                                             yield Ok(Event::default().data(c));
                                             reason_emitted = safe_end;
@@ -1574,7 +1633,7 @@ where
                                     let tool_at = tool_hold.and_then(|m| f_tool_c.find(&acc, cs, m));
                                     if let Some(upto) = f_open.find(&acc, cs, think_open).filter(|&u| tool_at.map_or(true, |t| u < t)) {
                                         if upto > content_emitted {
-                                            let c = content_chunk(&completion_id, created, &model_name, &acc[content_emitted..upto]);
+                                            let c = content_chunk(&completion_id, created, &model_name, &scrub.push_content(&acc[content_emitted..upto]));
                                             if let Some(r) = &otel_req { r.delta(&c); }
                                             yield Ok(Event::default().data(c));
                                         }
@@ -1590,7 +1649,7 @@ where
                                         tool_hold.and_then(|m| f_tool_c.find(&acc, cs, m)),
                                         acc.len(), region, &content_marks);
                                     if safe_end > content_emitted {
-                                        let c = content_chunk(&completion_id, created, &model_name, &acc[content_emitted..safe_end]);
+                                        let c = content_chunk(&completion_id, created, &model_name, &scrub.push_content(&acc[content_emitted..safe_end]));
                                         if let Some(r) = &otel_req { r.delta(&c); }
                                         yield Ok(Event::default().data(c));
                                         content_emitted = safe_end;
@@ -1633,7 +1692,7 @@ where
         if req_tools.is_some() {
             let dump = crate::opts::var(crate::opt!("dump-tools")).is_ok();
             if dump || parsed.tool_calls.is_empty() {
-                crate::reprintln!("[req] raw model output ({} chars): {:?}", done_content.chars().count(),
+                crate::dreprintln!("[req] raw model output ({} chars): {:?}", done_content.chars().count(),
                           done_content.chars().take(1200).collect::<String>());
             }
             if dump { crate::reprintln!("{}", dump_tools_line(&done_content)); }
@@ -1643,7 +1702,11 @@ where
         for a in crate::tools::empty_arg_alarms(&done_content, req_tools.as_deref(), &parsed.tool_calls) {
             crate::reprintln!("[tool-args-alarm] {a}");
         }
-        let (_, tool_calls, fin) = crate::tools::finalize_parsed(&done_content, parsed, &finish);
+        let (tc_content, tool_calls, fin) = crate::tools::finalize_parsed(&done_content, parsed, &finish);
+        // TOOLEVAL: the per-turn tool trace (None = flag off -> one Option check, nothing else).
+        if let Some(t) = &tool_trace {
+            crate::tool_trace::log(t, &acc, &done_content, tc_content.as_deref(), &tool_calls, &fin);
+        }
         mt.finish(if finish.starts_with("error") { finish.as_str() } else { fin.as_str() });
         if !tool_calls.is_empty() {
             // Log the ARGUMENTS, not just the names — see the note on the non-streaming path.
@@ -1652,7 +1715,28 @@ where
             for t in &tool_calls {
                 crate::reprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
             }
-            let tc = tool_calls_chunk(&completion_id, created, &model_name, &tool_calls);
+            // TOOLSCRUB1: flush any text the scrubber still holds (it belongs before the
+            // call), then scrub the call arguments themselves. The [req] log above keeps
+            // the RAW arguments (same class as --tool-trace / --dump-tools: server-side
+            // diagnostics of what the model actually produced).
+            let r_flush = scrub.finish_reasoning("");
+            if !r_flush.is_empty() {
+                let c = reasoning_chunk(&completion_id, created, &model_name, &r_flush);
+                if let Some(r) = &otel_req { r.delta(&c); }
+                yield Ok(Event::default().data(c));
+            }
+            let c_flush = scrub.finish_content("");
+            if !c_flush.is_empty() {
+                let c = content_chunk(&completion_id, created, &model_name, &c_flush);
+                if let Some(r) = &otel_req { r.delta(&c); }
+                yield Ok(Event::default().data(c));
+            }
+            let tc_scrubbed: Vec<ToolCall> = tool_calls.iter().map(|t| {
+                let mut t2 = t.clone();
+                t2.function.arguments = scrub.scrub_full(&t2.function.arguments).into_owned();
+                t2
+            }).collect();
+            let tc = tool_calls_chunk(&completion_id, created, &model_name, &tc_scrubbed);
             if let Some(r) = &otel_req { r.delta(&tc); }
             yield Ok(Event::default().data(tc));
             finish = fin;
@@ -1670,13 +1754,17 @@ where
             // response returns all of them.
             let (reasoning_tail, content_tail) = held_tail(&acc, reason_emitted.max(content_emitted),
                                                            content_start.is_none(), tool_hold, think_close);
-            if !reasoning_tail.is_empty() {
-                let c = reasoning_chunk(&completion_id, created, &model_name, reasoning_tail);
+            // TOOLSCRUB1: the tails (and anything the scrubber still holds) leave through
+            // the scrubber's finish path; off mode returns them byte-identical.
+            let rs = scrub.finish_reasoning(&reasoning_tail);
+            if !rs.is_empty() {
+                let c = reasoning_chunk(&completion_id, created, &model_name, &rs);
                 if let Some(r) = &otel_req { r.delta(&c); }
                 yield Ok(Event::default().data(c));
             }
-            if !content_tail.is_empty() {
-                let c = content_chunk(&completion_id, created, &model_name, content_tail);
+            let cs = scrub.finish_content(&content_tail);
+            if !cs.is_empty() {
+                let c = content_chunk(&completion_id, created, &model_name, &cs);
                 if let Some(r) = &otel_req { r.delta(&c); }
                 yield Ok(Event::default().data(c));
             }
@@ -1730,7 +1818,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(mut req) = match payload { Ok(j) => j, Err(e) => return bad_json(e) };
     // Log the request parameters the client sent (useful for debugging OpenWebUI behavior)
-    crate::reprintln!(
+    crate::dreprintln!(
         "[req] params  temp={:?} top_p={:?} top_k={:?} max_tok={:?} max_completion_tok={:?} rep_pen={:?} presence={:?} freq={:?} stream={} effort={:?} ctk={}",
         req.temperature, req.top_p, req.top_k,
         req.max_tokens, req.max_completion_tokens, req.repetition_penalty, req.presence_penalty, req.frequency_penalty,
@@ -1739,7 +1827,7 @@ async fn chat_completions(
     );
     if !req.unused_fields.is_empty() {
         let names: Vec<&str> = req.unused_fields.keys().map(|k| k.as_str()).collect();
-        crate::reprintln!("[req] fields not used by this server: {names:?}");
+        crate::dreprintln!("[req] fields not used by this server: {names:?}");
     }
     if let Err(msg) = validate_penalties(req.repetition_penalty, req.presence_penalty,
                                          req.frequency_penalty, req.min_p) {
@@ -2017,7 +2105,7 @@ async fn chat_completions(
     let temperature = req.temperature.unwrap_or(d_temp);
     let top_p = req.top_p.unwrap_or(d_top_p).max(0.01);
     let top_k = req.top_k.unwrap_or(d_top_k);
-    crate::reprintln!("[req] sampling temp={temperature} top_p={top_p} top_k={top_k} (thinking={thinking_on}; \
+    crate::dreprintln!("[req] sampling temp={temperature} top_p={top_p} top_k={top_k} (thinking={thinking_on}; \
                sent: temp={:?} top_p={:?} top_k={:?})", req.temperature, req.top_p, req.top_k);
 
     // Submit to the batching scheduler and receive tokens on a channel.
@@ -2026,6 +2114,32 @@ async fn chat_completions(
     let presence_penalty = req.presence_penalty.unwrap_or(state.default_presence_penalty);
     let pp_source = if req.presence_penalty.is_some() { "request" } else { "server-default" };
     let frequency_penalty = req.frequency_penalty.unwrap_or(state.default_frequency_penalty);
+    // TOOLEVAL (P18): arm the per-turn tool trace for requests that involve tools - the
+    // request offers tools, or its history carries a tool result. None (and no further cost)
+    // when the flag is off. The trace only READS the prompt, the raw output and the parse the
+    // server already computed: no served byte changes with it on or off.
+    let tool_trace = {
+        let tool_turn = req.tools.is_some() || req.messages.iter().any(|m| m.role == "tool");
+        if !tool_turn { None } else {
+            crate::tool_trace::capture(&prompt, serde_json::json!({
+                "id": format!("tt-{}", Uuid::new_v4()),
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "stream": req.stream,
+                "seed": req.seed,
+                "sampling": {
+                    "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                    "presence_penalty": presence_penalty, "frequency_penalty": frequency_penalty,
+                    "sent": { "temperature": req.temperature, "top_p": req.top_p, "top_k": req.top_k },
+                },
+                "thinking_on": thinking_on,
+                "n_tools": req.tools.as_ref().map_or(0, |t| t.len()),
+                "tool_choice": req.tool_choice.clone(),
+                "parse_as_tool_calls": parse_as_tool_calls,
+                "prompt_tokens": prompt_len,
+                "roles": req.messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            }))
+        }
+    };
 
     let (tx, mut rx, bl) = tok_channel(); // LR-5: `bl` counts consumed events in the loops below
     let request = BatchRequest {
@@ -2077,8 +2191,11 @@ async fn chat_completions(
         sess
     });
 
+    // TOOLSCRUB1: the per-request emission-side scrubber (one registry read +, when
+    // provenance is on, candidate extraction from this conversation's tool results).
+    let scrub = crate::tool_scrub::Scrubber::new(crate::tool_scrub::Mode::from_opt(), &req.messages);
     if req.stream {
-        crate::reprintln!("[req] stream  prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
+        crate::dreprintln!("[req] stream  prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let tokenizer = Arc::clone(&state.tokenizer);
         let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
         let stops = req.stop.clone();
@@ -2132,11 +2249,13 @@ async fn chat_completions(
             completion_id, created, model_name, stops,
             think_open, think_close, starts_in_reasoning, tool_hold, parse_as_tool_calls,
             req_tools, include_usage, prompt_len, t0,
+            tool_trace, scrub,
             gen_log: Some(GenLog {
                 tokenizer: Arc::clone(&state.tokenizer), stop_ids: state.stop_ids.clone(),
                 effort: effort_for_log, presence_penalty, pp_source,
             }),
         };
+        let ka_frame = sse_keepalive_frame(&cx.completion_id, cx.created, &cx.model_name, "chat.completion.chunk");
         let stream = chat_sse_stream(cx, move || {
             // Byte-level stream decoder: the per-token decode path above would mangle every
             // multi-byte char split across tokens (all emoji) into "�" — the crate's ByteLevel
@@ -2144,7 +2263,7 @@ async fn chat_completions(
             let mut dec = tokenizer.stream_decoder();
             move |t| dec.push(t)
         });
-        let mut resp = sse_with_keepalive(stream, sse_keepalive());
+        let mut resp = sse_with_keepalive(stream, sse_keepalive(), ka_frame);
         attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
         resp
     } else {
@@ -2246,7 +2365,7 @@ async fn chat_completions(
         if req.tools.is_some() {
             let dump = crate::opts::var(crate::opt!("dump-tools")).is_ok();
             if dump || parsed.tool_calls.is_empty() {
-                crate::reprintln!("[req] raw model output ({} chars): {:?}", content.chars().count(),
+                crate::dreprintln!("[req] raw model output ({} chars): {:?}", content.chars().count(),
                           content.chars().take(1200).collect::<String>());
             }
             if dump { crate::reprintln!("{}", dump_tools_line(&content)); }
@@ -2257,7 +2376,13 @@ async fn chat_completions(
         for a in crate::tools::empty_arg_alarms(&content, req.tools.as_deref(), &parsed.tool_calls) {
             crate::reprintln!("[tool-args-alarm] {a}");
         }
+        let parser_input = if tool_trace.is_some() { content.clone() } else { String::new() };
         let (content, tool_calls, finish) = crate::tools::finalize_parsed(&content, parsed, &finish);
+        // TOOLEVAL: the same per-turn trace as the streaming branch - raw output (thinking
+        // included), the parser input, and the finalized verdict the JSON response carries.
+        if let Some(t) = &tool_trace {
+            crate::tool_trace::log(t, &text, &parser_input, content.as_deref(), &tool_calls, &finish);
+        }
         mt.finish(&finish);
         if !tool_calls.is_empty() {
             // Log the ARGUMENTS, not just the names. When opencode reported a write as successful and
@@ -2269,6 +2394,15 @@ async fn chat_completions(
             }
         }
         let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
+
+        // TOOLSCRUB1: emission-side scrub - AFTER the raw-args log above (the server log
+        // stays raw, same class as --tool-trace / --dump-tools) and after the trace; only
+        // the response body text changes. Off mode = borrow passthrough, no allocation.
+        let content = content.map(|c| scrub.scrub_full(&c).into_owned());
+        let reasoning = reasoning.map(|r| scrub.scrub_full(&r).into_owned());
+        let tool_calls = tool_calls.map(|v| v.into_iter().map(|mut t| {
+            t.function.arguments = scrub.scrub_full(&t.function.arguments).into_owned();
+            t }).collect::<Vec<_>>());
 
         let (r_log, c_log) = gen_log_spans(reasoning.as_deref(), content.as_deref().unwrap_or(""),
                                            think_closed, starts_in_reasoning);
@@ -2336,7 +2470,7 @@ fn log_generation(tok: &QwenTokenizer, stop_ids: &[u32], id: &str, finish: &str,
     let r_tok = count(reasoning);
     let c_tok = count(Some(content));
     let is_stop = terminal.map(|t| stop_ids.contains(&t)).unwrap_or(false);
-    crate::reprintln!("[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={} \
+    crate::dreprintln!("[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={} \
                content_tokens={} completion_tokens={} prompt_tokens={} tool_calls={} \
                tools_offered={} effort={} presence_penalty={} pp_source={} stop_kind={} {}",
         id, finish, terminal.map(|t| t.to_string()).unwrap_or_else(|| "none".into()), is_stop,
@@ -2519,7 +2653,7 @@ async fn tokenize(State(state): State<AppState>, Json(body): Json<serde_json::Va
         }}))).into_response();
     }
     let count = tokens.len();
-    crate::reprintln!("[tokenize] model={model} n={count} add_special={add_special} truncate={truncate:?}");
+    crate::dreprintln!("[tokenize] model={model} n={count} add_special={add_special} truncate={truncate:?}");
     Json(serde_json::json!({
         "tokens": tokens,
         "count": count,
@@ -2699,6 +2833,9 @@ async fn completions(
     if req.stream {
         let t0 = std::time::Instant::now();
         let include_usage = completions_include_usage(req.stream_options.as_ref()); // item 6
+        // LANERES1: the keep-alive frame shape (comment or empty-choices data frame) is decided
+        // before the generator below moves cid/created/model_name into the stream.
+        let ka_frame = sse_keepalive_frame(&cid, created, &model_name, "text_completion.chunk");
         let stream = async_stream::stream! {
             let mut ntok: usize = 0;
             let mut cached = 0usize; // #8.2: prefix-cache-served prompt tokens (the usage chunk)
@@ -2756,7 +2893,7 @@ async fn completions(
         };
         // S-B9-REL-BENCHFIX: this stream never sent anything before its first token; it gets the
         // same idle comment frames as the chat stream (queue wait / long prefill).
-        return sse_with_keepalive(stream, sse_keepalive());
+        return sse_with_keepalive(stream, sse_keepalive(), ka_frame);
     }
     // non-streaming: collect everything, detokenize once, single response.
     let mut toks: Vec<u32> = Vec::with_capacity(req_max);
@@ -3321,6 +3458,11 @@ mod harden_review_h1_tests {
         let cnt = |s: &str| s.lines().find(|l| l.starts_with("velogb10_requests_rejected_total"))
             .unwrap().split_whitespace().last().unwrap().parse::<u64>().unwrap();
         assert!(cnt(&after) > cnt(&before), "server_busy must count the rejection");
+        // MAXBATCH1: the 503 is the refused arm of the over-cap arrival class.
+        let oc = |s: &str| s.lines().find(|l| l.starts_with("velogb10_over_cap_arrivals_total{disposition=\"rejected\"}"))
+            .unwrap().split_whitespace().last().unwrap().parse::<u64>().unwrap();
+        assert!(oc(&after) > oc(&before), "server_busy must count the over-cap rejection");
+        assert!(after.contains("velogb10_over_cap_arrivals_total{disposition=\"queued\"}"), "the queued series is always present");
     }
 
     /// LR-5 backlog predicate: fires AT the limit (>=), never below it; 0 = unlimited.
@@ -3776,8 +3918,10 @@ mod gen_line_tests {
     fn the_gen_line_keeps_its_key_order_and_appends_the_new_fields() {
         let src = include_str!("server.rs");
         let at = |pat: &str| src.find(pat).unwrap_or_else(|| panic!("missing `{pat}`"));
-        let a = at("crate::reprintln!(\"[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={}");
-        let tail = &src[a..a + 600];
+        let a = at("crate::dreprintln!(\"[gen] id={} finish={} terminal_tok={} is_stop_tok={} reasoning_tokens={}");
+        let mut end = a + 600;
+        while !src.is_char_boundary(end) { end -= 1; } // OUT2: 1-byte rename shifted this onto an em-dash
+        let tail = &src[a..end];
         let pos = |k: &str| tail.find(k).unwrap_or_else(|| panic!("[gen] line lost `{k}`"));
         let order = ["content_tokens={}", "completion_tokens={}", "prompt_tokens={}", "tool_calls={}", "tools_offered={}",
                      "effort={}", "presence_penalty={}", "pp_source={}", "stop_kind={}"];
@@ -3907,6 +4051,8 @@ pub(crate) mod benchfix_sse_tests {
             tool_hold: sh.tools.then_some(TOOL_OPEN), parse_as_tool_calls: sh.tools,
             req_tools: sh.tools.then(|| vec![weather]),
             include_usage: sh.usage, prompt_len: 7, t0: std::time::Instant::now(), gen_log: None,
+            tool_trace: None,
+            scrub: crate::tool_scrub::Scrubber::new(crate::tool_scrub::Mode::Off, &[]),
         }
     }
 
@@ -3932,7 +4078,7 @@ pub(crate) mod benchfix_sse_tests {
         F: Fn() -> SchedState + Send + 'static,
     {
         match every {
-            Some(d) => Sse::new(keepalive_frames(stream, d, SSE_KEEPALIVE_STALL, sched)).into_response(),
+            Some(d) => Sse::new(keepalive_frames(stream, d, SseKeepAliveFrame::Comment, SSE_KEEPALIVE_STALL, sched)).into_response(),
             None => Sse::new(stream).into_response(),
         }
     }
@@ -4537,7 +4683,7 @@ pub(crate) mod benchfix_sse_tests {
         crate::metrics::sched_idle();
         let (tx, rx, bl) = tok_channel();
         feed(tx, vec![(25, tok(0)), (26, fin("stop"))]);
-        let frames = read_frames(sse_with_keepalive(chat(rx, bl, PLAIN), Some(secs(10)))).await;
+        let frames = read_frames(sse_with_keepalive(chat(rx, bl, PLAIN), Some(secs(10)), SseKeepAliveFrame::Comment)).await;
         assert_eq!(timeline(&frames), [(10, "ka"), (20, "ka"), (25, "role"), (25, "data"), (26, "data"), (26, "data")]);
         // work completed just now (real clock: the whole test takes milliseconds): alive although busy
         crate::metrics::sched_step();
@@ -4546,6 +4692,24 @@ pub(crate) mod benchfix_sse_tests {
         crate::metrics::sched_touch();
         assert!(keepalive_live(crate::metrics::sched_state(), secs(100_000), SSE_KEEPALIVE_STALL));
         crate::metrics::sched_idle();
+    }
+
+    /// LANERES1 `--sse-keepalive-frame data`: the pure payload is a chunk with an EMPTY choices
+    /// array (the first real choices entry is still the request's first token — the keep-alive
+    /// adds none), carrying the stream's own id/created/model; "data" mode builds that frame and
+    /// the default mode stays the comment line.
+    #[test]
+    fn the_keepalive_data_frame_is_an_empty_choices_chunk() {
+        let p = sse_keepalive_data_payload("chatcmpl-x", 1_700_000_000, "test-model", "chat.completion.chunk");
+        let v: serde_json::Value = serde_json::from_str(&p).expect("valid JSON");
+        assert_eq!(v["id"], "chatcmpl-x");
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["created"], 1_700_000_000);
+        assert_eq!(v["model"], "test-model");
+        assert_eq!(v["choices"], serde_json::json!([]), "no choices entry before the first real token");
+        assert!(matches!(sse_keepalive_frame_of_mode("data", "id", 1, "m", "text_completion.chunk"), SseKeepAliveFrame::Data(_)));
+        assert!(matches!(sse_keepalive_frame_of_mode("comment", "id", 1, "m", "chat.completion.chunk"), SseKeepAliveFrame::Comment));
+        assert!(matches!(sse_keepalive_frame_of_mode("", "id", 1, "m", "chat.completion.chunk"), SseKeepAliveFrame::Comment));
     }
 
     /// `--inject-stall ROUND:SECONDS`, the W4 drill flag: parsed strictly (the store is not
@@ -4754,8 +4918,8 @@ pub(crate) mod benchfix_sse_tests {
         let code = &src[..src.find("mod benchfix_sse_tests").unwrap()];
         let n = |needle: String| code.matches(&needle).count();
         assert_eq!(n(format!("let stream = {}(cx, move || {{", "chat_sse_stream")), 1, "the chat handler's stream");
-        assert_eq!(n(format!("let mut resp = {}(stream, sse_keepalive());", "sse_with_keepalive")), 1);
-        assert_eq!(n(format!("return {}(stream, sse_keepalive());", "sse_with_keepalive")), 1, "/v1/completions");
+        assert_eq!(n(format!("let mut resp = {}(stream, sse_keepalive(), ka_frame);", "sse_with_keepalive")), 1);
+        assert_eq!(n(format!("return {}(stream, sse_keepalive(), ka_frame);", "sse_with_keepalive")), 1, "/v1/completions");
         // the only Sse responses are the two arms of sse_with_keepalive, and the only generator
         // that writes a role chunk is chat_sse_stream (once at the first token, once before the
         // terminal events)

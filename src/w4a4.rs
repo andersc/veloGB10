@@ -103,7 +103,7 @@ pub fn gdn_part_on(groups: &[String], part: &str) -> bool {
 impl W4a4State {
     pub fn build(dev: &Arc<CudaDevice>, groups: Vec<String>, enabled: HashSet<u64>, narrow_enabled: HashSet<u64>, x_gs: HashMap<u64, f32>,
                  rows_max: usize, k_max: usize, tiles_max: usize) -> anyhow::Result<Self> {
-        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_w4a4.ptx")?);
+        let ptx = Ptx::from_src(crate::ptx_embed::GPU_W4A4);
         dev.load_ptx(ptx, "gpu_w4a4", &["w4a4_quant_pack_b", "w4a4_gemm_b", "w4a4_gemm_n8_b", "w4a4_gemm_moe_b",
                                         "w4a4_moe_tilemap_b", "w4a4_fakequant_b", "kernel_build_id"])?;
         crate::gpu::GpuModel::assert_kernel_build_id(dev, "gpu_w4a4")?;

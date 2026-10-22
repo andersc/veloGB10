@@ -236,7 +236,7 @@ impl DsparkRound {
         let stream = fork_blocking_stream(&dev);
 
         // ---- modules (the DF2 round's name lists, minus its selector/tree extras, plus ours)
-        let bptx = cudarc::nvrtc::Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
+        let bptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         // gemm_mma_fp4_b: the TwoStage coarse head (the REAL trunk head is NVFP4 TwoStage —
         // the probe's synthetic head is Bf16 and never exercises it, so this only shows at
         // serving; DF2's list carries the same name).
@@ -245,12 +245,12 @@ impl DsparkRound {
             "embed_gather_b", "gemm_binv_b", "gemm_mma_fp4_b"].to_vec();
         dev.load_ptx(bptx, "gpu_batch", &bfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
-        let kptx = cudarc::nvrtc::Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_kernels.ptx")?);
+        let kptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         let kfnames = ["gemm_dsp_b_m8_r4", "gemm_tiled_b", "bf16tof32", "f32tobf16",
             "kernel_build_id", "df2_top256_b", "df2_head_rerank_b"];
         dev.load_ptx(kptx, "gpu_kernels", &kfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_kernels")?;
-        let sptx = cudarc::nvrtc::Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_dspark.ptx")?);
+        let sptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_DSPARK);
         let sfnames = ["kernel_build_id", "dspark_attn_full_ring_b", "dspark_attn_full_ring_c",
                       "dspark_attn_full_ring_d", "dspark_attn_full_ring_e", "dspark_attn_merge_d", "dspark_chain_a",
             "dspark_chain_b", "dspark_chain_c", "dspark_row0_argmax_b", "dspark_rope_b", "dspark_scalars_b"];

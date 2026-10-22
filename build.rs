@@ -241,12 +241,29 @@ fn main() {
     let mut kernel_files: Vec<String> = kernels.iter().map(|(s, _, _)| format!("kernels/{s}")).collect();
     kernel_files.push("native/tp_doorbell.h".to_string());
     println!("cargo:rustc-env=KERNEL_BUILD_FILES={}", kernel_files.join(";"));
+    // EMB1: cu:ptx pairs for every module this script emits (the loaders embed via src/ptx_embed.rs).
+    // cluster.rs build-id test exempts exactly these include targets as derived artifacts.
+    let mut manifest: Vec<String> = kernels.iter().map(|(s, d, _)| format!("{s}:{d}")).collect();
+    manifest.push(String::from("gpu_batch.cu:gpu_batch_b3.ptx")); // -DTQ_B3 variant of the first entry
+    println!("cargo:rustc-env=EMBEDDED_PTX_MANIFEST={}", manifest.join(";"));
 
     if !nvcc.exists() {
-        // Cross-compiling or a CI box with no CUDA: the checked-in PTX has to do. Say so clearly --
-        // a silent fallback here is exactly how a stale kernel ships.
-        println!("cargo:warning=nvcc not found at {}; using the CHECKED-IN PTX in src/ptx/. \
-                  Any kernels/*.cu edit will NOT take effect.", nvcc.display());
+        // No nvcc: the only buildable path is off the src/ptx/*.ptx a PREVIOUS build left in the
+        // tree (nothing is checked in; .gitignore has *.ptx). Since EMB1 embeds those bytes, that
+        // bakes possibly-stale kernels into the binary -- the KERNEL_BUILD_ID handshake refuses
+        // a mismatch at boot, but fail HERE when a target file is missing at all, because the
+        // include_str! compile error is otherwise a confusing rustc message.
+        let missing: Vec<&str> = kernels.iter()
+            .filter(|(_, dst, _)| !out_dir.join(dst).exists())
+            .map(|(_, dst, _)| *dst).collect();
+        if !missing.is_empty() {
+            panic!("nvcc not found at {} and src/ptx/ is missing {:?} -- cannot build: EMB1 embeds \
+                    these bytes (build once on a box with nvcc, or install CUDA)",
+                   nvcc.display(), missing);
+        }
+        println!("cargo:warning=nvcc not found at {}; embedding the src/ptx/*.ptx a previous \
+                  build left in the tree. Any kernels/*.cu edit will NOT take effect.",
+                 nvcc.display());
         return;
     }
 

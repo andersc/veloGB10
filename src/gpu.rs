@@ -1716,7 +1716,7 @@ static E11_KERNELS: std::sync::OnceLock<Option<E11RawKernels>> = std::sync::Once
 fn e11_raw_kernels() -> Option<&'static E11RawKernels> {
     E11_KERNELS.get_or_init(|| {
         use cudarc::driver::sys;
-        let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+        let ptx = crate::ptx_embed::GPU_BATCH;
         let ptx_c = std::ffi::CString::new(ptx).ok()?;
         let mut module: sys::CUmodule = std::ptr::null_mut();
         let r = unsafe {
@@ -1757,7 +1757,7 @@ static E9_KERNELS: std::sync::OnceLock<Option<E9Kernels>> = std::sync::OnceLock:
 
 fn e9_load_kernels() -> Option<E9Kernels> {
     use cudarc::driver::sys;
-    let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+    let ptx = crate::ptx_embed::GPU_BATCH;
     // cuModuleLoadDataEx requires a NULL-TERMINATED PTX string. A Rust String's buffer is NOT
     // null-terminated (the driver reads past it into garbage → CUDA_ERROR_INVALID_PTX, found
     // 2026-08-11: the raw as_ptr() call failed where cudarc's own load_ptx — which wraps the
@@ -2582,13 +2582,12 @@ impl GpuModel {
         unsafe { blas.set_stream(Some(&stream))?; }
         Self::init_ptx(&dev)?;
         let (k, bk) = Self::load_batch_kernels(&dev)?;
-        // E5: trunk YaRN override — env-first (single-box), then the shipped TpConfig (node).
+        // E5/YARN1: trunk YaRN — the flag wins, then the shipped TpConfig (node), then the
+        // pack config's rope_scaling (one precedence rule: qwen::pick_yarn).
         let mut cfg_host = host.config.clone();
-        cfg_host.rope_yarn_factor = crate::opts::var(crate::opt!("rope-yarn-factor")).ok()
-            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0)
-            .or(crate::tp::tp_config().map(|c| c.rope_yarn_factor))
-            .unwrap_or(1.0);
-        let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg_host)?;
+        let (yarn, yarn_src) = crate::qwen::resolved_yarn(&cfg_host);
+        cfg_host.rope_yarn_factor = yarn;
+        let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg_host, yarn_src)?;
         let sc_pos = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_rope = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_slot = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
@@ -2742,6 +2741,25 @@ impl GpuModel {
                  \x20 Use an EXL3-aware entry point: --server, --perplexity, --bench-mtp, --probe-state, --probe-exl3-*."));
         }
         let config_path = format!("{}/config.json", model_dir.trim_end_matches('/'));
+        // FIX1 #77: a DFlash2 DRAFT artifact booted as --model-dir used to fall through to the
+        // tensor loop and die as `missing tensor: <name>` — a message that says nothing about the
+        // real mistake. Detect the artifact by its own marker (config.json's df2_quant — the
+        // field dflash2::load bakes into every draft artifact) and say WHAT / WHERE / HOW TO FIX.
+        if let Ok(cfg_txt) = std::fs::read_to_string(&config_path) {
+            if cfg_txt.contains("df2_quant") || cfg_txt.contains("dflash_config") || cfg_txt.contains("num_target_layers") {
+                let d = model_dir.trim_end_matches('/');
+                anyhow::bail!(
+                    "--model-dir points at a DFlash2 DRAFT artifact, not a model\n  \
+                     WHAT: {config_path} carries a draft-head marker (df2_quant / dflash_config / num_target_layers) — this directory is the \
+                     DFlash2 DRAFT head (5-ish draft layers over the target model), so the main model's tensors are not in it\n  \
+                     WHERE: the engine was loading the MAIN model from --model-dir {d} \
+                     (tensors: {d}/model.safetensors; before FIX1 this died later as a generic \
+                     'missing tensor: <name>' panic)\n  \
+                     HOW TO FIX: pass the draft as --draft-dir {d} and point --model-dir at the \
+                     target model directory",
+                );
+            }
+        }
         let cfg = crate::qwen::Config::from_config_json(&config_path)
             .map_err(|e| load_error("corrupted",
                 &format!("config.json is missing or does not parse: {e}")))?;
@@ -2806,7 +2824,7 @@ impl GpuModel {
                                      cannot fit one node. Refusing to load.");
                 }
                 assert!(r >= 0 && (r as usize) < world as usize, "shard-at-load: rank {r} out of range [0, {world})");
-                eprintln!("[tp] shard-at-load: rank {r}/{world} — weights will be sliced host-side before upload");
+                crate::deprintln!("[tp] shard-at-load: rank {r}/{world} — weights will be sliced host-side before upload");
                 if mixers { Some(r as usize) } else { None }
             }
         };
@@ -2827,7 +2845,7 @@ impl GpuModel {
                 }
             };
             if let Some(i) = &info {
-                eprintln!("[tp] B32 shard dir: nvfp4 rank {} of world {} — {} tensors arrive pre-sliced (their load-time \
+                crate::deprintln!("[tp] B32 shard dir: nvfp4 rank {} of world {} — {} tensors arrive pre-sliced (their load-time \
                            slice is skipped)", i.rank, i.world, i.presliced.len());
             }
             // the loader's slice decision is per ASSEMBLED tensor (its `.weight` base name, whose raw parts are
@@ -2897,13 +2915,12 @@ impl GpuModel {
         let (k, bk) = Self::load_batch_kernels(&dev)?;
         let t_ptx = t_ptx0.elapsed();
         let t_rope0 = std::time::Instant::now();
-        // E5: trunk YaRN override — env-first (single-box), then the shipped TpConfig (node).
+        // E5/YARN1: trunk YaRN — the flag wins, then the shipped TpConfig (node), then the
+        // pack config's rope_scaling (one precedence rule: qwen::pick_yarn).
         let mut cfg = cfg;
-        cfg.rope_yarn_factor = crate::opts::var(crate::opt!("rope-yarn-factor")).ok()
-            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0)
-            .or(crate::tp::tp_config().map(|c| c.rope_yarn_factor))
-            .unwrap_or(1.0);
-        let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg)?;
+        let (yarn, yarn_src) = crate::qwen::resolved_yarn(&cfg);
+        cfg.rope_yarn_factor = yarn;
+        let (cos_table, sin_table) = Self::build_rope_tables(&dev, &cfg, yarn_src)?;
         let t_rope = t_rope0.elapsed();
         let sc_pos = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
         let sc_rope = dev.alloc_zeros::<i32>(MAX_VERIFY).unwrap();
@@ -3159,11 +3176,13 @@ impl GpuModel {
                 let steady = fp4_resident + q8_bytes + bf16_bytes + kv_bytes + ple_resident + (6 << 30);
                 est = steady.max(fp4_resident + q8_bytes + bf16_bytes + transient);
                 extra = 6 << 30;
+                if crate::boot_report::debug() {
                 eprintln!("[mem] qwen4_exp footprint: device {:.1} GB (+PLE {:.1} GB resident) | load transient ~{:.1} GB \
                            (shard {:.1} GB x3 + pipeline {:.1} GB) | steady ~{:.1} GB | peak ~{:.1} GB",
                           (fp4_resident + q8_bytes + bf16_bytes) as f64 / 1e9, ple_resident as f64 / 1e9,
                           transient as f64 / 1e9, max_shard as f64 / 1e9, PIPE_CAP_BYTES as f64 / 1e9,
                           steady as f64 / 1e9, est as f64 / 1e9);
+                }
             }
             if sal.is_some() {
                 // Rank-local TP=2, computed DIRECTLY (not est/2). Device fp4/fp8 halve; bf16
@@ -3210,7 +3229,9 @@ impl GpuModel {
                 .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).map(|l| l.to_string()));
             let avail = std::fs::read_to_string("/proc/meminfo").ok()
                 .and_then(|s| s.lines().find(|l| l.starts_with("MemAvailable:")).map(|l| l.to_string()));
-            eprintln!("[mem] {tag}: {rss:?} {avail:?}", );
+            if crate::boot_report::debug() {
+                eprintln!("[mem] {tag}: {rss:?} {avail:?}", );
+            }
         }
         mem_probe("pre-shards");
         let mut t_gwn = std::time::Duration::ZERO; // sum of whole `gwn` calls (gwn-cpu = gwn - its parts)
@@ -3609,7 +3630,9 @@ impl GpuModel {
 
             // Load MTP if present
             let mtp = if has_mtp {
-                println!("Loading MTP head...");
+                if crate::boot_report::debug() {
+                    println!("Loading MTP head...");
+                }
                 if is_hy3 {
                     // hy_v3's MTP block is `model.layers.80.*`: eh_proj (=fc), enorm/hnorm (=pre_fc
                     // norms), final_layernorm (=mtp.norm), and a full MoE decoder layer. One-to-one
@@ -3776,9 +3799,11 @@ impl GpuModel {
             }
         }
         if n_dq4 + n_dq8 > 0 {
-            println!("  QUANTIZED artifact: {} NVFP4 + {} FP8 tensors ({})", n_dq4, n_dq8,
+            if crate::boot_report::debug() {
+                println!("  QUANTIZED artifact: {} NVFP4 + {} FP8 tensors ({})", n_dq4, n_dq8,
                      if dequant_at_load { "dequantized to bf16 at load — NO speedup, reference only" }
                      else { "kept packed; dequantized in-register by the fused GEMV" });
+            }
         }
 
         // Per-group round-trip error — the first thing to look at if quality moves.
@@ -4657,7 +4682,7 @@ impl GpuModel {
                 let qweight = dev.htod_sync_copy(&wt)?;
                 let scales = dev.htod_sync_copy(&st)?;
                 let gs = dev.htod_sync_copy(&gsv)?;
-                eprintln!("[tp] rank {} — DFlash2 full lm_head kept for the round (at-load, {} x {} rows)",
+                crate::deprintln!("[tp] rank {} — DFlash2 full lm_head kept for the round (at-load, {} x {} rows)",
                           sal.unwrap_or(0), m, cfg.hidden_size);
                 df2_full_head_lc = Some(W::Nvfp4 { qweight, scales, gs, m, k });
             }
@@ -4726,7 +4751,7 @@ impl GpuModel {
                                 "dflash full lm_head D2D failed: {r:?}");
                     }
                     dev.synchronize()?;
-                    eprintln!("[tp] rank {rank} — DFlash full-vocab lm_head kept ({v} x {h} bf16, {:.1} MB)",
+                    crate::deprintln!("[tp] rank {rank} — DFlash full-vocab lm_head kept ({v} x {h} bf16, {:.1} MB)",
                               v as f64 * h as f64 * 2.0 / 1e6);
                     Some(full)
                 } else { None };
@@ -4779,6 +4804,7 @@ impl GpuModel {
             let gwn_cpu = t_gwn.saturating_sub(t_fuse + t_repack + t_hshard + t_up_post).as_secs_f64();
             let accounted = t_ptx + t_rope + t_shard_loop + t_asm0.elapsed();
             let other = t_load0.elapsed().saturating_sub(accounted).as_secs_f64();
+            if crate::boot_report::debug() {
             eprintln!(
                 "[load] total {:.1}s | ptx+jit {:.1}s rope {:.1}s | shards: read {:.1}s cpu {:.1}s repack-inline {:.1}s upload {:.1}s | assemble {:.1}s (draft {:.1}s fuse {:.1}s repack {:.1}s host-shard {:.1}s upload {:.1}s gwn-cpu {:.1}s omma-repack {:.1}s) | other {:.1}s",
                 total, t_ptx.as_secs_f64(), t_rope.as_secs_f64(),
@@ -4786,6 +4812,7 @@ impl GpuModel {
                 t_asm0.elapsed().as_secs_f64(), t_draft.as_secs_f64(),
                 t_fuse.as_secs_f64(), t_repack.as_secs_f64(), t_hshard.as_secs_f64(),
                 t_up_post.as_secs_f64(), gwn_cpu, t_omma.lock().unwrap().as_secs_f64(), other);
+            }
         }
 
         mem_probe("post-pipeline");
@@ -4810,7 +4837,7 @@ impl GpuModel {
     }
 
     fn init_ptx(dev: &Arc<CudaDevice>) -> anyhow::Result<()> {
-        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_kernels.ptx")?);
+        let ptx = Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         let fnames = ["rmsnorm_qwen","rmsnorm_gated","rmsnorm_perhead","silu_mul","add_residual",
             "sigmoid_gate","rope_rot_half","gqa_attention","write_kv","split_qgate","conv1d_step","delta_step",
             "f32tobf16","bf16tof32","fused_residual_rmsnorm","argmax_pass1","argmax_pass2"];
@@ -4858,8 +4885,8 @@ impl GpuModel {
         // same kernel names, 68-B TQ rows. The b=2 build (gpu_batch.ptx) stays untouched for
         // [kv-tq]=1. Both carry the same KERNEL_BUILD_ID (same source bytes).
         let tq_b3 = crate::opts::var(crate::opt!("kv-tq")).ok().as_deref() == Some("3");
-        let (ptx_file, module) = if tq_b3 { ("src/ptx/gpu_batch_b3.ptx", "gpu_batch_b3") } else { ("src/ptx/gpu_batch.ptx", "gpu_batch") };
-        let bptx = Ptx::from_src(std::fs::read_to_string(ptx_file)?);
+        let (ptx_src, module) = if tq_b3 { (crate::ptx_embed::GPU_BATCH_B3, "gpu_batch_b3") } else { (crate::ptx_embed::GPU_BATCH, "gpu_batch") };
+        let bptx = Ptx::from_src(ptx_src);
         let bfnames = ["rmsnorm_b","fused_res_rmsnorm_b","fused_res_rmsnorm_q_b","add_residual_b","silu_mul_b",
             "rmsnorm_perhead_b","rmsnorm_rope_b","rmsnorm_rope_kvwrite_b","rmsnorm_rope_kvwrite_q4_b","rmsnorm_gated_b","rope_b","conv1d_b","delta_step_b",
             "write_kv_b","compact_kv_b","sigmoid_gate_b","split_qgate_b",
@@ -4988,7 +5015,8 @@ impl GpuModel {
         (q4, tq, b3, k8v4, k8v8)
     }
 
-    fn build_rope_tables(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config) -> anyhow::Result<(S, S)> {
+    fn build_rope_tables(dev: &Arc<CudaDevice>, cfg: &crate::qwen::Config,
+                         yarn_src: Option<crate::qwen::YarnSource>) -> anyhow::Result<(S, S)> {
         let rdim = cfg.rotary_dim;
         let half = rdim / 2;
         let theta = cfg.rope_theta;
@@ -5000,9 +5028,15 @@ impl GpuModel {
         // and vLLM. factor 1.0 (default) leaves the legacy tables byte-identical.
         let factor = cfg.rope_yarn_factor;
         let max_pos = if factor > 1.0 {
-            let rows = (cfg.max_position_embeddings as f64 * factor as f64).ceil() as usize;
-            eprintln!("[rope] YaRN factor {factor}: {rows} rows (native {}), mscale {:.4}",
-                      cfg.max_position_embeddings, 0.1 * factor.ln() + 1.0);
+            let rows = (cfg.yarn_native_window as f64 * factor as f64).ceil() as usize;
+            // YARN1: this trunk's ONE boot line names the factor and where it came from.
+            let src = match yarn_src {
+                Some(crate::qwen::YarnSource::Flag) => "--rope-yarn-factor",
+                Some(crate::qwen::YarnSource::Tp) => "shipped TpConfig",
+                Some(crate::qwen::YarnSource::Config) | None => "config rope_scaling",
+            };
+            eprintln!("[rope] YaRN factor {factor} (from {src}): {rows} rows (native {}), mscale {:.4}",
+                      cfg.yarn_native_window, crate::dspark::oracle::yaarn_mscale(factor));
             rows
         } else {
             cfg.max_position_embeddings
@@ -5010,10 +5044,11 @@ impl GpuModel {
         let mut cos_t = vec![0.0f32; max_pos * rdim];
         let mut sin_t = vec![0.0f32; max_pos * rdim];
         let (mscale, freqs) = if factor > 1.0 {
-            // vLLM defaults beta_fast=32, beta_slow=1 (the draft artifact's values).
-            (0.1f32 * factor.ln() + 1.0,
+            // vLLM defaults beta_fast=32, beta_slow=1 (the draft artifact's values); the ramp
+            // anchors at the NATIVE window and mscale has ONE formula in the tree (YARN1).
+            (crate::dspark::oracle::yaarn_mscale(factor),
              crate::dspark::oracle::yaarn_freqs(rdim, theta, factor,
-                                                cfg.max_position_embeddings, 32, 1))
+                                                cfg.yarn_native_window, 32, 1))
         } else {
             (1.0f32, Vec::new())
         };
@@ -5079,7 +5114,9 @@ impl GpuModel {
                     let bv: Vec<half::bf16> = v.iter().map(|&x| half::bf16::from_f32(x)).collect();
                     dev.htod_sync_copy(&bv).unwrap()
                 };
-                println!("Loading MTP head...");
+                if crate::boot_report::debug() {
+                    println!("Loading MTP head...");
+                }
                 Some(GpuMtpLayer {
                     fc: W::Bf16(up_b(&m.fc)),
                     pre_fc_norm_hidden: up_f(&m.pre_fc_norm_hidden),
@@ -7929,7 +7966,7 @@ impl GpuModel {
             let ctx_addr = link.ctx_addr();
             std::mem::forget(link);
             crate::net::spawn_proxy(ctx_addr, 19);
-            eprintln!("[tp] rank {rank}/{world} — RDMA proxy thread up (doorbell ring R={}, {nbytes} B/reduction)", 8);
+            crate::deprintln!("[tp] rank {rank}/{world} — RDMA proxy thread up (doorbell ring R={}, {nbytes} B/reduction)", 8);
             self.tp_align_rounds();
         }
     }
@@ -8120,7 +8157,7 @@ impl GpuModel {
                             data: data.clone(), row_scale: row_scale.clone(), m: *m, k: *k },
                         other => panic!("df2 full-head capture: lm_head must be quantized (got a non-quantized weight)"),
                     };
-                    eprintln!("[tp] rank {rank} — DFlash2 full lm_head kept for the round ({} x {} rows)",
+                    crate::deprintln!("[tp] rank {rank} — DFlash2 full lm_head kept for the round ({} x {} rows)",
                               m, self.cfg.hidden_size);
                     self.df2_full_head = Some(full);
                 }
@@ -19217,8 +19254,7 @@ impl GpuModel {
             gs: cudarc::driver::CudaSlice<f32>,
         }
 
-        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/mxfp4_bench.ptx")
-            .expect("src/ptx/mxfp4_bench.ptx missing — run cargo build --release"));
+        let ptx = Ptx::from_src(crate::ptx_embed::MXFP4_BENCH);
         self.dev.load_ptx(ptx, "mxfp4_bench", &["mxfp4_gemv_bench"]).expect("load mxfp4_bench");
         let f_omma = self.dev.get_func("mxfp4_bench", "mxfp4_gemv_bench")
             .expect("mxfp4_gemv_bench not in mxfp4_bench module");
@@ -21363,8 +21399,10 @@ pub const SMEM_OPTIN_CAP: i32 = 99 * 1024;
 /// Log and check one raw-PTX dynamic-smem budget (TRIPWIRE_SPEC §3.4): the boot log must record
 /// the budget (so a re-derived number can be compared), and the cap must be a checked constant.
 fn smem_budget(tag: &str, bytes: i32) {
-    eprintln!("[{tag}] dynamic smem budget {bytes} B / cap {SMEM_OPTIN_CAP} B ({} KiB)",
-              bytes / 1024);
+    if crate::boot_report::debug() {
+        eprintln!("[{tag}] dynamic smem budget {bytes} B / cap {SMEM_OPTIN_CAP} B ({} KiB)",
+                  bytes / 1024);
+    }
     if bytes > SMEM_OPTIN_CAP {
         tripwire_fire("dynamic smem budget exceeds the GB10 opt-in cap",
             &format!("{tag}: {bytes} B > {SMEM_OPTIN_CAP} B — cuFuncSetAttribute would fail; \
@@ -21376,7 +21414,7 @@ fn smem_budget(tag: &str, bytes: i32) {
 /// to ~86KB dynamic smem (cuFuncSetAttribute). None disables the chunked path gracefully.
 fn gdn_chunk_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
     use cudarc::driver::sys;
-    let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+    let ptx = crate::ptx_embed::GPU_BATCH;
     // NULL-terminated PTX (the 2026-08-11 lesson; see the E9 loader comment)
     let ptx_c = std::ffi::CString::new(ptx).ok()?;
     let mut module: sys::CUmodule = std::ptr::null_mut();
@@ -21411,7 +21449,7 @@ fn gdn_chunk_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
 /// envelope). Same opt-in pattern; smem budget at kd=128/VC=64/C=32: ~81.3KB (under the ~99KB cap).
 fn gdn_chunk_tc_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
     use cudarc::driver::sys;
-    let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+    let ptx = crate::ptx_embed::GPU_BATCH;
     let ptx_c = std::ffi::CString::new(ptx).ok()?;
     let mut module: sys::CUmodule = std::ptr::null_mut();
     let r = unsafe {
@@ -21441,7 +21479,7 @@ fn gdn_chunk_tc_load_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
 #[allow(clippy::type_complexity)]
 fn gdn_split_load_raw_fns() -> Option<(cudarc::driver::sys::CUfunction, cudarc::driver::sys::CUfunction)> {
     use cudarc::driver::sys;
-    let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+    let ptx = crate::ptx_embed::GPU_BATCH;
     let ptx_c = std::ffi::CString::new(ptx).ok()?;
     let mut module: sys::CUmodule = std::ptr::null_mut();
     let r = unsafe {
@@ -21495,7 +21533,7 @@ fn fa_tc_raw_fn() -> Option<cudarc::driver::sys::CUfunction> {
     static V: std::sync::OnceLock<Option<FnH>> = std::sync::OnceLock::new();
     V.get_or_init(|| {
         use cudarc::driver::sys;
-        let ptx = std::fs::read_to_string("src/ptx/gpu_batch.ptx").ok()?;
+        let ptx = crate::ptx_embed::GPU_BATCH;
         let ptx_c = std::ffi::CString::new(ptx).ok()?;
         let mut module: sys::CUmodule = std::ptr::null_mut();
         let r = unsafe {
@@ -22577,6 +22615,7 @@ mod shard_factor_tests {
             // Pre-existing breakage (not Phase-2): 7e188f9 added Config::rope_yarn_factor and
             // did not update this test initializer, so `cargo test --lib` stopped compiling.
             rope_yarn_factor: 1.0,
+            yarn_native_window: 262144,
             rotary_dim: 64,
             max_position_embeddings: 262144,
             eos_token_id: 0,
@@ -25030,7 +25069,7 @@ impl GpuModel {
 /// thermally derating under load — which would cap every roofline number (decode, TP2, Hy3).
 pub fn probe_bandwidth(sustained: Option<u64>) -> anyhow::Result<()> {
     let dev = CudaDevice::new(0)?;
-    let bptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
+    let bptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
     dev.load_ptx(bptx, "gpu_batch", &["bw_read_b", "kernel_build_id"])?;
     GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
     let f = dev.get_func("gpu_batch", "bw_read_b").ok_or_else(|| anyhow::anyhow!("bw_read_b missing"))?;

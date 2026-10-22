@@ -55,6 +55,14 @@ static REQ_BY_FINISH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
 static CACHED_PROMPT: AtomicU64 = AtomicU64::new(0); // v0.7.3 #8.2: prefix-cache-served prompt tokens
 static GEN_TOKENS: AtomicU64 = AtomicU64::new(0);
+// TOOLSCRUB1: spans redacted by --scrub-tool-secrets, by layer, since boot (advisory
+// liveness: a span split by the pending cap can count twice). Zero forever when the
+// flag is off (the default): the counters exist but never move.
+static SCRUB_PROV_HITS: AtomicU64 = AtomicU64::new(0);
+static SCRUB_PAT_HITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn scrub_hit_provenance() { SCRUB_PROV_HITS.fetch_add(1, Relaxed); }
+pub fn scrub_hit_pattern() { SCRUB_PAT_HITS.fetch_add(1, Relaxed); }
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH: AtomicU64 = AtomicU64::new(0);
 /// F2: the `--max-batch` the command line asked for, BEFORE the EXL3 server's 16-lane cap. A number
@@ -64,6 +72,25 @@ static MAX_BATCH_REQUESTED: AtomicU64 = AtomicU64::new(0);
 /// F2: record the uncapped `--max-batch` the argv asked for (next to the served lane capacity).
 pub fn set_max_batch_requested(n: usize) {
     MAX_BATCH_REQUESTED.store(n as u64, Relaxed);
+}
+
+/// MAXBATCH1: requests that arrived while EVERY lane was busy (above the served cap) and were
+/// QUEUED — they run when a lane frees; the cap itself is applied and shown at boot (F2). This is
+/// the engagement counter for that cap: non-zero after a load run means over-cap traffic really
+/// flowed through the queue and was served, not refused. The refused arm of the same arrival
+/// class (LR-4 waiting-limit 503) is `velogb10_over_cap_arrivals_total{disposition="rejected"}`.
+static OVER_CAP_QUEUED: AtomicU64 = AtomicU64::new(0);
+/// MAXBATCH1: over-cap arrivals refused by the `--max-waiting` gate (503 `server_busy`).
+static OVER_CAP_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// MAXBATCH1: count one over-cap arrival that waits in the queue (owner_check prints it in words).
+pub fn over_cap_queued() {
+    OVER_CAP_QUEUED.fetch_add(1, Relaxed);
+}
+
+/// MAXBATCH1: count one over-cap arrival refused by the waiting limit (503 server_busy).
+pub fn over_cap_rejected() {
+    OVER_CAP_REJECTED.fetch_add(1, Relaxed);
 }
 
 /// F3: EXL3 prefill-chain GEMMs that a module the wide trellis kernel cannot decode (bit width
@@ -151,6 +178,37 @@ impl Drop for Req {
 static REQ_REJECTED: AtomicU64 = AtomicU64::new(0);
 static STREAMS_CANCELLED_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static SCHED_STEPS: AtomicU64 = AtomicU64::new(0);
+/// LANERES1: admissions decided by the --lane-reserve policy, by rule: 0 = own (the waiting
+/// request's prompt-end snapshot sat in a free lane — admitted first, there), 1 = unreserved (a
+/// free lane no reservation protects), 2 = forced (the queue head out-waited
+/// --lane-reserve-patience and took a reserved lane; rate-limited by --lane-reserve-swap).
+/// All zero when the policy is off.
+static LANE_RESERVE_ADMITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Requests the --lane-reserve policy is holding back right now: waiting while free lanes sit
+/// reserved for their conversations (0 when the policy is off or nothing waits).
+static LANE_RESERVE_WAITING: AtomicU64 = AtomicU64::new(0);
+/// One admission through the --lane-reserve policy (`kind`: 0 own, 1 unreserved, 2 forced).
+pub fn lane_reserve_admit(kind: usize) {
+    if let Some(c) = LANE_RESERVE_ADMITS.get(kind) { c.fetch_add(1, Relaxed); }
+}
+/// The lane-reserve holdback gauge (requests waiting while free lanes are reserved for others).
+pub fn lane_reserve_waiting(n: u64) { LANE_RESERVE_WAITING.store(n, Relaxed); }
+/// LANERES2 SSD spill tier counters (--kv-spill): writes, restores, recompute fallbacks, bytes
+/// stored, and prompt tokens whose re-prefill a restore avoided.
+pub static KV_SPILL_WRITES: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_HITS: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_SAVED: AtomicU64 = AtomicU64::new(0);
+pub fn kv_spill_write(bytes: u64, tokens: u64) {
+    KV_SPILL_WRITES.fetch_add(1, Relaxed);
+    KV_SPILL_BYTES.fetch_add(bytes, Relaxed);
+}
+pub fn kv_spill_hit(tokens: u64) {
+    KV_SPILL_HITS.fetch_add(1, Relaxed);
+    KV_SPILL_SAVED.fetch_add(tokens, Relaxed);
+}
+pub fn kv_spill_miss_recompute() { KV_SPILL_MISSES.fetch_add(1, Relaxed); }
 /// Milliseconds since `START` when the scheduler last completed a round; 0 = never stepped.
 static SCHED_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static SCHED_BUSY: AtomicU8 = AtomicU8::new(0);
@@ -569,6 +627,49 @@ pub fn lane_pack_skip(i: usize) { LANE_PACK_SKIP[i].fetch_add(1, Relaxed); }
 pub fn lane_pack_skips(i: usize) -> u64 { LANE_PACK_SKIP[i].load(Relaxed) }
 /// Lane capacity as set at boot (`set_max_batch`).
 pub fn max_batch() -> u64 { MAX_BATCH.load(Relaxed) }
+/// S-C4PRIMEA: shared-step primes served by the BATCHED single-launch path
+/// (xq_gather_tap_rows + one re-prime pass + xq_attn_kv_prefill_pairs), and
+/// the lanes those steps carried. 0 with --exl3-prime-batch off.
+static PRIME_BATCH: AtomicU64 = AtomicU64::new(0);
+static PRIME_BATCH_LANES: AtomicU64 = AtomicU64::new(0);
+pub fn prime_batch_round(lanes: u64) {
+    PRIME_BATCH.fetch_add(1, Relaxed);
+    PRIME_BATCH_LANES.fetch_add(lanes, Relaxed);
+}
+pub fn prime_batch_rounds() -> u64 { PRIME_BATCH.load(Relaxed) }
+pub fn prime_batch_lanes() -> u64 { PRIME_BATCH_LANES.load(Relaxed) }
+
+/// S-C4XOVER: the spec-lanes auto policy (--spec-lanes-max auto, the default under --mtp auto)
+/// made legible: the two arms' estimated AGGREGATE tok/s at the last measured decision, the
+/// learned shared-step scale, the busy-lane count at that decision, how many decisions compared
+/// real estimates, and how often the pick FLIPPED (thrash / stuck detection). Observability only.
+pub const SPEC_LANES_TO: [&str; 2] = ["shared", "serial"];
+static SPEC_LANES_SWITCHES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static SPEC_LANES_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static SPEC_LANES_EST_SERIAL: AtomicU64 = AtomicU64::new(0); // f64 bits: est serial aggregate tok/s
+static SPEC_LANES_EST_SHARED: AtomicU64 = AtomicU64::new(0); // f64 bits: est shared aggregate tok/s
+static SPEC_LANES_SCALE_MILLI: AtomicU64 = AtomicU64::new(0); // learned shared_scale x1000
+static SPEC_LANES_BUSY: AtomicU64 = AtomicU64::new(0);       // busy lanes at the last decision
+static SPEC_ARM_MS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];   // S-C4XOVER: cumulative ms each arm ran
+static SPEC_ARM_TOK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];  // ... and the tokens it delivered
+pub fn spec_lanes_switch(to: usize) { SPEC_LANES_SWITCHES[to].fetch_add(1, Relaxed); }
+pub fn spec_arm_charge(arm: usize, ms: f64, tok: f64) {
+    SPEC_ARM_MS[arm].fetch_add(ms as u64, Relaxed);
+    SPEC_ARM_TOK[arm].fetch_add(tok as u64, Relaxed);
+}
+pub fn spec_lanes_decision(serial_tps: f64, shared_tps: f64, scale: f64, busy: usize) {
+    SPEC_LANES_EST_SERIAL.store(serial_tps.to_bits(), Relaxed);
+    SPEC_LANES_EST_SHARED.store(shared_tps.to_bits(), Relaxed);
+    SPEC_LANES_SCALE_MILLI.store((scale * 1000.0) as u64, Relaxed);
+    SPEC_LANES_BUSY.store(busy as u64, Relaxed);
+    SPEC_LANES_DECISIONS.fetch_add(1, Relaxed);
+}
+static SPEC_LANES_MEASURED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)]; // f64 bits: measured tok/s
+static SPEC_LANES_PROBES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// S-C4XOVER: the arm's MEASURED delivered aggregate tok/s (EWMA over its last windows) and
+/// the arm-rate probe counter. arm: 0 = shared plain step, 1 = serial speculation.
+pub fn spec_lanes_measured(arm: usize, tps: f64) { SPEC_LANES_MEASURED[arm].store(tps.to_bits(), Relaxed); }
+pub fn spec_lanes_probe(arm: usize) { SPEC_LANES_PROBES[arm].fetch_add(1, Relaxed); }
 
 fn proc_status_kb(field: &str) -> Option<u64> {
     std::fs::read_to_string("/proc/self/status").ok()?.lines()
@@ -606,10 +707,22 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("# HELP velogb10_requests_running Requests holding a lane.\n# TYPE velogb10_requests_running gauge\nvelogb10_requests_running {running}\n"));
     o.push_str(&format!("# HELP velogb10_requests_waiting Requests queued for a lane.\n# TYPE velogb10_requests_waiting gauge\nvelogb10_requests_waiting {}\n",
                         inflight - running));
+    // MAXBATCH1: the F2 cap's engagement counter — arrivals that found every lane busy. Queued ran
+    // when a lane freed; rejected hit the LR-4 waiting-limit 503. scripts/owner_check.py prints it.
+    o.push_str("# HELP velogb10_over_cap_arrivals_total Requests that arrived beyond what the lane cap can run at once (a busy server, or a burst the queue must absorb): queued = waited for a lane, then served; rejected = waiting limit, 503 server_busy.\n# TYPE velogb10_over_cap_arrivals_total counter\n");
+    o.push_str(&format!("velogb10_over_cap_arrivals_total{{disposition=\"queued\"}} {}\n", OVER_CAP_QUEUED.load(Relaxed)));
+    o.push_str(&format!("velogb10_over_cap_arrivals_total{{disposition=\"rejected\"}} {}\n", OVER_CAP_REJECTED.load(Relaxed)));
+    // CLIPRUNE1: rendered since it was set (F7b) but never shown — scripts/owner_check.py
+    // already reads it and tolerates absence; keep that guard working.
+    o.push_str("# HELP velogb10_unknown_options Unknown '--' options seen at startup (warned and ignored; F7b).\n# TYPE velogb10_unknown_options gauge\n");
+    o.push_str(&format!("velogb10_unknown_options {}\n", UNKNOWN_OPTIONS.load(Relaxed)));
     o.push_str("# HELP velogb10_requests_total Finished requests by finish reason.\n# TYPE velogb10_requests_total counter\n");
     for (i, f) in FINISHES.iter().enumerate() {
         o.push_str(&format!("velogb10_requests_total{{finish=\"{f}\"}} {}\n", REQ_BY_FINISH[i].load(Relaxed)));
     }
+    o.push_str("# HELP velogb10_scrub_hits_total Spans redacted by --scrub-tool-secrets since boot, by layer (advisory liveness; a span split by the pending cap can count twice). layer=provenance: matches of strings extracted from this conversation's tool results; layer=pattern: key-shaped text. Zero forever when the flag is off (the default).\n# TYPE velogb10_scrub_hits_total counter\n");
+    o.push_str(&format!("velogb10_scrub_hits_total{{layer=\"provenance\"}} {}\nvelogb10_scrub_hits_total{{layer=\"pattern\"}} {}\n",
+                       SCRUB_PROV_HITS.load(Relaxed), SCRUB_PAT_HITS.load(Relaxed)));
     o.push_str(&format!("# HELP velogb10_prompt_tokens_total Prompt tokens of finished requests.\n# TYPE velogb10_prompt_tokens_total counter\nvelogb10_prompt_tokens_total {}\n",
                         PROMPT_TOKENS.load(Relaxed)));
     o.push_str(&format!("# HELP velogb10_prompt_tokens_cached_total Prompt tokens served from the prefix cache (prefill skipped) of finished requests.\n# TYPE velogb10_prompt_tokens_cached_total counter\nvelogb10_prompt_tokens_cached_total {}\n",
@@ -674,11 +787,43 @@ pub fn render(engine_alive: bool) -> String {
     for (i, kind) in LANE_PACK_KINDS.iter().enumerate() {
         o.push_str(&format!("velogb10_lane_pack_lane_rounds_total{{kind=\"{kind}\"}} {}\n", LANE_PACK_LANES[i].load(Relaxed)));
     }
-    o.push_str("# HELP velogb10_lane_pack_skip_total LANE rounds (one per request per scheduler step, not requests) that ran their own lone round outside a packed verify while lane packing was active and at least two requests were busy, by the reason that lane was not packed. NOT counted: steps the load-adaptive policy gave to the shared plain step (--spec-lanes-max; see velogb10_lane_pack_rounds_total{arm=\"shared_plain\"}), and a lone request. When a pair falls back to serial rounds for the control cadence BOTH of its lanes are counted as `control`, although only one of them owes the control round. Always 0 with --lane-pack off.\n# TYPE velogb10_lane_pack_skip_total counter\n");
+
+    o.push_str("# HELP velogb10_mtp_prime_batch_total Shared plain-step primes served by the BATCHED single-launch path (xq_gather_tap_rows + one re-prime pass + xq_attn_kv_prefill_pairs) since boot; velogb10_mtp_prime_batch_lanes_total counts the head-row lanes those steps carried. 0 with --exl3-prime-batch off; steps that fall back to the per-lane loop are NOT counted.\n# TYPE velogb10_mtp_prime_batch_total counter\n");
+    o.push_str(&format!("velogb10_mtp_prime_batch_total {}\n", PRIME_BATCH.load(Relaxed)));
+    o.push_str("# TYPE velogb10_mtp_prime_batch_lanes_total counter\n");
+    o.push_str(&format!("velogb10_mtp_prime_batch_lanes_total {}\n", PRIME_BATCH_LANES.load(Relaxed)));    o.push_str("# HELP velogb10_lane_pack_skip_total LANE rounds (one per request per scheduler step, not requests) that ran their own lone round outside a packed verify while lane packing was active and at least two requests were busy, by the reason that lane was not packed. NOT counted: steps the load-adaptive policy gave to the shared plain step (--spec-lanes-max; see velogb10_lane_pack_rounds_total{arm=\"shared_plain\"}), and a lone request. When a pair falls back to serial rounds for the control cadence BOTH of its lanes are counted as `control`, although only one of them owes the control round. Always 0 with --lane-pack off.\n# TYPE velogb10_lane_pack_skip_total counter\n");
     for (i, why) in crate::lane_pack::Skip::ALL.iter().enumerate() {
         o.push_str(&format!("velogb10_lane_pack_skip_total{{reason=\"{}\"}} {}\n", why.label(), LANE_PACK_SKIP[i].load(Relaxed)));
     }
     o.push_str("# HELP velogb10_lane_pack_disabled 1 once a packed round failed and the packed arm was turned off for the rest of this boot (the server then runs the serial arm; restart to re-enable). Always 0 with --lane-pack off and on a healthy boot.\n# TYPE velogb10_lane_pack_disabled gauge\n");
+    o.push_str("# HELP velogb10_spec_lanes_est_tok_s The spec-lanes auto policy's estimate of the AGGREGATE tok/s the busy clients would see on each arm, at its last decision that compared real measurements (the busy lanes' speculation EMAs known): serial = the busy requests taking turns on their own speculative rounds (packed pairs where two lanes pack); shared = one plain step for all of them. The arm with the higher estimate runs, with 4% hysteresis. 0 means no such decision yet this boot (the policy rides its fallback threshold).\n# TYPE velogb10_spec_lanes_est_tok_s gauge\n");
+    o.push_str(&format!("velogb10_spec_lanes_est_tok_s{{arm=\"serial\"}} {}\n", f64::from_bits(SPEC_LANES_EST_SERIAL.load(Relaxed))));
+    o.push_str(&format!("velogb10_spec_lanes_est_tok_s{{arm=\"shared\"}} {}\n", f64::from_bits(SPEC_LANES_EST_SHARED.load(Relaxed))));
+    o.push_str("# HELP velogb10_spec_lanes_shared_scale The learned correction the shared plain step's cost model carries for this boot's topology and content (1 = the fitted prior; learned from real shared steps; frozen at 1 until one runs).\n# TYPE velogb10_spec_lanes_shared_scale gauge\n");
+    o.push_str(&format!("velogb10_spec_lanes_shared_scale {}\n", SPEC_LANES_SCALE_MILLI.load(Relaxed) as f64 / 1000.0));
+    o.push_str("# HELP velogb10_spec_lanes_busy_lanes Busy lanes at the spec-lanes policy's last measured decision (the n of the shared-step cost model at that moment).\n# TYPE velogb10_spec_lanes_busy_lanes gauge\n");
+    o.push_str(&format!("velogb10_spec_lanes_busy_lanes {}\n", SPEC_LANES_BUSY.load(Relaxed)));
+    o.push_str("# HELP velogb10_spec_lanes_decisions_total Spec-lanes auto decisions that compared real measurements (both arms' estimates known); decisions taken on the fallback threshold (an estimate missing) are not counted.\n# TYPE velogb10_spec_lanes_decisions_total counter\n");
+    o.push_str(&format!("velogb10_spec_lanes_decisions_total {}\n", SPEC_LANES_DECISIONS.load(Relaxed)));
+    o.push_str("# HELP velogb10_spec_lanes_switches_total Times the spec-lanes auto pick FLIPPED between arms since boot (to = the arm it flipped to). A large count says thrash; zero with all rounds on one arm says the policy is stuck (see the est gauges for why).\n# TYPE velogb10_spec_lanes_switches_total counter\n");
+    for (i, to) in SPEC_LANES_TO.iter().enumerate() {
+        o.push_str(&format!("velogb10_spec_lanes_switches_total{{to=\"{to}\"}} {}\n", SPEC_LANES_SWITCHES[i].load(Relaxed)));
+    }
+    o.push_str("# HELP velogb10_spec_lanes_arm_ms_total Cumulative milliseconds the arm ran since boot (serial speculation rounds vs shared plain steps) and velogb10_spec_lanes_arm_tok_total the tokens it delivered: the exact time split behind the pick. kind=millisecond_count\n");
+    for (i, arm) in SPEC_LANES_TO.iter().enumerate() {
+        o.push_str(&format!("velogb10_spec_lanes_arm_ms_total{{arm=\"{arm}\"}} {}\n", SPEC_ARM_MS[i].load(Relaxed)));
+        o.push_str(&format!("velogb10_spec_lanes_arm_tok_total{{arm=\"{arm}\"}} {}\n", SPEC_ARM_TOK[i].load(Relaxed)));
+    }
+    o.push_str("# HELP velogb10_spec_lanes_measured_tok_s The MEASURED delivered aggregate tok/s of each arm (EWMA over the windows its rounds last folded; 0 = never ran recently): shared = plain steps for all busy lanes, serial = speculative rounds taking turns (packed pairs where two lanes pack). The auto pick compares these when both are fresh at the current busy count; the est_tok_s gauges are its modelled fallback. kind=rate_tokens_per_second\n");
+    o.push_str("# TYPE velogb10_spec_lanes_measured_tok_s gauge\n");
+    for (i, arm) in SPEC_LANES_TO.iter().enumerate() {
+        o.push_str(&format!("velogb10_spec_lanes_measured_tok_s{{arm=\"{arm}\"}} {}\n", f64::from_bits(SPEC_LANES_MEASURED[i].load(Relaxed))));
+    }
+    o.push_str("# HELP velogb10_spec_lanes_probes_total Arm-rate probe windows started: while one arm rides, a short window of the idle arm refreshes its measured rate so the pick stays grounded in delivery. kind=window_count\n");
+    o.push_str("# TYPE velogb10_spec_lanes_probes_total counter\n");
+    for (i, arm) in SPEC_LANES_TO.iter().enumerate() {
+        o.push_str(&format!("velogb10_spec_lanes_probes_total{{arm=\"{arm}\"}} {}\n", SPEC_LANES_PROBES[i].load(Relaxed)));
+    }
     o.push_str(&format!("velogb10_lane_pack_disabled {}\n", LANE_PACK_DISABLED.load(Relaxed)));
     // F1: the boot's --lane-pack decision — active, fell back with why, or off. The boot line prints
     // the same reason (`lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: ...; requests
@@ -706,6 +851,18 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_requests_rejected_total {}\n", REQ_REJECTED.load(Relaxed)));
     o.push_str("# HELP velogb10_streams_cancelled_backlog_total Streams cancelled for exceeding --stream-backlog-events (the client stopped reading).\n# TYPE velogb10_streams_cancelled_backlog_total counter\n");
     o.push_str(&format!("velogb10_streams_cancelled_backlog_total {}\n", STREAMS_CANCELLED_BACKLOG.load(Relaxed)));
+    o.push_str("# HELP velogb10_lane_reserve_admits_total Admissions decided by the --lane-reserve policy (EXL3 TP=1), by rule: own = the waiting request's prompt-end snapshot sat in a free lane (admitted first, into that lane); unreserved = a free lane no reservation protects; forced = the queue head out-waited --lane-reserve-patience and took a reserved lane (rate-limited by --lane-reserve-swap). All zero when --lane-reserve is off (default).\n# TYPE velogb10_lane_reserve_admits_total counter\n");
+    o.push_str(&format!("velogb10_lane_reserve_admits_total{{rule=\"own\"}} {}\n", LANE_RESERVE_ADMITS[0].load(Relaxed)));
+    o.push_str(&format!("velogb10_lane_reserve_admits_total{{rule=\"unreserved\"}} {}\n", LANE_RESERVE_ADMITS[1].load(Relaxed)));
+    o.push_str(&format!("velogb10_lane_reserve_admits_total{{rule=\"forced\"}} {}\n", LANE_RESERVE_ADMITS[2].load(Relaxed)));
+    o.push_str("# HELP velogb10_lane_reserve_waiting Requests waiting while the --lane-reserve policy holds every free lane reserved for their conversations (0 when the policy is off or nothing waits).\n# TYPE velogb10_lane_reserve_waiting gauge\n");
+    o.push_str(&format!("velogb10_lane_reserve_waiting {}\n", LANE_RESERVE_WAITING.load(Relaxed)));
+    o.push_str("# HELP velogb10_kv_spill SSD spill tier for evicted lane snapshots (--kv-spill)\n");
+    o.push_str(&format!("velogb10_kv_spill_writes_total {}\n", KV_SPILL_WRITES.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_hits_total {}\n", KV_SPILL_HITS.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_misses_recompute_total {}\n", KV_SPILL_MISSES.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_bytes {}\n", KV_SPILL_BYTES.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_tokens_recompute_saved_total {}\n", KV_SPILL_SAVED.load(Relaxed)));
     let (steps, drafts, accepted, emitted) = crate::tel::spec_totals();
     o.push_str("# HELP velogb10_spec_draft_tokens_total Speculative draft tokens proposed (MTP / DFlash2 / DFlash).\n# TYPE velogb10_spec_draft_tokens_total counter\n");
     o.push_str(&format!("velogb10_spec_draft_tokens_total {drafts}\n"));
@@ -722,6 +879,7 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_spec_mtp_reprobes_total {reprobes}\n"));
     o.push_str("# HELP velogb10_spec_mtp_reprobe_ok_total Re-probe windows that ended with speculation back on.\n# TYPE velogb10_spec_mtp_reprobe_ok_total counter\n");
     o.push_str(&format!("velogb10_spec_mtp_reprobe_ok_total {reprobe_ok}\n"));
+    crate::exl3_serve::df2_metrics_append(&mut o);
     render_toolcall(&mut o);
     o
 }
@@ -789,6 +947,10 @@ pub(crate) mod tests {
             "velogb10_requests_rejected_total", "velogb10_streams_cancelled_backlog_total",
             "velogb10_lane_pack_rounds_total", "velogb10_lane_pack_skip_total", "velogb10_lane_pack_lane_rounds_total",
             "velogb10_lane_pack_disabled",
+            "velogb10_spec_lanes_est_tok_s", "velogb10_spec_lanes_shared_scale", "velogb10_spec_lanes_busy_lanes",
+            "velogb10_spec_lanes_decisions_total", "velogb10_spec_lanes_switches_total",
+            "velogb10_spec_lanes_arm_ms_total", "velogb10_spec_lanes_arm_tok_total",
+            "velogb10_spec_lanes_measured_tok_s", "velogb10_spec_lanes_probes_total",
         ] {
             assert!(s.contains(name), "missing gauge {name}");
         }
@@ -1003,7 +1165,10 @@ pub(crate) mod tests {
     #[test]
     fn kv_pool_global_is_absent_until_an_engine_registers_it() {
         // (this is the only test that touches the global pool, so "absent before init" is exact)
-        assert!(!super::render(true).contains("velogb10_kv_"), "no engine registered a pool yet");
+        // the pool family only: velogb10_kv_spill_* is a separate family (LANERES2) and may be present
+        assert!(!super::render(true).contains("velogb10_kv_pool")
+            && !super::render(true).contains("velogb10_kv_positions")
+            && !super::render(true).contains("velogb10_kv_allocated_bytes"), "no engine registered a pool yet");
         super::kv_publish([(5, 0)].into_iter()); // a publish before init is a no-op, not a panic
         super::kv_pool_init(3, 4096);
         super::kv_pool_init(9, 9); // first call wins

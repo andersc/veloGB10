@@ -41,7 +41,7 @@ fn w4s_parse(var: crate::opts::OptId) -> u8 {
                     "0" | "none" => {}
                     _ => match W4S_NAMES.iter().find(|(n, _)| *n == t) {
                         Some((_, b)) => v |= b,
-                        None => eprintln!("W4S: {var}: unknown item '{t}' ignored"),
+                        None => crate::deprintln!("W4S: {var}: unknown item '{t}' ignored"),
                     },
                 }
             }
@@ -84,7 +84,7 @@ fn w4s_announce() {
     ONCE.call_once(|| {
         let on = w4s_env_on().unwrap_or(W4S_ALL);
         let xc = w4s_parse(crate::opt!("w4s-xcheck"));
-        println!("W4S: small-kernel levers ON = [{}] (--w4s-off=1|all or router,gdn,dattn,ple,draft = old kernels); \
+        crate::dprintln!("W4S: small-kernel levers ON = [{}] (--w4s-off=1|all or router,gdn,dattn,ple,draft = old kernels); \
                   xcheck [{}] (--w4s-xcheck, eager launches only)", w4s_names(on), w4s_names(xc));
     });
 }
@@ -126,7 +126,7 @@ fn w4s_report(item: u8, what: &str, bad: usize, tot: usize, first: String) {
     let k = (0..5).find(|&i| W4S_NAMES[i].1 == item).unwrap_or(0);
     let c = N[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if c < 4 || bad > 0 || c.is_power_of_two() {
-        println!("W4S_XCHECK {} #{c} {what}: bad {bad} of {tot}{first}", W4S_NAMES[k].0);
+        crate::dprintln!("W4S_XCHECK {} #{c} {what}: bad {bad} of {tot}{first}", W4S_NAMES[k].0);
     }
 }
 
@@ -188,7 +188,7 @@ impl FwdModel {
         let f = xq_raw_fn("xq_router_fold_w4")
             .ok_or_else(|| anyhow::anyhow!("xq_router_fold_w4 raw fn unavailable (stale PTX?)"))?;
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("W4S router: xq_router_fold_w4 ON (grid {g} x {W4R_NT}, x in smem; --w4s-off=router = xq_router_fold)"));
+        ONCE.call_once(|| crate::dprintln!("W4S router: xq_router_fold_w4 ON (grid {g} x {W4R_NT}, x in smem; --w4s-off=router = xq_router_fold)"));
         let mut a_lg = *sc.logits_r.device_ptr() as u64;
         let mut a_w = *moe.router.device_ptr() as u64;
         let mut a_x = *sc.x.device_ptr() as u64;
@@ -275,7 +275,7 @@ impl FwdModel {
                                   "xq_gemm_f16_rows_km_w4m7", "xq_gemm_f16_rows_km_w4m8"];
         let kname = NAMES[m - 1];
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("W4S ple: xq_gemm_f16_rows_km_w4m<M> ON ({} x {BT} threads, x in smem; --w4s-off=ple = xq_gemm_f16_rows_km)",
+        ONCE.call_once(|| crate::dprintln!("W4S ple: xq_gemm_f16_rows_km_w4m<M> ON ({} x {BT} threads, x in smem; --w4s-off=ple = xq_gemm_f16_rows_km)",
                                    nba + nbb));
         xqlaunch!(l, kname, ((nba + nbb) as u32, 1, 1), (BT as u32, 1, 1), smem,
                  (&mut sc.ple_key16, kk, NA as i32, nba as i32, &mut sc.ple_val, vk, NB as i32,
@@ -319,7 +319,7 @@ impl FwdModel {
         let vd_conv = (vd | (conv_dim << 16)) as i32;
         let ple_st = if ple { *self.ple_state.device_ptr() as u64 } else { 0u64 };
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("W4S gdn: xq_gdn_commit_all_w4 ON (one launch, grid {gx} x {gy}: {nl} layers x (ring + conv) \
+        ONCE.call_once(|| crate::dprintln!("W4S gdn: xq_gdn_commit_all_w4 ON (one launch, grid {gx} x {gy}: {nl} layers x (ring + conv) \
                                     + {} PLE ring; --w4s-off=gdn = per-layer commits)", if ple { "1" } else { "no" }));
         // XCHECK reference: the OLD per-layer launches on device COPIES of the live states
         // (taken before the new kernel runs), compared after both.
@@ -393,7 +393,7 @@ impl FwdModel {
     pub(super) fn w4s_dattn_kname(&self, old: &'static str) -> &'static str {
         if !w4s_on(W4S_DATTN) { return old; }
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("W4S dattn: xq_attn_dense_acc4_w4 / _acc1_w4 ON (5-stage V ring; --w4s-off=dattn = v3 acc)"));
+        ONCE.call_once(|| crate::dprintln!("W4S dattn: xq_attn_dense_acc4_w4 / _acc1_w4 ON (5-stage V ring; --w4s-off=dattn = v3 acc)"));
         super::dv3_w4_twin(old)   // TP-4G: includes the G=6 (W=4) twins
     }
 
@@ -431,7 +431,7 @@ impl FwdModel {
             return Ok(false);
         }
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| println!("W4S draft: head attention = xq_attn_dense_prep (grid m*nh) + xq_attn_dense_splitk4_w4 \
+        ONCE.call_once(|| crate::dprintln!("W4S draft: head attention = xq_attn_dense_prep (grid m*nh) + xq_attn_dense_splitk4_w4 \
                                     (smem K|V ring) + xq_attn_sel_combine_w4 ON (--w4s-off=draft = the old three)"));
         let nh_p = (cfg.num_heads as i32) | ((nkv as i32) << 16);
         let hd_p = (cfg.head_dim as i32) | ((cfg.rotary_dim as i32) << 16);

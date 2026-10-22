@@ -113,6 +113,30 @@ on decode and **×2.0–2.2** on prefill.
 Full setup (pack layout, node command, launch lines, expected output):
 **[QWEN_38_FLASH_NEXT_SETUP.md](QWEN_38_FLASH_NEXT_SETUP.md)**.
 
+### New in v0.7.5 — "EXL3 everywhere"
+
+The EXL3 path becomes the default way to serve this model family, on every topology, and the
+release is verified end-to-end before shipping: a readiness request on the served API, the
+losslessness probe ×5 for **every** EXL3 pack (dense 27B at 3.05 and 3.5 bpw, dense 9B, the 35B
+MoE, and 27B Flash-Next) on two machines, the recurrent-state probe per pack, batch-invariance
+on the trunk path, and 32-request overload sweeps against a TP=2 boot — zero failed requests.
+
+- **All five EXL3 packs serve everywhere**: TP=1, TP=2 (all five), TP=4 (9B / 35B / 27B-3.05 /
+  27B-3.5 — exercised by hand, no automated gate chain at TP=4 on this cut).
+- **`--max-batch` boots anyway.** A request count the memory cannot hold no longer refuses to
+  boot: the server starts on the most lanes that fit (the context length is never truncated),
+  prints what it serves and why in one line, and counts queued arrivals on `/metrics`. At the
+  full 262,144-token context with q8 KV that is 4–6 lanes on one machine and ~11 on a TP=2
+  pair; 16 lanes fit at a 90K context. Every over-cap request queues and completes.
+- **DFlash 2 drafting on the EXL3 serve path at TP=1**, and **KV-cache spill at TP=1**
+  (evictions re-prefill later, all counted on `/metrics`).
+- Measured on the release build at production sampling (requests that send no sampler fields):
+  27B-3.05 TP=1 31.5 tok/s (thinking on) / 43.0 tok/s (thinking off) over 1000 generated
+  tokens; a TP=2 pair at 16 lanes absorbed a 32-way burst with 0 failures at 22.5 tok/s
+  aggregate (thinking on). Full tables, request classes and the plain-words limits list (the
+  TP=2 over-cap counter gap, DFlash 2 concurrency, probe tooling gaps, the q8-KV quality
+  finding) are in the [CHANGELOG](CHANGELOG.md) under v0.7.5.
+
 ### New in v0.7.4
 
 This is a fix release for the EXL3 path. **It is not the speed release for sampled requests**

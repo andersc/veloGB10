@@ -64,6 +64,11 @@ impl Cat {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope { Spmd, Head, Local }
 
+/// CLIPRUNE1: where an option shows up. `Day` = the day-to-day launch set (`--help`);
+/// `Adv` = everything else (diagnostics, drills, bench/probe knobs): `--help-advanced`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Vis { Day, Adv }
+
 pub struct Opt {
     /// the command-line flag, without the leading "--"
     pub flag: &'static str,
@@ -74,6 +79,7 @@ pub struct Opt {
     pub def: &'static str,
     pub cat: Cat,
     pub scope: Scope,
+    pub vis: Vis,
     pub help: &'static str,
 }
 
@@ -431,370 +437,380 @@ pub fn install_head(map: &[(String, String)]) -> Result<(), String> {
 /// "--x" literal compared against argv in main.rs / exl3_ppl.rs / exl3_serve.rs / lib.rs is neither
 /// registered nor on this list. GENERATED from those four files on 2026-10-11 (363 names, 173 of
 /// them value-taking); keep it sorted when a hand flag is added.
-pub const HAND_FLAGS: &[(&str, bool)] = &[
-    ("after", false),
-    ("arm", true),
-    ("auto-disable-thinking-with-tools", false),
-    ("autotune", false),
-    ("autotune-report", false),
-    ("barriers", false),
-    ("batch", true),
-    ("bench-accept", false),
-    ("bench-batch", false),
-    ("bench-decode-ctx", false),
-    ("bench-df2-matrix", false),
-    ("bench-df2-sample", false),
-    ("bench-df2-sample-realq", false),
-    ("bench-dspark", false),
-    ("bench-exl3-forward", false),
-    ("bench-exl3-gemm", false),
-    ("bench-exl3-mtp", false),
-    ("bench-exl3-wide", false),
-    ("bench-file", true),
-    ("bench-lanes", false),
-    ("bench-mtp", false),
-    ("bench-mtp-sample", false),
-    ("bench-prefill", false),
-    ("bench-tau", false),
-    ("bench-tree", false),
-    ("bench-verify", false),
-    ("binv", false),
-    ("binv-trace", false),
-    ("blocks", false),
-    ("bundle", true),
-    ("cached-models-list", false),
-    ("cached-models-remove", false),
-    ("cached-models-remove-all", false),
-    ("capture-layers", false),
-    ("chat", false),
-    ("check", false),
-    ("chunk-sizes", true),
-    ("chunked", false),
-    ("classes", true),
-    ("clear-model-blobs", false),
-    ("converted-load", true),
-    ("cpu-affinity", false),
-    ("cq-hold", false),
-    ("cq-hold-us", false),
-    ("ctx", true),
-    ("ctxs", true),
-    ("default-frequency-penalty", true),
-    ("default-presence-penalty", true),
-    ("default-repetition-penalty", true),
-    ("depth", true),
-    ("dev", true),
-    ("dev2", true),
-    ("df2-bake-fp8", false),
-    ("df2-bake-nvfp4", false),
-    ("df2-block", true),
-    ("df2-carry", true),
-    ("df2-prose-lane", true),
-    ("df2-quant-fidelity", false),
-    ("df2-round-shard", true),
-    ("df2-step-dump", true),
-    ("dflash-dir", true),
-    ("discover-wait", true),
-    ("domains", true),
-    ("draft-confidence", false),
-    ("draft-temperature", false),
-    ("draws", true),
-    ("dry-run", false),
-    ("dspark", false),
-    ("dspark-depth", true),
-    ("dspark-fp8-head", true),
-    ("dsv4-bench-decode", false),
-    ("dsv4-bench-prefill", false),
-    ("dump-argmax", false),
-    ("dump-logits", true),
-    ("dump-rank-weights", false),
-    ("dump-weights", true),
-    ("embed", true),
-    ("embed-from", true),
-    ("exl3-bench-steps", true),
-    ("exl3-grouped-e", true),
-    ("exl3-iters", true),
-    ("exl3-l2-alias", true),
-    ("exl3-pack-manifest", false),
-    ("exl3-slab-cols", true),
-    ("exl3-wide-ms", true),
-    ("exl3-wide-mts", true),
-    ("exl3-widths", true),
-    ("extract-dspark", false),
-    ("floats", false),
-    ("from", true),
-    ("gen-dflash2-synth", true),
-    ("gen-dspark-synth", true),
-    ("gid", true),
-    ("golden", true),
-    ("gpu", false),
-    ("gpu-only", false),
-    ("graph-precapture", false),
-    ("grid", true),
-    ("gt-reprime", false),
-    ("head", true),
-    ("help", false),
-    ("help-diag", false),
-    ("ids", true),
-    ("imatrix", true),
-    ("in-x", true),
-    ("inject-delay-us-max", false),
-    ("io", true),
-    ("iters", true),
-    ("job", true),
-    ("jsonl", true),
-    ("kvnll-accept", false),
-    ("kvnll-accept-ctx", false),
-    ("kvnll-csv", true),
-    ("kvnll-dump-ref", true),
-    ("kvnll-ids", true),
-    ("kvnll-label", true),
-    ("kvnll-needles", true),
-    ("kvnll-ref", true),
-    ("kvnll-text", true),
-    ("kvnll-tf", false),
-    ("kvnll-windows", true),
-    ("label", true),
-    ("ladder-dir", true),
-    ("ladder-layers", true),
-    ("ladder-step", true),
-    ("layers", true),
-    ("legacy-oracle", false),
-    ("limit", true),
-    ("list-model-blobs", false),
-    ("lookahead", false),
-    ("loop-detect", false),
-    ("loop-min-reps", false),
-    ("loop-window", false),
-    ("ltrows-c", true),
-    ("ltrows-shapes", true),
-    ("main-core", false),
-    ("max-batch", true),
-    ("max-n", true),
-    ("max-new-tokens", true),
-    ("max-tokens", true),
-    ("mix", false),
-    ("mode", true),
-    ("model", true),
-    ("model-dir", true),
-    ("model-dir-b", true),
-    ("model-name", true),
-    ("module", true),
-    ("mtp-depth", true),
-    ("net-test", false),
-    ("ngram", true),
-    ("ngram-draft", true),
-    ("no-chat", false),
-    ("no-shard-mixers", false),
-    ("node", false),
-    ("nodes", true),
-    ("offset", true),
-    ("once", false),
-    ("oracle", true),
-    ("oracle-dir", true),
-    ("otel-endpoint", false),
-    ("otel-model-id", false),
-    ("otel-topology", false),
-    ("other", false),
-    ("out", true),
-    ("out-dir", true),
-    ("out-x", true),
-    ("output-prompts", false),
-    ("payload-bytes", false),
-    ("peer", true),
-    ("peer-ips", true),
-    ("penalty-range", false),
-    ("pixels", true),
-    ("plan-deals", true),
-    ("plan-worlds", true),
-    ("poison", false),
-    ("pool-census", false),
-    ("por", false),
-    ("port", true),
-    ("positions", false),
-    ("pp-bench-prefill", false),
-    ("pp-chunk-list", true),
-    ("pp-node", false),
-    ("ppl", false),
-    ("ppl-ref-windowz", false),
-    ("ppl-zzzz-qqqq", false),
-    ("prefill-chunk", true),
-    ("prefix", false),
-    ("prefix-cache", true),
-    ("prefix-ckpt-mem-gb", false),
-    ("print-config", false),
-    ("probe-bandwidth", false),
-    ("probe-bandwidth-sustained", false),
-    ("probe-binv", false),
-    ("probe-df2-draft", false),
-    ("probe-df2-graph", false),
-    ("probe-df2-lossless", false),
-    ("probe-df2-prime", false),
-    ("probe-df2-round", true),
-    ("probe-df2-tapcap", false),
-    ("probe-dflash", true),
-    ("probe-dflash-local", false),
-    ("probe-dflash2", false),
-    ("probe-dispatch", false),
-    ("probe-dspark", false),
-    ("probe-dspark-bind", true),
-    ("probe-dspark-rollback", false),
-    ("probe-dspark-round", true),
-    ("probe-dspark-synth", true),
-    ("probe-dsv4", false),
-    ("probe-exl3", false),
-    ("probe-exl3-binv", false),
-    ("probe-exl3-flashpf", false),
-    ("probe-exl3-hcw4", false),
-    ("probe-exl3-kernel", false),
-    ("probe-exl3-kvnll", false),
-    ("probe-exl3-kvq", false),
-    ("probe-exl3-ltrows", false),
-    ("probe-exl3-moeglue", false),
-    ("probe-exl3-oracle", false),
-    ("probe-exl3-pack2", false),
-    ("probe-exl3-pack3", false),
-    ("probe-exl3-packstate", false),
-    ("probe-exl3-pfxtrace", false),
-    ("probe-exl3-prefillx", false),
-    ("probe-exl3-regime", false),
-    ("probe-exl3-routergemm", false),
-    ("probe-exl3-slice", false),
-    ("probe-exl3-sppin", false),
-    ("probe-exl3-tailgemm", false),
-    ("probe-exl3-tpspec", false),
-    ("probe-exl3-wide", false),
-    ("probe-exl3-wp16", false),
-    ("probe-exl3-xchain", false),
-    ("probe-exl3-xtp", false),
-    ("probe-fold-xchain-compare", true),
-    ("probe-gemm", false),
-    ("probe-moe", false),
-    ("probe-moe-gemm", false),
-    ("probe-mxfp4", false),
-    ("probe-mxfp4-fused", false),
-    ("probe-mxfp4-xchain", false),
-    ("probe-mxfp4-xchain2", true),
-    ("probe-mxfp4-xchain2-compare", true),
-    ("probe-penalties", false),
-    ("probe-ppsplit", false),
-    ("probe-q4", false),
-    ("probe-reject", false),
-    ("probe-sampler", false),
-    ("probe-serve-pinned", false),
-    ("probe-shard-plan", false),
-    ("probe-spec-sampling", false),
-    ("probe-splitk", false),
-    ("probe-state", false),
-    ("probe-tp-gemv", false),
-    ("probe-tq", true),
-    ("probe-verify-m8", false),
-    ("probe-vision-tower", false),
-    ("profile-mtp", false),
-    ("prompt", true),
-    ("prompt-file", true),
-    ("prompt-ids", true),
-    ("prompt-len", true),
-    ("proxy-core", false),
-    ("proxy-core2", false),
-    ("quantize", false),
-    ("quick", false),
-    ("rank", true),
-    ("real-taps", true),
-    ("reasoning-effort", true),
-    ("recipe", true),
-    ("reduces", false),
-    ("remove-model-blob", false),
-    ("replay-df2-bisect", false),
-    ("replay-df2-round", false),
-    ("reps", true),
-    ("requant-gdn", false),
-    ("requant-q2fake", false),
-    ("requant-sim", false),
-    ("rounds", true),
-    ("runs", true),
-    ("scope", true),
-    ("seconds", true),
-    ("seed", true),
-    ("seeds", true),
-    ("seq-len", true),
-    ("served-model-name", true),
-    ("server", false),
-    ("server-dspark", true),
-    ("server-port", true),
-    ("sha256", true),
-    ("shapes", true),
-    ("shard", true),
-    ("shard-end", true),
-    ("shard-rank", true),
-    ("shard-start", true),
-    ("shard-world", true),
-    ("sizes-mb", true),
-    ("slice-experts", true),
-    ("spacing-us", false),
-    ("spec-dds", true),
-    ("spec-depths", true),
-    ("spec-gen", false),
-    ("spec-ident", true),
-    ("spec-prefix", true),
-    ("spec-prompts", true),
-    ("spec-reps", false),
-    ("spec-samp", true),
-    ("spec-sampling", false),
-    ("spec-source", true),
-    ("spec-trials", false),
-    ("split", true),
-    ("sppin-c", true),
-    ("sppin-world", true),
-    ("stall-consumer-every", false),
-    ("stall-us", false),
-    ("step", true),
-    ("steps", true),
-    ("stq-bake", false),
-    ("streaming", false),
-    ("sweep-gemm", false),
-    ("taps", true),
-    ("temp", true),
-    ("temperature", true),
-    ("thinking", true),
-    ("thinking-on", false),
-    ("time-widths", true),
-    ("tmp", true),
-    ("tokenizer", true),
-    ("tokens", true),
-    ("tool-call-format", true),
-    ("top-k", true),
-    ("top-p", true),
-    ("tp", false),
-    ("tp-barrier-bench", false),
-    ("tp-reduce-bench", false),
-    ("tp-sim", false),
-    ("tp-sim-full", false),
-    ("tp-sim-layer", true),
-    ("tree-draft", true),
-    ("trials", true),
-    ("tripwire", true),
-    ("tripwire-selftest", false),
-    ("tune-draft", false),
-    ("tune-profile", false),
-    ("tune-table", false),
-    ("verify", false),
-    ("vision-fail-gemm-x", false),
-    ("warmup", false),
-    ("with-trunk", false),
-    ("world", true),
-    ("wp16-b-ids", true),
-    ("wp16-split", true),
-    ("x-in", true),
-    ("xport", false),
-    ("xtp-gates", true),
-    ("xtp-gen", true),
-    ("xtp-ident-only", false),
-    ("xtp-out", true),
-    ("xtp-pf-chunk", true),
-    ("xtp-ref", true),
-    ("xtp-sp-fault", true),
-    ("xtp-time", true),
-    ("y-out", true),
+pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
+    ("after", false, Vis::Adv),
+    ("arm", true, Vis::Adv),
+    ("auto-disable-thinking-with-tools", false, Vis::Adv),
+    ("autotune", false, Vis::Adv),
+    ("autotune-report", false, Vis::Adv),
+    ("barriers", false, Vis::Adv),
+    ("batch", true, Vis::Adv),
+    ("bench-accept", false, Vis::Adv),
+    ("bench-batch", false, Vis::Adv),
+    ("bench-decode-ctx", false, Vis::Adv),
+    ("bench-df2-matrix", false, Vis::Adv),
+    ("bench-df2-sample", false, Vis::Adv),
+    ("bench-df2-sample-realq", false, Vis::Adv),
+    ("bench-dspark", false, Vis::Adv),
+    ("bench-exl3-forward", false, Vis::Adv),
+    ("bench-exl3-gemm", false, Vis::Adv),
+    ("bench-exl3-ladder", false, Vis::Adv),
+    ("bench-exl3-mtp", false, Vis::Adv),
+    ("bench-exl3-wide", false, Vis::Adv),
+    ("bench-file", true, Vis::Adv),
+    ("bench-lanes", false, Vis::Adv),
+    ("bench-mtp", false, Vis::Adv),
+    ("bench-mtp-sample", false, Vis::Adv),
+    ("bench-prefill", false, Vis::Adv),
+    ("bench-tau", false, Vis::Adv),
+    ("bench-tree", false, Vis::Adv),
+    ("bench-verify", false, Vis::Adv),
+    ("binv", false, Vis::Adv),
+    ("binv-trace", false, Vis::Adv),
+    ("blocks", false, Vis::Adv),
+    ("bundle", true, Vis::Adv),
+    ("cached-models-list", false, Vis::Adv),
+    ("cached-models-remove", false, Vis::Adv),
+    ("cached-models-remove-all", false, Vis::Adv),
+    ("capture-layers", false, Vis::Adv),
+    ("chat", false, Vis::Adv),
+    ("check", false, Vis::Adv),
+    ("chunk-sizes", true, Vis::Adv),
+    ("chunked", false, Vis::Adv),
+    ("classes", true, Vis::Adv),
+    ("clear-model-blobs", false, Vis::Adv),
+    ("converted-load", true, Vis::Adv),
+    ("cpu-affinity", false, Vis::Adv),
+    ("cq-hold", false, Vis::Adv),
+    ("cq-hold-us", false, Vis::Adv),
+    ("ctx", true, Vis::Adv),
+    ("ctxs", true, Vis::Adv),
+    ("default-frequency-penalty", true, Vis::Adv),
+    ("default-presence-penalty", true, Vis::Day),
+    ("default-repetition-penalty", true, Vis::Adv),
+    ("depth", true, Vis::Adv),
+    ("dev", true, Vis::Adv),
+    ("dev2", true, Vis::Adv),
+    ("df2-bake-fp8", false, Vis::Adv),
+    ("df2-bake-nvfp4", false, Vis::Adv),
+    ("df2-block", true, Vis::Adv),
+    ("df2-carry", true, Vis::Adv),
+    ("df2-prose-lane", true, Vis::Adv),
+    ("df2-quant-fidelity", false, Vis::Adv),
+    ("df2-round-shard", true, Vis::Adv),
+    ("df2-step-dump", true, Vis::Adv),
+    ("df2-trace", false, Vis::Adv),
+    ("dflash-dir", true, Vis::Adv),
+    ("discover-wait", true, Vis::Adv),
+    ("discovery-port", true, Vis::Adv), // OUT2: node UDP bind (default 29499); a 2nd node can coexist on a busy box
+    ("domains", true, Vis::Adv),
+    ("draft-confidence", false, Vis::Adv),
+    ("draft-temperature", false, Vis::Adv),
+    ("draws", true, Vis::Adv),
+    ("dry-run", false, Vis::Adv),
+    ("dspark", false, Vis::Adv),
+    ("dspark-depth", true, Vis::Adv),
+    ("dspark-fp8-head", true, Vis::Adv),
+    ("dsv4-bench-decode", false, Vis::Adv),
+    ("dsv4-bench-prefill", false, Vis::Adv),
+    ("dump-argmax", false, Vis::Adv),
+    ("dump-logits", true, Vis::Adv),
+    ("dump-rank-weights", false, Vis::Adv),
+    ("dump-weights", true, Vis::Adv),
+    ("embed", true, Vis::Adv),
+    ("embed-from", true, Vis::Adv),
+    ("exl3-bench-steps", true, Vis::Adv),
+    ("exl3-grouped-e", true, Vis::Adv),
+    ("exl3-iters", true, Vis::Adv),
+    ("exl3-ks", true, Vis::Adv),
+    ("exl3-l2-alias", true, Vis::Adv),
+    ("exl3-ladder-out", true, Vis::Adv),
+    ("exl3-ladder-skip-n", true, Vis::Adv),
+    ("exl3-ladder-window", true, Vis::Adv),
+    ("exl3-pack-manifest", false, Vis::Adv),
+    ("exl3-prime-batch", true, Vis::Adv),
+    ("exl3-prime-batch-xcheck", true, Vis::Adv),
+    ("exl3-slab-cols", true, Vis::Adv),
+    ("exl3-wide-ms", true, Vis::Adv),
+    ("exl3-wide-mts", true, Vis::Adv),
+    ("exl3-widths", true, Vis::Adv),
+    ("extract-dspark", false, Vis::Adv),
+    ("floats", false, Vis::Adv),
+    ("from", true, Vis::Adv),
+    ("gen-dflash2-synth", true, Vis::Adv),
+    ("gen-dspark-synth", true, Vis::Adv),
+    ("gid", true, Vis::Adv),
+    ("golden", true, Vis::Adv),
+    ("gpu", false, Vis::Adv),
+    ("gpu-only", false, Vis::Adv),
+    ("graph-precapture", false, Vis::Adv),
+    ("grid", true, Vis::Adv),
+    ("gt-reprime", false, Vis::Adv),
+    ("head", true, Vis::Adv),
+    ("help", false, Vis::Adv),
+    ("help-advanced", false, Vis::Adv),
+    ("help-diag", false, Vis::Adv),
+    ("ids", true, Vis::Adv),
+    ("imatrix", true, Vis::Adv),
+    ("in-x", true, Vis::Adv),
+    ("inject-delay-us-max", false, Vis::Adv),
+    ("io", true, Vis::Adv),
+    ("iters", true, Vis::Adv),
+    ("job", true, Vis::Adv),
+    ("jsonl", true, Vis::Adv),
+    ("kvnll-accept", false, Vis::Adv),
+    ("kvnll-accept-ctx", false, Vis::Adv),
+    ("kvnll-csv", true, Vis::Adv),
+    ("kvnll-dump-ref", true, Vis::Adv),
+    ("kvnll-ids", true, Vis::Adv),
+    ("kvnll-label", true, Vis::Adv),
+    ("kvnll-needles", true, Vis::Adv),
+    ("kvnll-ref", true, Vis::Adv),
+    ("kvnll-text", true, Vis::Adv),
+    ("kvnll-tf", false, Vis::Adv),
+    ("kvnll-windows", true, Vis::Adv),
+    ("label", true, Vis::Adv),
+    ("ladder-dir", true, Vis::Adv),
+    ("ladder-layers", true, Vis::Adv),
+    ("ladder-step", true, Vis::Adv),
+    ("layers", true, Vis::Adv),
+    ("legacy-oracle", false, Vis::Adv),
+    ("limit", true, Vis::Adv),
+    ("list-model-blobs", false, Vis::Adv),
+    ("lookahead", false, Vis::Adv),
+    ("loop-detect", false, Vis::Adv),
+    ("loop-min-reps", false, Vis::Adv),
+    ("loop-window", false, Vis::Adv),
+    ("ltrows-c", true, Vis::Adv),
+    ("ltrows-shapes", true, Vis::Adv),
+    ("main-core", false, Vis::Adv),
+    ("max-batch", true, Vis::Day),
+    ("max-n", true, Vis::Adv),
+    ("max-new-tokens", true, Vis::Adv),
+    ("max-tokens", true, Vis::Day),
+    ("mix", false, Vis::Adv),
+    ("mode", true, Vis::Adv),
+    ("model", true, Vis::Adv),
+    ("model-dir", true, Vis::Day),
+    ("model-dir-b", true, Vis::Adv),
+    ("model-name", true, Vis::Adv),
+    ("module", true, Vis::Adv),
+    ("mtp-depth", true, Vis::Adv),
+    ("net-test", false, Vis::Adv),
+    ("ngram", true, Vis::Adv),
+    ("ngram-draft", true, Vis::Adv),
+    ("no-chat", false, Vis::Adv),
+    ("no-shard-mixers", false, Vis::Adv),
+    ("node", false, Vis::Day),
+    ("nodes", true, Vis::Adv),
+    ("offset", true, Vis::Adv),
+    ("once", false, Vis::Adv),
+    ("oracle", true, Vis::Adv),
+    ("oracle-dir", true, Vis::Adv),
+    ("otel-endpoint", false, Vis::Adv),
+    ("otel-model-id", false, Vis::Adv),
+    ("otel-topology", false, Vis::Adv),
+    ("other", false, Vis::Adv),
+    ("out", true, Vis::Adv),
+    ("out-dir", true, Vis::Adv),
+    ("out-x", true, Vis::Adv),
+    ("output-prompts", false, Vis::Adv),
+    ("payload-bytes", false, Vis::Adv),
+    ("peer", true, Vis::Adv),
+    ("peer-ips", true, Vis::Adv),
+    ("penalty-range", false, Vis::Adv),
+    ("pixels", true, Vis::Adv),
+    ("plan-deals", true, Vis::Adv),
+    ("plan-worlds", true, Vis::Adv),
+    ("poison", false, Vis::Adv),
+    ("pool-census", false, Vis::Adv),
+    ("por", false, Vis::Adv),
+    ("port", true, Vis::Day),
+    ("positions", false, Vis::Adv),
+    ("pp-bench-prefill", false, Vis::Adv),
+    ("pp-chunk-list", true, Vis::Adv),
+    ("pp-node", false, Vis::Adv),
+    ("ppl", false, Vis::Adv),
+    ("ppl-ref-windowz", false, Vis::Adv),
+    ("ppl-zzzz-qqqq", false, Vis::Adv),
+    ("prefill-chunk", true, Vis::Adv),
+    ("prefix", false, Vis::Adv),
+    ("prefix-cache", true, Vis::Day),
+    ("prefix-ckpt-mem-gb", false, Vis::Adv),
+    ("print-config", false, Vis::Adv),
+    ("probe-bandwidth", false, Vis::Adv),
+    ("probe-bandwidth-sustained", false, Vis::Adv),
+    ("probe-binv", false, Vis::Adv),
+    ("probe-df2-draft", false, Vis::Adv),
+    ("probe-df2-graph", false, Vis::Adv),
+    ("probe-df2-lossless", false, Vis::Adv),
+    ("probe-df2-prime", false, Vis::Adv),
+    ("probe-df2-round", true, Vis::Adv),
+    ("probe-df2-tapcap", false, Vis::Adv),
+    ("probe-dflash", true, Vis::Adv),
+    ("probe-dflash-local", false, Vis::Adv),
+    ("probe-dflash2", false, Vis::Adv),
+    ("probe-dispatch", false, Vis::Adv),
+    ("probe-dspark", false, Vis::Adv),
+    ("probe-dspark-bind", true, Vis::Adv),
+    ("probe-dspark-rollback", false, Vis::Adv),
+    ("probe-dspark-round", true, Vis::Adv),
+    ("probe-dspark-synth", true, Vis::Adv),
+    ("probe-dsv4", false, Vis::Adv),
+    ("probe-exl3", false, Vis::Adv),
+    ("probe-exl3-binv", false, Vis::Adv),
+    ("probe-exl3-flashpf", false, Vis::Adv),
+    ("probe-exl3-hcw4", false, Vis::Adv),
+    ("probe-exl3-kernel", false, Vis::Adv),
+    ("probe-exl3-kvnll", false, Vis::Adv),
+    ("probe-exl3-kvq", false, Vis::Adv),
+    ("probe-exl3-ltrows", false, Vis::Adv),
+    ("probe-exl3-moeglue", false, Vis::Adv),
+    ("probe-exl3-oracle", false, Vis::Adv),
+    ("probe-exl3-pack2", false, Vis::Adv),
+    ("probe-exl3-pack3", false, Vis::Adv),
+    ("probe-exl3-packstate", false, Vis::Adv),
+    ("probe-exl3-pfxtrace", false, Vis::Adv),
+    ("probe-exl3-prefillx", false, Vis::Adv),
+    ("probe-exl3-regime", false, Vis::Adv),
+    ("probe-exl3-routergemm", false, Vis::Adv),
+    ("probe-exl3-slice", false, Vis::Adv),
+    ("probe-exl3-sppin", false, Vis::Adv),
+    ("probe-exl3-tailgemm", false, Vis::Adv),
+    ("probe-exl3-tpspec", false, Vis::Adv),
+    ("probe-exl3-wide", false, Vis::Adv),
+    ("probe-exl3-wp16", false, Vis::Adv),
+    ("probe-exl3-xchain", false, Vis::Adv),
+    ("probe-exl3-xtp", false, Vis::Adv),
+    ("probe-fold-xchain-compare", true, Vis::Adv),
+    ("probe-gemm", false, Vis::Adv),
+    ("probe-moe", false, Vis::Adv),
+    ("probe-moe-gemm", false, Vis::Adv),
+    ("probe-mxfp4", false, Vis::Adv),
+    ("probe-mxfp4-fused", false, Vis::Adv),
+    ("probe-mxfp4-xchain", false, Vis::Adv),
+    ("probe-mxfp4-xchain2", true, Vis::Adv),
+    ("probe-mxfp4-xchain2-compare", true, Vis::Adv),
+    ("probe-penalties", false, Vis::Adv),
+    ("probe-ppsplit", false, Vis::Adv),
+    ("probe-q4", false, Vis::Adv),
+    ("probe-reject", false, Vis::Adv),
+    ("probe-sampler", false, Vis::Adv),
+    ("probe-serve-pinned", false, Vis::Adv),
+    ("probe-shard-plan", false, Vis::Adv),
+    ("probe-spec-sampling", false, Vis::Adv),
+    ("probe-splitk", false, Vis::Adv),
+    ("probe-state", false, Vis::Adv),
+    ("probe-tp-gemv", false, Vis::Adv),
+    ("probe-tq", true, Vis::Adv),
+    ("probe-verify-m8", false, Vis::Adv),
+    ("probe-vision-tower", false, Vis::Adv),
+    ("profile-mtp", false, Vis::Adv),
+    ("prompt", true, Vis::Adv),
+    ("prompt-file", true, Vis::Adv),
+    ("prompt-ids", true, Vis::Adv),
+    ("prompt-len", true, Vis::Adv),
+    ("proxy-core", false, Vis::Adv),
+    ("proxy-core2", false, Vis::Adv),
+    ("quantize", false, Vis::Adv),
+    ("quick", false, Vis::Adv),
+    ("rank", true, Vis::Adv),
+    ("real-taps", true, Vis::Adv),
+    ("reasoning-effort", true, Vis::Adv),
+    ("recipe", true, Vis::Adv),
+    ("reduces", false, Vis::Adv),
+    ("remove-model-blob", false, Vis::Adv),
+    ("replay-df2-bisect", false, Vis::Adv),
+    ("replay-df2-round", false, Vis::Adv),
+    ("reps", true, Vis::Adv),
+    ("requant-gdn", false, Vis::Adv),
+    ("requant-q2fake", false, Vis::Adv),
+    ("requant-sim", false, Vis::Adv),
+    ("rounds", true, Vis::Adv),
+    ("runs", true, Vis::Adv),
+    ("scope", true, Vis::Adv),
+    ("seconds", true, Vis::Adv),
+    ("seed", true, Vis::Adv),
+    ("seeds", true, Vis::Adv),
+    ("seq-len", true, Vis::Adv),
+    ("served-model-name", true, Vis::Adv),
+    ("server", false, Vis::Day),
+    ("server-dspark", true, Vis::Adv),
+    ("server-port", true, Vis::Adv),
+    ("sha256", true, Vis::Adv),
+    ("shapes", true, Vis::Adv),
+    ("shard", true, Vis::Adv),
+    ("shard-end", true, Vis::Adv),
+    ("shard-rank", true, Vis::Adv),
+    ("shard-start", true, Vis::Adv),
+    ("shard-world", true, Vis::Adv),
+    ("sizes-mb", true, Vis::Adv),
+    ("slice-experts", true, Vis::Adv),
+    ("spacing-us", false, Vis::Adv),
+    ("spec-dds", true, Vis::Adv),
+    ("spec-depths", true, Vis::Adv),
+    ("spec-gen", false, Vis::Adv),
+    ("spec-ident", true, Vis::Adv),
+    ("spec-prefix", true, Vis::Adv),
+    ("spec-prompts", true, Vis::Adv),
+    ("spec-reps", false, Vis::Adv),
+    ("spec-samp", true, Vis::Adv),
+    ("spec-sampling", false, Vis::Adv),
+    ("spec-source", true, Vis::Adv),
+    ("spec-trials", false, Vis::Adv),
+    ("split", true, Vis::Adv),
+    ("sppin-c", true, Vis::Adv),
+    ("sppin-world", true, Vis::Adv),
+    ("stall-consumer-every", false, Vis::Adv),
+    ("stall-us", false, Vis::Adv),
+    ("step", true, Vis::Adv),
+    ("steps", true, Vis::Adv),
+    ("stq-bake", false, Vis::Adv),
+    ("streaming", false, Vis::Adv),
+    ("sweep-gemm", false, Vis::Adv),
+    ("taps", true, Vis::Adv),
+    ("temp", true, Vis::Adv),
+    ("temperature", true, Vis::Adv),
+    ("thinking", true, Vis::Day),
+    ("thinking-on", false, Vis::Adv),
+    ("time-widths", true, Vis::Adv),
+    ("tmp", true, Vis::Adv),
+    ("tokenizer", true, Vis::Adv),
+    ("tokens", true, Vis::Adv),
+    ("tool-call-format", true, Vis::Adv),
+    ("top-k", true, Vis::Adv),
+    ("top-p", true, Vis::Adv),
+    ("tp", false, Vis::Day),
+    ("tp-barrier-bench", false, Vis::Adv),
+    ("tp-reduce-bench", false, Vis::Adv),
+    ("tp-sim", false, Vis::Adv),
+    ("tp-sim-full", false, Vis::Adv),
+    ("tp-sim-layer", true, Vis::Adv),
+    ("tree-draft", true, Vis::Adv),
+    ("trials", true, Vis::Adv),
+    ("tripwire", true, Vis::Adv),
+    ("tripwire-selftest", false, Vis::Adv),
+    ("tune-draft", false, Vis::Adv),
+    ("tune-profile", false, Vis::Adv),
+    ("tune-table", false, Vis::Adv),
+    ("verify", false, Vis::Adv),
+    ("vision-fail-gemm-x", false, Vis::Adv),
+    ("warmup", false, Vis::Adv),
+    ("with-trunk", false, Vis::Adv),
+    ("world", true, Vis::Adv),
+    ("wp16-b-ids", true, Vis::Adv),
+    ("wp16-split", true, Vis::Adv),
+    ("x-in", true, Vis::Adv),
+    ("xport", false, Vis::Adv),
+    ("xtp-gates", true, Vis::Adv),
+    ("xtp-gen", true, Vis::Adv),
+    ("xtp-ident-only", false, Vis::Adv),
+    ("xtp-out", true, Vis::Adv),
+    ("xtp-pf-chunk", true, Vis::Adv),
+    ("xtp-ref", true, Vis::Adv),
+    ("xtp-sp-fault", true, Vis::Adv),
+    ("xtp-time", true, Vis::Adv),
+    ("y-out", true, Vis::Adv),
 ];
 
 /// F9 (owner decision A, 2026-10-11): `HAND_FLAGS` value-taking rows get the F7 refusal too.
@@ -818,7 +834,7 @@ pub fn refuse_hand_flag_swallows(args: &[String]) -> Option<String> {
             Some((n, v)) => (n, Some(v)),
             None => (body, None),
         };
-        let Some(&(flag, takes_value)) = HAND_FLAGS.iter().find(|(f, _)| *f == name) else { i += 1; continue };
+        let Some(&(flag, takes_value, _vis)) = HAND_FLAGS.iter().find(|(f, _, _)| *f == name) else { i += 1; continue };
         if lookup(name).is_some() { i += 1; continue; } // registry rows: F7 owns them
         if inline.is_some() { i += 1; continue; }        // the `=` form is always fine
         // F9b: optional-value flags (bare is a documented form) never refuse, in either direction
@@ -896,7 +912,7 @@ pub fn unknown_warnings(args: &[String]) -> Vec<String> {
         if a == "--" { after_sep = true; continue; }
         let Some(body) = a.strip_prefix("--") else { continue };
         if body.is_empty() || body.contains('=') { continue; }
-        let known = lookup(body).is_some() || HAND_FLAGS.iter().any(|(f, _)| *f == body);
+        let known = lookup(body).is_some() || HAND_FLAGS.iter().any(|(f, _, _)| *f == body);
         if !known {
             if seen.insert(body.to_string()) {
                 let near = suggest(body);
@@ -913,7 +929,7 @@ pub fn unknown_warnings(args: &[String]) -> Vec<String> {
         prev_takes_value = if let Some(id) = lookup(body) {
             !matches!(id.def().ty, Ty::Flag | Ty::Bool)
         } else {
-            HAND_FLAGS.iter().any(|(f, v)| *f == body && *v)
+            HAND_FLAGS.iter().any(|(f, v, _)| *f == body && *v)
         };
     }
     out
@@ -933,7 +949,7 @@ fn suggest(name: &str) -> Vec<String> {
     let mut c: Vec<(usize, &str)> = REG.iter()
         .filter(|o| !matches!(o.ty, Ty::Internal(_)))
         .map(|o| (edit_distance(name, o.flag), o.flag))
-        .chain(HAND_FLAGS.iter().map(|(f, _)| (edit_distance(name, f), *f)))
+        .chain(HAND_FLAGS.iter().map(|(f, _, _)| (edit_distance(name, f), *f)))
         .filter(|(d, _)| *d <= 3 && d * 2 <= name.len())
         .collect();
     c.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
@@ -1032,33 +1048,84 @@ fn help_line(o: &Opt) -> String {
     s
 }
 
-/// The generated option sections of `--help` (diag = false) or `--help-diag` (diag = true).
-pub fn help_text(diag: bool) -> String {
-    let mut s = String::new();
-    let n_diag = REG.iter().filter(|o| o.cat == Cat::Diag && !matches!(o.ty, Ty::Internal(_))).count();
-    s += if diag { "\nDIAGNOSTIC / TEST-DRILL OPTIONS (every engine option is a flag; the engine reads no env vars)\n" }
-         else { "\nENGINE OPTIONS (generated from the option registry; every engine option is a flag — the engine\n\
-                 reads no environment variables; `--x` / `--x on|off` / `--x=V` / `--x V`)\n" };
-    for c in Cat::ALL {
-        if (c == Cat::Diag) != diag { continue; }
-        let rows: Vec<&Opt> = REG.iter().filter(|o| o.cat == c && !matches!(o.ty, Ty::Internal(_))).collect();
-        if rows.is_empty() { continue; }
-        s += &format!("\n  {}\n", c.title());
-        let mut rows = rows;
-        rows.sort_by_key(|o| o.flag);
-        for o in rows { s += &help_line(o); s.push('\n'); }
-    }
-    if !diag {
-        s += &format!("\n  {n_diag} diagnostic / test-drill options: --help-diag.   Resolved values: --print-config.\n");
-    } else {
-        s += "\n  Set internally (not command-line options; shown by --print-config):\n";
-        for o in REG.iter().filter(|o| matches!(o.ty, Ty::Internal(_))) {
-            if let Ty::Internal(via) = o.ty { s += &format!("    {:<34} {} (via {via})\n", o.flag, o.help); }
+/// CLIPRUNE1: the three option views. `--help` = day-to-day launch set only (registry rows with
+/// `vis: Vis::Day` + the day-to-day hand-read launch flags). `--help-diag` = the diagnostic /
+/// test-drill group (unchanged view). `--help-advanced` = EVERYTHING the binary accepts: every
+/// registry row (diagnostics included, grouped by category), the internally-set rows, and every
+/// hand-read mode/bench flag. Drift in the two owner-facing views is pinned by snapshot fixtures
+/// (tests/fixtures/help_{day,advanced}.txt; refresh with `cargo test -- --bless`).
+pub fn help_day() -> String {
+    let mut s = String::from("\nDAY-TO-DAY LAUNCH OPTIONS (everything the binary accepts: --help-advanced; resolved values: --print-config)\n");
+    let mut hand: Vec<&str> = HAND_FLAGS.iter().filter(|(_, _, v)| *v == Vis::Day).map(|(f, _, _)| *f).collect();
+    hand.sort();
+    if !hand.is_empty() {
+        s += "\n  launch flags (read at boot)\n";
+        for f in hand {
+            let takes = HAND_FLAGS.iter().any(|(hf, t, _)| *hf == f && *t);
+            s += &format!("    --{}{}\n", f, if takes { " <value>" } else { "" });
         }
     }
-    s += "\n  A value that really starts with \"--\" must be written --option=value; a value-taking option is never taken from the next --flag - no value-taking option, registry or hand-read, ever eats one (F7/F9).\n";
+    for c in Cat::ALL {
+        let mut rows: Vec<&Opt> = REG.iter()
+            .filter(|o| o.cat == c && o.vis == Vis::Day && !matches!(o.ty, Ty::Internal(_))).collect();
+        rows.sort_by_key(|o| o.flag);
+        if rows.is_empty() { continue; }
+        s += &format!("\n  {}\n", c.title());
+        for o in rows { s += &help_line(o); s.push('\n'); }
+    }
+    let n_adv = REG.iter().filter(|o| o.vis == Vis::Adv).count()
+        + HAND_FLAGS.iter().filter(|(_, _, v)| *v == Vis::Adv).count();
+    s += &format!("\n  {n_adv} further options (diagnostics, test drills, probes, tunables): --help-advanced.   Resolved values: --print-config.\n");
+    s += F7_NOTE;
     s
 }
+
+/// `--help-diag` (unchanged): the diagnostic / test-drill group only.
+pub fn help_text(diag: bool) -> String {
+    debug_assert!(diag, "CLIPRUNE1: --help is help_day(); help_text(false) is retired");
+    let mut s = String::from("\nDIAGNOSTIC / TEST-DRILL OPTIONS (every engine option is a flag; the engine reads no env vars)\n");
+    for c in Cat::ALL {
+        if c != Cat::Diag { continue; }
+        let mut rows: Vec<&Opt> = REG.iter().filter(|o| o.cat == c && !matches!(o.ty, Ty::Internal(_))).collect();
+        rows.sort_by_key(|o| o.flag);
+        if rows.is_empty() { continue; }
+        s += &format!("\n  {}\n", c.title());
+        for o in rows { s += &help_line(o); s.push('\n'); }
+    }
+    s += INTERNAL_NOTE;
+    for o in REG.iter().filter(|o| matches!(o.ty, Ty::Internal(_))) {
+        if let Ty::Internal(via) = o.ty { s += &format!("    {:<34} {} (via {via})\n", o.flag, o.help); }
+    }
+    s += F7_NOTE;
+    s
+}
+
+/// `--help-advanced`: every registry row (grouped, diagnostics included), the internally-set
+/// rows, and every hand-read mode/bench flag — the complete accepted option set.
+pub fn help_advanced() -> String {
+    let mut s = String::from("\nALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)\n");
+    for c in Cat::ALL {
+        let mut rows: Vec<&Opt> = REG.iter().filter(|o| o.cat == c && !matches!(o.ty, Ty::Internal(_))).collect();
+        rows.sort_by_key(|o| o.flag);
+        if rows.is_empty() { continue; }
+        s += &format!("\n  {}\n", c.title());
+        for o in rows { s += &help_line(o); s.push('\n'); }
+    }
+    s += INTERNAL_NOTE;
+    let mut all_hand: Vec<(&str, bool, bool)> = HAND_FLAGS.iter()
+        .map(|(f, t, v)| (*f, *t, *v == Vis::Day)).collect();
+    all_hand.sort();
+    s += &format!("\n  MODE / BENCH / PROBE FLAGS (hand-read by the mode dispatch; [day-to-day] ones are the launch set in --help)\n");
+    for (f, takes, day) in all_hand {
+        s += &format!("    --{}{}{}\n", f, if takes { " <value>" } else { "" }, if day { "   [day-to-day]" } else { "" });
+    }
+    s += F7_NOTE;
+    s
+}
+
+const F7_NOTE: &str = "\n  A value that really starts with \"--\" must be written --option=value; a value-taking option is never taken from the next --flag - no value-taking option, registry or hand-read, ever eats one (F7/F9).\n";
+
+const INTERNAL_NOTE: &str = "\n  Set internally (not command-line options; shown by --print-config):\n";
 
 /// `--print-config`: every option, its value (or its default) and where the value came from.
 pub fn print_config() -> String {
@@ -1172,7 +1239,7 @@ mod tests {
             }
             out
         }
-        let mut hand: Vec<&str> = HAND_FLAGS.iter().map(|(f, _)| *f).collect();
+        let mut hand: Vec<&str> = HAND_FLAGS.iter().map(|(f, _, _)| *f).collect();
         let sorted = hand.is_sorted();
         hand.sort();
         assert!(sorted, "HAND_FLAGS stays sorted");
@@ -1403,9 +1470,84 @@ mod tests {
     /// (`help_text`); the hand-written part is `print_help` in src/main.rs (a binary: its text is
     /// read from the source here, as the env-read test above reads the tree).
     #[test]
+
+    /// CLIPRUNE1: `--help` is the day-to-day launch set ONLY; `--help-advanced` is everything.
+    /// Drift in either fails against the committed snapshot fixtures; refresh (after a DELIBERATE
+    /// content change only) with `cargo test -- --bless`.
+    #[test]
+    fn help_day_snapshot() { check_help_snapshot("help_day.txt", &help_day()); }
+
+    #[test]
+    fn help_advanced_snapshot() { check_help_snapshot("help_advanced.txt", &help_advanced()); }
+
+    fn check_help_snapshot(name: &str, actual: &str) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let want = std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|_| panic!("{name} fixture missing; create it with: cargo test --lib -- --ignored bless_help_snapshots"));
+        assert_eq!(want, actual, "{name} drifted; if the change is intended refresh with: cargo test --lib -- --ignored bless_help_snapshots");
+    }
+
+    /// Refresh the snapshot fixtures. Ignored by default (a normal run only compares):
+    /// cargo test --lib -- --ignored bless_help_snapshots
+    #[test]
+    #[ignore = "explicit refresh only: cargo test --lib -- --ignored bless_help_snapshots"]
+    fn bless_help_snapshots() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("help_day.txt"), help_day()).unwrap();
+        std::fs::write(dir.join("help_advanced.txt"), help_advanced()).unwrap();
+    }
+
+    /// The advanced view must list EVERY accepted option: every non-Internal registry row and
+    /// every hand-read flag (registry rows via their help line; hand flags via the mode section).
+    fn lists_flag(view: &str, flag: &str) -> bool {
+        let pre = format!("    --{flag} ");
+        let bare = format!("    --{flag}");
+        view.lines().any(|l| l.starts_with(&pre) || l.trim_end() == bare)
+    }
+
+    #[test]
+    fn help_advanced_covers_every_accepted_option() {
+        let h = help_advanced();
+        for o in REG.iter() {
+            if !matches!(o.ty, Ty::Internal(_)) {
+                assert!(lists_flag(&h, &o.flag), "--{} missing from --help-advanced", o.flag);
+            }
+        }
+        for (f, _, _) in HAND_FLAGS {
+            assert!(lists_flag(&h, f), "--{f} missing from --help-advanced");
+        }
+    }
+
+    /// `--help` stays day-to-day only: no advanced registry row, no advanced hand flag leaks in.
+    #[test]
+    fn help_day_stays_day_to_day() {
+        let h = help_day();
+        for o in REG.iter() {
+            if o.vis == Vis::Adv && !matches!(o.ty, Ty::Internal(_)) {
+                assert!(!lists_flag(&h, &o.flag), "--{} (advanced) leaked into --help", o.flag);
+            }
+        }
+        for (f, _, v) in HAND_FLAGS {
+            if *v == Vis::Adv {
+                assert!(!lists_flag(&h, f), "--{f} (advanced hand flag) leaked into --help");
+            }
+        }
+    }
+
+    /// N1 (FIX1): reworked onto the post-CLIPRUNE1 help API — `--help` IS `help_day()`, so
+    /// "listed in --help" is asserted against it; `help_text(false)` is retired (debug_assert).
+    /// The test had lost its #[test] attribute while it still called the retired fn (the ISSUES
+    /// CLIPRUNE1 asterisk) — it runs again from this change.
+    /// MIGRATION NOTE (N2/N3): when OUT1's boot_report uniform-stage API merges (branch feat/out1,
+    /// unmerged at FIX1 time), the boot-line assertions move to it; --help stays the flag source.
+    #[test]
     fn help_says_what_the_servers_do() {
-        let (gen, diag) = (help_text(false), help_text(true));
-        // every one of these is a serving option: listed in --help (not --help-diag) with its default
+        let (day, diag) = (help_day(), help_text(true));
+        let adv = help_advanced();
+        // every one of these is a serving option with its default shown. CLIPRUNE1 split --help
+        // into tiers: Vis::Day rows are the day-to-day launch set (--help); every accepted row is
+        // in --help-advanced; a serving row never lives only in --help-diag.
         for (flag, def) in [("qsa-row-regime", "[on]"), ("prefill-interleave", "[0]"), ("mtp-lanes", "[off]"),
                             ("prefill-sched", "[cursor]"), ("mtp", "[auto]"), ("lane-order", "[rr]"), ("lane-pack", "[on]")] {
             let o = REG.iter().find(|o| o.flag == flag).unwrap_or_else(|| panic!("--{flag} is not registered"));
@@ -1414,7 +1556,10 @@ mod tests {
             let line = help_line(o);
             assert!(line.trim_start().starts_with(&format!("--{flag} ")), "{line}");
             assert!(line.ends_with(def), "--{flag} must show its default {def}: ...{}", &line[line.len().saturating_sub(40)..]);
-            assert!(gen.contains(&line), "--{flag} missing from --help");
+            if o.vis == Vis::Day {
+                assert!(day.contains(&line), "--{flag} missing from --help");
+            }
+            assert!(adv.contains(&line), "--{flag} missing from --help-advanced");
             assert!(!diag.contains(&line), "--{flag} must not be a --help-diag option");
         }
         // the two flags main.rs parsed but --help never listed: both ride to the TP nodes
@@ -1558,10 +1703,11 @@ mod tests {
         want.sort();
         got.sort();
         assert_eq!(got, want, "options listed by hand and by the registry");
-        for flag in ["mtp", "prefill-interleave"] {
+        for (flag, day) in [("mtp", true), ("prefill-interleave", false)] {
             assert!(!hand.contains(flag), "--{flag} is described by its registry line only");
             let line = help_line(&REG[idx(flag)]);
-            assert_eq!(help_text(false).matches(line.as_str()).count(), 1, "--{flag}: one generated line");
+            let view = if day { help_day() } else { help_advanced() };
+            assert_eq!(view.matches(line.as_str()).count(), 1, "--{flag}: one generated line");
         }
         // no help or registry text cites a release the crate is not (the cut bumps the version, not the text)
         let ver = env!("CARGO_PKG_VERSION");
@@ -1633,11 +1779,11 @@ mod tests {
         format!("--{flag} needs a value, but it is the last argument; to give a value that starts with \"--\" write --{flag}=<value>")
     }
 
-    /// Every Text/Path row (39 Text + 26 Path = 65): the four cases of the addendum.
+    /// Every Text/Path row (39 Text + 27 Path = 66): the four cases of the addendum.
     #[test]
     fn f7_text_path_rows_never_eat_a_flag_shaped_token() {
         let rows: Vec<&Opt> = REG.iter().filter(|o| matches!(o.ty, Ty::Text | Ty::Path)).collect();
-        assert_eq!(rows.len(), 65, "39 Text + 26 Path");
+        assert_eq!(rows.len(), 67, "39 Text + 28 Path");
         let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         for o in rows {
             let id = lookup(o.flag).unwrap();
@@ -1686,7 +1832,7 @@ mod tests {
     /// F7: the --help footer carries the same sentence as the refusal.
     #[test]
     fn f7_help_footer_says_the_escape() {
-        for diag in [false, true] {
+        for diag in [true] {
             assert!(help_text(diag).contains("must be written --option=value"), "diag={diag}");
         }
     }
@@ -1706,7 +1852,7 @@ mod tests {
     }
     #[test]
     fn f9_generated_hand_flag_rules() {
-        for &(f, takes) in HAND_FLAGS {
+        for &(f, takes, _) in HAND_FLAGS {
             let registry_owned = lookup(f).is_some();
             let fflag = format!("--{f}");
             // (a) a swallowed flag refuses, naming BOTH flags
@@ -1774,7 +1920,7 @@ mod tests {
     }
     #[test]
     fn f9b_help_optionals_cover_every_help_entry() {
-        for diag in [false, true] {
+        for diag in [true] {
             for line in help_text(diag).lines() {
                 let t = line.trim_start();
                 let Some(body) = t.strip_prefix("--") else { continue };
@@ -1808,7 +1954,7 @@ mod tests {
         let mut s = 0x9E3779B97F4A7C15u64;
         let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
         let mut pool = Vec::new();
-        for &(f, _) in HAND_FLAGS { pool.push(format!("--{f}")); }
+        for &(f, _, _) in HAND_FLAGS { pool.push(format!("--{f}")); }
         for v in ["4", "29500", "on", "auto", "-1", "a--b", "0.0.0.0", "262144", "--",
                   "--max-batch", "--tp", "--probe-binv", "--unknown-flag", "--nodes=a,b"] {
             pool.push(v.to_string());
@@ -1818,7 +1964,7 @@ mod tests {
             pool.push(format!("--{f}=4"));
         }
         let mut value_taking = Vec::new();
-        for &(f, t) in HAND_FLAGS {
+        for &(f, t, _) in HAND_FLAGS {
             if t && lookup(f).is_none() && !OPTIONAL_VALUE_FLAGS.iter().any(|(vf, _)| *vf == f) {
                 value_taking.push(format!("--{f}"));
             }
@@ -1836,7 +1982,7 @@ mod tests {
                 };
                 if inline.is_some() || lookup(name).is_some() { continue; }
                 let mut hit = false;
-                for &(hf, takes) in HAND_FLAGS {
+                for &(hf, takes, _) in HAND_FLAGS {
                     if hf == name && !OPTIONAL_VALUE_FLAGS.iter().any(|(vf, _)| *vf == hf) {
                         if takes && v.get(j + 1).is_some_and(|x| x.starts_with("--")) { hit = true; }
                         if takes && j + 1 == v.len() { hit = true; }

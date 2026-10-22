@@ -333,7 +333,7 @@ impl TpConfig {
     /// Snapshot the GB10_TP_* env vars (flags = presence; probes/depth = parse). Serving fields get
     /// their v1-compatible defaults — a bench config is indistinguishable from before.
     pub fn from_opts() -> Self {
-        eprintln!("[from_opts] [kv-k8v8]={:?}", crate::opts::var(crate::opt!("kv-k8v8")).ok());
+        crate::deprintln!("[from_opts] [kv-k8v8]={:?}", crate::opts::var(crate::opt!("kv-k8v8")).ok());
         TpConfig {
             config_version: 25,
             // TP rank count. The --tp CLI flag is the single authority for a TP run (bare --tp = 2,
@@ -396,7 +396,10 @@ impl TpConfig {
             mxfp4_mtp_native: crate::opts::var(crate::opt!("mxfp4-mtp-native")).is_ok(),
             server_dspark: false,
             dspark_fp8_head: crate::opts::var(crate::opt!("dspark-fp8-logits")).is_ok(),
-            rope_yarn_factor: 1.0,
+            // YARN1: the head's --rope-yarn-factor rides the snapshot so the node's rope-table
+            // build resolves the same factor (resolved_yarn reads it when the flag is absent).
+            rope_yarn_factor: crate::opts::var(crate::opt!("rope-yarn-factor")).ok()
+                .and_then(|v| v.parse::<f32>().ok()).filter(|f| f.is_finite() && *f >= 1.0).unwrap_or(1.0),
             dflash: crate::opts::var(crate::opt!("tp-dflash")).is_ok(),
             df2_capture: crate::opts::var(crate::opt!("df2-capture")).is_ok(),
             // E12/E8/E9 escapes: VALUE-based like [kv-tq] — only the explicit disable
@@ -454,7 +457,7 @@ pub fn set_tp_config(c: TpConfig) {
     if c.oneshot && crate::opts::var(crate::opt!("tp-oneshot")).is_err() {
         crate::opts::set(crate::opt!("tp-oneshot"), "1");
     }
-    eprintln!("[tp] config installed: world={} shard_mixers={} shard_mtp={} graph={} fp32_partials={} trace={} mtp={} \
+    crate::deprintln!("[tp] config installed: world={} shard_mixers={} shard_mtp={} graph={} fp32_partials={} trace={} mtp={} \
                mtp_depth={:?} batch_probe={:?} step_probe={:?} mode_serve={} accept={:?} capture={:?} \
                dspark={} dspark_depth={:?} exact_gemm={} server_dspark={} fp8_head={} splitk_gemm={} \
                mxfp4={} mxfp4_mtp_native={} dflash={} moe_fold={} e8_shard={} e9_fold={} \
@@ -549,7 +552,7 @@ pub fn scan_rocev2_gid(sysfs: &std::path::Path, dev: &str) -> Option<(i32, Strin
 pub fn resolve_gid_idx(dev: &str) -> i32 {
     if let Ok(s) = crate::opts::var(crate::opt!("gid-idx")) {
         if let Ok(v) = s.trim().parse::<i32>() {
-            crate::reprintln!("[tp] gid_idx={v} (explicit --gid-idx)");
+            crate::dreprintln!("[tp] gid_idx={v} (explicit --gid-idx)");
             return v;
         }
     }
@@ -562,11 +565,11 @@ pub fn resolve_gid_idx(dev: &str) -> i32 {
 pub(crate) fn resolve_gid_idx_at(sysfs: &std::path::Path, dev: &str) -> i32 {
     match scan_rocev2_gid(sysfs, dev) {
         Some((idx, t, g)) => {
-            crate::reprintln!("[tp] gid_idx={idx} auto-detected on {dev} (sysfs type '{t}', gid {g})");
+            crate::dreprintln!("[tp] gid_idx={idx} auto-detected on {dev} (sysfs type '{t}', gid {g})");
             idx
         }
         None => {
-            crate::reprintln!("[tp] gid_idx={} (static default: no RoCE v2 IPv4-mapped GID found on {dev})", GID_IDX);
+            crate::dreprintln!("[tp] gid_idx={} (static default: no RoCE v2 IPv4-mapped GID found on {dev})", GID_IDX);
             GID_IDX
         }
     }
@@ -590,14 +593,14 @@ impl TpContext {
     pub fn bring_up_head(world: i32) -> Result<Self> {
         let dev = rdma_dev();
         let gid = resolve_gid_idx(&dev);
-        eprintln!("[tp] rank 0/{} — bringing up RDMA data-plane link on {} gid_idx={} (listening) ...", world, dev, gid);
+        crate::deprintln!("[tp] rank 0/{} — bringing up RDMA data-plane link on {} gid_idx={} (listening) ...", world, dev, gid);
         let link = if world == 2 {
             TpLink::connect(0, "", TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         } else {
             let ips = resolve_topology(world)?;
             TpLink::connect_nway(0, world, &ips, TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         };
-        eprintln!("[tp] rank 0/{} — link UP", world);
+        crate::deprintln!("[tp] rank 0/{} — link UP", world);
         Ok(TpContext { rank: 0, world, link })
     }
 
@@ -605,14 +608,14 @@ impl TpContext {
     pub fn bring_up_node(head_ip: IpAddr, rank: i32, world: i32) -> Result<Self> {
         let dev = rdma_dev();
         let gid = resolve_gid_idx(&dev);
-        eprintln!("[tp] rank {}/{} — connecting RDMA data-plane link to head {head_ip} on {} gid_idx={} ...", rank, world, dev, gid);
+        crate::deprintln!("[tp] rank {}/{} — connecting RDMA data-plane link to head {head_ip} on {} gid_idx={} ...", rank, world, dev, gid);
         let link = if world == 2 {
             TpLink::connect(rank, &head_ip.to_string(), TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         } else {
             let ips = resolve_topology(world)?;
             TpLink::connect_nway(rank, world, &ips, TP_PORT, &dev, gid, TP_SLOT_BYTES)?
         };
-        eprintln!("[tp] rank {}/{} — link UP", rank, world);
+        crate::deprintln!("[tp] rank {}/{} — link UP", rank, world);
         Ok(TpContext { rank, world, link })
     }
 
@@ -729,7 +732,7 @@ impl TpContext {
             let peer = self.link.recv_host::<u8>(16)[0];
             let expect = 0xA0u8 + (1 - self.rank) as u8;
             if peer != expect { anyhow::bail!("tp sanity: peer stamp {peer:#x}, expected {expect:#x}"); }
-            eprintln!("[tp] rank {}/{} — data-plane all-reduce link SANE (peer stamp {peer:#x})", self.rank, self.world);
+            crate::deprintln!("[tp] rank {}/{} — data-plane all-reduce link SANE (peer stamp {peer:#x})", self.rank, self.world);
             return Ok(());
         }
         // world > 2: head-hub. Each rank stages its own stamp; the head fans out and checks every node,
@@ -750,7 +753,7 @@ impl TpContext {
             let expect = 0xA0u8;   // the head's rank stamp
             if peer != expect { anyhow::bail!("tp sanity: head stamp {peer:#x}, expected {expect:#x}"); }
         }
-        eprintln!("[tp] rank {}/{} — data-plane all-reduce link SANE", self.rank, self.world);
+        crate::deprintln!("[tp] rank {}/{} — data-plane all-reduce link SANE", self.rank, self.world);
         Ok(())
     }
 
@@ -774,7 +777,7 @@ impl TpContext {
                                the env differs between the boxes; set the knob on the head (it ships) \
                                or on both.");
             }
-            eprintln!("[tp] rank {}/{} — branch selector {s:#04x} AGREED with peer", self.rank, self.world);
+            crate::deprintln!("[tp] rank {}/{} — branch selector {s:#04x} AGREED with peer", self.rank, self.world);
             return Ok(());
         }
         // world > 2: head-hub. The head verifies every node's selector equals its own; each node checks
@@ -795,7 +798,7 @@ impl TpContext {
                 anyhow::bail!("TP BRANCH MISMATCH: head resolved selector {peer:#04x}, this rank {s:#04x}");
             }
         }
-        eprintln!("[tp] rank {}/{} — branch selector {s:#04x} AGREED", self.rank, self.world);
+        crate::deprintln!("[tp] rank {}/{} — branch selector {s:#04x} AGREED", self.rank, self.world);
         Ok(())
     }
 }

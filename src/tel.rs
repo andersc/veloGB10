@@ -63,11 +63,22 @@ static DF_ACCN: [AtomicU64; MAXK_BLOCK] = [const { AtomicU64::new(0) }; MAXK_BLO
 // Boot context + active mode
 static TP_WORLD: AtomicU64 = AtomicU64::new(0);
 static DF2_BLOCK: AtomicU64 = AtomicU64::new(0);
-// DFlash2 TREE window (the fork-then-chain lane's own counters; it has no drafts/emitted meters)
+// DFlash2 TREE window (the fork-then-chain lane's own counters). FIX1 #76 adds the engagement
+// side (drafts/accepted/emitted — the tree always had them, it just never published them).
 static DT_STEPS: AtomicU64 = AtomicU64::new(0);
 static DT_NODES: AtomicU64 = AtomicU64::new(0);
 static DT_RESCUES: AtomicU64 = AtomicU64::new(0);
-/// 0 = no speculation yet, 1 = mtp, 2 = dflash2, 3 = dflash2-tree, 4 = dflash (P14 v1 block lane)
+static DT_DRAFTS: AtomicU64 = AtomicU64::new(0);
+static DT_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static DT_EMITTED: AtomicU64 = AtomicU64::new(0);
+// FIX1 #76: the DSpark-draft lane window. The lane accumulated dspark_stat_* that fed only its
+// dump dirs — spec_totals (and therefore /metrics + /health) never saw a dspark round.
+static DS_STEPS: AtomicU64 = AtomicU64::new(0);
+static DS_DRAFTS: AtomicU64 = AtomicU64::new(0);
+static DS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static DS_EMITTED: AtomicU64 = AtomicU64::new(0);
+/// 0 = no speculation yet, 1 = mtp, 2 = dflash2, 3 = dflash2-tree, 4 = dflash (P14 v1 block lane),
+/// 5 = dspark (FIX1 #76)
 static MODE: AtomicU64 = AtomicU64::new(0);
 static UPDATED_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -139,10 +150,13 @@ pub fn publish_df2(steps: u64, drafts: u64, accepted: u64, emitted: u64) {
 /// The tree lane has no drafts/emitted meters of its own, and without this the status route
 /// reported `mode: mtp` for tree-served lanes (the MTP window's samples were the only ones on the
 /// ring) — assert on THIS mode, never on the MTP window.
-pub fn publish_df2_tree(steps: u64, nodes: u64, rescues: u64) {
+pub fn publish_df2_tree(steps: u64, drafts: u64, accepted: u64, emitted: u64, nodes: u64, rescues: u64) {
     DT_STEPS.store(steps, Relaxed);
     DT_NODES.store(nodes, Relaxed);
     DT_RESCUES.store(rescues, Relaxed);
+    DT_DRAFTS.store(drafts, Relaxed);
+    DT_ACCEPTED.store(accepted, Relaxed);
+    DT_EMITTED.store(emitted, Relaxed);
     MODE.store(3, Relaxed);
     UPDATED_MS.store(now_ms(), Relaxed);
 }
@@ -207,13 +221,28 @@ pub fn add_spec(rounds: u64, drafted: u64, accepted: u64) {
     X_ACCEPTED.fetch_add(accepted, Relaxed);
 }
 
-/// Cumulative speculation totals across every source (MTP, DFlash2, DFlash v1, EXL3 MTP):
-/// (rounds, drafted, accepted, emitted). Feeds `/metrics`.
+/// FIX1 #76: publish the DSpark-draft lane window. Same watermark contract as the DF2 chain —
+/// called every step from batch.rs; the 50-step log cadence lives there.
+pub fn publish_dspark(steps: u64, drafts: u64, accepted: u64, emitted: u64) {
+    DS_STEPS.store(steps, Relaxed);
+    DS_DRAFTS.store(drafts, Relaxed);
+    DS_ACCEPTED.store(accepted, Relaxed);
+    DS_EMITTED.store(emitted, Relaxed);
+    MODE.store(5, Relaxed);
+    UPDATED_MS.store(now_ms(), Relaxed);
+}
+
+/// Cumulative speculation totals across every source (MTP, DFlash2, DF2 tree, DSpark, DFlash v1,
+/// EXL3 MTP): (rounds, drafted, accepted, emitted). Feeds `/metrics`.
 pub fn spec_totals() -> (u64, u64, u64, u64) {
-    let rounds = M_VERIFY.load(Relaxed) + D_STEPS.load(Relaxed) + DF_STEPS.load(Relaxed) + X_ROUNDS.load(Relaxed);
-    let drafts = M_DRAFTS.load(Relaxed) + D_DRAFTS.load(Relaxed) + DF_DRAFTS.load(Relaxed) + X_DRAFTS.load(Relaxed);
-    let accepted = M_ACCEPTED.load(Relaxed) + D_ACCEPTED.load(Relaxed) + DF_ACCEPTED.load(Relaxed) + X_ACCEPTED.load(Relaxed);
-    let emitted = M_EMITTED.load(Relaxed) + D_EMITTED.load(Relaxed) + DF_EMITTED.load(Relaxed)
+    let rounds = M_VERIFY.load(Relaxed) + D_STEPS.load(Relaxed) + DT_STEPS.load(Relaxed)
+        + DS_STEPS.load(Relaxed) + DF_STEPS.load(Relaxed) + X_ROUNDS.load(Relaxed);
+    let drafts = M_DRAFTS.load(Relaxed) + D_DRAFTS.load(Relaxed) + DT_DRAFTS.load(Relaxed)
+        + DS_DRAFTS.load(Relaxed) + DF_DRAFTS.load(Relaxed) + X_DRAFTS.load(Relaxed);
+    let accepted = M_ACCEPTED.load(Relaxed) + D_ACCEPTED.load(Relaxed) + DT_ACCEPTED.load(Relaxed)
+        + DS_ACCEPTED.load(Relaxed) + DF_ACCEPTED.load(Relaxed) + X_ACCEPTED.load(Relaxed);
+    let emitted = M_EMITTED.load(Relaxed) + D_EMITTED.load(Relaxed) + DT_EMITTED.load(Relaxed)
+        + DS_EMITTED.load(Relaxed) + DF_EMITTED.load(Relaxed)
         + X_ACCEPTED.load(Relaxed) + X_ROUNDS.load(Relaxed);
     (rounds, drafts, accepted, emitted)
 }
@@ -232,6 +261,7 @@ pub fn snapshot_json() -> serde_json::Value {
         2 => "dflash2",
         3 => "dflash2-tree",
         4 => "dflash",
+        5 => "dspark",
         _ => "none",
     };
     let m_steps = M_STEPS.load(Relaxed);
@@ -329,4 +359,62 @@ pub fn snapshot_json() -> serde_json::Value {
             "yield_tok_per_step": yield_dflash,
         },
     })
+}
+
+#[cfg(test)]
+mod fix1_tests {
+    // FIX1 #76: an engagement counter must move the moment a round is served — not at the next
+    // 50-step log boundary, and not only on the paths that happened to carry a publish call.
+    // These construct the counter paths directly (store-window semantics, delta-asserted so the
+    // tests stay order-independent).
+    use super::*;
+
+    #[test]
+    fn df2_chain_publishes_immediately() {
+        let (r0, d0, a0, e0) = spec_totals();
+        publish_df2(32, 90, 71, 103); // ends at step 32: under the old %50-only publish this stayed 0
+        let (r1, d1, a1, e1) = spec_totals();
+        assert!(r1 >= r0 + 32 && d1 >= d0 + 90 && a1 >= a0 + 71 && e1 >= e0 + 103,
+                "df2 chain window must be live after a short request: ({r0},{d0},{a0},{e0}) -> ({r1},{d1},{a1},{e1})");
+    }
+
+    #[test]
+    fn dspark_publishes_immediately() {
+        let (r0, d0, a0, e0) = spec_totals();
+        publish_dspark(7, 48, 30, 37);
+        let (r1, d1, a1, e1) = spec_totals();
+        assert!(r1 >= r0 + 7 && d1 >= d0 + 48 && a1 >= a0 + 30 && e1 >= e0 + 37,
+                "dspark rounds were invisible to /metrics before FIX1 #76");
+    }
+
+    #[test]
+    fn df2_tree_counts_as_speculation() {
+        let (r0, d0, a0, e0) = spec_totals();
+        publish_df2_tree(12, 60, 44, 56, 130, 3);
+        let (r1, d1, a1, e1) = spec_totals();
+        assert!(r1 >= r0 + 12 && d1 >= d0 + 60 && a1 >= a0 + 44 && e1 >= e0 + 56,
+                "df2-tree rounds must add to velogb10_spec_*");
+    }
+
+    #[test]
+    fn exl3_add_spec_accumulates() {
+        let (r0, d0, a0, _) = spec_totals();
+        add_spec(40, 336, 136);
+        let (r1, d1, a1, _) = spec_totals();
+        assert!(r1 >= r0 + 40 && d1 >= d0 + 336 && a1 >= a0 + 136, "EXL3 per-request totals add");
+    }
+
+    /// Structural guard (the src/server.rs self-source-scan pattern): every speculative lane
+    /// step in batch.rs carries a watermark publish, so a future lane cannot reintroduce the
+    /// #76 class (stats accumulated, /metrics blind) by losing its tel:: call.
+    #[test]
+    fn every_spec_lane_step_publishes_its_window() {
+        let src = include_str!("batch.rs");
+        for marker in ["df2_stat_published", "dspark_stat_published", "df2_tree_stat_published"] {
+            assert!(src.contains(marker), "batch.rs lost the watermark publish field {marker}");
+        }
+        for call in ["tel::publish_df2(", "tel::publish_dspark(", "tel::publish_df2_tree("] {
+            assert!(src.contains(call), "batch.rs lost the {call} publish");
+        }
+    }
 }

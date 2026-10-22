@@ -454,7 +454,7 @@ impl Df2Round {
         let dev = CudaDevice::new(0).context("CudaDevice")?;
         let stream = fork_blocking_stream(&dev);
 
-        let bptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
+        let bptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         let mut bfnames = ["rmsnorm_b", "rmsnorm_perhead_b", "rope_b", "gather_rope_b",
             "write_kv_b", "add_residual_b", "silu_mul_b", "kernel_build_id",
             "gemm_mma_fp4_b", "gemm_mma_fp8_b", "embed_gather_fp4_tiled_b", "dequant_fp4_tiled_b",
@@ -469,7 +469,7 @@ impl Df2Round {
         // bf16tof32 lives in gpu_kernels.cu (next to the df2 kernels).
         dev.load_ptx(bptx, "gpu_batch", &bfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
-        let kptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_kernels.ptx")?);
+        let kptx = Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         // S5F adds gemm_tiled_b (the S3F large-M ctx GEMM) for the prompt-prime path
         // (prime_window runs fc + per-layer k/v at M = the whole prefill window).
         let kfnames = ["gemm_dsp_b_m8_r4", "gemm_tiled_b", "gqa_attn_band_b", "gqa_attn_band_ring_b",

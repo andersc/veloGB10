@@ -1640,7 +1640,7 @@ pub fn compile_response_format(rf: &serde_json::Value) -> Result<Option<SchemaMa
             let what = name.map(|n| format!("json_schema '{n}'")).unwrap_or_else(|| "json_schema".to_string());
             let mask = build_mask(sv, 1, "schema")?;
             // Loud success line: a wrong-but-accepted schema must be visible in the server log.
-            eprintln!("[json_schema] enforcing {what}: {}", mask.summary());
+            crate::deprintln!("[json_schema] enforcing {what}: {}", mask.summary());
             Ok(Some(mask))
         }
         other => Err(err_msg(format!(

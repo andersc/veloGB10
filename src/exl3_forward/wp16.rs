@@ -156,7 +156,9 @@ pub fn merge_grid_cap(from: usize, ends: Vec<usize>, tail: Option<usize>, c: usi
 }
 
 /// TP-4X1 ragged-tail folding: ALWAYS on since v0.7.1 (owner 2026-10-02, D-TP4-6; no off switch).
-/// `--prefill-absorb-tail` is still accepted so older command lines keep working.
+/// (CLIPRUNE1 2026-11-06: the `--prefill-absorb-tail` flag was REMOVED from the registry -
+/// it had been a deliberate no-op since v0.7.1. An old command line that still passes it gets
+/// ONE `[opts] unknown option --prefill-absorb-tail (ignored)` warning line and boots unchanged.)
 pub fn absorb_on() -> bool { true }
 
 /// The ragged-chunk threshold when absorb is on: chunks below `recon_min_rows()` (17) are the replicated
@@ -524,7 +526,7 @@ impl<B> CkptStore<B> {
             match alloc() {
                 Ok(b) => { self.n_alloc += 1; return Some(b); }
                 Err(e) => {
-                    crate::rprintln!("[exl3-serve] WP16: checkpoint allocation failed after {} buffer(s) ({e:#}) — \
+                    crate::drprintln!("[exl3-serve] WP16: checkpoint allocation failed after {} buffer(s) ({e:#}) — \
                               the cap is frozen there (LRU eviction from now on)", self.n_alloc);
                     self.alloc_failed = true;
                 }
@@ -647,7 +649,7 @@ fn probe_tail(a: &FwdArgs, c: usize, pa: &[u32], t0: usize) -> Result<()> {
     let mut sc = Scratch::new(&model.dev, &model.cfg, 2, model.cfg.rotary_dim, model.max_pos)?;
     let mut psc = model.prefill_scratch(2 * c - 1)?; // v2: merged chunks up to 2C - 1 rows
     let v = model.cfg.vocab_size;
-    println!("C1 TAIL probe: A {} tokens, tail t={t}, B {} tokens (LCP t), C {c}, continuation {cont}", pa.len(), pb.len());
+    crate::dprintln!("C1 TAIL probe: A {} tokens, tail t={t}, B {} tokens (LCP t), C {c}, continuation {cont}", pa.len(), pb.len());
     let run = |psc: &mut PrefillScratch, slot: usize, p: &[u32], from: usize, grid: &[usize]| -> Result<f64> {
         let t = std::time::Instant::now();
         let mut pos = from;
@@ -678,7 +680,7 @@ fn probe_tail(a: &FwdArgs, c: usize, pa: &[u32], t0: usize) -> Result<()> {
         let (at, af) = (am(lt), am(lf));
         let rank = lt.iter().filter(|&&x| f(x) > f(lt[af])).count() + 1;
         let fd = tt.iter().zip(tf).position(|(x, y)| x != y);
-        println!("C1 TAIL {tag}: state {} | S relL2 med {:.3e} max {:.3e} | conv relL2 {:.3e} | first-token logits differ \
+        crate::dprintln!("C1 TAIL {tag}: state {} | S relL2 med {:.3e} max {:.3e} | conv relL2 {:.3e} | first-token logits differ \
                   {nl}/{v} (max|d| {md:.4}), argmax tail {at} vs fresh {af} (fresh argmax rank {rank} in tail) | greedy \
                   continuation {}", d.line(), rel.0, rel.1, rel.2,
                  match fd { None => format!("IDENTICAL over {} tokens", tt.len()), Some(i) => format!("first differs at token {i} of {}", tt.len()) });
@@ -701,7 +703,7 @@ fn probe_tail(a: &FwdArgs, c: usize, pa: &[u32], t0: usize) -> Result<()> {
     let mut at = model.ckpt_alloc()?;
     model.ckpt_save(0, &psc, &mut at)?;
     let (lg_at, tk_at) = tail_of(&mut sc, 0, pa)?;
-    println!("C1 TAIL A: prefill fresh {ms_af:.1} ms ({} chunks) vs split {:.1} ms ({} chunks: grid {g:?})",
+    crate::dprintln!("C1 TAIL A: prefill fresh {ms_af:.1} ms ({} chunks) vs split {:.1} ms ({} chunks: grid {g:?})",
              run_grid(0, end_a, c, false, None).len(), ms_a1 + ms_a2, g.len());
     report("A (split at t vs fresh)", &model.ckpt_diff(&at, &af)?, model.ckpt_rel(&at, &af)?, &lg_at, &lg_af, &tk_at, &tk_af);
     // B resumed from the tail checkpoint (slot 0, realigned) vs fresh (slot 1)
@@ -717,10 +719,10 @@ fn probe_tail(a: &FwdArgs, c: usize, pa: &[u32], t0: usize) -> Result<()> {
     let mut bf = model.ckpt_alloc()?;
     model.ckpt_save(1, &psc, &mut bf)?;
     let (lg_bf, tk_bf) = tail_of(&mut sc, 1, &pb)?;
-    println!("C1 TAIL B: resumed at {t}: prefill {ms_br:.1} ms ({} tokens, grid {gb:?}) vs fresh {ms_bf:.1} ms ({} tokens)",
+    crate::dprintln!("C1 TAIL B: resumed at {t}: prefill {ms_br:.1} ms ({} tokens, grid {gb:?}) vs fresh {ms_bf:.1} ms ({} tokens)",
              end_b - t, end_b);
     report("B (tail resume vs fresh)", &model.ckpt_diff(&br, &bf)?, model.ckpt_rel(&br, &bf)?, &lg_br, &lg_bf, &tk_br, &tk_bf);
-    println!("C1 TAIL PROBE: DONE");
+    crate::dprintln!("C1 TAIL PROBE: DONE");
     Ok(())
 }
 
@@ -747,7 +749,7 @@ pub fn probe_wp16(p: &Wp16ProbeArgs) -> Result<()> {
     anyhow::ensure!(need <= a.max_pos, "prompts + continuation need {need} positions > --max-seq-len {}", a.max_pos);
     let model = FwdModel::load(&a.dir, 2, a.max_pos)?;
     let lay = model.ckpt_layout();
-    println!("WP16 probe: A {} tokens, B {} tokens, C {c}, continuation {cont}; {}", pa.len(), pb.len(), lay.describe());
+    crate::dprintln!("WP16 probe: A {} tokens, B {} tokens, C {c}, continuation {cont}; {}", pa.len(), pb.len(), lay.describe());
     let mut sc = Scratch::new(&model.dev, &model.cfg, 2, model.cfg.rotary_dim, model.max_pos)?;
     let mut psc = model.prefill_scratch(c)?;
     let v = model.cfg.vocab_size;
@@ -759,7 +761,7 @@ pub fn probe_wp16(p: &Wp16ProbeArgs) -> Result<()> {
     store.begin_aligned(0, 0, c);
     let t = std::time::Instant::now();
     let taken = probe_prefill(&model, &mut psc, 0, &pa, 0, end_a, c, Some(&mut store))?;
-    println!("WP16 probe: A prefilled on slot 0 in {:.1} ms; checkpoints at {taken:?}", t.elapsed().as_secs_f64() * 1e3);
+    crate::dprintln!("WP16 probe: A prefilled on slot 0 in {:.1} ms; checkpoints at {taken:?}", t.elapsed().as_secs_f64() * 1e3);
 
     // B resumed on slot 0
     let end_b = pb.len() - 1;
@@ -799,16 +801,16 @@ pub fn probe_wp16(p: &Wp16ProbeArgs) -> Result<()> {
     let (lg_f, tk_f) = run_tail(1)?;
     let nl = lg_r.iter().zip(&lg_f).filter(|(x, y)| x != y).count();
     let nt = tk_r.iter().zip(&tk_f).filter(|(x, y)| x != y).count();
-    println!("WP16 probe: B resumed at {q} (LCP {lcp}, plen {}; {dropped} checkpoint(s) above dropped): prefill {:.1} ms \
+    crate::dprintln!("WP16 probe: B resumed at {q} (LCP {lcp}, plen {}; {dropped} checkpoint(s) above dropped): prefill {:.1} ms \
               resumed vs {:.1} ms fresh", pb.len(), ms_res, ms_fresh);
-    println!("WP16 probe: state after prefill (resumed slot 0 vs fresh slot 1): {}", d.line());
-    println!("WP16 probe: first-token logits differ {nl}/{v} (argmax {} vs {}); greedy continuation differs at {nt}/{cont} tokens",
+    crate::dprintln!("WP16 probe: state after prefill (resumed slot 0 vs fresh slot 1): {}", d.line());
+    crate::dprintln!("WP16 probe: first-token logits differ {nl}/{v} (argmax {} vs {}); greedy continuation differs at {nt}/{cont} tokens",
              tk_r[0], tk_f[0]);
     if d.exact() && nl == 0 && nt == 0 {
-        println!("WP16 PROBE: EXACT");
+        crate::dprintln!("WP16 PROBE: EXACT");
         Ok(())
     } else {
-        println!("WP16 PROBE: MISMATCH");
+        crate::dprintln!("WP16 PROBE: MISMATCH");
         anyhow::bail!("WP16 resumed prefill is not bit-identical to the fresh prefill")
     }
 }
@@ -1105,7 +1107,7 @@ mod tests {
                 let ck: Vec<usize> = g.iter().copied().filter(|&e| wp16_due(e, n, c) || tail == Some(e)).collect();
                 let shown = if rows.len() > 10 { format!("{:?} .. {:?}", &rows[..3], &rows[rows.len() - 4..]) } else { format!("{rows:?}") };
                 let cks = if ck.len() > 6 { format!("{} (last {:?})", ck.len(), &ck[ck.len() - 4..]) } else { format!("{ck:?}") };
-                println!("TABLE n={n:>7} {name:<16} tail={tail:?} chunks={:>3} ragged={ragged} rows={shown} | ckpts {cks}", rows.len());
+                crate::dprintln!("TABLE n={n:>7} {name:<16} tail={tail:?} chunks={:>3} ragged={ragged} rows={shown} | ckpts {cks}", rows.len());
             }
         }
     }

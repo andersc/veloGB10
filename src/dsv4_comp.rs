@@ -139,7 +139,8 @@ impl CompKernels {
     pub fn load(dev: &Arc<CudaDevice>) -> Result<Self> {
         let comp = Dsv4Kernels::load_module(
             dev,
-            "src/ptx/gpu_dsv4_comp.ptx",
+            crate::ptx_embed::GPU_DSV4_COMP,
+            "gpu_dsv4_comp",
             &[
                 "dsv4_comp_state_init_b",
                 "dsv4_comp_gemm_tree_f32w_b",

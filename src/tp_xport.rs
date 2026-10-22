@@ -39,8 +39,7 @@ impl Kernels {
     /// Load (once per module name) the five doorbell kernels from src/ptx/gpu_batch.ptx.
     pub fn load(dev: &Arc<CudaDevice>, module: &str) -> Result<Self> {
         if dev.get_func(module, "tp_gate_copy_signal_mb").is_none() {
-            let ptx = cudarc::nvrtc::Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")
-                .context("src/ptx/gpu_batch.ptx missing — the doorbell kernels live there")?);
+            let ptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_BATCH);
             dev.load_ptx(ptx, module, &KERNEL_NAMES).context("load the TP doorbell kernels (gpu_batch.ptx)")?;
         }
         let f = |n: &str| dev.get_func(module, n).with_context(|| format!("doorbell kernel {n} missing"));

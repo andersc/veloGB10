@@ -296,7 +296,7 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
     }
     let hashed: u64 = todo.iter().map(|t| t.2).sum();
     if !todo.is_empty() {
-        eprintln!("[head] B32: hashing {} new shard file(s), {:.2} GB (first ship only; cached afterwards) ...",
+        crate::deprintln!("[head] B32: hashing {} new shard file(s), {:.2} GB (first ship only; cached afterwards) ...",
                   todo.len(), hashed as f64 / 1e9);
         let t0 = std::time::Instant::now();
         todo.sort_by(|a, b| b.2.cmp(&a.2));
@@ -318,7 +318,7 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
             cache.insert(todo[i].0.clone(), r?);
         }
         hash_cache_save(&cache);
-        eprintln!("[head] B32: hashed in {:.1} s", t0.elapsed().as_secs_f64());
+        crate::deprintln!("[head] B32: hashed in {:.1} s", t0.elapsed().as_secs_f64());
     }
     let mut ships = vec![RankShip { model_id: base.clone(), artifacts: Vec::new(), srcs: HashMap::new() }];
     for p in plans {
@@ -334,7 +334,7 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
             srcs.insert(f.logical, f.src);
         }
         let total: u64 = arts.iter().map(|a| a.size).sum();
-        eprintln!("[head] B32 plan rank {}/{} ({}, deal {}): {} files, {:.2} GiB",
+        crate::deprintln!("[head] B32 plan rank {}/{} ({}, deal {}): {} files, {:.2} GiB",
                   p.rank, world, fmt.name(), p.deal, arts.len(), total as f64 / (1u64 << 30) as f64);
         ships.push(RankShip { model_id: format!("{base}@{}-w{world}-r{}-{}", fmt.name(), p.rank, p.deal), artifacts: arts, srcs });
     }
@@ -635,7 +635,7 @@ pub(crate) fn accept_head(listener: &TcpListener, first_frame_wait: Duration) ->
                 s.set_read_timeout(None).ok();
                 return Ok((s, from));
             }
-            Err(why) => eprintln!("[node] connection from {from} dropped: {why} (not a head sync; still listening)"),
+            Err(why) => crate::deprintln!("[node] connection from {from} dropped: {why} (not a head sync; still listening)"),
         }
     }
 }
@@ -701,7 +701,7 @@ pub fn watch_nodes_during_bring_up(streams: &[TcpStream]) -> Result<NodeWatch> {
         let addr = c.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
         watched.push((i + 1, addr, c));
     }
-    eprintln!("[head] watching {} node control stream(s) through the RDMA bring-up + boot (a node failure is reported here, never hung on)",
+    crate::deprintln!("[head] watching {} node control stream(s) through the RDMA bring-up + boot (a node failure is reported here, never hung on)",
               watched.len());
     let stop2 = stop.clone();
     let handle = std::thread::Builder::new().name("tp-node-watch".into()).spawn(move || {
@@ -802,8 +802,8 @@ struct DiscoverProbe { magic: String, version: String }
 struct DiscoverReply { hostname: String, tcp_port: u16, version: String }
 
 /// Node side: answer discovery probes with our on-path IP + TCP port. Runs until the process exits.
-pub fn spawn_discovery_responder(tcp_port: u16) -> Result<()> {
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT))
+pub fn spawn_discovery_responder(tcp_port: u16, udp_port: u16) -> Result<()> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, udp_port))
         .context("bind UDP discovery port")?;
     let hostname = hostname();
     std::thread::spawn(move || {
@@ -832,7 +832,7 @@ pub fn discover_nodes(wait: Duration) -> Result<Vec<NodeInfo>> {
     // runtime (IPs are config, names/types are fixed) and broadcast there + a global catch-all.
     let ifaces = roce_interfaces();
     for f in &ifaces {
-        eprintln!("  [discover] RoCE rail {} {} ({}) ip {} bcast {}", f.rail, f.ib, f.netdev, f.ip, f.bcast);
+        crate::deprintln!("  [discover] RoCE rail {} {} ({}) ip {} bcast {}", f.rail, f.ib, f.netdev, f.ip, f.bcast);
     }
     if ifaces.is_empty() {
         eprintln!("  [discover] no RoCE interface resolved — broadcasting globally only");
@@ -1133,7 +1133,7 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
                 send_msg(&mut s, &Msg::Error { msg: why.clone() })?;
                 bail!("head/node {why}");
             }
-            eprintln!("  [node] head '{hostname}' connected (binary {version})");
+            crate::deprintln!("  [node] head '{hostname}' connected (binary {version})");
         }
         _ => bail!("expected Hello"),
     }
@@ -1146,7 +1146,7 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
     let missing: Vec<String> = artifacts.iter().map(|a| a.hash.clone())
         .filter(|h| !have_blob(h)).collect();
     let have = artifacts.len() - missing.len();
-    eprintln!("  [node] manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
+    crate::deprintln!("  [node] manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
               artifacts.len(), missing.len());
     let fetch_bytes: u64 = artifacts.iter().filter(|a| missing.contains(&a.hash)).map(|a| a.size).sum();
     let t_fetch = std::time::Instant::now();
@@ -1157,7 +1157,7 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
             Msg::BlobHeader { hash, size } => {
                 let tmp = recv_blob(&mut s, &hash, size)?;
                 publish_blob(&hash, &tmp)?;
-                eprintln!("  [node] cached {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
+                crate::deprintln!("  [node] cached {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
             }
             _ => bail!("expected BlobHeader"),
         }
@@ -1168,7 +1168,7 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
         Msg::Config(c) => c,
         _ => bail!("expected Config"),
     };
-    eprintln!("  [node] config from head: shard_mixers={} graph={} fp32_partials={} mtp={} depth={:?} mode_serve={}",
+    crate::deprintln!("  [node] config from head: shard_mixers={} graph={} fp32_partials={} mtp={} depth={:?} mode_serve={}",
               cfg.shard_mixers, cfg.graph, cfg.fp32_partials, cfg.mtp, cfg.mtp_depth, cfg.mode_serve);
 
 
@@ -1179,14 +1179,14 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
     let draft_dir: Option<PathBuf> = match recv_msg(&mut s)? {
         Msg::DraftManifest { model_id, artifacts } if artifacts.is_empty() => {
             send_msg(&mut s, &Msg::DraftReady { model_dir: String::new() })?;
-            eprintln!("  [node] no draft artifact this session (head sent an empty manifest)");
+            crate::deprintln!("  [node] no draft artifact this session (head sent an empty manifest)");
             None
         }
         Msg::DraftManifest { model_id, artifacts } => {
             let missing: Vec<String> = artifacts.iter().map(|a| a.hash.clone())
                 .filter(|h| !have_blob(h)).collect();
             let have = artifacts.len() - missing.len();
-            eprintln!("  [node] draft manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
+            crate::deprintln!("  [node] draft manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
                       artifacts.len(), missing.len());
             send_msg(&mut s, &Msg::Missing { hashes: missing.clone() })?;
             for _ in 0..missing.len() {
@@ -1194,14 +1194,14 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
                     Msg::BlobHeader { hash, size } => {
                         let tmp = recv_blob(&mut s, &hash, size)?;
                         publish_blob(&hash, &tmp)?;
-                        eprintln!("  [node] cached draft blob {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
+                        crate::deprintln!("  [node] cached draft blob {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
                     }
                     _ => bail!("expected draft BlobHeader"),
                 }
             }
             let ddir = assemble_model_dir(&model_id, &artifacts)?;
             send_msg(&mut s, &Msg::DraftReady { model_dir: ddir.to_string_lossy().to_string() })?;
-            eprintln!("  [node] DRAFT READY — drafter assembled at {} (loads from the cache, no local copy)",
+            crate::deprintln!("  [node] DRAFT READY — drafter assembled at {} (loads from the cache, no local copy)",
                       ddir.display());
             Some(ddir)
         }
@@ -1224,16 +1224,16 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp:
 /// Run as a node: answer discovery, accept ONE head sync, return the assembled model dir + the head's
 /// IP (its RoCE address, used to bring up the RDMA data-plane link back to it) + the head's TP config
 /// + the retained control stream (dropped by bench sessions, kept by serving ones).
-pub fn run_node(tcp_port: u16)
+pub fn run_node(tcp_port: u16, udp_port: u16)
     -> Result<(PathBuf, Option<PathBuf>, IpAddr, crate::tp::TpConfig, TcpStream)> {
-    spawn_discovery_responder(tcp_port)?;
+    spawn_discovery_responder(tcp_port, udp_port)?;
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, tcp_port))
         .with_context(|| format!("bind TCP {tcp_port}"))?;
-    eprintln!("[node] {} ready: discovery on UDP {DISCOVERY_PORT}, control on TCP {tcp_port}, cache {}",
+    eprintln!("[node] {} ready: discovery on UDP {udp_port}, control on TCP {tcp_port}, cache {}",
               hostname(), cache_root().display());
     // TP-4D (C4/C9): hardened stream + stray connections dropped (see `accept_head`)
     let (s, from) = accept_head(&listener, NODE_FIRST_FRAME_WAIT)?;
-    eprintln!("[node] head connected from {from}");
+    crate::deprintln!("[node] head connected from {from}");
     let (dir, draft_dir, cfg, s) = node_handle(s)?;
     eprintln!("[node] SYNCED — model ready at {}{}",
               dir.display(),
@@ -1294,7 +1294,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
     };
     let by_hash: HashMap<&str, &Artifact> = artifacts.iter().map(|a| (a.hash.as_str(), a)).collect();
     let total: u64 = missing.iter().filter_map(|h| by_hash.get(h.as_str())).map(|a| a.size).sum();
-    eprintln!("[head] {} (rank {node_rank}) needs {} / {} artifacts ({:.2} GB)", node.hostname,
+    crate::deprintln!("[head] {} (rank {node_rank}) needs {} / {} artifacts ({:.2} GB)", node.hostname,
               missing.len(), artifacts.len(), total as f64 / 1e9);
     let t0 = std::time::Instant::now();
     for h in &missing {
@@ -1305,7 +1305,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
     match recv_msg(&mut s)? {
         Msg::Ready { model_dir } => {
             let secs = t0.elapsed().as_secs_f64();
-            eprintln!("[head] {} (rank {node_rank}) READY — model at {} ({:.2} GB in {:.1}s = {:.2} GB/s)",
+            crate::deprintln!("[head] {} (rank {node_rank}) READY — model at {} ({:.2} GB in {:.1}s = {:.2} GB/s)",
                       node.hostname, model_dir, total as f64/1e9, secs,
                       if secs > 0.0 { total as f64/1e9/secs } else { 0.0 });
             let mut node_cfg = cfg.clone();
@@ -1316,7 +1316,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
             // so every option the head resolved before its sync reaches the node.
             node_cfg.opts = crate::opts::snapshot();
             send_msg(&mut s, &Msg::Config(node_cfg.clone()))?;
-            eprintln!("[head] shipped config to {} (rank {node_rank}/{})", node.hostname, node_cfg.world);
+            crate::deprintln!("[head] shipped config to {} (rank {node_rank}/{})", node.hostname, node_cfg.world);
 
             // v5 — the DFlash2 draft round: ALWAYS exactly one DraftManifest after Config (empty
             // artifacts = none), so the node's receive state machine is unconditional and can
@@ -1333,7 +1333,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
                     let dby_hash: HashMap<&str, &Artifact> =
                         draft_arts.iter().map(|a| (a.hash.as_str(), a)).collect();
                     let dtotal: u64 = dmissing.iter().filter_map(|h| dby_hash.get(h.as_str())).map(|a| a.size).sum();
-                    eprintln!("[head] {} drafter: {} / {} artifacts ({:.2} GB)",
+                    crate::deprintln!("[head] {} drafter: {} / {} artifacts ({:.2} GB)",
                               node.hostname, dmissing.len(), draft_arts.len(), dtotal as f64 / 1e9);
                     let dt0 = std::time::Instant::now();
                     for h in &dmissing {
@@ -1344,7 +1344,7 @@ fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &s
                     match recv_msg(&mut s)? {
                         Msg::DraftReady { model_dir } => {
                             let secs = dt0.elapsed().as_secs_f64();
-                            eprintln!("[head] {} drafter READY at {} ({:.2} GB in {:.1}s)",
+                            crate::deprintln!("[head] {} drafter READY at {} ({:.2} GB in {:.1}s)",
                                       node.hostname, model_dir, dtotal as f64/1e9, secs);
                         }
                         Msg::Error { msg } => bail!("node draft error: {msg}"),
@@ -1385,7 +1385,7 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
     -> Result<(Vec<NodeInfo>, Vec<TcpStream>)>
 {
     let world = cfg.world.max(1);
-    eprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
+    crate::deprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
     // TP-A (EXL3, D-T0-6) legacy path: nothing ships — every node loads its OWN local pack copy at the
     // head's path (`TpConfig.exl3_pack_dir`). Nothing checks that copy against the head's: the manifest
     // check was removed (owner, 074c669, 2026-09-30). The node still runs the unchanged
@@ -1402,7 +1402,7 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
         build_manifest(model_dir, world)?
     };
     let total: u64 = per_rank.iter().flatten().map(|a| a.size).sum();
-    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB{}", total_artifacts(&per_rank), total as f64/1e9,
+    crate::deprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB{}", total_artifacts(&per_rank), total as f64/1e9,
               if ships.is_some() { " (B32: per-rank shards through the blob cache)" }
               else if cfg.exl3 { " (EXL3 legacy: nodes load their local pack at the head's path, unchecked)" } else { "" });
 
@@ -1411,10 +1411,10 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
         Some(addrs) => addrs.into_iter()
             .map(|a| NodeInfo { hostname: a.ip().to_string(), addr: a }).collect(),
         None => {
-            eprintln!("[head] discovering nodes (UDP broadcast, {}s) ...", discover_wait.as_secs());
+            crate::deprintln!("[head] discovering nodes (UDP broadcast, {}s) ...", discover_wait.as_secs());
             let n = discover_nodes(discover_wait)?;
             if n.is_empty() { bail!("no nodes discovered — is a --node running? (or pass --nodes <ip:port>)"); }
-            for x in &n { eprintln!("  [head] found node '{}' at {}", x.hostname, x.addr); }
+            for x in &n { crate::deprintln!("  [head] found node '{}' at {}", x.hostname, x.addr); }
             n
         }
     };
@@ -1437,7 +1437,7 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
         };
         streams.push(head_sync_one(node, rank, model_dir, mid, &per_rank[rank as usize], &topology, cfg, None, srcs)?);
     }
-    eprintln!("[head] all {} node(s) synced.", nodes.len());
+    crate::deprintln!("[head] all {} node(s) synced.", nodes.len());
     sync_only_exit(cfg, nodes.len());
     Ok((nodes, streams))
 }
@@ -1466,7 +1466,7 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
     -> Result<(Vec<NodeInfo>, Vec<TcpStream>)>
 {
     let world = cfg.world.max(1);
-    eprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
+    crate::deprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
     // B32: per-rank shard dirs instead of the whole-model replica — always, when the shard plan covers the model
     let ships = if crate::shard_plan::applies(model_dir, world as usize).is_some() { Some(ship_plans(model_dir, world)?) } else { None };
     let (model_id, per_rank) = match &ships {
@@ -1474,7 +1474,7 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
         None => build_manifest(model_dir, world)?,
     };
     let total: u64 = per_rank.iter().flatten().map(|a| a.size).sum();
-    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB{}", total_artifacts(&per_rank), total as f64/1e9,
+    crate::deprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB{}", total_artifacts(&per_rank), total as f64/1e9,
               if ships.is_some() { " (B32: per-rank shards through the blob cache)" } else { "" });
 
     let ifaces = roce_interfaces();
@@ -1482,10 +1482,10 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
         Some(addrs) => addrs.into_iter()
             .map(|a| NodeInfo { hostname: a.ip().to_string(), addr: a }).collect(),
         None => {
-            eprintln!("[head] discovering nodes (UDP broadcast, {}s) ...", discover_wait.as_secs());
+            crate::deprintln!("[head] discovering nodes (UDP broadcast, {}s) ...", discover_wait.as_secs());
             let n = discover_nodes(discover_wait)?;
             if n.is_empty() { bail!("no nodes discovered — is a --node running? (or pass --nodes <ip:port>)"); }
-            for x in &n { eprintln!("  [head] found node '{}' at {}", x.hostname, x.addr); }
+            for x in &n { crate::deprintln!("  [head] found node '{}' at {}", x.hostname, x.addr); }
             n
         }
     };
@@ -1517,7 +1517,7 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
         match draft_manifest(Path::new(&cfg.df2_draft_dir)) {
             Ok((id, arts)) => {
                 let dtotal: u64 = arts.iter().map(|a| a.size).sum();
-                eprintln!("[head] draft manifest '{id}': {} artifacts, {:.2} GB — ships to every node",
+                crate::deprintln!("[head] draft manifest '{id}': {} artifacts, {:.2} GB — ships to every node",
                           arts.len(), dtotal as f64 / 1e9);
                 Some((id, arts))
             }
@@ -1546,7 +1546,7 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
     }
     anyhow::ensure!(streams.len() == need,
         "expected {need} retained serving control stream(s), got {}", streams.len());
-    eprintln!("[head] {} node(s) synced; all control streams RETAINED for the serving session", streams.len());
+    crate::deprintln!("[head] {} node(s) synced; all control streams RETAINED for the serving session", streams.len());
     sync_only_exit(cfg, streams.len());
     Ok((nodes, streams))
 }
@@ -2219,6 +2219,20 @@ mod build_id_tests {
                     // only an include that sits after a `#[cfg(test)]` line of that file.
                     if CFG_TEST_ONLY_INCLUDES.contains(&(src.as_str(), target.as_str()))
                         && text[..at].contains("#[cfg(test)]") {
+                        continue;
+                    }
+                    // EMB1: build.rs-EMITTED PTX embeds are derived artifacts. Their bytes are a
+                    // pure function of inputs that ARE stamped: the paired kernels/*.cu in the
+                    // kernel stamp, and build.rs (owner of the nvcc flags and of this manifest)
+                    // in the source stamp. cargo dep-info pins the crate rebuild on the emitted
+                    // bytes; the boot-time KERNEL_BUILD_ID assert pins module-binary pairing.
+                    // The manifest comes from build.rs itself: the exemption cannot grow.
+                    if let Some((cu, _)) = env!("EMBEDDED_PTX_MANIFEST")
+                        .split(';').filter_map(|p| p.split_once(':'))
+                        .find(|&(_, ptx)| format!("src/ptx/{ptx}") == target)
+                    {
+                        assert!(kernel.contains(format!("kernels/{cu}").as_str()),
+                                "{target} is emitted from kernels/{cu}, not in the kernel stamp");
                         continue;
                     }
                     if !hashed.contains(target.as_str()) && !kernel.contains(target.as_str()) {

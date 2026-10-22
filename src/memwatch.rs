@@ -42,8 +42,10 @@ pub fn phase(tag: &str) {
             .and_then(|v| v.parse::<u64>().ok()))
         .map(|kb| kb as f64 / 1e6)
         .unwrap_or(f64::NAN);
-    eprintln!("[memwatch] phase {tag} @{:.1}s: avail {avail:.1} GB | rss {rss:.1} GB | min-so-far {:.1} GB",
+    if crate::boot_report::debug() {
+        eprintln!("[memwatch] phase {tag} @{:.1}s: avail {avail:.1} GB | rss {rss:.1} GB | min-so-far {:.1} GB",
               t0(), min_available_gb());
+    }
 }
 
 /// Env-gated 1 Hz sampler (`--mem-trace=1`): the timeline BETWEEN phases. An oscillating

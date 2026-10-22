@@ -26,7 +26,8 @@ fn print_help() {
     println!("  --cached-models-remove <ID>  Remove ONE cached model (name/unique prefix)");
     println!("  --cached-models-remove-all  Clear the whole TP model cache");
     println!("  (default)           Interactive CLI: load model, generate from a prompt");
-    println!("  --help, -h          Show this help");
+    println!("  --help, -h          Show this help (day-to-day options only)");
+    println!("  --help-advanced     Every option incl. diagnostics, drills and probes");
     println!();
     println!("═══════════════════════════════════════════════════════════════════════════");
     println!("  SERVER MODE (--server) — OpenAI-compatible, continuous batching");
@@ -45,6 +46,10 @@ fn print_help() {
     println!("  SERVING");
     println!("    --port <N>                 Listen port                                          [8000]");
     println!("    --max-batch <N>            Max concurrent sequences (lanes)                        [8]");
+    println!("                              EXL3 server: at most 16 lanes serve at once; a larger N boots");
+    println!("                              with 16 (or fewer if memory at the asked --max-seq-len holds");
+    println!("                              fewer — the boot line and /metrics velogb10_max_batch say how");
+    println!("                              many) and further requests wait in the queue");
     println!("    --max-tokens <N>           Output length for a CHAT request that omits max_tokens. A default,\n\
 \x20                              not a cap: a request may ask for more, up to the room left in\n\
 \x20                              the context. Unset: EXL3 server = no limit (a stop token or the\n\
@@ -188,7 +193,7 @@ fn print_help() {
     println!("  sides LOUDLY on any divergence.");
     println!();
     println!("  Node (on the peer, resident — re-arms itself between head sessions):");
-    println!("    gb10_inference --node [--port 29500] [--rdma-dev <ib0[,ib1]>] [--once]");
+    println!("    gb10_inference --node [--port 29500] [--discovery-port 29499] [--rdma-dev <ib0[,ib1]>] [--once]");
     println!();
     println!("  Head (this box):");
     println!("    gb10_inference --server --model-dir <DIR> --tp --nodes <ip>[:port] \\");
@@ -600,6 +605,9 @@ fn main() {
         eprintln!("FATAL: {e}");
         std::process::exit(2);
     }
+    // OUT1: the boot report starts here — every family's boot prints through it from the first
+    // line on (the level comes from the store; a TP node refreshes it after install_head).
+    gb10_inference::boot_report::init_from_args(&args);
     // F9 (owner decision A, 2026-10-11): the hand-read value flags refuse the same swallow the
     // registry refuses (F7) - one pass over argv before any warning, --help, --print-config,
     // mode dispatch, model load or TP shipping; nodes included (their own --node/--port line).
@@ -675,7 +683,13 @@ fn main() {
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
-        print!("{}", gb10_inference::opts::help_text(false));
+        print!("{}", gb10_inference::opts::help_day());
+        return;
+    }
+    // CLIPRUNE1: everything the binary accepts (diagnostics/drills/hand-read flags included).
+    if args.iter().any(|a| a == "--help-advanced") {
+        print_help();
+        print!("{}", gb10_inference::opts::help_advanced());
         return;
     }
     // CLI-1: the diagnostics / test-drill options (kept out of --help so it stays readable).
@@ -897,8 +911,8 @@ fn main() {
     if args.iter().any(|a| a == "--probe-dspark-round" || a.starts_with("--probe-dspark-round=")) {
         // value on the flag itself, else --draft-dir (the same convention as --probe-df2-round)
         let dir = parse_arg(&args, "--probe-dspark-round").filter(|v| !v.starts_with("--"))
-            .or_else(|| parse_arg(&args, "--draft-dir"))
             .map(str::to_string)
+            .or_else(|| gb10_inference::opt_or_arg(&args, "--draft-dir"))
             .unwrap_or_else(|| panic!("--probe-dspark-round needs <draft-dir> (on the flag or --draft-dir)"));
         run_probe_dspark_round(&args, &dir);
         return;
@@ -1230,7 +1244,7 @@ fn main() {
     //   (TP=2: the same flags with --head --tp 2 --nodes ip:port; the node runs it from TpConfig)
     if args.iter().any(|a| a == "--probe-exl3-tpspec") && !args.iter().any(|a| a == "--head") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-tpspec requires --model-dir <DIR>");
-        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+        let max_pos: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
         let opts = exl3_spec_opts(&args);
         let prompts = exl3_spec_prompts(&args);
         gb10_inference::exl3_serve::run_spec(dir, None, Some(prompts), max_pos, &opts).unwrap_or_else(|e| {
@@ -1243,7 +1257,7 @@ fn main() {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-xtp requires --model-dir <DIR>");
         let out = parse_arg(&args, "--xtp-out").expect("--probe-exl3-xtp (TP=1 reference) requires --xtp-out <DIR>");
         let gen: usize = parse_arg(&args, "--xtp-gen").and_then(|s| s.parse().ok()).unwrap_or(64);
-        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+        let max_pos: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
         let ids = exl3_xtp_prompt_ids(&args, dir);
         let opts = exl3_xtp_opts(&args);
         gb10_inference::exl3_forward::xtp::probe_xtp_ref(dir, &ids, gen, max_pos, out, &opts).unwrap_or_else(|e| {
@@ -1312,7 +1326,7 @@ fn main() {
     //     [--kvnll-label name] [--prefill-chunk 2048] [--max-seq-len 262144]
     if args.iter().any(|a| a == "--probe-exl3-kvnll") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-kvnll requires --model-dir <DIR>");
-        let num = |k: &str, d: usize| parse_arg(&args, k).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+        let num = |k: &str, d: usize| gb10_inference::opt_or_arg(&args, k).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
         let a = gb10_inference::exl3_forward::KvNllArgs {
             dir: dir.to_string(),
             max_pos: num("--max-seq-len", 262144),
@@ -1343,16 +1357,16 @@ fn main() {
     //     [--prefill-chunk 2048] [--max-seq-len 32768]
     if args.iter().any(|a| a == "--probe-exl3-regime") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-regime requires --model-dir <DIR>");
-        let num = |k: &str, d: usize| parse_arg(&args, k).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+        let num = |k: &str, d: usize| gb10_inference::opt_or_arg(&args, k).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
         let a = gb10_inference::exl3_forward::RegimeArgs {
             dir: dir.to_string(),
             max_pos: num("--max-seq-len", 32768),
             chunk: num("--prefill-chunk", 2048),
-            runner: parse_arg(&args, "--regime-runner").expect("--probe-exl3-regime requires --regime-runner <file>").to_string(),
-            joiner: parse_arg(&args, "--regime-joiner").expect("--probe-exl3-regime requires --regime-joiner <file>").to_string(),
+            runner: gb10_inference::opt_or_arg(&args, "--regime-runner").expect("--probe-exl3-regime requires --regime-runner <file>").to_string(),
+            joiner: gb10_inference::opt_or_arg(&args, "--regime-joiner").expect("--probe-exl3-regime requires --regime-joiner <file>").to_string(),
             steps: num("--regime-steps", 1600),
-            out_csv: parse_arg(&args, "--regime-csv").map(|s| s.to_string()),
-            long_first: parse_arg(&args, "--regime-order") == Some("long-first"),
+            out_csv: gb10_inference::opt_or_arg(&args, "--regime-csv").map(|s| s.to_string()),
+            long_first: gb10_inference::opt_or_arg(&args, "--regime-order").as_deref() == Some("long-first"),
             time_steps: num("--regime-time", 0),
         };
         gb10_inference::exl3_forward::probe_regime(&a).unwrap_or_else(|e| {
@@ -1380,7 +1394,7 @@ fn main() {
     //   requested check passed. Diagnostics: --prefillx-rel=1|2, --prefillx-ulp=none,0,13,
     //   --prefillx-widths=2048,256 (served widths), --prefillx-qsa-keys=1.
     //   TP-4X1: a width entry g<C> / g<C>a (e.g. g2048,g4095a) runs this prompt's SERVED chunk grid
-    //   (plan_grid, tail checkpoint at n-14; trailing 'a' = --prefill-absorb-tail) and prints its rows.
+    //   (plan_grid, tail checkpoint at n-14; trailing 'a' = the removed --prefill-absorb-tail) and prints its rows.
     if args.iter().any(|a| a == "--probe-exl3-prefillx") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-prefillx requires --model-dir <DIR>");
         let a = gb10_inference::exl3_forward::FwdArgs {
@@ -1392,7 +1406,7 @@ fn main() {
             ladder_dir: None,
             ladder_layers: Vec::new(),
             ladder_step: None,
-            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            max_pos: gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
             bench_steps: 0,
             widths: Vec::new(),
             prefill_chunk: None,
@@ -1417,7 +1431,7 @@ fn main() {
                 ladder_dir: None,
                 ladder_layers: Vec::new(),
                 ladder_step: None,
-                max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(40960),
+                max_pos: gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(40960),
                 bench_steps: 0,
                 widths: Vec::new(),
                 prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
@@ -1446,7 +1460,7 @@ fn main() {
             ladder_dir: None,
             ladder_layers: Vec::new(),
             ladder_step: None,
-            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            max_pos: gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
             bench_steps: 0,
             widths: Vec::new(),
             prefill_chunk: None,
@@ -1480,7 +1494,7 @@ fn main() {
     // PACK1 LEG 1 (S-B9-CF-PACK1): the eager 2-request packed-verify probe.
     if args.iter().any(|a| a == "--probe-exl3-pack2") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-pack2 requires --model-dir <DIR>");
-        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        let max_pos: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
         gb10_inference::exl3_forward::pack2_probe_exl3(&dir, max_pos).unwrap_or_else(|e| {
             eprintln!("EXL3_PACK2_FAIL: {e:#}");
             std::process::exit(1);
@@ -1491,7 +1505,7 @@ fn main() {
     // PACK2 LEG 2 (S-B9-CF-PACK2): the packed-ROUND correctness probe.
     if args.iter().any(|a| a == "--probe-exl3-packstate") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-packstate requires --model-dir <DIR>");
-        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        let max_pos: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
         gb10_inference::exl3_forward::packstate_probe_exl3(&dir, max_pos).unwrap_or_else(|e| {
             eprintln!("EXL3_PACKSTATE_FAIL: {e:#}");
             std::process::exit(1);
@@ -1500,7 +1514,7 @@ fn main() {
     }
     if args.iter().any(|a| a == "--probe-exl3-pack3") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-pack3 requires --model-dir <DIR>");
-        let max_pos: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        let max_pos: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
         gb10_inference::exl3_forward::pack3_probe_exl3(&dir, max_pos).unwrap_or_else(|e| {
             eprintln!("EXL3_PACK3_FAIL: {e:#}");
             std::process::exit(1);
@@ -1608,7 +1622,7 @@ fn main() {
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
             .collect();
-        let mt: usize = parse_arg(&args, "--exl3-wide-mt")
+        let mt: usize = gb10_inference::opt_or_arg(&args, "--exl3-wide-mt")
             .and_then(|s| s.parse().ok())
             .unwrap_or(4);
         let iters: usize = parse_arg(&args, "--exl3-iters")
@@ -1637,6 +1651,25 @@ fn main() {
     // S-A3-c: standalone weight-path GEMM bench — per-class GB/s at verify widths,
     // vs the 238 GB/s roofline and the 79-83 GB/s naive decode floor (spec §10.4).
     //   ./gb10_inference --bench-exl3-gemm --model-dir <EXL3-pack> [--exl3-widths 1,2,4,8] [--exl3-iters 20]
+    if args.iter().any(|a| a == "--bench-exl3-ladder") {
+        let dir = parse_arg(&args, "--model-dir").expect("--bench-exl3-ladder requires --model-dir <DIR>");
+        let ms: Vec<usize> = parse_arg(&args, "--exl3-widths")
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 4, 8]);
+        let kss: Vec<usize> = parse_arg(&args, "--exl3-ks")
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![4, 5, 8]);
+        let iters: usize = parse_arg(&args, "--exl3-iters").and_then(|s| s.parse().ok()).unwrap_or(50);
+        let win: usize = parse_arg(&args, "--exl3-ladder-window").and_then(|s| s.parse().ok()).unwrap_or(16);
+        let skip_n: usize = parse_arg(&args, "--exl3-ladder-skip-n").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let out = parse_arg(&args, "--exl3-ladder-out");
+        gb10_inference::exl3_bench::bench_ladder(&dir, &ms, &kss, iters, win, skip_n, out.as_deref())
+            .unwrap_or_else(|e| {
+                eprintln!("EXL3_LADDER_FAIL: {e:#}");
+                std::process::exit(1);
+            });
+        return;
+    }
     if args.iter().any(|a| a == "--bench-exl3-gemm") {
         let dir = parse_arg(&args, "--model-dir").expect("--bench-exl3-gemm requires --model-dir <DIR>");
         let widths: Vec<usize> = parse_arg(&args, "--exl3-widths")
@@ -1696,7 +1729,7 @@ fn main() {
             ladder_dir: parse_arg(&args, "--ladder-dir").map(|s| s.to_string()),
             ladder_layers,
             ladder_step: parse_arg(&args, "--ladder-step").and_then(|s| s.parse().ok()),
-            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            max_pos: gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
             bench_steps: parse_arg(&args, "--exl3-bench-steps").and_then(|s| s.parse().ok()).unwrap_or(0),
             widths,
             prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
@@ -1723,7 +1756,7 @@ fn main() {
             ladder_dir: None,
             ladder_layers: Vec::new(),
             ladder_step: None,
-            max_pos: parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            max_pos: gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
             bench_steps: 0,
             widths: Vec::new(),
             prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
@@ -1755,7 +1788,7 @@ fn main() {
         let prompt_text = parse_arg(&args, "--prompt").unwrap_or(
             "The invention of the printing press in the fifteenth century changed Europe forever.");
         let max_new: usize = parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32);
-        let max_seq_len: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let max_seq_len: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
         let prompt = tokenizer.encode(prompt_text, true).expect("encode");
         println!("probe-dflash-local: prompt {} tokens, max_new={max_new}, max_seq_len={max_seq_len}, drafter {ddir}",
                  prompt.len());
@@ -1787,7 +1820,7 @@ fn main() {
              information what the printing press did for ink. But there is an important \
              difference, which historians of technology are still arguing about.");
         let max_new: usize = parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(16);
-        let max_seq_len: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+        let max_seq_len: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
         let prompt = tokenizer.encode(prompt_text, true).expect("encode");
         println!("probe-mxfp4-xchain: prompt '{}…' ({} tokens), max_new={}", &prompt_text[..prompt_text.len().min(60)], prompt.len(), max_new);
         let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
@@ -1821,7 +1854,7 @@ fn main() {
              information what the printing press did for ink. But there is an important \
              difference, which historians of technology are still arguing about.");
         let max_new: usize = parse_arg(&args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(16);
-        let max_seq_len: usize = parse_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+        let max_seq_len: usize = gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
         let chain = if args.iter().any(|a| a == "--mxfp4=on") { "native" } else { "ref" };
         let prompt = tokenizer.encode(prompt_text, true).expect("encode");
         println!("probe-mxfp4-xchain2: chain '{chain}', prompt '{}…' ({} tokens), max_new={} -> {}",
@@ -2213,8 +2246,23 @@ fn main() {
 /// node never parses these flags itself.
 fn cli_opts_bridge(args: &[String]) {
     use gb10_inference::{opt, opts};
+    // EXL27 (§1b-bis 8, owner scope add 2026-10-16): single-file EXL3 packs are served, not refused.
+    // Synthesize the one-shard index BEFORE any is_exl3_pack dispatch (server / probes / TP) so
+    // every later check sees the standard indexed layout. The pack dir gains exactly one metadata
+    // file, atomically (tmp + rename); weight files are untouched.
+    if let Some(mp) = parse_arg(args, "--model-dir") {
+        if let Ok(qc) = std::fs::read_to_string(format!("{}/quantization_config.json", mp.trim_end_matches('/'))) {
+            if qc.contains("exl3") && !gb10_inference::exl3_serve::is_exl3_pack(&mp) {
+                match gb10_inference::exl3_serve::ensure_singlefile_index(&mp) {
+                    Ok(true) => gb10_inference::rprintln!("[boot] single-file EXL3 pack: synthesized model.safetensors.index.json (1 shard) — serving via the standard indexed path"),
+                    Ok(false) => {}
+                    Err(e) => gb10_inference::reprintln!("[boot] single-file EXL3 index synthesis failed: {e}"),
+                }
+            }
+        }
+    }
     // KV cache format (NVFP4 formats write the kv-* internals; EXL3 formats write kv-cache).
-    if let Some(v) = parse_arg(args, "--kv-cache") {
+    if let Some(v) = gb10_inference::opt_or_arg(args, "--kv-cache").as_deref() {
         let (q4, tq, k8v4, k8v8) = (opt!("kv-quant"), opt!("kv-tq"), opt!("kv-k8v4"), opt!("kv-k8v8"));
         match v {
             "q4" => { opts::set(q4, "1"); opts::unset(tq); opts::unset(k8v4); }
@@ -2240,7 +2288,7 @@ fn cli_opts_bridge(args: &[String]) {
         }
     }
     // MTP: the bench-path [tp-mtp] / [tp-mtp-depth] internals from the server CLI (`--mtp=on|off`, `--mtp-depth`).
-    if let Some(v) = parse_arg(args, "--mtp") {
+    if let Some(v) = gb10_inference::opt_or_arg(args, "--mtp").as_deref() {
         match v {
             "on" => opts::set(opt!("tp-mtp"), "1"),
             "off" => opts::unset(opt!("tp-mtp")),
@@ -2269,7 +2317,7 @@ fn parse_arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 /// see it) or the app STOPS right here. `--node` mode is exempt by design: it loads model
 /// shards, whole files AND the DFlash2 draft artifact from its blob cache, never from paths.
 fn required_dir_arg(args: &[String], flag: &str, what: &str) -> String {
-    let d = match parse_arg(args, flag) {
+    let d = match gb10_inference::opt_or_arg(args, flag) {
         Some(v) => v.to_string(),
         None => {
             eprintln!("FATAL: {flag} <dir> is REQUIRED ({what}) — there is no default; pass an explicit path");
@@ -2316,7 +2364,7 @@ fn draft_source_requires_artifact(src: Option<gb10_inference::batch::SpecSource>
 /// A flag that IS provided but points nowhere is always a hard stop, whatever the source.
 fn resolve_draft_dir(args: &[String], src: Option<gb10_inference::batch::SpecSource>) -> Option<String> {
     let is_v1 = matches!(src, Some(gb10_inference::batch::SpecSource::DFlash));
-    let from_flag = parse_arg(args, "--draft-dir").map(str::to_string).or_else(|| {
+    let from_flag = gb10_inference::opt_or_arg(args, "--draft-dir").as_deref().map(str::to_string).or_else(|| {
         if !is_v1 { return None; }
         parse_arg(args, "--dflash-dir").map(|d| {
             warn_deprecated_alias("--dflash-dir", "--draft-dir");
@@ -3409,7 +3457,7 @@ fn run_cli(args: &[String]) {
     let model_path = parse_arg(args, "--model").unwrap_or("qwen3.5-0.8b-packed");
     let tokenizer_path = parse_arg(args, "--tokenizer").unwrap_or("model/tokenizer.json");
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
-    let max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
+    let max_seq_len = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     let max_new_tokens = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
     let temperature = parse_arg(args, "--temperature").and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
 
@@ -3643,7 +3691,7 @@ fn run_bench_batch(args: &[String]) {
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
     let m: usize = parse_arg(args, "--batch").and_then(|s| s.parse().ok()).unwrap_or(4);
     let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -3686,7 +3734,7 @@ fn run_bench_tree(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--bench-tree requires --model-dir");
     let tok_path = format!("{}/tokenizer.json", dir.trim_end_matches('/'));
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The quick brown fox jumps over the lazy dog near the river bank at dawn.");
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
     let (gpu, _) = load_model_gpu(dir, None, 1);
@@ -3761,7 +3809,7 @@ fn run_bench_lanes(args: &[String]) {
          downstream from the mill, where her grandfather had once worked as a keeper and where, if the \
          deeds could be believed, a right of way still existed across the water meadow to the church. \
          The fox, unbothered by any of this, had long since gone to ground.");
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
     let (gpu, _) = load_model_gpu(dir, None, 1);
@@ -3838,7 +3886,7 @@ fn run_bench_accept(args: &[String]) {
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("Write a short essay about the sea.");
     let depth: usize = parse_arg(args, "--depth").and_then(|s| s.parse().ok()).unwrap_or(8);
     let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(400);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let label = parse_arg(args, "--label").unwrap_or("workload");
     let ngram: usize = parse_arg(args, "--ngram").and_then(|s| s.parse().ok()).unwrap_or(0);
 
@@ -4095,7 +4143,7 @@ fn run_bench_tau(args: &[String]) {
     // positions — a stride == ctx OOBs the MTP KV (asserted at mtp_draft_step). Default with
     // headroom; honor an explicit --max-seq-len only if it already has room.
     let needed = ctxs.iter().max().copied().unwrap_or(4096) + max_new + depth + 8;
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok())
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok())
         .unwrap_or(needed).max(needed);
 
     let tokenizer_path = format!("{}/tokenizer.json", dir.trim_end_matches('/'));
@@ -5748,7 +5796,7 @@ fn run_probe_df2_lossless(args: &[String]) {
     use gb10_inference::batch::SpecSource;
     let trunk_dir = parse_arg(args, "--model-dir")
         .expect("--probe-df2-lossless needs --model-dir <trunk>").to_string();
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len")
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len")
         .and_then(|s| s.parse().ok()).unwrap_or(4096);
     let max_new: usize = parse_arg(args, "--max-new-tokens")
         .and_then(|s| s.parse().ok()).unwrap_or(32);
@@ -5905,7 +5953,7 @@ fn run_bench_df2_sample(args: &[String]) {
     let trials: usize = parse_arg(args, "--trials").and_then(|s| s.parse().ok()).unwrap_or(100_000);
     let top_k: usize = parse_arg(args, "--top-k").and_then(|s| s.parse().ok()).unwrap_or(20);
     let top_p: f32 = parse_arg(args, "--top-p").and_then(|s| s.parse().ok()).unwrap_or(0.8);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let temps: Vec<f32> = match parse_arg(args, "--temp") {
         Some(s) => vec![s.parse().expect("--temp")],
         None => vec![0.7, 1.0],
@@ -5990,7 +6038,7 @@ fn run_bench_df2_sample_realq(args: &[String]) {
     let trials: usize = parse_arg(args, "--trials").and_then(|s| s.parse().ok()).unwrap_or(100_000);
     let top_k: usize = parse_arg(args, "--top-k").and_then(|s| s.parse().ok()).unwrap_or(20);
     let top_p: f32 = parse_arg(args, "--top-p").and_then(|s| s.parse().ok()).unwrap_or(0.8);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let temps: Vec<f32> = match parse_arg(args, "--temp") {
         Some(s) => vec![s.parse().expect("--temp")],
         None => vec![0.7, 1.0],
@@ -6083,7 +6131,7 @@ fn run_bench_df2_matrix(args: &[String]) {
     let max_new: usize = parse_arg(args, "--max-new-tokens")
         .and_then(|s| s.parse().ok()).unwrap_or(40);
     let reps: usize = parse_arg(args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(3);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len")
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len")
         .and_then(|s| s.parse().ok()).unwrap_or(4096);
     let mtp_depth: usize = parse_arg(args, "--mtp-depth")
         .and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -6148,10 +6196,10 @@ fn run_bench_df2_matrix(args: &[String]) {
     // dspark triple as None and the cells silently ran MTP — a NOT-a-dspark measurement).
     // Same refuse-don't-fallback discipline as the DF2 arm: an unloadable drafter exits loudly.
     let (ds_round, ds_sink, ds_prime) = if spec_source == gb10_inference::batch::SpecSource::Dspark {
-        let draft_dir = parse_arg(args, "--draft-dir")
+        let draft_dir = gb10_inference::opt_or_arg(args, "--draft-dir")
             .unwrap_or_else(|| panic!("--bench-df2-matrix --spec-source dspark needs --draft-dir \
                                       <Qwen3.8-27B-DSpark artifact>"));
-        match load_dspark_round_dir(&mut gpu, max_seq_len, draft_dir, None) {
+        match load_dspark_round_dir(&mut gpu, max_seq_len, &draft_dir, None) {
             Some(x) => (Some(x.0), Some(x.1), Some(x.2)),
             None => {
                 println!("RESULT: DSPARK_UNAVAILABLE — serving the DSpark cells via the MTP \
@@ -6428,7 +6476,7 @@ fn run_probe_df2_prime(args: &[String]) {
     use half::bf16;
     let trunk_dir = parse_arg(args, "--model-dir")
         .expect("--probe-df2-prime needs --model-dir <trunk>").to_string();
-    let max_c: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_c: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let draft_dir = required_dir_arg(args, "--draft-dir", "the DFlash2 draft artifact");
     let all_pass = std::cell::Cell::new(true);
     let check = |name: &str, ok: bool| {
@@ -6641,7 +6689,7 @@ fn run_probe_df2_graph(args: &[String]) {
     use half::bf16;
     let trunk_dir = parse_arg(args, "--model-dir")
         .expect("--probe-df2-graph needs --model-dir <trunk>").to_string();
-    let max_c: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_c: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let draft_dir = required_dir_arg(args, "--draft-dir", "the DFlash2 draft artifact");
     let all_pass = std::cell::Cell::new(true);
     let check = |name: &str, ok: bool| {
@@ -7786,7 +7834,7 @@ fn run_bench_verify(args: &[String]) {
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
     let depth: usize = parse_arg(args, "--depth").and_then(|s| s.parse().ok()).unwrap_or(4);
     let offset: usize = parse_arg(args, "--offset").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -7826,7 +7874,7 @@ fn run_bench_verify(args: &[String]) {
         assert!(!widths.is_empty() && widths.iter().all(|&w| w >= 1 && w <= 16),
                 "--time-widths: widths must be in 1..=16 (MAX_VERIFY — wider is not a chain verify)");
         let reps: usize = parse_arg(args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(7);
-        let max_seq_len_tw = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+        let max_seq_len_tw = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
         let prompt_tw = tokenizer.encode(
             parse_arg(args, "--prompt").unwrap_or("The capital of France is"), true)
             .expect("encode");
@@ -7927,7 +7975,7 @@ fn run_probe_q4(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--probe-q4 requires --model-dir <DIR>");
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
     let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
     let chat = args.iter().any(|a| a == "--chat");
     let t0 = std::time::Instant::now();
     let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
@@ -8017,7 +8065,7 @@ fn run_probe_state(args: &[String]) {
                 ladder_dir: None,
                 ladder_layers: Vec::new(),
                 ladder_step: None,
-                max_pos: parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+                max_pos: gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
                 bench_steps: 0,
                 widths: Vec::new(),
                 prefill_chunk: None,
@@ -8034,7 +8082,7 @@ fn run_probe_state(args: &[String]) {
          parse_arg(args, "--tokenizer").unwrap_or("model/tokenizer.json").to_string())
     };
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -8074,7 +8122,7 @@ fn run_probe_state(args: &[String]) {
 fn run_probe_verify_m8(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--probe-verify-m8 requires --model-dir <DIR>");
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let max_n: usize = parse_arg(args, "--max-n").and_then(|s| s.parse().ok()).unwrap_or(8).min(gb10_inference::gpu::MAX_VERIFY);
 
     let tokenizer_path = format!("{}/tokenizer.json", dir.trim_end_matches('/'));
@@ -8114,7 +8162,7 @@ fn run_probe_reject(args: &[String]) {
          parse_arg(args, "--tokenizer").unwrap_or("model/tokenizer.json").to_string())
     };
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -8140,7 +8188,7 @@ fn run_probe_reject(args: &[String]) {
 /// TP-4C: `--tp-reduce-bench --mode decw|decwf32|decwserial|decwkeys|decwmix` — the decode-path reduce at
 /// world 2 or 4 (separate bench over `connect_nway`; every other mode is the unchanged pair bench below).
 fn run_tp_reduce_bench_world(args: &[String]) {
-    let g = |k: &str, d: u64| parse_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let g = |k: &str, d: u64| gb10_inference::opt_or_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
     let a = gb10_inference::tp_bench::DecWorldArgs {
         rank: parse_arg(args, "--rank").and_then(|s| s.parse().ok()).expect("--tp-reduce-bench --mode decw* needs --rank 0..world-1"),
         world: g("--world", 4) as u32,
@@ -8167,7 +8215,7 @@ fn run_tp_reduce_bench(args: &[String]) {
     if parse_arg(args, "--mode").map_or(false, |m| m.starts_with("decw")) {
         return run_tp_reduce_bench_world(args);
     }
-    let g = |k: &str, d: u64| parse_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let g = |k: &str, d: u64| gb10_inference::opt_or_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
     if g("--world", 2) > 2 { return run_tp_reduce_bench_w4(args); }   // TP-4E: the world > 2 prefill sweep
     let a = gb10_inference::tp_bench::ReduceArgs {
         rank: parse_arg(args, "--rank").and_then(|s| s.parse().ok()).expect("--tp-reduce-bench needs --rank 0|1"),
@@ -8198,7 +8246,7 @@ fn run_tp_reduce_bench(args: &[String]) {
 /// all-reduce at world > 2 on the real transport (no model), every reduce bitwise-checked against the host
 /// recursive-doubling reference; per-reduce microseconds and GB/s per direction. Same command on all four boxes.
 fn run_tp_reduce_bench_w4(args: &[String]) {
-    let g = |k: &str, d: u64| parse_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let g = |k: &str, d: u64| gb10_inference::opt_or_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
     fn fail(e: anyhow::Error) -> ! { eprintln!("\n[tp-reduce-bench --world>2] FAILED: {e:#}"); std::process::exit(1) }
     let sizes = gb10_inference::tp_bench::w4_parse_sizes(parse_arg(args, "--sizes-mb").unwrap_or("2,8,21,42")).unwrap_or_else(|e| fail(e));
     let a = gb10_inference::tp_bench::ReduceW4Args {
@@ -8229,7 +8277,7 @@ fn run_tp_reduce_bench_w4(args: &[String]) {
 /// Run the SAME command on both boxes with `--rank 0` (head, listens) and `--rank 1 --peer <head-ip>`;
 /// the barrier count and every mode flag must match, since the two ranks rendezvous per barrier.
 fn run_tp_barrier_bench(args: &[String]) {
-    let g = |k: &str, d: u64| parse_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let g = |k: &str, d: u64| gb10_inference::opt_or_arg(args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
     let a = gb10_inference::tp_bench::BenchArgs {
         rank: parse_arg(args, "--rank").and_then(|s| s.parse().ok())
             .expect("--tp-barrier-bench needs --rank 0|1"),
@@ -8345,6 +8393,10 @@ fn run_net_test(args: &[String]) {
 fn run_cluster_node(args: &[String]) {
     // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     let port: u16 = parse_arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(29500);
+    // OUT2: the node's UDP discovery bind is 29499 by default; a resident supervisor (or any other
+    // process) may already hold it on a shared box -- this flag lets a second node coexist without
+    // touching the first. The head is unaffected (explicit --nodes dials TCP; no UDP involved).
+    let udp: u16 = parse_arg(args, "--discovery-port").and_then(|s| s.parse().ok()).unwrap_or(29499);
 
     // RESIDENT by default (TP item B): supervise one-shot sessions, re-arming after each so the node
     // survives a head restart with zero manual intervention. One process per session is the whole
@@ -8355,7 +8407,7 @@ fn run_cluster_node(args: &[String]) {
     // debugging. A graceful per-request serve loop (no reload between requests) is item A's server
     // mode; until then a session = one sync + one SPMD run.
     let once = args.iter().any(|a| a == "--once");
-    if once { run_cluster_node_once(port); return; }
+    if once { run_cluster_node_once(port, udp); return; }
 
     let exe = std::env::current_exe().expect("current_exe");
     eprintln!("[node-resident] supervisor up on port {port} — one process per head session; \
@@ -8363,7 +8415,7 @@ fn run_cluster_node(args: &[String]) {
     loop {
         let t0 = std::time::Instant::now();
         let status = std::process::Command::new(&exe)
-            .args(node_child_args(&args, port))
+            .args(node_child_args(&args, port, udp))
             .status();
         match status {
             Ok(s) => eprintln!("[node-resident] session ended ({s}) after {:.1}s — re-arming for the next head",
@@ -8376,9 +8428,9 @@ fn run_cluster_node(args: &[String]) {
 }
 
 /// One head session: sync (model + config) -> bring up the RDMA link -> serve one SPMD run -> exit.
-fn run_cluster_node_once(port: u16) {
-    println!("{}", gb10_inference::exl3_forward::xtp::identity_line("node"));
-    let (dir, draft_dir, head_ip, mut tpc, stream) = match gb10_inference::cluster::run_node(port) {
+fn run_cluster_node_once(port: u16, udp: u16) {
+    gb10_inference::dprintln!("{}", gb10_inference::exl3_forward::xtp::identity_line("node"));
+    let (dir, draft_dir, head_ip, mut tpc, stream) = match gb10_inference::cluster::run_node(port, udp) {
         Ok(x) => x,
         Err(e) => { eprintln!("node error: {e:#}"); std::process::exit(1); }
     };
@@ -8403,7 +8455,7 @@ fn run_cluster_node_once(port: u16) {
         gb10_inference::cluster::node_report_failure(&mut stream, &format!("head options refused: {e}"));
         eprintln!("node error: {e}"); std::process::exit(1);
     }
-    println!("[node] options from the head: {}", gb10_inference::opts::set_summary());
+    gb10_inference::dprintln!("[node] options from the head: {}", gb10_inference::opts::set_summary());
     // The head's TP config, shipped during the sync — install BEFORE any TP consumer reads a setting,
     // so the node reproduces the head's behavior with zero local configuration.
     gb10_inference::tp::set_tp_config(tpc.clone());
@@ -8416,7 +8468,7 @@ fn run_cluster_node_once(port: u16) {
         // HeadFlag plane); the programs drop it.
         let mut tpc = tpc;
         if tpc.ship_shards {
-            println!("NODE — B32 shard dir from the blob cache: {} (the head's path is not read)", dir.display());
+            gb10_inference::dprintln!("NODE — B32 shard dir from the blob cache: {} (the head's path is not read)", dir.display());
             tpc.exl3_pack_dir = dir.to_string_lossy().to_string();
             gb10_inference::tp::set_tp_config(tpc.clone());
         }
@@ -8544,24 +8596,29 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
         .map(|kb| kb * 1024).unwrap_or(0);
     let fmt = |b: f64| format!("{b:.1}");
     let kv_label = match kv_mode { KM::Bf16 => "bf16", KM::Q4 => "q4", KM::Tq => "tq", KM::K8v4 => "k8v4", KM::K8v8 => "k8v8" };
-    eprintln!("[mem-budget] {} ({}), max-seq-len {max_seq_len}, batch {max_batch}, kv-cache {}:",
+    let dbg_mb = gb10_inference::boot_report::debug();
+    if dbg_mb {
+    eprintln!("[mem-budget] {} ({}), max-seq-len {max_seq_len}, batch {max_batch}, kv-cache {}",
               std::path::Path::new(model_dir).file_name().unwrap_or_default().to_string_lossy(),
               if tp { "TP=2, rank-local" } else { "single node" }, kv_label);
-    eprintln!("  weights (per rank)     ~{} GB", fmt(weights as f64 / gf));
+    }
+    if dbg_mb { eprintln!("  weights (per rank)     ~{} GB", fmt(weights as f64 / gf)); }
     if total == 0 {
         eprintln!("  *** WARNING: no .safetensors shards found in {} — the directory may be empty, a",
                   std::path::Path::new(model_dir).display());
         eprintln!("  *** partial/stale download, or the wrong format (see the load error below).");
     }
-    eprintln!("  KV cache (~{slots} slots)  ~{} GB", fmt(kv / gf));
-    eprintln!("  calibration transient  ~{} GB (startup only, freed)", fmt(calib / gf));
-    if quantized { eprintln!("  packed-KV mirror (<=32K) ~{} GB", fmt(mirror / gf)); }
+    if dbg_mb { eprintln!("  KV cache (~{slots} slots)  ~{} GB", fmt(kv / gf)); }
+    if dbg_mb { eprintln!("  calibration transient  ~{} GB (startup only, freed)", fmt(calib / gf)); }
+    if quantized && dbg_mb { eprintln!("  packed-KV mirror (<=32K) ~{} GB", fmt(mirror / gf)); }
+    if dbg_mb {
     eprintln!("  pools/workspaces (est) ~{} GB", fmt(pools / gf));
     eprintln!("  ----------------------------------------------");
     eprintln!("  steady-state estimate  ~{} GB of {} GB physical", fmt(steady / gf), fmt(phys as f64 / gf));
     eprintln!("  startup peak estimate  ~{} GB of {} GB physical", fmt(peak / gf), fmt(phys as f64 / gf));
+    }
     if avail > 0 {
-        eprintln!("  available NOW          ~{} GB (other load on this box already eats the rest)", fmt(avail as f64 / gf));
+        if dbg_mb { eprintln!("  available NOW          ~{} GB (other load on this box already eats the rest)", fmt(avail as f64 / gf)); }
     }
     let headroom = phys as f64 - steady;
     let headroom_now = if avail > 0 { avail as f64 - steady } else { headroom };
@@ -8906,7 +8963,7 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     }
     tpc.mode_serve = true;
     // Same flag as qwen serving; the serve loops resolve env --max-seq-len > this > 4096.
-    tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
+    tpc.max_seq_len = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     // item 2.3: --prefix-cache <on|off> (AGENTS §7 CLI flag; rides TpConfig to the node).
     // DEFAULT ON for the dsv4 server (the pre-flag always-on behavior); the A/B uses off.
     tpc.prefix_cache = matches!(parse_arg(args, "--prefix-cache").unwrap_or("on"),
@@ -8928,7 +8985,7 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     // rel-L2). DEFAULT OFF until the owner's release gate; --fp8-prefill stays as the
     // diagnostics/back-compat alias. Requires --mxfp4=on (allow_pf4), batch >= 256, %128
     // geometry. Rides TpConfig so the zero-config node dispatches identically (SPMD).
-    if let Some(v) = parse_arg(args, "--fp8-prefill") {
+    if let Some(v) = gb10_inference::opt_or_arg(args, "--fp8-prefill") {
         tpc.fp8_prefill = matches!(&v[..], "on" | "true" | "1" | "yes");
     }
     if tpc.fp8_prefill {
@@ -8938,7 +8995,7 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     // legacy tables byte-identical). f=2 on the 256K-native trunk extends the rope tables to
     // 512K rows with the vLLM-convention per-dim ramp + mscale — the same math the dspark
     // oracle validated (yaarn_freqs). Rides TpConfig so the node builds the same tables.
-    tpc.rope_yarn_factor = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok())
+    tpc.rope_yarn_factor = gb10_inference::opt_or_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok())
         .filter(|f| *f >= 1.0).unwrap_or(1.0);
     // Single-box serves have no TpConfig (that's the --tp channel), so mirror the parsed flag
     // into the env — build_rope_tables resolves env-first. Startup-time set_var, before any
@@ -8959,10 +9016,13 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
     gb10_inference::tp::set_tp_config(tpc.clone());
     // The DSpark server keeps the control stream RETAINED: the head ships its measured r(D)
     // table over it once per process (item 3.4 — see dsv4_tp_serve_server).
+    let st_weights = gb10_inference::boot_report::Stage::begin("weights");
     let ctl = if tpc.server_dspark {
         match gb10_inference::cluster::run_head_session(std::path::Path::new(model_dir), explicit, wait, &tpc) {
             Ok((nodes, mut streams)) => {
-                println!("HEAD SYNCED {} node(s) (control stream retained)", nodes.len());
+                if gb10_inference::boot_report::debug() {
+                    println!("HEAD SYNCED {} node(s) (control stream retained)", nodes.len());
+                }
                 // DSV4 serving is still TP=2 (N-way deferred): exactly one retained stream.
                 Some(streams.pop().expect("world==2 requires exactly one retained control stream"))
             }
@@ -8970,15 +9030,16 @@ fn run_dsv4_server_tp(args: &[String], model_dir: &str, port: u16) {
         }
     } else {
         match gb10_inference::cluster::run_head(std::path::Path::new(model_dir), explicit, wait, &tpc) {
-            Ok(nodes) => println!("HEAD SYNCED {} node(s)", nodes.len()),
+            Ok(nodes) => if gb10_inference::boot_report::debug() { println!("HEAD SYNCED {} node(s)", nodes.len()) },
             Err(e) => { eprintln!("head error: {e:#}"); std::process::exit(1); }
         }
         None
     };
-    eprintln!("[head] deepseek_v4 detected → Dsv4GpuModel TP=2 persistent server (standard --server --tp interface{})", if tpc.server_dspark { ", DSpark speculation" } else { "" });
+    st_weights.ok();
+    gb10_inference::boot_report::notice(&format!("[head] deepseek_v4 detected → Dsv4GpuModel TP=2 persistent server (standard --server --tp interface{})", if tpc.server_dspark { ", DSpark speculation" } else { "" }));
     let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     // P4: DSV4 N-way deferred (still TP=2).
-    if let Err(e) = dsv4_tp_serve_server(model_dir, gb10_inference::tp::TpContext::bring_up_head(2), port, default_max_tokens, ctl, tpc.server_dspark) {
+    if let Err(e) = dsv4_tp_serve_server(model_dir, gb10_inference::tp::TpContext::bring_up_head(2), port, default_max_tokens, ctl, &tpc) {
         eprintln!("head tp serve error: {e:#}"); std::process::exit(1);
     }
 }
@@ -9019,7 +9080,7 @@ fn exl3_xtp_opts(args: &[String]) -> gb10_inference::exl3_forward::xtp::XtpOpts 
 /// TP-C: the spec program's options from the CLI (shipped to the node in TpConfig.exl3_mode).
 fn exl3_spec_opts(args: &[String]) -> gb10_inference::exl3_serve::SpecOpts {
     let mut o = gb10_inference::exl3_serve::SpecOpts::default();
-    let num = |n: &str| parse_arg(args, n).map(|s| s.parse::<usize>().unwrap_or_else(|_| panic!("{n} N")));
+    let num = |n: &str| gb10_inference::opt_or_arg(args, n).map(|s| s.parse::<usize>().unwrap_or_else(|_| panic!("{n} N")));
     if let Some(v) = num("--spec-gen") { o.gen = v; }
     if let Some(v) = num("--spec-reps") { o.reps = v; }
     if let Some(v) = num("--max-batch") { o.width = v; }
@@ -9051,9 +9112,10 @@ fn exl3_spec_prompts(args: &[String]) -> Vec<(String, Vec<u32>)> {
 /// CLI-1: the node supervisor's session child: `--node --once --port N` plus the supervisor's own
 /// node-local registry options (`--rdma-dev`, `--tp-cache`, `--mem-watchdog-gb`, `--mem-trace`) —
 /// flags, never an inherited env (every other option arrives from the head in TpConfig.opts).
-fn node_child_args(args: &[String], port: u16) -> Vec<String> {
+fn node_child_args(args: &[String], port: u16, udp: u16) -> Vec<String> {
     let _ = args;
-    let mut v: Vec<String> = vec!["--node".into(), "--once".into(), "--port".into(), port.to_string()];
+    let mut v: Vec<String> = vec!["--node".into(), "--once".into(), "--port".into(), port.to_string(),
+                                  "--discovery-port".into(), udp.to_string()];
     for (i, o) in gb10_inference::opts::REG.iter().enumerate() {
         if o.scope != gb10_inference::opts::Scope::Local { continue; }
         if let Ok(val) = gb10_inference::opts::var(gb10_inference::opts::OptId(i as u16)) {
@@ -9109,7 +9171,7 @@ fn exl3_tp_cli_knobs(args: &[String], tpc: &mut gb10_inference::tp::TpConfig) {
 
 /// TP-A: the EXL3 TP head (rank 0). Rung 3 program: `--probe-exl3-xtp`.
 fn run_exl3_tp_head(args: &[String], model_dir: &str) {
-    println!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0"));
+    gb10_inference::dprintln!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0"));
     let world = parse_tp_world(args).unwrap_or(2);
     if world != 2 && world != 4 { eprintln!("EXL3 TP: --tp 2 or --tp 4 only (got {world})"); std::process::exit(2); }
     if let Err(e) = gb10_inference::exl3_forward::xtp::world_gt2_flag_refusals(world as i32) { eprintln!("{e}"); std::process::exit(2); }
@@ -9132,7 +9194,7 @@ fn run_exl3_tp_head(args: &[String], model_dir: &str) {
         let gen: usize = parse_arg(args, "--xtp-gen").and_then(|s| s.parse().ok()).unwrap_or(16);
         Some((exl3_xtp_prompt_ids(args, model_dir), gen))
     } else { None };
-    let max_pos: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let max_pos: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let dir_abs = std::fs::canonicalize(model_dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| model_dir.to_string());
     let explicit = parse_arg(args, "--nodes").map(|s| {
         s.split(',').map(|p| {
@@ -9194,7 +9256,7 @@ fn exl3_head_bring_up_watched(streams: &[std::net::TcpStream], world: i32) -> an
 /// binds HTTP once the node's mirror is armed.
 fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
     // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
-    println!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0 (serve)"));
+    gb10_inference::dprintln!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0 (serve)"));
     let world = parse_tp_world(args).unwrap_or(2);
     // TP-4D: world 2 (the pairwise lockstep, unchanged) or world 4 (the head-hub lockstep); anything else is refused
     // BEFORE the model load, and so is every flag the world-4 engine cannot honour (--tp-oneshot, --tp-dec-grecv != 0,
@@ -9235,10 +9297,10 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
     // Public PR #21: the shipped window is the clamped one. Every rank's build_serve resolves the same
     // clamp from the same argv and pack config, and logs the line naming the limit.
     tpc.max_seq_len = gb10_inference::exl3_serve::resolve_max_seq_len(
-        &dir_abs, parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096)).0;
+        &dir_abs, gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096)).0;
     if args.iter().any(|a| a == "--tp-trace") { tpc.trace = true; }
     exl3_tp_cli_knobs(args, &mut tpc);
-    println!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,
+    gb10_inference::dprintln!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,
              gb10_inference::opts::snapshot(), node_args);
     gb10_inference::tp::set_tp_config(tpc.clone());
     let streams = match gb10_inference::cluster::run_head_retain(std::path::Path::new(&dir_abs), explicit, wait, &tpc) {
@@ -9324,7 +9386,7 @@ fn exl3_tp_node_prelink(tpc: &gb10_inference::tp::TpConfig) -> anyhow::Result<Ex
     gb10_inference::exl3_forward::xtp::set_vp_sampled(tpc.exl3_vp_sampled.unwrap_or(0));
     // TP-SP1 (v22): None (a pre-v22 head) = off, the replicated prefill
     gb10_inference::exl3_forward::xtp::set_seq_parallel(tpc.exl3_seq_parallel.unwrap_or(0));
-    println!("[node] EXL3 TP CLI knobs from the head: --tp-prefill-overlap {} --tp-vp-sampled {}{}",
+    gb10_inference::dprintln!("[node] EXL3 TP CLI knobs from the head: --tp-prefill-overlap {} --tp-vp-sampled {}{}",
              gb10_inference::exl3_forward::xtp::pf_overlap_desc(tpc.exl3_pf_overlap.unwrap_or(0)),
              gb10_inference::exl3_forward::xtp::vp_sampled_desc(tpc.exl3_vp_sampled.unwrap_or(0)),
              if tpc.exl3_seq_parallel.unwrap_or(0) != 0 {
@@ -9332,7 +9394,7 @@ fn exl3_tp_node_prelink(tpc: &gb10_inference::tp::TpConfig) -> anyhow::Result<Ex
              } else { String::new() });
     if let Some(j) = tpc.exl3_mode.strip_prefix("serve:") {
         let argv: Vec<String> = serde_json::from_str(j).map_err(|e| anyhow::anyhow!("serve argv from the head: {e}"))?;
-        println!("[node] EXL3 TP serve: head argv {argv:?}");
+        gb10_inference::dprintln!("[node] EXL3 TP serve: head argv {argv:?}");
         // S-B9-CF-AGREE16B (W4): the same pre-network refusal as on the head, from the head's argv, before the link
         gb10_inference::exl3_serve::tp_lane_width_refusal(&argv, tpc.world as u32)?;
         return Ok(Exl3NodeProgram::Serve(argv));
@@ -9384,7 +9446,7 @@ fn run_cluster_head(args: &[String]) {
         "on" | "true" | "1" | "yes");
     if parse_arg(args, "--server-port").is_some() {
         tpc.mode_serve = true;
-        tpc.max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
+        tpc.max_seq_len = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     }
     // item 3.4: --server-dspark <on|off> — DSpark speculation in the persistent --server-port
     // server (DEFAULT ON — user decision 2026-08-05; pass off for greedy; rides TpConfig to
@@ -9401,7 +9463,7 @@ fn run_cluster_head(args: &[String]) {
     // rel-L2). DEFAULT OFF until the owner's release gate; --fp8-prefill stays as the
     // diagnostics/back-compat alias. Requires --mxfp4=on (allow_pf4), batch >= 256, %128
     // geometry. Rides TpConfig so the zero-config node dispatches identically (SPMD).
-    if let Some(v) = parse_arg(args, "--fp8-prefill") {
+    if let Some(v) = gb10_inference::opt_or_arg(args, "--fp8-prefill") {
         tpc.fp8_prefill = matches!(&v[..], "on" | "true" | "1" | "yes");
     }
     if tpc.fp8_prefill {
@@ -9411,7 +9473,7 @@ fn run_cluster_head(args: &[String]) {
     // legacy tables byte-identical). f=2 on the 256K-native trunk extends the rope tables to
     // 512K rows with the vLLM-convention per-dim ramp + mscale — the same math the dspark
     // oracle validated (yaarn_freqs). Rides TpConfig so the node builds the same tables.
-    tpc.rope_yarn_factor = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok())
+    tpc.rope_yarn_factor = gb10_inference::opt_or_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok())
         .filter(|f| *f >= 1.0).unwrap_or(1.0);
     // Single-box serves have no TpConfig (that's the --tp channel), so mirror the parsed flag
     // into the env — build_rope_tables resolves env-first. Startup-time set_var, before any
@@ -9437,7 +9499,9 @@ fn run_cluster_head(args: &[String]) {
     let ctl_stream = if retain_ctl {
         match gb10_inference::cluster::run_head_session(std::path::Path::new(&model_dir), explicit, wait, &tpc) {
             Ok((nodes, mut streams)) => {
-                println!("HEAD SYNCED {} node(s) (control stream retained)", nodes.len());
+                if gb10_inference::boot_report::debug() {
+                    println!("HEAD SYNCED {} node(s) (control stream retained)", nodes.len());
+                }
                 // DSV4 serving is still TP=2 (N-way deferred): exactly one retained stream.
                 Some(streams.pop().expect("world==2 requires exactly one retained control stream"))
             }
@@ -9445,7 +9509,7 @@ fn run_cluster_head(args: &[String]) {
         }
     } else {
         match gb10_inference::cluster::run_head(std::path::Path::new(&model_dir), explicit, wait, &tpc) {
-            Ok(nodes) => println!("HEAD SYNCED {} node(s)", nodes.len()),
+            Ok(nodes) => if gb10_inference::boot_report::debug() { println!("HEAD SYNCED {} node(s)", nodes.len()) },
             Err(e) => { eprintln!("head error: {e:#}"); std::process::exit(1); }
         }
         None
@@ -9463,7 +9527,7 @@ fn run_cluster_head(args: &[String]) {
             // SPMD greedy (or DSpark when --server-dspark on) → OpenAI JSON → exit.
             let port: u16 = port.parse().expect("--server-port N");
             let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
-            dsv4_tp_serve_server(&model_dir, gb10_inference::tp::TpContext::bring_up_head(2), port, default_max_tokens, ctl_stream, tpc.server_dspark)
+            dsv4_tp_serve_server(&model_dir, gb10_inference::tp::TpContext::bring_up_head(2), port, default_max_tokens, ctl_stream, &tpc)
         } else {
             // P4: DSV4 N-way deferred (still TP=2).
             dsv4_tp_serve(&model_dir, gb10_inference::tp::TpContext::bring_up_head(2),
@@ -10827,7 +10891,7 @@ fn dsv4_tp_serve_server(
     port: u16,
     default_max_tokens: usize,
     ctl: Option<std::net::TcpStream>,
-    server_dspark: bool,
+    tpc: &gb10_inference::tp::TpConfig,
 ) -> anyhow::Result<()> {
     use gb10_inference::dsv4_load;
     use cudarc::driver::CudaDevice;
@@ -10836,7 +10900,10 @@ fn dsv4_tp_serve_server(
 
     let mut ctx = ctx_result?;
     ctx.sanity()?;
-    println!("HEAD (rank 0/2) — DSV4 TP LINK UP (server mode, port {port})");
+    if gb10_inference::boot_report::debug() {
+        println!("HEAD (rank 0/2) — DSV4 TP LINK UP (server mode, port {port})");
+    }
+    let st_weights = gb10_inference::boot_report::Stage::begin("weights");
 
     let cfg = dsv4_load::load_config(std::path::Path::new(model_dir))
         .map_err(|e| anyhow::anyhow!("load_config: {e:#}"))?;
@@ -10844,7 +10911,9 @@ fn dsv4_tp_serve_server(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| DSV4_MODEL_ID.to_string());
-    println!("[dsv4-server] model ID: {model_id_str}");
+    if gb10_inference::boot_report::debug() {
+        println!("[dsv4-server] model ID: {model_id_str}");
+    }
     let dev = CudaDevice::new(0)?;
     // max_seq_len (KV-ring depth): env --max-seq-len (operator override) > the shipped
     // TpConfig (--max-seq-len on the head, zero-config to the node) > 4096.
@@ -10855,7 +10924,10 @@ fn dsv4_tp_serve_server(
     let s_max = gb10_inference::dsv4_model::PREFILL_CHUNK;
     let (m0, load_secs) = dsv4_load_for_serve(&dev, std::path::Path::new(model_dir), &cfg,
                                                    max_seq_len, s_max, 0, 2)?;
-    println!("[dsv4-server] head shard loaded (43 layers, rank 0/2) in {load_secs:.1}s — listening on port {port} (max_seq_len={max_seq_len})");
+    st_weights.ok();
+    if gb10_inference::boot_report::debug() {
+        println!("[dsv4-server] head shard loaded (43 layers, rank 0/2) in {load_secs:.1}s — listening on port {port} (max_seq_len={max_seq_len})");
+    }
 
     // NOTE: TP attach is deferred to the first request (matches the old one-shot timing:
     // broadcast_prompt uses the raw RDMA exchange, not the proxy; the proxy is only needed
@@ -10866,7 +10938,23 @@ fn dsv4_tp_serve_server(
     let tok = QwenTokenizer::from_file(&tok_path)?;
     let addr = gb10_inference::server::http_bind_addr(port)?;
     let listener = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?;
-    println!("[dsv4-server] listening on http://{addr}/v1/chat/completions");
+    if gb10_inference::boot_report::debug() {
+        println!("[dsv4-server] listening on http://{addr}/v1/chat/completions");
+    }
+    {
+        // OUT1: the one idle line for the DSV4 family, resolved from the registry.
+        // (UNVERIFIED ON GPU — DSV4 serving needs a TP=2 pair; .11 has none.)
+        let kv_b = if gb10_inference::opts::var(gb10_inference::opt!("kv-k8v8")).ok().as_deref() == Some("1") { "k8v8" }
+                   else if gb10_inference::opts::var(gb10_inference::opt!("kv-k8v4")).ok().as_deref() == Some("1") { "k8v4" } else { "bf16" };
+        gb10_inference::boot_report::serving(&gb10_inference::boot_report::ServingLine {
+            family: "dsv4", model: &model_id_str, tp: 2, ctx: max_seq_len, batch: tpc.max_batch, kv: kv_b,
+            prefix: if tpc.prefix_cache { "on" } else { "off" },
+            mtp: "off",
+            spec: if tpc.server_dspark { "dspark" } else { "plain" },
+            port,
+            url: format!("http://{addr}"),
+        });
+    }
 
     let mut tp_attached = false;
     // R2.3 prefix-cache (+ item 2.3 LRU): snapshot/restore at 128-aligned conversation-prefix
@@ -10881,7 +10969,7 @@ fn dsv4_tp_serve_server(
     // load, byte-identical behavior). The trunk model moves INTO the state in that case; the
     // greedy path keeps it as `m0` (see the per-request branch below).
     let mut m: Option<gb10_inference::dsv4_model::Dsv4GpuModel> = Some(m0);
-    let mut dspark_state: Option<DsparkServeState> = if server_dspark {
+    let mut dspark_state: Option<DsparkServeState> = if tpc.server_dspark {
         Some(DsparkServeState::new(&dev, std::path::Path::new(model_dir), &cfg, max_seq_len,
                                    m.take().expect("fresh model"), 0, true)?)
     } else {
@@ -11791,7 +11879,7 @@ fn run_probe_dsv4(args: &[String]) {
     if layers > 0 && !args.iter().any(|a| a == "--chunked") {
         use gb10_inference::dsv4_cpu;
         eprintln!("\n=== DSV4 trunk gate: {layers} layer(s) — GPU vs CPU layer-by-layer diff ===");
-        let max_seq_len: usize = parse_arg(args, "--max-seq-len")
+        let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len")
             .map(|s| s.parse().expect("--max-seq-len")).unwrap_or(2048);
         // A short fixed prompt (Phase 4 brings the real tokenizer; arbitrary ids exercise the glue:
         // embed → kind-dispatched layers → head). ids are small valid token ids. --prompt-len N pads
@@ -12082,7 +12170,7 @@ fn run_probe_dsv4(args: &[String]) {
         let chunk_sizes: Vec<usize> = parse_arg(args, "--chunk-sizes")
             .map(|v| v.split(',').map(|x| x.trim().parse().expect("--chunk-sizes a[,b]")).collect())
             .unwrap_or_else(|| vec![128, 4096]);
-        let max_seq_len: usize = parse_arg(args, "--max-seq-len")
+        let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len")
             .map(|v| v.parse().expect("--max-seq-len N"))
             .unwrap_or((s + 256).max(2048));
         let ids: Vec<i32> = (0..s).map(|i| ((7 + i as i64 * 9973) % cfg.vocab_size as i64) as i32).collect();
@@ -12166,7 +12254,7 @@ fn run_probe_dsv4_prefix(args: &[String]) {
     let bundle = parse_arg(args, "--model-dir").expect("--probe-dsv4 --prefix requires --model-dir <bundle>");
     let rank: usize = parse_arg(args, "--shard-rank").and_then(|s| s.parse().ok()).unwrap_or(0);
     let world: usize = parse_arg(args, "--shard-world").and_then(|s| s.parse().ok()).unwrap_or(2);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let cfg = dsv4_load::load_config(Path::new(bundle)).expect("load_config");
     let dev = CudaDevice::new(0).expect("CUDA device 0");
     let s_max = gb10_inference::dsv4_model::PREFILL_CHUNK;
@@ -13020,7 +13108,7 @@ fn run_sweep_gemm(args: &[String]) {
 /// bandwidth, and spends draft quality to do it).
 fn run_df2_bake(args: &[String], fp8: bool) {
     use safetensors::{SafeTensors, Dtype, tensor::TensorView};
-    let src = parse_arg(args, "--draft-dir").expect("--draft-dir <src artifact> required");
+    let src = gb10_inference::opt_or_arg(args, "--draft-dir").expect("--draft-dir <src artifact> required");
     let out_dir = parse_arg(args, "--out").expect("--out <baked dir> required");
     let outd = std::path::Path::new(&out_dir);
     std::fs::create_dir_all(outd).expect("create --out dir");
@@ -13132,7 +13220,7 @@ fn run_df2_bake(args: &[String], fp8: bool) {
 /// ~3x cleaner than nvfp4's ~0.105 overall or the block-scale kernel is not worth building.
 fn run_df2_quant_fidelity(args: &[String]) {
     use safetensors::SafeTensors;
-    let src = parse_arg(args, "--draft-dir").expect("--draft-dir <src artifact> required");
+    let src = gb10_inference::opt_or_arg(args, "--draft-dir").expect("--draft-dir <src artifact> required");
     let path = std::path::Path::new(&src).join("model.safetensors");
     let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let st = SafeTensors::deserialize(&raw).expect("parse src safetensors");
@@ -14141,7 +14229,7 @@ fn write_mtp_calib(path: &Option<std::path::PathBuf>, stamp: &str, buckets: &[(u
         .map(|&(ctx, ref t)| serde_json::json!([ctx, t.iter().map(|&(d, r)| serde_json::json!([d, r])).collect::<Vec<_>>()]))
         .collect();
     if let Ok(s) = serde_json::to_string_pretty(&serde_json::json!({ "stamp": stamp, "fmt": 2, "buckets": bs })) {
-        if std::fs::write(p, s).is_ok() { println!("MTP cost/depth: cached to {}", p.display()); }
+        if std::fs::write(p, s).is_ok() && gb10_inference::boot_report::debug() { println!("MTP cost/depth: cached to {}", p.display()); }
     }
 }
 
@@ -14168,10 +14256,10 @@ fn run_perplexity(args: &[String]) {
         (parse_arg(args, "--model").unwrap_or("model/model.safetensors").to_string(),
          parse_arg(args, "--tokenizer").unwrap_or("model/tokenizer.json").to_string())
     };
-    let text_path = parse_arg(args, "--text").expect("--text <file> required");
-    let window: usize = parse_arg(args, "--window").and_then(|s| s.parse().ok()).unwrap_or(1024);
-    let max_windows: usize = parse_arg(args, "--max-windows").and_then(|s| s.parse().ok()).unwrap_or(8);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let text_path = gb10_inference::opt_or_arg(args, "--text").expect("--text <file> required");
+    let window: usize = gb10_inference::opt_or_arg(args, "--window").and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let max_windows: usize = gb10_inference::opt_or_arg(args, "--max-windows").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     if window < 2 {
         // a scored position needs two tokens; this used to run and print `mean_nll=NaN`
         eprintln!("--window must be >= 2 (one scored position needs two tokens), got {window}");
@@ -14838,10 +14926,10 @@ fn run_capture_layers(args: &[String]) {
 fn run_dump_argmax(args: &[String]) {
     let model_path = parse_arg(args, "--model-dir").expect("--dump-argmax requires --model-dir <DIR>").to_string();
     let tokenizer_path = format!("{}/tokenizer.json", model_path.trim_end_matches('/'));
-    let text_path = parse_arg(args, "--text").expect("--text <file> required");
+    let text_path = gb10_inference::opt_or_arg(args, "--text").expect("--text <file> required");
     let out_path = parse_arg(args, "--out").expect("--out <file> required");
-    let window: usize = parse_arg(args, "--window").and_then(|s| s.parse().ok()).unwrap_or(512);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let window: usize = gb10_inference::opt_or_arg(args, "--window").and_then(|s| s.parse().ok()).unwrap_or(512);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let text = std::fs::read_to_string(&text_path).expect("read --text file");
@@ -14878,7 +14966,7 @@ fn run_profile_mtp(args: &[String]) {
     };
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
     let iters: usize = parse_arg(args, "--iters").and_then(|s| s.parse().ok()).unwrap_or(20);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -14933,7 +15021,7 @@ fn run_bench_mtp_sample(args: &[String]) {
     let trials: usize = parse_arg(args, "--trials").and_then(|s| s.parse().ok()).unwrap_or(100_000);
     let top_k: usize = parse_arg(args, "--top-k").and_then(|s| s.parse().ok()).unwrap_or(20);
     let top_p: f32 = parse_arg(args, "--top-p").and_then(|s| s.parse().ok()).unwrap_or(0.8);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let temps: Vec<f32> = match parse_arg(args, "--temp") {
         Some(s) => vec![s.parse().expect("--temp")],
         None => vec![0.3, 0.7, 1.0],
@@ -15028,7 +15116,7 @@ fn run_bench_mtp(args: &[String]) {
                 ladder_dir: None,
                 ladder_layers: Vec::new(),
                 ladder_step: None,
-                max_pos: parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+                max_pos: gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
                 bench_steps: 0,
                 widths: Vec::new(),
                 prefill_chunk: parse_arg(&args, "--prefill-chunk").and_then(|s| s.parse().ok()),
@@ -15049,7 +15137,7 @@ fn run_bench_mtp(args: &[String]) {
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
     let depth: usize = parse_arg(args, "--depth").and_then(|s| s.parse().ok()).unwrap_or(4);
     let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(64);
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
 
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
@@ -15265,17 +15353,20 @@ fn run_server(args: &[String]) {
             run_exl3_tp_serve_head(args, &model_path);
             return;
         }
-        gb10_inference::exl3_serve::run(args, &model_path).expect("exl3 serve");
+        if let Err(e) = gb10_inference::exl3_serve::run(args, &model_path) {
+            gb10_inference::boot_report::error(&format!("exl3 serve: {e:#}"));
+            std::process::exit(1);
+        }
         return;
     }
     let port = parse_arg(args, "--port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(8000);
     // E5 (512K mandate): --rope-yarn-factor <f> — trunk YaRN override, mirrored into the env
     // BEFORE the model load (rope tables build at load; single-box has no TpConfig channel).
     // Under --tp the value also rides TpConfig to the node (SPMD — both ranks' tables match).
-    if let Some(f) = parse_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(f) = gb10_inference::opt_or_arg(args, "--rope-yarn-factor").and_then(|v| v.parse::<f32>().ok()) {
         if f >= 1.0 { gb10_inference::opts::set(gb10_inference::opt!("rope-yarn-factor"), f.to_string()); }
     }
-    let max_seq_len = parse_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
+    let max_seq_len = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     let max_batch = parse_arg(args, "--max-batch").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
     // W3 (Phase 13): fail FAST on an unsupported KV-mode x lane-width combination — before the
     // model load and before any node contact. Used to surface as a panic inside the attention
@@ -15283,7 +15374,7 @@ fn run_server(args: &[String]) {
     {
         let tp_for_check = parse_tp_world(args).unwrap_or(1) as usize;
         if let gb10_inference::kv_cache::KvLaneVerdict::Reject(msg) =
-            gb10_inference::kv_cache::kv_lane_check(parse_arg(args, "--kv-cache"), max_batch, tp_for_check)
+            gb10_inference::kv_cache::kv_lane_check(gb10_inference::opt_or_arg(args, "--kv-cache").as_deref(), max_batch, tp_for_check)
         {
             eprintln!("error: {msg}");
             std::process::exit(2);
@@ -15317,7 +15408,7 @@ fn run_server(args: &[String]) {
     // required. The node stays zero-config (resident supervisor + shipped TpConfig, as for qwen).
     if is_dsv4_bundle(std::path::Path::new(&model_path)) {
         if !tp {
-            eprintln!("[dsv4] this bundle is TP=2-sharded: serving requires --tp --nodes <peer:29500>");
+            gb10_inference::boot_report::error("[dsv4] this bundle is TP=2-sharded: serving requires --tp --nodes <peer:29500>");
             std::process::exit(1);
         }
         run_dsv4_server_tp(args, &model_path, port);
@@ -15391,11 +15482,15 @@ fn run_server(args: &[String]) {
             let max_seq_pre = if max_seq_len > pre.max_position_embeddings {
                 pre.max_position_embeddings
             } else { max_seq_len };
-            println!("Loading tokenizer from {}...", tokenizer_path);
+            let st_tok_pre = gb10_inference::boot_report::Stage::begin("tokenizer");
+            if gb10_inference::boot_report::debug() {
+                println!("Loading tokenizer from {}...", tokenizer_path);
+            }
             let tok_pre = QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+            st_tok_pre.ok();
             // Same parses as their post-load counterparts below (idempotent; needed here for tpc).
             let mtp_depth_pre = parse_arg(args, "--mtp-depth").and_then(|s| s.parse::<usize>().ok());
-            let mtp_force_pre = match parse_arg(args, "--mtp").unwrap_or("auto") {
+            let mtp_force_pre = match gb10_inference::opt_or_arg(args, "--mtp").as_deref().unwrap_or("auto") {
                 "on"  | "1" | "true"  => Some(true),
                 "off" | "0" | "false" => Some(false),
                 "auto" => None,
@@ -15419,7 +15514,7 @@ fn run_server(args: &[String]) {
                                         "on" | "true" | "1" | "yes");
             tpc.ngram_draft = parse_arg(args, "--ngram-draft").and_then(|s| s.parse().ok()).unwrap_or(0);
             tpc.tree_draft = matches!(parse_arg(args, "--tree-draft").unwrap_or("off"), "on"|"true"|"1"|"yes");
-            tpc.mtp_lanes = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"), "on"|"true"|"1"|"yes");
+            tpc.mtp_lanes = matches!(gb10_inference::opt_or_arg(args, "--mtp-lanes").as_deref().unwrap_or("off"), "on"|"true"|"1"|"yes");
             tpc.mtp_force = mtp_force_pre;
             tpc.mtp_depth_pin = mtp_depth_pre;
             tpc.no_decode_graphs = gb10_inference::opts::var(gb10_inference::opt!("no-decode-graphs")).is_ok();
@@ -15485,6 +15580,27 @@ fn run_server(args: &[String]) {
         }
 
         if is_dir {
+            // OUT1 (§1b-bis 8): a single-file EXL3 pack (no model.safetensors.index.json) is not
+            // detected by is_exl3_pack and used to fall into the NVFP4 loader, dying mid-load with
+            // a raw `missing tensor: lm_head.weight` panic. Refuse at the door, with the way out.
+            if let Ok(qc) = std::fs::read_to_string(format!("{}/quantization_config.json", model_path.trim_end_matches('/'))) {
+                if qc.contains("exl3") && !gb10_inference::exl3_serve::is_exl3_pack(&model_path) {
+                    // EXL27 (§1b-bis 8, owner scope add 2026-10-16): single-file packs are served, not
+                    // refused. Best effort: synthesize the one-shard index from the safetensors header;
+                    // the refusal below stays only for packs we truly cannot read (no safetensors at all).
+                    match gb10_inference::exl3_serve::ensure_singlefile_index(&model_path) {
+                        Ok(true) => gb10_inference::rprintln!("[boot] single-file EXL3 pack: synthesized model.safetensors.index.json (1 shard) — serving via the standard indexed path"),
+                        Ok(false) => {},
+                        Err(e) => gb10_inference::reprintln!("[boot] single-file EXL3 index synthesis failed: {e}"),
+                    }
+                    if !gb10_inference::exl3_serve::is_exl3_pack(&model_path) {
+                        gb10_inference::boot_report::error("[exl3] this EXL3 bundle has no readable tensors (no index, no model.safetensors): re-download the pack. Refusing.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // OUT1: the config stage covers the config read + the mem-budget forecast (debug).
+            let st_config = gb10_inference::boot_report::Stage::begin("config");
             // Config pre-read for the mem budget. A corrupt config.json is a load error, not a
             // panic: surface the same graceful message and exit cleanly (owner directive 2026-08-27).
             let cfg_pre = match gb10_inference::qwen::Config::from_config_json(
@@ -15510,9 +15626,13 @@ fn run_server(args: &[String]) {
                      else if gb10_inference::opts::var(gb10_inference::opt!("kv-quant")).is_ok() { gb10_inference::gpu::KVCacheMode::Q4 }
                      else { gb10_inference::gpu::KVCacheMode::Bf16 };
             mem_budget_report(&model_path, &cfg_pre, tp, max_seq_len, max_batch, km);
+            st_config.ok();
         }
+        let st_weights = gb10_inference::boot_report::Stage::begin("weights");
         let (mut gpu, cfg) = if is_dir {
-            println!("Loading model from {} (streaming bf16)...", model_path);
+            if gb10_inference::boot_report::debug() {
+                println!("Loading model from {} (streaming bf16)...", model_path);
+            }
             if tp {
                 // TP=2 head = rank 0. hy_v3 shards host-side in the loader (full model > one node);
                 // qwen loads whole and shards at attach_tp, unchanged.
@@ -15521,11 +15641,14 @@ fn run_server(args: &[String]) {
                 load_model_gpu(&model_path, None, 1)
             }
         } else {
-            println!("Loading model from {} ...", model_path);
+            if gb10_inference::boot_report::debug() {
+                println!("Loading model from {} ...", model_path);
+            }
             let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
             let gpu = gb10_inference::gpu::GpuModel::new(&host).expect("gpu init");
             (gpu, host.config)
         };
+        st_weights.ok();
         // Guardrail on the TP parallel-load reorder: the pre-read values drove the TpConfig shipped
         // to the node (and our own clamp); the loaded cfg MUST agree, or head and node would run
         // with different context limits / stop tokens.
@@ -15544,23 +15667,27 @@ fn run_server(args: &[String]) {
         // for rotations past the end of the tables. Going UP to the model max is fully supported (KV is
         // ~64 KB/token — 256K/batch-2 ≈ 34 GB, fine on 128 GB, just slow to prefill); going beyond is not.
         let model_max = cfg.max_position_embeddings;
-        // E5 (512K mandate): a trunk YaRN factor > 1 EXTENDS the rope tables (build_rope_tables
-        // sizes them to factor x native), so the seq-len ceiling rises with it - clamp against
-        // the extended ceiling, not the native one. No yarn -> native clamp, unchanged.
-        let yarn = gb10_inference::opts::var(gb10_inference::opt!("rope-yarn-factor")).ok()
-            .and_then(|v| v.parse::<f32>().ok()).filter(|f| *f >= 1.0).unwrap_or(1.0f32);
-        let eff_max = ((model_max as f64) * (yarn as f64)).ceil() as usize;
-        let max_seq_len = if max_seq_len > eff_max {
-            eprintln!("[warn] --max-seq-len {} exceeds the model max {} (effective {} at rope yarn factor {}) - clamping to {}.",
-                      max_seq_len, model_max, eff_max, yarn, eff_max);
-            eff_max
-        } else { max_seq_len };
+        // E5/YARN1: the trunk YaRN factor (--rope-yarn-factor > shipped TpConfig > the pack's
+        // rope_scaling; one rule: qwen::pick_yarn) extends the rope ceiling to native x factor,
+        // and the launch-argument bit-packings cap it in turn — the same two-ceiling clamp the
+        // EXL3 serve uses (the packings are 20 bits on this path too). Over-length boots on
+        // the nearest workable value with one line, never a silent refusal.
+        let (yarn, _yarn_src) = gb10_inference::qwen::resolved_yarn(&cfg);
+        let (eff_max, why) = gb10_inference::exl3_serve::clamp_ctx(
+            max_seq_len, Some(cfg.yarn_native_window), yarn as f64);
+        if let Some(why) = why {
+            gb10_inference::boot_report::notice(&gb10_inference::exl3_serve::clamp_ctx_message(
+                max_seq_len, eff_max, why, Some(cfg.yarn_native_window), yarn as f64));
+        }
+        let max_seq_len = eff_max;
+        if gb10_inference::boot_report::debug() {
         println!("Context: --max-seq-len {} (model max {}). KV cache ~{:.1} GB at batch {}.",
                  max_seq_len, model_max,
                  {
                      let nfull = cfg.layer_types.iter().filter(|t| matches!(t, gb10_inference::qwen::LayerType::FullAttention)).count();
                      (nfull * cfg.num_kv_heads * cfg.head_dim * 2 * 2 * max_seq_len * max_batch) as f64 / 1e9
                  }, max_batch);
+        }
 
         // MTP speculative decoding. There is no on/off flag and no env var: the engine measures
         // whether MTP pays and decides for itself.
@@ -15576,7 +15703,7 @@ fn run_server(args: &[String]) {
         // `--mtp-depth` PINS the depth (benchmarking); by default the policy picks it from the
         // measured r(d) and the live acceptance, and re-picks as the workload changes.
         let mtp_depth = parse_arg(args, "--mtp-depth").and_then(|s| s.parse::<usize>().ok());
-        let mtp_force = match parse_arg(args, "--mtp").unwrap_or("auto") {
+        let mtp_force = match gb10_inference::opt_or_arg(args, "--mtp").as_deref().unwrap_or("auto") {
             "on"  | "1" | "true"  => Some(true),
             "off" | "0" | "false" => Some(false),
             "auto" => None,
@@ -15598,8 +15725,13 @@ fn run_server(args: &[String]) {
             // The TP parallel-load path already loaded it (and printed) before the weight load.
             Some(t) => t,
             None => {
-                println!("Loading tokenizer from {}...", tokenizer_path);
-                QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer")
+                let st_tok = gb10_inference::boot_report::Stage::begin("tokenizer");
+                if gb10_inference::boot_report::debug() {
+                    println!("Loading tokenizer from {}...", tokenizer_path);
+                }
+                let tok = QwenTokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+                st_tok.ok();
+                tok
             }
         };
 
@@ -15612,7 +15744,9 @@ fn run_server(args: &[String]) {
         // A3: AppState needs its own copy of the stop set (the original `eos` is moved into the
         // TP config below).
         let stop_ids_for_state = eos.clone();
-        println!("Stop tokens: {:?}  (config.json advertises {})", eos, config_eos);
+        if gb10_inference::boot_report::debug() {
+            println!("Stop tokens: {:?}  (config.json advertises {})", eos, config_eos);
+        }
 
         // Serving-option values, parsed once here so the TP config (below) and BatchScheduler::new
         // (further down) agree. The explanatory prints stay at their original spots.
@@ -15620,9 +15754,9 @@ fn run_server(args: &[String]) {
                                     "on" | "true" | "1" | "yes");
         let ngram_draft: usize = parse_arg(args, "--ngram-draft").and_then(|s| s.parse().ok()).unwrap_or(0);
         let tree_draft = matches!(parse_arg(args, "--tree-draft").unwrap_or("off"), "on"|"true"|"1"|"yes");
-        let mtp_lanes = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"), "on"|"true"|"1"|"yes");
+        let mtp_lanes = matches!(gb10_inference::opt_or_arg(args, "--mtp-lanes").as_deref().unwrap_or("off"), "on"|"true"|"1"|"yes");
         // P11 W5a: --prefill-sched <inline|cursor> (default cursor = the scheduler default-ON).
-        let pf_sched_inline = parse_arg(args, "--prefill-sched").map(|s| s == "inline").unwrap_or(false);
+        let pf_sched_inline = gb10_inference::opt_or_arg(args, "--prefill-sched").map(|s| s == "inline").unwrap_or(false);
 
         // TP=2 serving bring-up (TP item A). Order matters and mirrors the node's `node_serve_tp`:
         // ship the model + config, bring up the RDMA link, attach TP — from here on EVERY forward
@@ -15666,7 +15800,7 @@ fn run_server(args: &[String]) {
                     tpc.cpu_sample = gb10_inference::opts::var(gb10_inference::opt!("cpu-sample")).is_ok();
                     tpc.no_verify_graph = gb10_inference::opts::var(gb10_inference::opt!("no-verify-graph")).is_ok();
                     // --device-loop (device-resident token loop): OFF by default until gated.
-                    tpc.device_loop = matches!(parse_arg(args, "--device-loop").unwrap_or("off"),
+                    tpc.device_loop = matches!(gb10_inference::opt_or_arg(args, "--device-loop").as_deref().unwrap_or("off"),
                                                 "on" | "true" | "1" | "yes");
                     tpc.eos = eos.clone();
                     tpc.calib_prompt = tokenizer.encode("The capital of France is", true)
@@ -15728,13 +15862,18 @@ fn run_server(args: &[String]) {
             // run the same SPMD forward sequence the head runs — an unshared skip deadlocks the
             // all-reduce barriers. Both ranks therefore always calibrate in lockstep; the cache
             // WRITE below still lands, so single-node launches keep the fast path.
+            let st_cal = gb10_inference::boot_report::Stage::begin("calibrate");
             let cached = if tp { None } else { read_mtp_calib(&calib_path, &calib_stamp) };
             if let Some(bs) = cached {
-                println!("MTP cost/depth: loaded from cache ({} ctx buckets) -> {}",
-                         bs.len(), calib_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
+                if gb10_inference::boot_report::debug() {
+                    println!("MTP cost/depth: loaded from cache ({} ctx buckets) -> {}",
+                             bs.len(), calib_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
+                }
                 for (ctx, t) in &bs {
                     let r2 = t.iter().find(|&&(d, _)| d == 2).map(|&(_, r)| r).unwrap_or(0.0);
-                    println!("    ctx {:>6}: depth 2 costs {:.2}x a decode  (cached)", ctx, r2);
+                    if gb10_inference::boot_report::debug() {
+                        println!("    ctx {:>6}: depth 2 costs {:.2}x a decode  (cached)", ctx, r2);
+                    }
                 }
                 bs
             } else {
@@ -15743,7 +15882,9 @@ fn run_server(args: &[String]) {
             // costs the phases, not a long prompt. The state needs ONE live KV slot (the verify
             // writes only slot 0) at the top bucket's stride; the GDN checkpoint slots (2..=N) live
             // in the separately-sized state half, so the long stride does not multiply slots.
-            println!("Calibrating MTP cost per depth, per context bucket...");
+            if gb10_inference::boot_report::debug() {
+                println!("Calibrating MTP cost per depth, per context bucket...");
+            }
             let mut cpool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
             let calib_points = gb10_inference::gpu::mtp_calib_ctx_points(max_seq_len);
             let calib_seq = *calib_points.last().unwrap();
@@ -15752,10 +15893,13 @@ fn run_server(args: &[String]) {
             let bs = gpu.calibrate_mtp_r(&mut cpool, &mut cstate, &probe, calib_seq);
             for (ctx, t) in &bs {
                 for &(d, r) in t {
-                    println!("    ctx {:>6} depth {}: a step costs {:.2}x a decode  (pays if it emits > {:.2} tok)", ctx, d, r, r);
+                    if gb10_inference::boot_report::debug() {
+                        println!("    ctx {:>6} depth {}: a step costs {:.2}x a decode  (pays if it emits > {:.2} tok)", ctx, d, r, r);
+                    }
                 }
             }
             write_mtp_calib(&calib_path, &calib_stamp, &bs);
+            st_cal.ok();
             bs
             }
         } else {
@@ -15774,9 +15918,11 @@ fn run_server(args: &[String]) {
             }
         } else { None };
         if df2.is_some() {
-            println!("[df2] DFlash2 round RESIDENT (spec-source={}) — serving via the S4F \
+            if gb10_inference::boot_report::debug() {
+                println!("[df2] DFlash2 round RESIDENT (spec-source={}) — serving via the S4F \
                       integrated round (b==1 lanes); MTP remains the fallback (standing directive)",
                      spec_source.cli_name());
+            }
         }
         // WI1: the DSpark drafter (--spec-source dspark). Same fail-soft load contract; the
         // residency line is the startup-log proof the acceptance gate greps for.
@@ -15814,16 +15960,21 @@ fn run_server(args: &[String]) {
                 gb10_inference::tp_serve::send_serving(s, &calib)
                     .expect("ship MTP calib table to node");
             }
-            println!("TP — MTP calib table + df2_round={} shipped to {} node(s)",
-                     df2.is_some(), streams.len());
+            if gb10_inference::boot_report::debug() {
+                println!("TP — MTP calib table + df2_round={} shipped to {} node(s)",
+                         df2.is_some(), streams.len());
+            }
         }
         let policy = gb10_inference::batch::MtpPolicy::with_source(
             gpu.mtp_present(), mtp_force, mtp_depth, mtp_r, spec_source);
         // Captured before `policy` moves into the scheduler (PR #4: the HTTP clamp mirror).
         let mtp_active_at_start = policy.active();
         if !gpu.mtp_present() {
-            println!("MTP: model has no MTP head — plain decode.");
+            if gb10_inference::boot_report::debug() {
+                println!("MTP: model has no MTP head — plain decode.");
+            }
         } else {
+            if gb10_inference::boot_report::debug() {
             println!("MTP: {}; depth {}; greedy requests verify by argmax (bitwise lossless), \
                       temp>0 requests by rejection sampling (distribution-exact).",
                      match mtp_force {
@@ -15835,6 +15986,7 @@ fn run_server(args: &[String]) {
                          Some(d) => format!("PINNED at {}", d),
                          None => format!("starts at {}, re-picked from live acceptance", policy.depth()),
                      });
+            }
         }
 
         // Prefix caching is OPT-IN. It skips re-prefilling a conversation's history — on a 5-turn tool
@@ -15844,12 +15996,16 @@ fn run_server(args: &[String]) {
         // can word an answer slightly differently depending on cache state. That is a trade the operator
         // makes, not one we make for them. (Value parsed above, next to the TP config build.)
         if prefix_cache {
-            println!("Prefix cache: ON — a conversation's history is reused instead of re-prefilled \
+            if gb10_inference::boot_report::debug() {
+                println!("Prefix cache: ON — a conversation's history is reused instead of re-prefilled \
                       (~3x faster follow-up turns). Cached turns are NOT bit-identical to cold ones: \
                       reuse re-chunks the prefill and cuBLAS picks a kernel per shape.");
+            }
         } else {
-            println!("Prefix cache: off — every request prefills its whole prompt (bit-exact, and \
+            if gb10_inference::boot_report::debug() {
+                println!("Prefix cache: off — every request prefills its whole prompt (bit-exact, and \
                       slow on multi-turn agents: ~88% of prefill is recomputed). Enable: --prefix-cache on");
+            }
         }
 
         // Prompt-lookup n-gram drafting: EXPERIMENTAL, default OFF. Lossless (the verify checks every
@@ -15860,12 +16016,12 @@ fn run_server(args: &[String]) {
         // proposes the n-gram token as an ADDITIONAL candidate (tree verify, backlog #7), not a
         // replacement. Kept behind a flag for that work. `--ngram-draft 3` to experiment.
         if ngram_draft > 0 {
-            println!("Prompt-lookup drafting: ON (order {ngram_draft}) — EXPERIMENTAL, measured net-negative vs MTP");
+            gb10_inference::boot_report::notice(&format!("Prompt-lookup drafting: ON (order {ngram_draft}) — EXPERIMENTAL, measured net-negative vs MTP"));
         }
 
-        if tree_draft { println!("Tree drafting: ON (k=2 fork-then-chain) — EXPERIMENTAL, lossless, gated on yield"); }
+        if tree_draft { gb10_inference::boot_report::notice("Tree drafting: ON (k=2 fork-then-chain) — EXPERIMENTAL, lossless, gated on yield"); }
         let (stx, srx) = tokio::sync::mpsc::unbounded_channel::<gb10_inference::batch::BatchRequest>();
-        if mtp_lanes { println!("Batched MTP verify across lanes: ON -- EXPERIMENTAL, lossless (LANES_OK), packs concurrent greedy lanes into one verify"); }
+        if mtp_lanes { gb10_inference::boot_report::notice("Batched MTP verify across lanes: ON -- EXPERIMENTAL, lossless (LANES_OK), packs concurrent greedy lanes into one verify"); }
         let (df2_round, df2_sink, df2_prime) = match df2 {
             Some((r, s, p)) => (Some(r), Some(s), Some(p)),
             None => (None, None, None),
@@ -15874,9 +16030,11 @@ fn run_server(args: &[String]) {
             Some((r, s2, p2)) => (Some(r), Some(s2), Some(p2)),
             None => (None, None, None),
         };
+        let st_graphs = gb10_inference::boot_report::Stage::begin("graphs");
         let mut scheduler = gb10_inference::batch::BatchScheduler::with_df2(
             gpu, max_batch, max_seq_len, eos, srx, policy, prefix_cache, ngram_draft, tree_draft, mtp_lanes,
             df2_round, df2_sink, df2_prime, dspark_round, dspark_sink, dspark_prime, cov_dump);
+        st_graphs.ok();
         // P14: the DFlash v1 lane (--spec-source dflash). The artifact is REQUIRED and the install is
         // loud: a missing dir or a failed load refuses to start rather than silently serving MTP.
         if matches!(spec_source, gb10_inference::batch::SpecSource::DFlash) {
@@ -15888,8 +16046,10 @@ fn run_server(args: &[String]) {
                 eprintln!("FATAL: DFlash v1 lane install failed for {d}: {e:#}");
                 std::process::exit(2);
             }
-            println!("[dflash] v1 lane RESIDENT (spec-source=dflash) — greedy b==1 lanes; unprimed \
+            if gb10_inference::boot_report::debug() {
+                println!("[dflash] v1 lane RESIDENT (spec-source=dflash) — greedy b==1 lanes; unprimed \
                       requests (prefix-cache reuse) are served by MTP and logged");
+            }
         }
         // P11 W5a: the prefill-schedule escape (default = cursor, the owner-blessed default-ON).
         scheduler.set_pf_inline(pf_sched_inline);
@@ -15919,13 +16079,13 @@ fn run_server(args: &[String]) {
             Ok(Some(_)) => match gb10_inference::vision_tower::VisualTower::load(&model_path) {
                 Ok(t) => Some(std::sync::Arc::new(t)),
                 Err(e) => {
-                    eprintln!("[vision] tower load failed ({e}); serving text-only (image requests are rejected)");
+                    gb10_inference::boot_report::warn(&format!("[vision] tower load failed ({e}); serving text-only (image requests are rejected)"));
                     None
                 }
             },
             Ok(None) => None,
             Err(e) => {
-                eprintln!("[vision] vision geometry probe failed ({e}); serving text-only");
+                gb10_inference::boot_report::warn(&format!("[vision] vision geometry probe failed ({e}); serving text-only"));
                 None
             }
         };
@@ -15944,7 +16104,7 @@ fn run_server(args: &[String]) {
             vision_tower.as_ref().and_then(|t| {
                 let dev = match cudarc::driver::CudaDevice::new(0) {
                     Ok(d) => d,
-                    Err(e) => { eprintln!("[vision] no CUDA device ({e}); image requests use the CPU path."); return None; }
+                    Err(e) => { gb10_inference::boot_report::warn(&format!("[vision] no CUDA device ({e}); image requests use the CPU path.")); return None; }
                 };
                 match gb10_inference::vision_gpu::GpuVisualTower::new_with_drill(dev, t, vision_fail_gemm) {
                     Ok(v) => Some(std::sync::Arc::new(std::sync::Mutex::new(v))),
@@ -16093,7 +16253,7 @@ fn run_server(args: &[String]) {
         // actually runs under. Every Phase-1 report had to infer these from campaign notes, and
         // the ledger's config fingerprint could not tell two legs apart without them (te_hard2
         // vs te_hard3). Log line only — nothing here changes behaviour.
-        {
+        if gb10_inference::boot_report::debug() {
             let (tpl_origin, tpl_sha, tpl_bytes) = state.tokenizer.template_meta.clone()
                 .unwrap_or_else(|| ("<none: legacy hand-rolled template>".to_string(),
                                     "<none>".to_string(), 0));
@@ -16107,8 +16267,10 @@ fn run_server(args: &[String]) {
             // read as an explicit choice (the `--df2-round-shard` default-on trap of K2 §W0').
             let tp_world_boot = parse_tp_world(args).unwrap_or(1);
             let nodes_boot = parse_arg(args, "--nodes").unwrap_or("<none>");
-            let kvb = parse_arg(args, "--kv-cache").unwrap_or("<default:bf16>");
-            let mtp_boot = parse_arg(args, "--mtp").unwrap_or("<default:auto>");
+            let kvb_s = gb10_inference::opt_or_arg(args, "--kv-cache");
+            let kvb = kvb_s.as_deref().unwrap_or("<default:bf16>");
+            let mtp_boot_s = gb10_inference::opt_or_arg(args, "--mtp");
+            let mtp_boot = mtp_boot_s.as_deref().unwrap_or("<default:auto>");
             let mtp_depth_boot = parse_arg(args, "--mtp-depth").unwrap_or("<default:auto>");
             let spec_src_boot = parse_arg(args, "--spec-source").unwrap_or("<default:mtp>");
             let df2_block_boot = parse_arg(args, "--df2-block")
@@ -16116,11 +16278,14 @@ fn run_server(args: &[String]) {
                 .unwrap_or_else(|| format!("<default:{}>", gb10_inference::dflash2::block()));
             let df2_carry_boot = parse_arg(args, "--df2-carry").unwrap_or("<default:off>");
             let df2_shard_boot = parse_arg(args, "--df2-round-shard").unwrap_or("<default:on>");
-            let mtp_lanes_boot = matches!(parse_arg(args, "--mtp-lanes").unwrap_or("off"),
+            let mtp_lanes_boot = matches!(gb10_inference::opt_or_arg(args, "--mtp-lanes").as_deref().unwrap_or("off"),
                                           "on" | "true" | "1" | "yes");
-            let pf_sched_boot = parse_arg(args, "--prefill-sched").unwrap_or("cursor");
-            let fp8_pf_boot = parse_arg(args, "--fp8-prefill").unwrap_or("<default:off>");
-            let draft_boot = parse_arg(args, "--draft-dir").unwrap_or("<none>");
+            let pf_sched_s = gb10_inference::opt_or_arg(args, "--prefill-sched");
+            let pf_sched_boot = pf_sched_s.as_deref().unwrap_or("cursor");
+            let fp8_pf_s = gb10_inference::opt_or_arg(args, "--fp8-prefill");
+            let fp8_pf_boot = fp8_pf_s.as_deref().unwrap_or("<default:off>");
+            let draft_s = gb10_inference::opt_or_arg(args, "--draft-dir");
+            let draft_boot = draft_s.as_deref().unwrap_or("<none>");
             eprintln!("[boot] model_dir={} template={} template_sha256={} template_bytes={} \
                        tool_call_format={} reasoning_effort_default={} thinking={} \
                        auto_disable_thinking_with_tools={} presence_penalty_default={} \
@@ -16129,7 +16294,7 @@ fn run_server(args: &[String]) {
                        trunk_dir={} tp_world={} nodes={} kv_cache={} mtp={} mtp_depth={} \
                        spec_source={} df2_block={} df2_carry={} df2_round_shard={} mtp_lanes={} \
                        prefill_sched={} fp8_prefill={} draft_dir={} tripwire={:?} pool_census={}",
-                tokenizer_path, tpl_origin, tpl_sha, tpl_bytes,
+                parse_arg(args, "--model-dir").unwrap_or_else(|| "<none>".into()), tpl_origin, tpl_sha, tpl_bytes,
                 state.tokenizer.tool_call_format.as_deref().unwrap_or("<template-default:xml>"),
                 state.reasoning_effort.as_deref().unwrap_or("<template-default:medium>"),
                 state.thinking.as_str(),
@@ -16144,14 +16309,32 @@ fn run_server(args: &[String]) {
                 gb10_inference::gpu::tripwire_get(), gb10_inference::gpu::census_on());
         }
         gb10_inference::memwatch::phase("serve:pre-bind");
+        let prefix_on = state.prefix_cache; // OUT1: read before `state` moves into the router.
         let app = create_router(state);
         let listener = gb10_inference::server::http_listen(port).await;
-        println!("OpenAI-compatible server running on http://{}",
-                 listener.local_addr().map_or_else(|_| format!("0.0.0.0:{port}"), |a| a.to_string()));
-        println!("Serving model: {}  (GET /v1/models)", model_name);
-        println!("POST /v1/chat/completions   max_batch={}  default max_tokens={}", max_batch, default_max_tokens);
-        println!("POST /v1/tokenize           vLLM-compatible: {{tokens, count, max_model_len}} — pure tokenizer, no forward (prompt | messages)");
-        println!("POST /v1/detokenize         vLLM-compatible: {{model, prompt}} — decode half of the pair (exact-N prompt building)");
+        let url_boot = listener.local_addr().map_or_else(|_| format!("0.0.0.0:{port}"), |a| a.to_string());
+        if gb10_inference::boot_report::debug() {
+            println!("OpenAI-compatible server running on http://{}", url_boot);
+            println!("Serving model: {}  (GET /v1/models)", model_name);
+            println!("POST /v1/chat/completions   max_batch={}  default max_tokens={}", max_batch, default_max_tokens);
+            println!("POST /v1/tokenize           vLLM-compatible: {{tokens, count, max_model_len}} — pure tokenizer, no forward (prompt | messages)");
+            println!("POST /v1/detokenize         vLLM-compatible: {{model, prompt}} — decode half of the pair (exact-N prompt building)");
+        }
+        {
+            // OUT1: THE one idle line. Field values are the RESOLVED posture (defaults shown resolved).
+            let kvb_s = gb10_inference::opt_or_arg(args, "--kv-cache");
+            let kvb = kvb_s.as_deref().unwrap_or("bf16");
+            let mtp_b = if mtp_force == Some(false) { "off" }
+                        else if !mtp_active_at_start { "none" }
+                        else if mtp_force.is_some() { "on" } else { "auto" };
+            gb10_inference::boot_report::serving(&gb10_inference::boot_report::ServingLine {
+                family: "nvfp4", model: &model_name, tp: parse_tp_world(args).unwrap_or(1),
+                ctx: max_seq_len, batch: max_batch, kv: kvb,
+                prefix: if prefix_on { "on" } else { "off" },
+                mtp: mtp_b, spec: spec_source.cli_name(), port,
+                url: format!("http://{url_boot}"),
+            });
+        }
         // WP01: TCP_NODELAY on accepted sockets — SSE token chunks are small writes that Nagle +
         // delayed-ACK can hold for tens of ms. Bytes on the wire are unchanged, only when they
         // leave. --wp01-off=1 = legacy (OS default, Nagle on).
@@ -16167,7 +16350,7 @@ fn run_server(args: &[String]) {
 fn run_probe_serve_pinned(args: &[String]) -> i32 {
     let model_dir = parse_arg(args, "--model-dir")
         .expect("--probe-serve-pinned requires --model-dir <DIR>").to_string();
-    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_seq_len: usize = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let max_tokens: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(128);
     let port0: u16 = parse_arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8140);
     let prompt = parse_arg(args, "--prompt").unwrap_or(

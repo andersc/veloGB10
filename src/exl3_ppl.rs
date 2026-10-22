@@ -1145,7 +1145,7 @@ mod tests {
 
     #[test]
     fn every_perplexity_option_is_registered_typed_and_listed_once() {
-        let help = crate::opts::help_text(false);
+        let help = crate::opts::help_advanced();
         let diag = crate::opts::help_text(true);
         for f in TOOL_FLAGS {
             let id = crate::opts::lookup(f).unwrap_or_else(|| panic!("--{f} is not registered"));

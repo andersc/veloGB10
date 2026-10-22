@@ -219,7 +219,7 @@ impl GpuVisualTower {
         let pool = TPool::new(stream.stream);
 
         // Load the FP32 vision kernels.
-        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_vision.ptx")?);
+        let ptx = Ptx::from_src(crate::ptx_embed::GPU_VISION);
         let fnames = [
             "vision_layernorm", "vision_add_inplace", "vision_bias_add",
             "vision_gelu_tanh", "vision_gelu", "vision_attn", "vision_attn_generic",

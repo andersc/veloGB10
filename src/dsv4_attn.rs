@@ -413,7 +413,7 @@ impl Dsv4AttnRuntime {
         spine
             .set_dynamic_smem("dsv4_hc_pre_fused_b", HC_PRE_FUSED_SMEM)
             .context("set_dynamic_smem hc_pre_fused_b")?;
-        let attn = Dsv4Kernels::load_module(dev, "src/ptx/gpu_dsv4_attn.ptx", ATTN_FUNCS)
+        let attn = Dsv4Kernels::load_module(dev, crate::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", ATTN_FUNCS)
             .context("load gpu_dsv4_attn.ptx (lane 3A/3C)")?;
         // CSA/HCA need the comp module (compressor + indexer kernels). SWA skips it
         // (no compressor/indexer constructed — stays 3A-byte-identical).
@@ -423,13 +423,9 @@ impl Dsv4AttnRuntime {
             None
         };
 
-        let bptx = Ptx::from_src(
-            std::fs::read_to_string("src/ptx/gpu_batch.ptx").context("read gpu_batch.ptx")?,
-        );
+        let bptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         dev.load_ptx(bptx, "gpu_batch", BATCH_FUNCS).context("load_ptx gpu_batch")?;
-        let dptx = Ptx::from_src(
-            std::fs::read_to_string("src/ptx/gpu_dsv4.ptx").context("read gpu_dsv4.ptx")?,
-        );
+        let dptx = Ptx::from_src(crate::ptx_embed::GPU_DSV4);
         dev.load_ptx(dptx, "gpu_dsv4", MOE_DFUNCS).context("load_ptx gpu_dsv4 (moe)")?;
         let collect = |m: &str, names: &[&'static str]| -> HashMap<String, CudaFunction> {
             names
@@ -479,18 +475,14 @@ impl Dsv4AttnRuntime {
         spine
             .set_dynamic_smem("dsv4_hc_pre_fused_b", HC_PRE_FUSED_SMEM)
             .context("set_dynamic_smem hc_pre_fused_b")?;
-        let attn = Dsv4Kernels::load_module(dev, "src/ptx/gpu_dsv4_attn.ptx", ATTN_FUNCS)
+        let attn = Dsv4Kernels::load_module(dev, crate::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", ATTN_FUNCS)
             .context("load gpu_dsv4_attn.ptx (lane 3A/3C)")?;
         // Multikind always needs the comp module (CSA + HCA layers construct compressors).
         let comp = Some(CompKernels::load(dev).context("CompKernels::load (multikind)")?);
 
-        let bptx = Ptx::from_src(
-            std::fs::read_to_string("src/ptx/gpu_batch.ptx").context("read gpu_batch.ptx")?,
-        );
+        let bptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         dev.load_ptx(bptx, "gpu_batch", BATCH_FUNCS).context("load_ptx gpu_batch")?;
-        let dptx = Ptx::from_src(
-            std::fs::read_to_string("src/ptx/gpu_dsv4.ptx").context("read gpu_dsv4.ptx")?,
-        );
+        let dptx = Ptx::from_src(crate::ptx_embed::GPU_DSV4);
         dev.load_ptx(dptx, "gpu_dsv4", MOE_DFUNCS).context("load_ptx gpu_dsv4 (moe)")?;
         let collect = |m: &str, names: &[&'static str]| -> HashMap<String, CudaFunction> {
             names

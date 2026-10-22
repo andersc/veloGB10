@@ -274,10 +274,13 @@ impl Exl3Pack {
         // 1. Config + family gate (COMMON family resolution — no parallel family).
         let cfg = crate::qwen::Config::from_config_json(&format!("{dir}/config.json"))
             .with_context(|| format!("EXL3 pack {dir}: config.json missing or unparsable"))?;
-        if cfg.family != crate::qwen::Family::Qwen4Exp {
+        // EXL27 (V074): Qwen35 (Qwen3.8-27B dense hybrid) is served too — the EXL3-side
+        // plumbing is family-generic: dense MLP rides the 1-expert MoE fiction, the plain
+        // residual recipe rides hc_count=1/hc_lowrank=0 (qwen.rs already sets both).
+        if !matches!(cfg.family, crate::qwen::Family::Qwen4Exp | crate::qwen::Family::Qwen35) {
             bail!(
                 "EXL3 pack {dir}: config.json declares family {:?} — this EXL3 loader only \
-                 serves the qwen4_exp family (the wrong-model hazard). Refusing.",
+                 serves the qwen4_exp / qwen3_5 families (the wrong-model hazard). Refusing.",
                 cfg.family
             );
         }

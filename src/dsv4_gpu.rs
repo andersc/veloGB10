@@ -51,32 +51,30 @@ pub struct Dsv4Kernels {
 }
 
 impl Dsv4Kernels {
-    /// Load `src/ptx/gpu_dsv4.ptx`, assert the build-id stamp, resolve `names` to raw handles.
+    /// Load the embedded gpu_dsv4 module, assert the build-id stamp, resolve `names` to raw handles.
     /// `dsv4_kernel_build_id` is resolved implicitly for the handshake (not required in `names`).
     pub fn load(dev: &Arc<CudaDevice>, names: &[&'static str]) -> Result<Self> {
-        Self::load_module(dev, "src/ptx/gpu_dsv4.ptx", names)
+        Self::load_module(dev, crate::ptx_embed::GPU_DSV4, "gpu_dsv4", names)
     }
 
-    /// Load an arbitrary DSV4 PTX module (e.g. the Phase-3 lane modules
-    /// `src/ptx/gpu_dsv4_{attn,comp}.ptx`), assert the build-id stamp, resolve `names`.
-    pub fn load_module(dev: &Arc<CudaDevice>, ptx_path: &str, names: &[&'static str]) -> Result<Self> {
+    /// Load an arbitrary embedded DSV4 PTX module (e.g. the Phase-3 lane modules
+    /// `gpu_dsv4_{attn,comp}`), assert the build-id stamp, resolve `names`.
+    pub fn load_module(dev: &Arc<CudaDevice>, ptx_src: &str, ptx_label: &str, names: &[&'static str]) -> Result<Self> {
         let ctx = *dev.cu_primary_ctx();
         // Bind the primary context to THIS thread before any raw driver op (the constructor bound
         // it on the device-creating thread, which may not be this one under the test harness).
         unsafe { result::ctx::set_current(ctx) }.map_err(|e| anyhow!("ctx bind in load: {e}"))?;
 
-        let ptx = std::fs::read_to_string(ptx_path)
-            .map_err(|e| anyhow!("read {ptx_path} (run `cargo build` first): {e}"))?;
-        let ptx_c = CString::new(ptx).unwrap();
+        let ptx_c = CString::new(ptx_src).unwrap();
         let module = unsafe { result::module::load_data(ptx_c.as_ptr() as *const _) }
-            .map_err(|e| anyhow!("cuModuleLoadData {ptx_path}: {e}"))?;
+            .map_err(|e| anyhow!("cuModuleLoadData {ptx_label}: {e}"))?;
 
         let mut funcs: HashMap<&'static str, sys::CUfunction> = HashMap::new();
         // The stamp kernel is always resolved — the loader asserts it below.
         for n in names.iter().copied().chain(std::iter::once("dsv4_kernel_build_id")) {
             let cname = CString::new(n).unwrap();
             let f = unsafe { result::module::get_function(module, cname) }
-                .map_err(|e| anyhow!("cuModuleGetFunction {ptx_path}::{n}: {e}"))?;
+                .map_err(|e| anyhow!("cuModuleGetFunction {ptx_label}::{n}: {e}"))?;
             funcs.insert(n, f);
         }
         let me = Self { module, funcs, ctx };

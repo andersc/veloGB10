@@ -147,7 +147,8 @@ impl EpShard {
     #[allow(clippy::too_many_arguments)]
     pub fn new(dev: &Arc<CudaDevice>, ne: usize, rank: usize, world: usize, local: &[usize], tag: &str,
                gu_len: usize, d_len: usize, suh_gu_len: usize, svh_gu_len: usize, suh_d_len: usize,
-               svh_d_len: usize, gu_words: u64, d_words: u64, h: usize, mi: usize) -> Result<Self> {
+               svh_d_len: usize, gu_words: u64, d_words: u64, h: usize, mi: usize,
+               split: bool) -> Result<Self> {
         anyhow::ensure!(world >= 2 && rank < world && ne % world == 0,
             "EP shard @{tag}: bad geometry ne={ne} rank={rank} world={world}");
         let kind = ep_deal_kind();
@@ -164,7 +165,9 @@ impl EpShard {
             ("gate|up trellis words", gu_len, n * gu_words as usize),
             ("down trellis words", d_len, n * d_words as usize),
             ("suh_gu", suh_gu_len, n * h),
-            ("svh_gu", svh_gu_len, n * 2 * mi),
+            // split layout (Qwen3.5-class routed experts): svh_gu holds the GATE's svh only
+            // (n*mi); up's svh rides SplitGu. Fused (FN): gate|up interleaved -> n*2*mi.
+            ("svh_gu", svh_gu_len, if split { n * mi } else { n * 2 * mi }),
             ("suh_d", suh_d_len, n * mi),
             ("svh_d", svh_d_len, n * h),
         ];
@@ -906,14 +909,14 @@ fn boot_rendezvous(rank: i32, mode: u8) -> Result<()> {
         if let Some((r, s)) = v.split_once(':') {
             if r.trim().parse::<i32>().ok() == Some(rank) {
                 let secs: u64 = s.trim().parse().unwrap_or(0);
-                println!("[exl3-tp] rank {rank}: --tp-boot-delay test injection — sleeping {secs}s before the boot rendezvous");
+                crate::dprintln!("[exl3-tp] rank {rank}: --tp-boot-delay test injection — sleeping {secs}s before the boot rendezvous");
                 std::thread::sleep(std::time::Duration::from_secs(secs));
             }
         }
     }
     const MAGIC: u32 = 0xB00F_0C06;
     let t0 = std::time::Instant::now();
-    println!("[exl3-tp] rank {rank}: entering the post-load boot rendezvous (probe-tolerant, no overall deadline)");
+    crate::dprintln!("[exl3-tp] rank {rank}: entering the post-load boot rendezvous (probe-tolerant, no overall deadline)");
     let all = crate::net::exchange_u32s_all(&[MAGIC, mode as u32], 4)
         .context("TP-F dual-rail boot rendezvous (probe-tolerant exchange; peer dead or link aborted)")?;
     for (r, peer) in all.iter().enumerate().filter(|(r, _)| *r as i32 != rank) {
@@ -922,7 +925,7 @@ fn boot_rendezvous(rank: i32, mode: u8) -> Result<()> {
                           peer[0], peer[1]);
         }
     }
-    println!("[exl3-tp] rank {rank}: boot rendezvous OK after {:.1}s wait (probe-tolerant; mode {mode})",
+    crate::dprintln!("[exl3-tp] rank {rank}: boot rendezvous OK after {:.1}s wait (probe-tolerant; mode {mode})",
              t0.elapsed().as_secs_f64());
     Ok(())
 }
@@ -964,7 +967,7 @@ fn align_round_phase(dev: &Arc<CudaDevice>, kern: &crate::tp_xport::Kernels, str
     }
     let e1 = epoch();
     anyhow::ensure!(e1 % rounds as u64 == 0, "TP round phase ({rail}): device epoch {e1} is not a multiple of {rounds} after alignment");
-    println!("[exl3-tp] rank {rank}: round phase aligned ({rail}: device epoch {e0} -> {e1}, {pad} pad exchange(s)): the first all-reduce \
+    crate::dprintln!("[exl3-tp] rank {rank}: round phase aligned ({rail}: device epoch {e0} -> {e1}, {pad} pad exchange(s)): the first all-reduce \
               runs round {} first", (e1 + 1) % rounds as u64);
     Ok(())
 }
@@ -981,7 +984,7 @@ fn rail2_preflight(rank: i32, dev2: &str) -> Result<()> {
     // the static GID_IDX default can differ from what the sysfs scan picked for this boot.
     let gid_idx = crate::tp::resolve_gid_idx(dev2);
     let (ok, why) = rail_device_state(std::path::Path::new("/sys/class/infiniband"), dev2, gid_idx);
-    if !ok { println!("[exl3-tp] rank {rank}: rail 2 preflight FAILED locally: {why}"); }
+    if !ok { crate::dprintln!("[exl3-tp] rank {rank}: rail 2 preflight FAILED locally: {why}"); }
     let all = crate::net::exchange_u32s_all(&[preflight_word(ok), rank as u32], 4)
         .context("TP-4E rail 2 preflight exchange (rail 1 control plane)")?;
     let bad = preflight_failures(&all.iter().map(|f| f[0]).collect::<Vec<_>>());
@@ -1078,7 +1081,7 @@ impl TpState {
         let trace = crate::opts::var(crate::opt!("tp-trace")).is_ok() || crate::tp::tp_config().map_or(false, |c| c.trace);
         if trace {
             crate::net::trace_enable(&mut link);
-            println!("[exl3-tp] per-barrier tracing ON");
+            crate::dprintln!("[exl3-tp] per-barrier tracing ON");
         }
         let ctx = link.ctx_device_ptr();
         let addr = link.ctx_addr();
@@ -1137,7 +1140,7 @@ impl TpState {
                     align_round_phase(dev, &kern, stream, *rails.last().unwrap(), &mut part, t.world, t.rank, "rail 2",
                                       &move || crate::net::ctx_device_epoch(a2))?;
                 }
-                println!("[exl3-tp] rank {} rail 2 UP: {dev2} ({how}), proxy pinned to core {TP_AUX_PROXY_CORE}", t.rank);
+                crate::dprintln!("[exl3-tp] rank {} rail 2 UP: {dev2} ({how}), proxy pinned to core {TP_AUX_PROXY_CORE}", t.rank);
             }
             let lookahead = crate::opts::var(crate::opt!("tp-xport-lookahead")).ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
             let blocks = crate::opts::var(crate::opt!("tp-xport-blocks")).ok().and_then(|v| v.parse().ok()).unwrap_or(16u32);
@@ -1163,7 +1166,7 @@ impl TpState {
             let a3 = l3.ctx_addr();
             std::mem::forget(l3);
             crate::net::spawn_proxy_aux(a3, TP_SINGLE_PROXY_CORE);
-            println!("[exl3-tp] rank {} --tp-reduce single UP: dedicated uniform one-shot ctx on {dev1} (N-way, TCP base {base}, {} peers), \
+            crate::dprintln!("[exl3-tp] rank {} --tp-reduce single UP: dedicated uniform one-shot ctx on {dev1} (N-way, TCP base {base}, {} peers), \
                       proxy pinned to core {TP_SINGLE_PROXY_CORE}; decode/verify reduces = ONE all-peers fp32 stage, sum (p0+p2)+(p1+p3) \
                       (bitwise the rd two-stage tree); prefill reduces and the key/screen exchanges stay on rail 1",
                      t.rank, t.world - 1);
@@ -1179,47 +1182,47 @@ impl TpState {
         } else { None };
         dev.synchronize()?;
         match &dec {
-            Some(d) if t.world > 2 => println!("[exl3-tp] decode transport: world {} = {} exchanges per logical reduce (TP-4C): the producer's \
+            Some(d) if t.world > 2 => crate::dprintln!("[exl3-tp] decode transport: world {} = {} exchanges per logical reduce (TP-4C): the producer's \
                                                 folded K1 + multi-block K2 for round 0, plain K1 + K2 for the later rounds (fp32 \
                                                 intermediate, f16 only on the last round), {} K2 blocks, receive cpu_done only \
                                                 (--tp-dec-grecv is world 2 only — TP-4F lever)",
                                                t.world, (t.world as u32).trailing_zeros(), d.blocks),
-            Some(d) => println!("[exl3-tp] decode transport: K1 FOLDED into the producers + multi-block K2 ({} blocks, f16 cvt folded), \
+            Some(d) => crate::dprintln!("[exl3-tp] decode transport: K1 FOLDED into the producers + multi-block K2 ({} blocks, f16 cvt folded), \
                                  receive {} (--tp-dec-xport default; =0 = the serial pair)", d.blocks,
                                 if d.grecv { "GPU-side (payload tail) or cpu_done" } else { "cpu_done only (--tp-dec-grecv=0)" }),
-            None => println!("[exl3-tp] decode transport: serial single-block K1/K2 + cvt (--tp-dec-xport=0)"),
+            None => crate::dprintln!("[exl3-tp] decode transport: serial single-block K1/K2 + cvt (--tp-dec-xport=0)"),
         }
-        println!("[exl3-tp] rank {}/{} attached: fp32 all-reduce, proxy pinned to core {TP_PROXY_CORE}, \
+        crate::dprintln!("[exl3-tp] rank {}/{} attached: fp32 all-reduce, proxy pinned to core {TP_PROXY_CORE}, \
                   EP deal '{}', partial buffer {} rows", t.rank, t.world, ep_deal_kind(), TP_MAX_ROWS);
         match &xport {
-            Some(x) => println!("[exl3-tp] prefill transport: PIPELINED multi-block (--tp-prefill-xport) — \
+            Some(x) => crate::dprintln!("[exl3-tp] prefill transport: PIPELINED multi-block (--tp-prefill-xport) — \
                                  {} rail(s), lookahead {} epochs/rail, {} blocks, reduces > {} KiB",
                                  x.rails.len(), x.lookahead, x.blocks, XPORT_MIN_BYTES / 1024),
-            None => println!("[exl3-tp] prefill transport: serial single-block K1/K2 (--tp-prefill-xport=0)"),
+            None => crate::dprintln!("[exl3-tp] prefill transport: serial single-block K1/K2 (--tp-prefill-xport=0)"),
         }
-        println!("[exl3-tp] prefill transport choice: {}",
+        crate::dprintln!("[exl3-tp] prefill transport choice: {}",
                  prefill_xport_why(t.world, mode, crate::opts::var(crate::opt!("tp-prefill-xport")).is_ok()));
         match pf_overlap_rows() {
-            0 => println!("[exl3-tp] prefill overlap: OFF (--tp-prefill-overlap off)"),
-            _ if pf_overlap_fold() => println!("[exl3-tp] prefill overlap: FOLD — whole-row epochs, each epoch's K2m replaced \
+            0 => crate::dprintln!("[exl3-tp] prefill overlap: OFF (--tp-prefill-overlap off)"),
+            _ if pf_overlap_fold() => crate::dprintln!("[exl3-tp] prefill overlap: FOLD — whole-row epochs, each epoch's K2m replaced \
                            by the fused consumer (xq_pf_hc_inj_norm_k2 / exl3_had_svh_k2 + inject+norm), one stream \
                            (--tp-prefill-overlap fold)"),
-            r => println!("[exl3-tp] prefill overlap: ON — the next hc_pre's inject+norm (and the mixer's svh) run per \
+            r => crate::dprintln!("[exl3-tp] prefill overlap: ON — the next hc_pre's inject+norm (and the mixer's svh) run per \
                            landed {r}-row range inside each pipelined prefill reduce, {} (--tp-prefill-overlap {})",
                           if pf_overlap_dual() { "K1m/K2m on the transport's own stream (dual)" } else { "same stream (inline)" },
                           pf_overlap_desc(pf_overlap_code())),
         }
         if t.world > 2 && pf_overlap_rows() > 0 {
-            println!("[exl3-tp] prefill overlap at world {}: the hooks ride the round-aware program (TP-4E): a row range is consumed \
+            crate::dprintln!("[exl3-tp] prefill overlap at world {}: the hooks ride the round-aware program (TP-4E): a row range is consumed \
                       only after its LAST round's K2m (fp32 running sum staged in the partial buffer, one f16 rounding at the end); \
                       --tp-prefill-overlap fold is refused at world > 2", t.world);
         }
         if seq_parallel_on() && t.world > 4 {
-            println!("[exl3-tp] TP-SP sequence-parallel prefill: INACTIVE at world {} (the default ON yields: SP exists at world 2 \
+            crate::dprintln!("[exl3-tp] TP-SP sequence-parallel prefill: INACTIVE at world {} (the default ON yields: SP exists at world 2 \
                       and world 4 only; the replicated prefill runs; an explicit --tp-seq-parallel is refused here)",
                      t.world);
         } else if seq_parallel_on() {
-            println!("[exl3-tp] TP-SP sequence-parallel prefill: ON (--tp-seq-parallel {}) at world {} — chunks of {SP_MIN_ROWS}..={SP_MAX_ROWS} \
+            crate::dprintln!("[exl3-tp] TP-SP sequence-parallel prefill: ON (--tp-seq-parallel {}) at world {} — chunks of {SP_MIN_ROWS}..={SP_MAX_ROWS} \
                       rows: hc_pre on the own row block (rank r the rows [r*ceil(c/{}), (r+1)*ceil(c/{})), hc GEMM plans pinned to the full \
                       chunk's), x all-gathered before every mixer / router, reduce-scatters instead of all-reduces{}{}{}",
                      seq_parallel_desc(seq_parallel_code()), t.world, t.world, t.world,
@@ -1229,7 +1232,7 @@ impl TpState {
         }
         let pf_on = !matches!(crate::opts::var(crate::opt!("tp-k2-prefetch")).map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                               Ok("off") | Ok("0") | Ok("false"));
-        println!("[exl3-tp] rank {} --tp-k2-prefetch {} (L2 run-ahead of the next hc mixer's weights from the idle threads of the decode K2)",
+        crate::dprintln!("[exl3-tp] rank {} --tp-k2-prefetch {} (L2 run-ahead of the next hc mixer's weights from the idle threads of the decode K2)",
                  t.rank, if pf_on { "ON" } else { "OFF" });
         Ok(TpState { rank: t.rank, world: t.world, ctx, part, xport, kern, aux, dec, single, pf_on, pf_hint: Default::default() })
     }
@@ -1887,13 +1890,15 @@ fn probe_agree(step: u64, argmax: u32) -> std::result::Result<(), String> {
     crate::exl3_serve::tp_agree_eq(step, 0, 1, argmax).map_err(|why| { crate::net::abort_link(); why })
 }
 
-/// `TP-IDENT` — binary sha256 + the two PTX modules this path loads + the build token.
+/// `TP-IDENT` — binary sha256 + the two PTX modules this path loads (embedded bytes since EMB1) + the build token.
 pub fn identity_line(role: &str) -> String {
     let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let short = |h: String| h.chars().take(16).collect::<String>();
     format!("TP-IDENT role={role} host={} bin={} exl3_bench.ptx={} gpu_batch.ptx={} kernel_build_id={} source_build_id={}",
             std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
-            short(sha256_hex(&exe)), short(sha256_hex(crate::exl3_bench::bench_ptx_path())), short(sha256_hex("src/ptx/gpu_batch.ptx")),
+            short(sha256_hex(&exe)),
+            short(crate::exl3_tune::sha256_hex(crate::exl3_bench::bench_ptx_src().as_bytes())),
+            short(crate::exl3_tune::sha256_hex(crate::ptx_embed::GPU_BATCH.as_bytes())),
             env!("KERNEL_BUILD_ID"), env!("SOURCE_BUILD_ID"))
 }
 
@@ -2170,7 +2175,7 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
             if err / scale > 1e-6 { ent.6 += 1; } else { neg_fail += 1; }
         }
         if n_mod % 200 == 0 {
-            println!("  slice oracle: {n_mod} modules ({:.0}s)", t0.elapsed().as_secs_f32());
+            crate::dprintln!("  slice oracle: {n_mod} modules ({:.0}s)", t0.elapsed().as_secs_f32());
         }
     }
     // plain (non-trellis) tensors the TP map touches: fp16/bf16 as stored — slicing is a copy
@@ -2187,16 +2192,16 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
                                                 .map(|(_, d)| d.as_str()).collect();
         plain_report.insert(format!("{cls} ({})", dts.into_iter().collect::<Vec<_>>().join("/")), c);
     }
-    println!("SLICE_ORACLE per class (W = 2 and 4, planned design §1.3 splits):");
+    crate::dprintln!("SLICE_ORACLE per class (W = 2 and 4, planned design §1.3 splits):");
     for (cls, (mods, blocks, bad, ops, ecol, erow, neg, desc)) in &per {
-        println!("SLICE_CLASS {cls:<28} modules {mods:>5} blocks {blocks:>10} bad_values {bad} op_checks {ops} \
+        crate::dprintln!("SLICE_CLASS {cls:<28} modules {mods:>5} blocks {blocks:>10} bad_values {bad} op_checks {ops} \
                   col_op_maxabs {ecol:.3e} row_op_relL2 {erow:.3e} neg_ctrl_detected {neg}/{mods} |{desc}");
     }
     for (cls, c) in &plain_report {
-        println!("SLICE_PLAIN {cls:<34} tensors {c:>5}: not trellis-coded — a slice is a plain copy (exact by construction)");
+        crate::dprintln!("SLICE_PLAIN {cls:<34} tensors {c:>5}: not trellis-coded — a slice is a plain copy (exact by construction)");
     }
     let ok = total_bad == 0 && neg_fail == 0 && !per.is_empty();
-    println!("SLICE_ORACLE_VERDICT {} modules={n_mod} bad_values={total_bad} neg_control_misses={neg_fail} wall={:.1}s",
+    crate::dprintln!("SLICE_ORACLE_VERDICT {} modules={n_mod} bad_values={total_bad} neg_control_misses={neg_fail} wall={:.1}s",
              if ok { "SLICE_OK" } else { "SLICE_FAIL" }, t0.elapsed().as_secs_f32());
     if gpu { probe_slice_gpu(dir, &pack)?; }
     if !ok { anyhow::bail!("slice oracle FAILED"); }
@@ -2237,7 +2242,7 @@ fn probe_slice_gpu(dir: &str, pack: &Exl3Pack) -> Result<()> {
                   "model.language_model.layers.0.mlp.experts.7.gate_proj", "lm_head"];
     let mut all_ok = true;
     for name in wanted {
-        let Some(m) = pack.modules.iter().find(|m| m.name == name) else { println!("SLICE_GPU {name}: not in pack"); continue };
+        let Some(m) = pack.modules.iter().find(|m| m.name == name) else { crate::dprintln!("SLICE_GPU {name}: not in pack"); continue };
         let tr = le_i16v(&m.trellis.read_bytes(dir)?);
         let suh = le_u16v(&m.suh.read_bytes(dir)?);
         let svh = le_u16v(&m.svh.read_bytes(dir)?);
@@ -2311,9 +2316,9 @@ fn probe_slice_gpu(dir: &str, pack: &Exl3Pack) -> Result<()> {
             chain_line = format!(" sum-of-partials vs full chain relL2 {:.2e} (f16 partials, reassociated)", (num / den.max(1e-30)).sqrt());
         }
         all_ok &= dec_bad == 0;
-        println!("SLICE_GPU {name} [{desc}] served-decode bad_values {dec_bad} | m=1 chain:{chain_line}");
+        crate::dprintln!("SLICE_GPU {name} [{desc}] served-decode bad_values {dec_bad} | m=1 chain:{chain_line}");
     }
-    println!("SLICE_GPU_VERDICT {}", if all_ok { "SLICE_GPU_OK" } else { "SLICE_GPU_FAIL" });
+    crate::dprintln!("SLICE_GPU_VERDICT {}", if all_ok { "SLICE_GPU_OK" } else { "SLICE_GPU_FAIL" });
     if !all_ok { anyhow::bail!("GPU slice check FAILED"); }
     Ok(())
 }
@@ -2985,8 +2990,8 @@ fn topk_ids(v: &[f32], k: usize) -> Vec<usize> {
 /// every floor member); `opts.gates` = the TP=1 control of G-T1-c/d; `opts.time_tokens` = an
 /// untraced timing pass (eager + graphed ms/token, prefill s).
 pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_dir: &str, opts: &XtpOpts) -> Result<()> {
-    println!("{}", identity_line("xtp-ref"));
-    println!("XTP_REF program {} (prompt {} tokens, gen {gen})", opts.to_mode(), prompt.len());
+    crate::dprintln!("{}", identity_line("xtp-ref"));
+    crate::dprintln!("XTP_REF program {} (prompt {} tokens, gen {gen})", opts.to_mode(), prompt.len());
     let model = FwdModel::load(dir, 1, max_pos)?;
     let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1, model.max_pos())?;
     let mut psc_store = match opts.pf_chunk { Some(c) => Some(model.prefill_scratch(c)?), None => None };
@@ -3014,20 +3019,20 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
             Ok(())
         })?;
     let (seq, am, lg, layers, tt0) = (p.seq, p.am, p.lg, p.at_cmp, p.t0);
-    println!("XTP_REF pass: {} steps from t0 {tt0} in {:.1}s (eager, captures on; chunked prefill {:.2}s)",
+    crate::dprintln!("XTP_REF pass: {} steps from t0 {tt0} in {:.1}s (eager, captures on; chunked prefill {:.2}s)",
              am.len(), t0.elapsed().as_secs_f32(), p.pf_s);
     let tok = crate::tokenizer::QwenTokenizer::from_file(&format!("{dir}/tokenizer.json"))?;
     let text = tok.decode(&seq[plen..], false).unwrap_or_default();
-    println!("XTP_REF greedy[{gen}]: {:?}", text);
+    crate::dprintln!("XTP_REF greedy[{gen}]: {:?}", text);
     for (di, kind) in ["interleave", "contig"].iter().enumerate() {
-        println!("XTP_DEAL {kind}: mean busiest-rank share of the top-{topk} per (layer, token) = {:.4} over {} routings (ideal 0.5)",
+        crate::dprintln!("XTP_DEAL {kind}: mean busiest-rank share of the top-{topk} per (layer, token) = {:.4} over {} routings (ideal 0.5)",
                  bal[di].0 / bal[di].1.max(1) as f64, bal[di].1);
     }
     // determinism control: a plain teacher-forced rerun must be bit-exact
     let p2 = trace_pass(&model, &mut sc, psc_store.as_mut(), false, prompt, Some(&seq), gen, cmp, None, true,
                         &mut |_, _| Ok(()), &mut |_, _, _| Ok(()))?;
     let rerun_bitexact = p2.am == am && p2.lg.iter().zip(&lg).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
-    println!("XTP_REF rerun (teacher-forced, no perturbation): {}", if rerun_bitexact { "BIT-EXACT" } else { "NOT bit-exact (nondeterministic reference!)" });
+    crate::dprintln!("XTP_REF rerun (teacher-forced, no perturbation): {}", if rerun_bitexact { "BIT-EXACT" } else { "NOT bit-exact (nondeterministic reference!)" });
     // The floor ENSEMBLE (Q1-style, measured in THIS run): for each seed, (a) bit-0 = one f32 ulp
     // flipped in ~half of every GDN S element after every step (Q1's floor), (b) moe-ulp = one
     // f16 ulp flipped in ~half of every MoE output (the site TP=2 reassociates). A single seed's
@@ -3053,11 +3058,11 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
             let pf = res?;
             let c = compare(&lg, &layers, &seq, plen, &pf.lg, &pf.at_cmp, &pf.am, pf.t0);
             let flips = router_flips(&layers, &pf.at_cmp, ne, topk);
-            println!("XTP_FLOOR {kind} seed {seed}: logits relL2 med {:.3e} max {:.3e} | hidden relL2 med {:.3e} max {:.3e} | argmax div {:?} | first router flip {:?} ({} flipped layers)",
+            crate::dprintln!("XTP_FLOOR {kind} seed {seed}: logits relL2 med {:.3e} max {:.3e} | hidden relL2 med {:.3e} max {:.3e} | argmax div {:?} | first router flip {:?} ({} flipped layers)",
                      c.0, c.1, c.2, c.3, c.4.map(|d| d as i64 - (plen as i64 - 1)), flips.first(), flips.len());
             if seed == 0 {
                 for chunk in lay_only(&c.5).chunks(12) {
-                    println!("XTP_FLOOR {kind} seed 0 per-layer hidden: {}", chunk.iter().map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
+                    crate::dprintln!("XTP_FLOOR {kind} seed 0 per-layer hidden: {}", chunk.iter().map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
                 }
                 seed0[ki] = c.clone();
             }
@@ -3069,7 +3074,7 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
     let mut bl: Vec<f64> = band.iter().map(|b| b.2).collect();
     let bh_max = band.iter().map(|b| b.3).fold(0f64, f64::max);
     let bh_min = band.iter().map(|b| b.3).fold(f64::INFINITY, f64::min);
-    println!("XTP_BAND {} members: logits relL2 med-of-meds {:.3e} | hidden relL2 med range [{bh_min:.3e}, {bh_max:.3e}] | first flip layers {:?}",
+    crate::dprintln!("XTP_BAND {} members: logits relL2 med-of-meds {:.3e} | hidden relL2 med range [{bh_min:.3e}, {bh_max:.3e}] | first flip layers {:?}",
              band.len(), median(&mut bl), band.iter().map(|b| b.4.map(|f| f.0)).collect::<Vec<_>>());
     // TP-B: the untraced timing pass (eager AND graphed at TP=1; TP=2 runs eager) — not a perf claim
     let timing = if opts.time_tokens > 1 {
@@ -3077,15 +3082,15 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
         let (pf_e, ms_e, ids_e) = time_pass(&model, &mut sc, psc_store.as_mut(), prompt, opts.time_tokens, &mut |_, _| Ok(()))?;
         crate::opts::unset(crate::opt!("exl3-no-graph"));
         let (_, ms_g, ids_g) = time_pass(&model, &mut sc, psc_store.as_mut(), prompt, opts.time_tokens, &mut |_, _| Ok(()))?;
-        println!("XTP_TIME TP=1: prefill {pf_e:.3}s ({} tok{}) | decode eager {ms_e:.2} ms/token, graphed {ms_g:.2} ms/token over {} tokens | eager==graphed ids: {}",
+        crate::dprintln!("XTP_TIME TP=1: prefill {pf_e:.3}s ({} tok{}) | decode eager {ms_e:.2} ms/token, graphed {ms_g:.2} ms/token over {} tokens | eager==graphed ids: {}",
                  plen, if opts.pf_chunk.is_some() { ", chunked" } else { ", token-by-token" }, opts.time_tokens - 1, ids_e == ids_g);
         Some((pf_e, ms_e, ms_g))
     } else { None };
     // TP-B: the TP=1 control of G-T1-c / G-T1-d (same function the TP=2 run executes)
     let gates = if opts.gates > 0 {
         let (ok, rep) = gates_bv_state(&model, psc_store.as_mut(), prompt, opts.gates, &mut |_, v| Ok(v))?;
-        for l in &rep { println!("TP1 {l}"); }
-        println!("TP1 GATES {} (the TP=1 control)", if ok { "EXACT" } else { "DIVERGES" });
+        for l in &rep { crate::dprintln!("TP1 {l}"); }
+        crate::dprintln!("TP1 GATES {} (the TP=1 control)", if ok { "EXACT" } else { "DIVERGES" });
         rep
     } else { Vec::new() };
     std::fs::create_dir_all(out_dir)?;
@@ -3102,7 +3107,7 @@ pub fn probe_xtp_ref(dir: &str, prompt: &[u32], gen: usize, max_pos: usize, out_
         opts_mode: opts.to_mode(), t0: tt0, timing, gates,
     };
     std::fs::write(format!("{out_dir}/xtp_ref.json"), serde_json::to_string_pretty(&r)?)?;
-    println!("XTP_REF written to {out_dir} (seq {} tokens, {} logits rows, {} layer captures)", seq.len(), lg.len(), layers.len());
+    crate::dprintln!("XTP_REF written to {out_dir} (seq {} tokens, {} logits rows, {} layer captures)", seq.len(), lg.len(), layers.len());
     Ok(())
 }
 
@@ -3235,11 +3240,11 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     // The launch thread pinned to a big core (gpu.rs / tp_serve rule: an unpinned launch thread
     // presents exactly like a protocol stall) — the proxy takes core 19.
     anyhow::ensure!(crate::net::pin_thread(9), "launch thread failed to pin to core 9 — TP refuses to run unpinned");
-    println!("[exl3-tp] rank {rank}/{world}: program {} — loading {pack_dir} (EP deal '{}', max_pos {max_pos}) ...",
+    crate::dprintln!("[exl3-tp] rank {rank}/{world}: program {} — loading {pack_dir} (EP deal '{}', max_pos {max_pos}) ...",
              opts.to_mode(), ep_deal_kind());
     let t_load = std::time::Instant::now();
     let model = FwdModel::load_tp(pack_dir, 1, max_pos, Some(TpAttach { rank, world, link }))?;
-    println!("[exl3-tp] rank {rank}/{world}: loaded in {:.1}s — trunk per rank: {} q heads / {} kv heads, GDN {} k / {} v heads",
+    crate::dprintln!("[exl3-tp] rank {rank}/{world}: loaded in {:.1}s — trunk per rank: {} q heads / {} kv heads, GDN {} k / {} v heads",
              t_load.elapsed().as_secs_f32(), model.tc.num_heads, model.tc.num_kv_heads, model.tc.lin_num_k_heads, model.tc.lin_num_v_heads);
     let mut sc = FwdModel::scratch(&model.dev, &model.cfg, 1, model.max_pos())?;
     let mut psc_store = match opts.pf_chunk { Some(c) => Some(model.prefill_scratch(c)?), None => None };
@@ -3277,7 +3282,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         anyhow::ensure!(seq_parallel_on() && fr < world as usize && fl < model.layers.len(),
                         "--xtp-sp-fault {fl}:{fr} needs --tp-seq-parallel on, a rank < {world} and a layer < {}", model.layers.len());
         SP_FAULT.store((fl + 1) | (fr << 16), AtOrd::Relaxed);
-        println!("[exl3-tp] rank {rank}: TP-SP2 G-T1-b fault injection ARMED: rank {fr} perturbs one own stream row after layer {fl} \
+        crate::dprintln!("[exl3-tp] rank {rank}: TP-SP2 G-T1-b fault injection ARMED: rank {fr} perturbs one own stream row after layer {fl} \
                   in the first split chunk's sequence-parallel run (the gate must FAIL)");
     }
     let t1 = std::time::Instant::now();
@@ -3311,7 +3316,7 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
             // through `?` BEFORE the class table was printed; the digests of the steps compared so far are the evidence.
             for (k, v) in &nb2 { *names_bad.entry(format!("prefill:{k}")).or_default() += v; }
             if first_bad.is_none() { first_bad = fb2.clone(); }
-            println!("{}", rank_identity_abort_line(n_dig, steps_seen, steps_ok, pf_dig, pf_chunks, pf_bad, &names_bad,
+            crate::dprintln!("{}", rank_identity_abort_line(n_dig, steps_seen, steps_ok, pf_dig, pf_chunks, pf_bad, &names_bad,
                                                     first_bad.as_deref(), &format!("{e:#}")));
             return Err(e);
         }
@@ -3322,14 +3327,14 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
     for (k, v) in nb2 { *names_bad.entry(format!("prefill:{k}")).or_default() += v; }
     if first_bad.is_none() { first_bad = fb2; }
     let ident_ok = names_bad.is_empty() && n_dig > 0;
-    println!("G-T1-b RANK_IDENTITY {} — {n_dig} replicated decode buffers over {total_steps} steps x (embed, 48 x [xpre, yatt, rlog, ymlp, layer], precollapse, finalmix, logits){}; \
+    crate::dprintln!("G-T1-b RANK_IDENTITY {} — {n_dig} replicated decode buffers over {total_steps} steps x (embed, 48 x [xpre, yatt, rlog, ymlp, layer], precollapse, finalmix, logits){}; \
               steps fully identical {steps_ok}/{total_steps}; mismatches by class {:?}{}",
              if ident_ok { "OK" } else { "FAIL" },
              if pf_chunks > 0 { format!(" + {pf_dig} whole-chunk prefill digests over {pf_chunks} chunks ({pf_bad} bad) x (embed, 48 x [xpre, rmid, yatt, xpre_mlp, inj, ymlp, layer], precollapse, finalmix)") } else { String::new() },
              names_bad,
              first_bad.map(|s| format!("; first: {s}")).unwrap_or_default());
     if spt.chunks > 0 {
-        println!("G-T1-b SP (row ownership, TP-SP2) — {} sequence-parallel chunk(s), each run twice on the same state: \
+        crate::dprintln!("G-T1-b SP (row ownership, TP-SP2) — {} sequence-parallel chunk(s), each run twice on the same state: \
                   R = the replicated reference ({} whole-buffer digests compared across ranks, {} bad) | S = the \
                   sequence-parallel run: {} gathered / all-row digests (embed, xpre, xpre_mlp, streams, hcarry, logits) \
                   == the peer's AND this rank's R ({} bad); {} own-row block digests (rmid, yatt, inj, ymlp, layer, \
@@ -3369,8 +3374,8 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         }
         "barrier latency: tracing off (--tp-trace=1 / --tp-trace to measure)".to_string()
     };
-    println!("[exl3-tp] rank {rank}: {}", lat_line("(traced passes)"));
-    println!("[exl3-tp] rank {rank}: pass1 {total_steps} steps from t0 {pt0} {pass1_s:.1}s (digest capture on; chunked prefill {:.2}s), pass2 greedy {pass2_s:.1}s (captures on, eager)",
+    crate::dprintln!("[exl3-tp] rank {rank}: {}", lat_line("(traced passes)"));
+    crate::dprintln!("[exl3-tp] rank {rank}: pass1 {total_steps} steps from t0 {pt0} {pass1_s:.1}s (digest capture on; chunked prefill {:.2}s), pass2 greedy {pass2_s:.1}s (captures on, eager)",
              p1.pf_s);
 
     // ---- TP-B: untraced timing pass (eager; not a perf claim) ----
@@ -3380,12 +3385,12 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
                 token {i} (argmax {am}): {why}"))?;
             Ok(())
         })?;
-        println!("XTP_TIME TP={world} rank {rank}: prefill {pf_s:.3}s ({plen} tok{}) | decode eager {ms:.2} ms/token over {} tokens (48 x 3 all-reduces per token){}",
+        crate::dprintln!("XTP_TIME TP={world} rank {rank}: prefill {pf_s:.3}s ({plen} tok{}) | decode eager {ms:.2} ms/token over {} tokens (48 x 3 all-reduces per token){}",
                  if opts.pf_chunk.is_some() { ", chunked" } else { ", token-by-token" }, opts.time_tokens - 1,
                  rref.as_ref().and_then(|r| r.timing).map(|(p1s, e, g)| format!(" | TP=1 ref: prefill {p1s:.3}s, eager {e:.2} ms/token, graphed {g:.2} ms/token")).unwrap_or_default());
         let tokz = crate::tokenizer::QwenTokenizer::from_file(&format!("{pack_dir}/tokenizer.json"))?;
-        if rank == 0 { println!("XTP_TIME greedy text: {:?}", tokz.decode(&ids, false).unwrap_or_default()); }
-        println!("[exl3-tp] rank {rank}: {}", lat_line("(incl. the untraced timing pass)"));
+        if rank == 0 { crate::dprintln!("XTP_TIME greedy text: {:?}", tokz.decode(&ids, false).unwrap_or_default()); }
+        crate::dprintln!("[exl3-tp] rank {rank}: {}", lat_line("(incl. the untraced timing pass)"));
     }
 
     // ---- TP-B: G-T1-c / G-T1-d at TP=W ----
@@ -3399,15 +3404,15 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
             // The caller compares the returned word with its own: hand back a differing rank's word if any.
             Ok(all.iter().map(|p| p[1]).find(|&w| w != v).unwrap_or(v))
         })?;
-        for l in &rep { println!("TP{world} rank {rank} {l}"); }
+        for l in &rep { crate::dprintln!("TP{world} rank {rank} {l}"); }
         let peer_ok = crate::net::exchange_u32s_all(&[ok as u32], 4)?
             .iter().enumerate().filter(|(r, _)| *r as i32 != rank).all(|(_, p)| p[0] != 0);
         gates_ok = ok && peer_ok;
-        println!("TP{world} GATES rank {rank}: this rank {} | {} => {}", if ok { "EXACT" } else { "DIVERGES" },
+        crate::dprintln!("TP{world} GATES rank {rank}: this rank {} | {} => {}", if ok { "EXACT" } else { "DIVERGES" },
                  if world == 2 { format!("peer {}", if peer_ok { "EXACT" } else { "DIVERGES" }) }
                  else { format!("all peers {}", if peer_ok { "EXACT" } else { "DIVERGE" }) },
                  if gates_ok { format!("G-T1-c/d EXACT at TP={world}") } else { "G-T1-c/d FAIL".to_string() });
-        if let Some(r) = &rref { for l in &r.gates { println!("  (TP=1 control) {l}"); } }
+        if let Some(r) = &rref { for l in &r.gates { crate::dprintln!("  (TP=1 control) {l}"); } }
     }
 
     let tok = crate::tokenizer::QwenTokenizer::from_file(&format!("{pack_dir}/tokenizer.json"))?;
@@ -3423,47 +3428,47 @@ pub fn run_tp_xtp(pack_dir: &str, ctx: crate::tp::TpContext, ref_dir: Option<&st
         let (lm, lx, hm, hx, div, per) = compare(&ref_lg, &ref_layers, &r.seq, plen, &lg1, &lay1, &am1, pt0);
         let rel = |x: f64, f: f64| x / f.max(1e-30);
         let flips = router_flips(&ref_layers, &lay1, model.cfg.num_experts, model.cfg.num_experts_per_tok);
-        println!("XTP router top-{} flips at cmp TP={world} vs TP=1 (layer, ids, ref gap k|k+1): {:?}", model.cfg.num_experts_per_tok, flips);
-        println!("XTP floors (TP=1): bit-0 GDN-state logits med {:.3e} hidden med {:.3e} | moe-ulp (reduction site) logits med {:.3e} hidden med {:.3e}",
+        crate::dprintln!("XTP router top-{} flips at cmp TP={world} vs TP=1 (layer, ids, ref gap k|k+1): {:?}", model.cfg.num_experts_per_tok, flips);
+        crate::dprintln!("XTP floors (TP=1): bit-0 GDN-state logits med {:.3e} hidden med {:.3e} | moe-ulp (reduction site) logits med {:.3e} hidden med {:.3e}",
                  r.floor_logits_med, r.floor_hidden_med, r.moeulp_logits_med, r.moeulp_hidden_med);
-        println!("XTP TP={world} vs the bit-0 floor: logits {:.2}x hidden {:.2}x | vs the moe-ulp floor: logits {:.2}x hidden {:.2}x",
+        crate::dprintln!("XTP TP={world} vs the bit-0 floor: logits {:.2}x hidden {:.2}x | vs the moe-ulp floor: logits {:.2}x hidden {:.2}x",
                  rel(lm, r.floor_logits_med), rel(hm, r.floor_hidden_med), rel(lm, r.moeulp_logits_med), rel(hm, r.moeulp_hidden_med));
         let mut bl: Vec<f64> = r.band.iter().map(|b| b.2).collect();
         let band_l = median(&mut bl);
         let band_h = r.band.iter().map(|b| b.3).fold(0f64, f64::max);
-        println!("XTP band ({} floor members): logits med {:.3e} | hidden med max {:.3e} | member first flips {:?}",
+        crate::dprintln!("XTP band ({} floor members): logits med {:.3e} | hidden med max {:.3e} | member first flips {:?}",
                  r.band.len(), band_l, band_h, r.band.iter().map(|b| (b.0.clone(), b.1, b.4)).collect::<Vec<_>>());
-        println!("XTP TP={world} vs the band: logits {:.2}x (<= 3x) | hidden {:.2}x of the band edge (<= 3x) | TP={world} first flip {:?}",
+        crate::dprintln!("XTP TP={world} vs the band: logits {:.2}x (<= 3x) | hidden {:.2}x of the band edge (<= 3x) | TP={world} first flip {:?}",
                  rel(lm, band_l), rel(hm, band_h), flips.first());
         let tier_ok = !r.band.is_empty() && lm <= 3.0 * band_l && hm <= 3.0 * band_h;
         let gdiv = (0..gen).find(|&i| seq2[plen + i] != r.seq[plen + i]);
-        println!("XTP per-layer hidden relL2 at the last prompt position (TP={world} vs TP=1):");
+        crate::dprintln!("XTP per-layer hidden relL2 at the last prompt position (TP={world} vs TP=1):");
         for chunk in per.iter().filter(|(n, _)| n.starts_with("layer")).collect::<Vec<_>>().chunks(8) {
-            println!("  {}", chunk.iter().map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
+            crate::dprintln!("  {}", chunk.iter().map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
         }
         let yatt: Vec<&(String, f64)> = per.iter().filter(|(n, _)| n.starts_with("yatt")).collect();
         if !yatt.is_empty() {
-            println!("XTP per-layer mixer-output (yatt, post all-reduce) relL2 at cmp: {}",
+            crate::dprintln!("XTP per-layer mixer-output (yatt, post all-reduce) relL2 at cmp: {}",
                      yatt.iter().take(12).map(|(n, v)| format!("{n}={v:.2e}")).collect::<Vec<_>>().join(" "));
         }
-        println!("XTP TP={world} vs TP=1 (teacher-forced, {} steps): logits relL2 med {lm:.3e} ({:.2}x floor) max {lx:.3e} | hidden relL2 med {hm:.3e} ({:.2}x floor) max {hx:.3e} | first argmax divergence {:?} (floor {:?})",
+        crate::dprintln!("XTP TP={world} vs TP=1 (teacher-forced, {} steps): logits relL2 med {lm:.3e} ({:.2}x floor) max {lx:.3e} | hidden relL2 med {hm:.3e} ({:.2}x floor) max {hx:.3e} | first argmax divergence {:?} (floor {:?})",
                  total_steps, rel(lm, r.floor_logits_med), rel(hm, r.floor_hidden_med),
                  div.map(|d| d as i64 - (plen as i64 - 1)), r.floor_div.map(|d| d as i64 - (plen as i64 - 1)));
         let text = tok.decode(&seq2[plen..], false).unwrap_or_default();
-        println!("XTP greedy[{gen}] TP={world}: {:?}", text);
-        println!("XTP greedy[{gen}] TP=1: {:?}", r.text);
-        println!("XTP greedy divergence index (free-running TP={world} vs TP=1): {}",
+        crate::dprintln!("XTP greedy[{gen}] TP={world}: {:?}", text);
+        crate::dprintln!("XTP greedy[{gen}] TP=1: {:?}", r.text);
+        crate::dprintln!("XTP greedy divergence index (free-running TP={world} vs TP=1): {}",
                  gdiv.map(|i| i.to_string()).unwrap_or_else(|| format!("none — all {gen} tokens identical")));
-        println!("RESULT: {} (tier: logits relL2 med <= 3x band median {band_l:.3e}, hidden relL2 med <= 3x band edge {band_h:.3e}; {} floor members) ; {}{}",
+        crate::dprintln!("RESULT: {} (tier: logits relL2 med <= 3x band median {band_l:.3e}, hidden relL2 med <= 3x band edge {band_h:.3e}; {} floor members) ; {}{}",
                  if tier_ok { "XTP_TIER_OK" } else { "XTP_TIER_FAIL" }, r.band.len(),
                  if ident_ok { "RANK_IDENTITY_OK" } else { "RANK_IDENTITY_FAIL" },
                  if opts.gates > 0 { if gates_ok { " ; GATES_OK" } else { " ; GATES_FAIL" } } else { "" });
         if !(tier_ok && ident_ok && gates_ok) { anyhow::bail!("xtp gate failed"); }
     } else {
         if rank == 0 {
-            println!("XTP greedy[{gen}] TP={world} (free-running, agreed every step): {:?}", tok.decode(&seq2[plen..], false).unwrap_or_default());
+            crate::dprintln!("XTP greedy[{gen}] TP={world} (free-running, agreed every step): {:?}", tok.decode(&seq2[plen..], false).unwrap_or_default());
         }
-        println!("RESULT: {} ; {}{}", if opts.ident_only { "IDENT_ONLY (no TP=1 reference)" } else { "node (the head holds the reference)" },
+        crate::dprintln!("RESULT: {} ; {}{}", if opts.ident_only { "IDENT_ONLY (no TP=1 reference)" } else { "node (the head holds the reference)" },
                  if ident_ok { "RANK_IDENTITY_OK" } else { "RANK_IDENTITY_FAIL" },
                  if opts.gates > 0 { if gates_ok { " ; GATES_OK" } else { " ; GATES_FAIL" } } else { "" });
         if !(ident_ok && gates_ok) { anyhow::bail!("rank identity / gates FAILED on rank {rank}"); }
@@ -3494,7 +3499,7 @@ impl FwdModel {
         let mut n: usize = 0;
         unsafe {
             if sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut n) != sys::CUresult::CUDA_SUCCESS {
-                println!("TP-SPINE {what} m={m}: node query failed — graph discarded (eager)");
+                crate::dprintln!("TP-SPINE {what} m={m}: node query failed — graph discarded (eager)");
                 crate::metrics::graph_capture_lost(what, &format!("spine audit, width/index {m}"), "tp_spine_audit: node query failed");
                 return false;
             }
@@ -3511,7 +3516,7 @@ impl FwdModel {
             sys::cuGraphGetEdges(graph, from.as_mut_ptr(), to.as_mut_ptr(), &mut e) == sys::CUresult::CUDA_SUCCESS
         });
         if !ok_e {
-            println!("TP-SPINE {what} m={m}: edge query failed — graph discarded (eager)");
+            crate::dprintln!("TP-SPINE {what} m={m}: edge query failed — graph discarded (eager)");
             crate::metrics::graph_capture_lost(what, &format!("spine audit, width/index {m}"), "tp_spine_audit: edge query failed");
             return false;
         }
@@ -3565,7 +3570,7 @@ impl FwdModel {
         // graphs are captured at runtime, after the boot precapture has used up the first 24 lines
         let new_shape = SPINE_SEEN.lock().map(|mut s| s.insert((what.to_string(), m, bells.len()))).unwrap_or(false);
         if !ok || SPINE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 || new_shape {
-            println!("TP-SPINE {what} m={m}: {n} nodes, {e} edges, {} doorbell nodes (K1+K2), {bad} with a concurrent node{} -> {}",
+            crate::dprintln!("TP-SPINE {what} m={m}: {n} nodes, {e} edges, {} doorbell nodes (K1+K2), {bad} with a concurrent node{} -> {}",
                      bells.len(), if bad > 0 { format!(" (worst {worst})") } else { String::new() },
                      if ok { "OK (every barrier is a cut vertex of the DAG)" } else { "VIOLATION — graph discarded, this shape runs eager" });
         }

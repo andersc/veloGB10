@@ -35,8 +35,14 @@ pub struct Config {
     pub vocab_size: usize,
     pub rms_eps: f32,
     pub rope_theta: f32,
-    /// E5: >1 enables trunk YaRN rope (vLLM-convention ramp + mscale; see build_rope_tables).
+    /// E5/YARN1: >1 enables trunk YaRN rope (vLLM-convention ramp + mscale; see
+    /// build_rope_tables). Set from the pack's `rope_scaling` block when it says
+    /// `type: "yarn"`; an explicit --rope-yarn-factor wins over it (resolved_yarn).
     pub rope_yarn_factor: f32,
+    /// YARN1: the NATIVE window the rope factor multiplies — `rope_scaling`'s
+    /// `original_max_position_embeddings` when present, else `max_position_embeddings`.
+    /// Anchors the ramp's correction range and the rope-side context clamp.
+    pub yarn_native_window: usize,
     pub rotary_dim: usize,
     pub max_position_embeddings: usize,
     pub eos_token_id: u32,
@@ -93,6 +99,75 @@ pub struct Config {
     pub indexer_head_dim: usize,
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
+}
+
+/// Where a served YaRN factor came from (the boot line names it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YarnSource { Flag, Tp, Config }
+
+/// ONE precedence rule for the trunk YaRN factor: the `--rope-yarn-factor` flag wins, then a
+/// shipped TpConfig value > 1 (the TP node), then the pack config's `rope_scaling`. Returns
+/// (factor, where it came from); `(1.0, None)` = native rope. Pure — fully unit-tested.
+pub fn pick_yarn(flag: Option<f32>, tp: Option<f32>, cfg: Option<f32>) -> (f32, Option<YarnSource>) {
+    if let Some(f) = flag.filter(|f| f.is_finite() && *f >= 1.0) {
+        return (f, if f > 1.0 { Some(YarnSource::Flag) } else { None });
+    }
+    if let Some(f) = tp.filter(|f| *f > 1.0) { return (f, Some(YarnSource::Tp)); }
+    match cfg.filter(|f| f.is_finite() && *f >= 1.0) {
+        Some(f) if f > 1.0 => (f, Some(YarnSource::Config)),
+        _ => (1.0, None),
+    }
+}
+
+/// The trunk YaRN factor this process serves and where it came from: the `--rope-yarn-factor`
+/// flag wins, then the shipped TpConfig (TP node), then the model config's `rope_scaling`
+/// (YARN1 auto-detect).
+pub fn resolved_yarn(cfg: &Config) -> (f32, Option<YarnSource>) {
+    pick_yarn(
+        crate::opts::var(crate::opt!("rope-yarn-factor")).ok().and_then(|v| v.parse::<f32>().ok()),
+        crate::tp::tp_config().map(|c| c.rope_yarn_factor),
+        if cfg.rope_yarn_factor > 1.0 { Some(cfg.rope_yarn_factor) } else { None },
+    )
+}
+
+#[cfg(test)]
+mod yarn_tests {
+    use super::*;
+
+    /// The precedence rule: flag > shipped TpConfig > the pack's rope_scaling; an explicit
+    /// factor 1.0 is a deliberate legacy request (no YaRN, no line); junk is never half-applied.
+    #[test]
+    fn the_flag_wins_then_tp_then_the_pack_config() {
+        assert_eq!(pick_yarn(None, None, None), (1.0, None));
+        assert_eq!(pick_yarn(Some(4.0), Some(2.0), Some(8.0)), (4.0, Some(YarnSource::Flag)));
+        assert_eq!(pick_yarn(None, Some(2.0), Some(8.0)), (2.0, Some(YarnSource::Tp)));
+        assert_eq!(pick_yarn(None, Some(1.0), Some(8.0)), (8.0, Some(YarnSource::Config)));
+        assert_eq!(pick_yarn(None, None, Some(8.0)), (8.0, Some(YarnSource::Config)));
+        assert_eq!(pick_yarn(Some(1.0), Some(8.0), Some(8.0)), (1.0, None));
+        assert_eq!(pick_yarn(Some(0.5), None, Some(2.0)), (2.0, Some(YarnSource::Config)));
+        assert_eq!(pick_yarn(Some(f32::NAN), None, None), (1.0, None));
+    }
+
+    /// config.json rope_scaling auto-detect: `type: "yarn"` + factor (+ optional native
+    /// window); a non-yarn rope_scaling (linear, ...) enables nothing.
+    #[test]
+    fn the_pack_config_enables_yarn_from_its_rope_scaling_block() {
+        let dir = std::env::temp_dir().join(format!("gb10_yarn_cfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, r#"{"model_type":"qwen3_5_moe","text_config":{"max_position_embeddings":262144,
+            "rope_scaling":{"type":"yarn","factor":4.0,"original_max_position_embeddings":131072}}}"#).unwrap();
+        let cfg = Config::from_config_json(p).unwrap();
+        assert_eq!(cfg.rope_yarn_factor, 4.0);
+        assert_eq!(cfg.yarn_native_window, 131_072);
+        std::fs::write(&path, r#"{"model_type":"qwen3_5_moe","text_config":{"max_position_embeddings":262144,
+            "rope_scaling":{"type":"linear","factor":4.0}}}"#).unwrap();
+        let cfg = Config::from_config_json(p).unwrap();
+        assert_eq!(cfg.rope_yarn_factor, 1.0, "a non-yarn rope_scaling enables nothing");
+        assert_eq!(cfg.yarn_native_window, 262_144);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 impl Config {
@@ -168,6 +243,19 @@ impl Config {
         let max_position_embeddings = tc["max_position_embeddings"].as_u64().unwrap_or(262144) as usize;
         let eos_token_id = tc["eos_token_id"].as_u64().unwrap_or(248044) as u32;
 
+        // YARN1: config.json rope_scaling auto-detect — `{"type": "yarn", "factor": f,
+        // "original_max_position_embeddings": n}` enables YaRN at f over the native window n
+        // (HF/vLLM export convention). An explicit --rope-yarn-factor still wins (resolved_yarn);
+        // the boot line names which source served.
+        let yarn_scaling = tc["rope_scaling"]["type"].as_str()
+            .map_or(false, |t| t.eq_ignore_ascii_case("yarn"));
+        let yarn_cfg = if yarn_scaling {
+            tc["rope_scaling"]["factor"].as_f64()
+                .map(|f| f as f32).filter(|f| f.is_finite() && *f >= 1.0)
+        } else { None };
+        let yarn_native_window = tc["rope_scaling"]["original_max_position_embeddings"].as_u64()
+            .map(|v| v as usize).unwrap_or(max_position_embeddings);
+
         // Parse RoPE
         let rope_theta = tc["rope_parameters"]["rope_theta"]
             .as_f64().unwrap_or(1e7) as f32;
@@ -242,7 +330,9 @@ impl Config {
             family,
             hidden_size, intermediate_size, num_layers, num_heads, num_kv_heads,
             head_dim, lin_num_k_heads, lin_num_v_heads, lin_k_dim, lin_v_dim,
-            conv_kernel, vocab_size, rms_eps, rope_theta, rope_yarn_factor: 1.0, rotary_dim,
+            conv_kernel, vocab_size, rms_eps, rope_theta, rope_yarn_factor: yarn_cfg.unwrap_or(1.0),
+            yarn_native_window,
+            rotary_dim,
             max_position_embeddings, eos_token_id, layer_types,
             tie_word_embeddings: tie,
             is_moe, num_experts, num_experts_per_tok, moe_intermediate_size,
@@ -290,6 +380,7 @@ impl Config {
             lin_num_k_heads: 16, lin_num_v_heads: 16, lin_k_dim: 128, lin_v_dim: 128,
             conv_kernel: 4, vocab_size: 248320, rms_eps: 1e-6, rope_theta: 1e7,
             rope_yarn_factor: 1.0,
+            yarn_native_window: 262144,
             rotary_dim: 64, max_position_embeddings: 262144, eos_token_id: 248044,
             layer_types: lt, tie_word_embeddings: true,
             is_moe: false, num_experts: 0, num_experts_per_tok: 0, moe_intermediate_size: 0,
@@ -457,17 +548,23 @@ impl Model {
             let mut c = Config::from_config_json_placeholder();
             c.hidden_size = hidden;
             c.intermediate_size = intermediate;
-            println!("Auto-detected (no config.json): hidden={}, intermediate={}", hidden, intermediate);
+            if crate::boot_report::debug() {
+                println!("Auto-detected (no config.json): hidden={}, intermediate={}", hidden, intermediate);
+            }
             c
         } else {
-            println!("Loading config from {}...", config_path);
+            if crate::boot_report::debug() {
+                println!("Loading config from {}...", config_path);
+            }
             Config::from_config_json(&config_path)?
         };
 
+        if crate::boot_report::debug() {
         println!("Model config: hidden={} layers={} inter={} heads={} kv={} gdn_v={} GQA={}:1",
                  cfg.hidden_size, cfg.num_layers, cfg.intermediate_size,
                  cfg.num_heads, cfg.num_kv_heads, cfg.lin_num_v_heads,
                  cfg.num_heads / cfg.num_kv_heads);
+        }
 
         let h = cfg.hidden_size;
         let pref = "model.language_model";
@@ -475,7 +572,7 @@ impl Model {
         // Load all safetensors files. Keep raw bytes alive in a Vec.
         let mut all_raw: Vec<Vec<u8>> = Vec::new();
         for (i, sf_path) in safetensors_files.iter().enumerate() {
-            if safetensors_files.len() > 1 {
+            if safetensors_files.len() > 1 && crate::boot_report::debug() {
                 println!("  Loading shard {}/{}: {}", i + 1, safetensors_files.len(),
                          std::path::Path::new(sf_path).file_name().unwrap_or_default().to_string_lossy());
             }
@@ -503,7 +600,9 @@ impl Model {
 
         // Load lm_head (tied or untied)
         let lm_head = if !cfg.tie_word_embeddings {
-            println!("Loading untied lm_head...");
+            if crate::boot_report::debug() {
+                println!("Loading untied lm_head...");
+            }
             Some(load_w(&map, "lm_head.weight", cfg.vocab_size, h))
         } else {
             None
@@ -555,7 +654,9 @@ impl Model {
 
         // Load MTP head if present
         let mtp = if map.contains_key("mtp.fc.weight") {
-            println!("Loading MTP head...");
+            if crate::boot_report::debug() {
+                println!("Loading MTP head...");
+            }
             Some(MtpLayer {
                 fc: load_w(&map, "mtp.fc.weight", h, h * 2),
                 pre_fc_norm_hidden: load_w(&map, "mtp.pre_fc_norm_hidden.weight", h, 1),

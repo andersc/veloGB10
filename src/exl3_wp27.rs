@@ -471,7 +471,7 @@ pub fn finish(graph: sys::CUgraph, what: &str, m: usize) {
     let joins = ins.values().filter(|&&c| c > 1).count();
     let pr = if prio { format!(", side nodes {} / raised {} (prio {})", side.len(), raised, greatest_priority()) }
              else { String::new() };
-    println!("WP27_DAG {what} m={m}: nodes {n} edges {e} forks {forks} joins {joins}{pr} \
+    crate::dprintln!("WP27_DAG {what} m={m}: nodes {n} edges {e} forks {forks} joins {joins}{pr} \
               (linear = {} edges, 0 forks)", n.saturating_sub(1));
 }
 

@@ -8,6 +8,7 @@ pub mod vision_tower;
 pub mod vision_encoder;
 pub mod vision_gpu;
 pub mod gpu;
+pub mod ptx_embed; // EMB1: every PTX module embedded at compile time (one-file deploy)
 /// S-B9-REL-PPL: alignment-safe reads of file-derived bytes (safetensors offsets are not
 /// guaranteed aligned; a bare `bytemuck::cast_slice` panics on them).
 pub mod podread;
@@ -17,6 +18,19 @@ pub mod podread;
 /// (opts::parse) — a server-side reader that matched only the space form silently IGNORED
 /// `--lane-order=fcfs` / `--model-name=X` / `--otel-endpoint=...` while `--print-config`
 /// showed them as set.
+/// CLIPRUNE1 (one flag = one registry row): single-parse read for the mixed call sites.
+/// A flag WITH a registry row is read from the store `opts::parse_cli` filled (main calls it
+/// before any mode dispatch), so the registry is the one parse path; a flag WITHOUT a row keeps
+/// the shared `=`-aware argv scan below (hand flags unchanged).
+pub fn opt_or_arg(args: &[String], name: &str) -> Option<String> {
+    match opts::lookup(name.trim_start_matches("--")) {
+        // Internal rows are never CLI-parsed (another flag's writer sets them), so the
+        // store holds nothing at read time: keep reading argv for those.
+        Some(id) if !matches!(id.def().ty, opts::Ty::Internal(_)) => opts::var(id).ok(),
+        _ => arg_value(args, name).map(|s| s.to_string()),
+    }
+}
+
 pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter()
         .position(|a| a == flag || a.starts_with(&format!("{flag}=")))
@@ -42,12 +56,14 @@ pub mod exl3_serve;
 pub mod exl3_wp27;
 pub mod logq;
 pub mod loop_detect;
+pub mod boot_report; // OUT1: one vocabulary for every family's boot output (stages, notices, the SERVING line)
 pub mod wp24; // WP24: real-q speculative sampling (host replicas, dump, cross-check, gate)
 pub mod batch;
 pub mod tel;
 pub mod dispatch_assert;
-pub mod kernels;
 pub mod sampler;
+pub mod tool_trace;
+pub mod tool_scrub;
 pub mod tools;
 pub mod kv_cache;
 pub mod engine;
@@ -56,6 +72,8 @@ pub mod server;
 pub mod metrics;
 pub mod mtp_reprobe;
 pub mod lane_pack; // S-B9-CF-PACK4: --lane-pack (pure decision; the arm lives in exl3_serve)
+pub mod lane_reserve; // LANERES1: --lane-reserve (pure admission policy; the arm lives in exl3_serve)
+pub mod kv_spill; // LANERES2: --kv-spill (pure spill policy + disk store; the arm lives in exl3_serve/exl3_forward)
 pub mod otel;
 pub mod net;
 // HOST / RO-7: big-core detection + pinning of the serving engine's critical host threads.

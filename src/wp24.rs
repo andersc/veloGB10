@@ -731,8 +731,7 @@ fn kernel_gate(rows: usize, launches: usize, n_seeds: usize, top_k: u32, tau_fix
     let v_full: usize = 248_320;
     let (dr, tr) = synthetic_rows(v_full, 65_536);
     let dev = CudaDevice::new(0).context("CudaDevice::new(0)")?;
-    let ptx = Ptx::from_src(std::fs::read_to_string(crate::exl3_bench::bench_ptx_path())
-        .context("src/ptx/exl3_bench.ptx missing (run from the deploy dir)")?);
+    let ptx = Ptx::from_src(crate::exl3_bench::bench_ptx_src());
     dev.load_ptx(ptx, "wp24_probe", &["xq_rq_draft", "xq_sample_rows_rq", "xq_sample_rows"])?;
     let g = ProbeFns {
         draft: dev.get_func("wp24_probe", "xq_rq_draft").context("xq_rq_draft missing")?,

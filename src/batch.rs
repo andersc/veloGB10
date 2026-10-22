@@ -1162,6 +1162,8 @@ pub struct BatchScheduler {
     dspark_stat_drafts: u64,
     dspark_stat_accepted: u64,
     dspark_stat_emitted: u64,
+    /// FIX1 #76: dspark publish watermark (same contract as the DF2 chain).
+    dspark_stat_published: u64,
     /// P3(a) close: route GREEDY (temp-0) General requests to GREEDY drafts — the DEFAULT since
     /// the 2026-08-23 quad temp-0 sweep (prose τ +10.5% step-weighted, code control
     /// bit-identical). Sampled-temp General keeps the real-q walk. `--df2-prose-lane rq`
@@ -1202,9 +1204,18 @@ pub struct BatchScheduler {
     df2_stat_drafts: u64,
     df2_stat_accepted: u64,
     df2_stat_emitted: u64,
+    /// FIX1 #76: last df2_stat_steps handed to tel::publish_df2 (B31's watermark, applied to the
+    /// DF2 chain): publish every step, log every 50. A short request must still light /metrics.
+    df2_stat_published: u64,
     df2_tree_stat_steps: u64,   // df2_tree_step invocations
     df2_tree_stat_rescues: u64, // accepted path crossed into the B branch (the tree's whole point)
     df2_tree_stat_nodes: u64,   // verified tree nodes (cost side: the chain would be depth+1)
+    /// FIX1 #76: the engagement side of the tree (drafts/accepted/emitted were always known, the
+    /// lane just never published them) + the publish watermark.
+    df2_tree_stat_drafts: u64,
+    df2_tree_stat_accepted: u64,
+    df2_tree_stat_emitted: u64,
+    df2_tree_stat_published: u64,
     // ---- P14: DFlash v1 lane telemetry (block drafter; the lane was INVISIBLE at /health) ----
     dflash_stat_steps: u64,     // dflash_lane_step invocations
     dflash_stat_drafts: u64,    // block-1 proposals per step
@@ -1412,7 +1423,9 @@ impl BatchScheduler {
         };
         let mut graphs = std::collections::HashMap::new();
         if smem_bytes <= 48 * 1024 {
+            if crate::boot_report::debug() {
             print!("Attempting CUDA graph capture for batch sizes 1..={}... ", max_batch);
+            }
             let mut ok = true;
             for b in 1..=max_batch {
                 match gpu.capture_decode_graph(&mut pool, &mut bufs, &mut state,
@@ -1425,14 +1438,16 @@ impl BatchScheduler {
             gpu.zero_state(&mut state);
             gpu.dev().synchronize().unwrap(); // ensure zeroed state visible to non-blocking stream
             if ok {
-                println!("captured (smem {} KB).", smem_bytes / 1024);
+                if crate::boot_report::debug() {
+                    println!("captured (smem {} KB).", smem_bytes / 1024);
+                }
             } else {
                 graphs.clear();
                 println!("unsupported (legacy stream); using non-graph decode.");
             }
         } else {
-            println!("Skipping CUDA graphs: attention smem {} KB > 48 KB. Using non-graph decode.",
-                     smem_bytes / 1024);
+            crate::boot_report::notice(&format!("Skipping CUDA graphs: attention smem {} KB > 48 KB. Using non-graph decode.",
+                                          smem_bytes / 1024));
         }
 
         // When GPU sampling is enabled, also capture a decode+sample graph per batch size so that
@@ -1449,7 +1464,9 @@ impl BatchScheduler {
             }
             gpu.zero_state(&mut state);
             gpu.dev().synchronize().unwrap();
-            println!("captured {} GPU-sample graph(s).", sample_graphs.len());
+            if crate::boot_report::debug() {
+                println!("captured {} GPU-sample graph(s).", sample_graphs.len());
+            }
         }
         crate::memwatch::phase("sched:post-graphs");
 
@@ -1611,6 +1628,7 @@ impl BatchScheduler {
             dspark_stat_drafts: 0,
             dspark_stat_accepted: 0,
             dspark_stat_emitted: 0,
+            dspark_stat_published: 0,
             prose_lane_greedy: false,
             df2_carry_enabled: false,
             cov_trace: step_dump.is_some(),
@@ -1625,10 +1643,15 @@ impl BatchScheduler {
             df2_tree_stat_steps: 0,
             df2_tree_stat_rescues: 0,
             df2_tree_stat_nodes: 0,
+            df2_tree_stat_drafts: 0,
+            df2_tree_stat_accepted: 0,
+            df2_tree_stat_emitted: 0,
+            df2_tree_stat_published: 0,
             df2_stat_steps: 0,
             df2_stat_drafts: 0,
             df2_stat_accepted: 0,
             df2_stat_emitted: 0,
+            df2_stat_published: 0,
             dflash_stat_steps: 0,
             dflash_stat_drafts: 0,
             dflash_stat_accepted: 0,
@@ -4756,6 +4779,8 @@ impl BatchScheduler {
         // whether that is "rescue rate ~ 0, chain never derails" or "tree never engaged".) ----
         self.df2_tree_stat_steps += 1;
         self.df2_tree_stat_nodes += n as u64;
+        self.df2_tree_stat_drafts += drafts.len() as u64;   // FIX1 #76: engagement side
+        self.df2_tree_stat_accepted += nacc as u64;
         if leaf >= 1 + drafts.len() { self.df2_tree_stat_rescues += 1; }
         if self.df2_tree_stat_steps % 50 == 0 {
             let resc = self.df2_tree_stat_rescues as f64
@@ -4763,10 +4788,8 @@ impl BatchScheduler {
             let width = self.df2_tree_stat_nodes as f64 / self.df2_tree_stat_steps.max(1) as f64;
             crate::reprintln!("[df2-tree] steps={} b_rescue={:.1}% avg_nodes={:.1} (chain equivalent {})",
                       self.df2_tree_stat_steps, resc, width, LEVELS + 1);
-            // /health: publish the tree window too, so the status route can be asserted on
-            // (mode == "dflash2-tree") instead of inferred from the MTP window.
-            crate::tel::publish_df2_tree(self.df2_tree_stat_steps, self.df2_tree_stat_nodes,
-                                         self.df2_tree_stat_rescues);
+            // (/health: the tree window now publishes EVERY step at the emit point below —
+            // FIX1 #76 — so mode == "dflash2-tree" is live mid-request, not at step 50.)
         }
 
         // ---- Commit: compact the accepted path's KV into sequential slots [main_pos..). The topo
@@ -4829,6 +4852,16 @@ impl BatchScheduler {
             }
         }
         self.mtp.record_step(drafts.len() as u64, nacc as u64, emit_count as u64);
+        // FIX1 #76: the tree's engagement numbers publish EVERY step here (emit_count is the one
+        // value not known before the emit loop). Watermark, not %50: a short request must still
+        // light up velogb10_spec_*.
+        self.df2_tree_stat_emitted += emit_count as u64;
+        if self.df2_tree_stat_steps != self.df2_tree_stat_published {
+            self.df2_tree_stat_published = self.df2_tree_stat_steps;
+            crate::tel::publish_df2_tree(self.df2_tree_stat_steps, self.df2_tree_stat_drafts,
+                                         self.df2_tree_stat_accepted, self.df2_tree_stat_emitted,
+                                         self.df2_tree_stat_nodes, self.df2_tree_stat_rescues);
+        }
         self.rec_step(SpecStepRec {
             greedy: true, pos: main_pos as u32, drafts: drafts.len() as u32, nacc: nacc as u32,
             emitted: emit_count as u32, round_ms, verify_ms,
@@ -5345,7 +5378,13 @@ impl BatchScheduler {
                       self.df2_stat_steps, self.df2_stat_drafts, acc,
                       self.df2_stat_emitted,
                       self.df2_stat_emitted as f64 / self.df2_stat_steps as f64);
-            // A.2: same numbers to the status route (published exactly where the log line prints).
+        }
+        // FIX1 #76 (B31's lesson, applied to the DF2 chain): publish EVERY step. The old
+        // publish-inside-the-%50-guard left velogb10_spec_* at 0 for any request that finished
+        // under 50 steps — exactly the owner-posture report (DFlash2 row-9 flags, b==1, ~30
+        // steps). A handful of Relaxed stores against a ~70 ms step; the log cadence is unchanged.
+        if self.df2_stat_steps != self.df2_stat_published {
+            self.df2_stat_published = self.df2_stat_steps;
             crate::tel::publish_df2(self.df2_stat_steps, self.df2_stat_drafts,
                                     self.df2_stat_accepted, self.df2_stat_emitted);
         }
@@ -5541,6 +5580,23 @@ impl BatchScheduler {
         self.dspark_stat_drafts += drafts.len() as u64;
         self.dspark_stat_accepted += nacc as u64;
         self.dspark_stat_emitted += emit_count as u64;
+        if self.dspark_stat_steps % 50 == 0 {
+            let acc = if self.dspark_stat_drafts > 0 {
+                self.dspark_stat_accepted as f64 / self.dspark_stat_drafts as f64 * 100.0
+            } else { 0.0 };
+            eprintln!("[dspark] steps={} drafts={} accepted={:.1}% emitted={} tok/step={:.3}",
+                      self.dspark_stat_steps, self.dspark_stat_drafts, acc,
+                      self.dspark_stat_emitted,
+                      self.dspark_stat_emitted as f64 / self.dspark_stat_steps.max(1) as f64);
+        }
+        // FIX1 #76: same watermark contract as the DF2 chain — publish every step, log every 50.
+        // Before this the dspark lane accumulated stats that fed only its dump dirs: /metrics and
+        // /health never saw a dspark round.
+        if self.dspark_stat_steps != self.dspark_stat_published {
+            self.dspark_stat_published = self.dspark_stat_steps;
+            crate::tel::publish_dspark(self.dspark_stat_steps, self.dspark_stat_drafts,
+                                       self.dspark_stat_accepted, self.dspark_stat_emitted);
+        }
         // A6: the round's ring rows are valid through the lane's whole committed sequence —
         // record it so a follow-up request reusing this slot's prefix can carry the ring.
         // The identity claim is bound HERE (after the round ran for `phys`), which is what makes
@@ -5684,6 +5740,23 @@ impl BatchScheduler {
         self.dspark_stat_drafts += drafts.len() as u64;
         self.dspark_stat_accepted += nacc as u64;
         self.dspark_stat_emitted += emit_count as u64;
+        if self.dspark_stat_steps % 50 == 0 {
+            let acc = if self.dspark_stat_drafts > 0 {
+                self.dspark_stat_accepted as f64 / self.dspark_stat_drafts as f64 * 100.0
+            } else { 0.0 };
+            eprintln!("[dspark] steps={} drafts={} accepted={:.1}% emitted={} tok/step={:.3}",
+                      self.dspark_stat_steps, self.dspark_stat_drafts, acc,
+                      self.dspark_stat_emitted,
+                      self.dspark_stat_emitted as f64 / self.dspark_stat_steps.max(1) as f64);
+        }
+        // FIX1 #76: same watermark contract as the DF2 chain — publish every step, log every 50.
+        // Before this the dspark lane accumulated stats that fed only its dump dirs: /metrics and
+        // /health never saw a dspark round.
+        if self.dspark_stat_steps != self.dspark_stat_published {
+            self.dspark_stat_published = self.dspark_stat_steps;
+            crate::tel::publish_dspark(self.dspark_stat_steps, self.dspark_stat_drafts,
+                                       self.dspark_stat_accepted, self.dspark_stat_emitted);
+        }
         finished
     }
 
@@ -5888,6 +5961,16 @@ impl BatchScheduler {
         self.df2_stat_drafts += drafts.len() as u64;
         self.df2_stat_accepted += nacc as u64;
         self.df2_stat_emitted += emit_count as u64;
+
+        // FIX1 #76 (sampled lanes): the greedy lane's watermark publish, applied here too. The
+        // owner-posture request class (sampled + thinking, b==1) rides THIS function — before
+        // this, its rounds bumped the df2 stats but never reached /metrics, so a DF2 chain
+        // serving every step still read as zero engagement (ISSUES #76's exact case).
+        if self.df2_stat_steps != self.df2_stat_published {
+            self.df2_stat_published = self.df2_stat_steps;
+            crate::tel::publish_df2(self.df2_stat_steps, self.df2_stat_drafts,
+                                    self.df2_stat_accepted, self.df2_stat_emitted);
+        }
         // P2 Phase A finding: the sampled-greedy lane (temp>0 + Code) had NO [df2-step] line —
         // the step tables silently dropped every code-class step. Same format as the greedy lane.
         if crate::opts::var(crate::opt!("df2-step-log")).is_ok() {
@@ -6083,6 +6166,16 @@ impl BatchScheduler {
         self.df2_stat_drafts += drafts.len() as u64;
         self.df2_stat_accepted += nacc as u64;
         self.df2_stat_emitted += emit_count as u64;
+
+        // FIX1 #76 (sampled lanes): the greedy lane's watermark publish, applied here too. The
+        // owner-posture request class (sampled + thinking, b==1) rides THIS function — before
+        // this, its rounds bumped the df2 stats but never reached /metrics, so a DF2 chain
+        // serving every step still read as zero engagement (ISSUES #76's exact case).
+        if self.df2_stat_steps != self.df2_stat_published {
+            self.df2_stat_published = self.df2_stat_steps;
+            crate::tel::publish_df2(self.df2_stat_steps, self.df2_stat_drafts,
+                                    self.df2_stat_accepted, self.df2_stat_emitted);
+        }
         if crate::opts::var(crate::opt!("df2-step-log")).is_ok() {
             eprintln!("[df2-step] pos={main_pos} nacc={nacc} emitted={emit_count} committed={committed_tok} \
                        round={round_ms:.1}ms verify={verify_ms:.1}ms step={:.1}ms",

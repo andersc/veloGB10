@@ -26,6 +26,206 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     crate::arg_value(args, name)
 }
 
+// ===========================================================================================
+// DFlash2 (DF2) speculation on the EXL3 serve path (ISSUES[94]).
+//
+// Until now the EXL3 server ACCEPTED --spec-source dflash2* / --draft-dir / --df2-block /
+// --df2-round-shard and silently ignored them: the flags passed the shared validators in
+// main.rs (run_server -> resolve_draft_dir / resolve_spec_source) and then fell on the floor,
+// because build_serve only ever built the pack-MTP chain verifier. This section parses those
+// flags FOR REAL, gates the engagement (source x artifact x pack dims x ctx x TP=1), loads
+// the DF2 round through the forward-side contract (FwdModel::df2_* / dflash2::round), primes
+// the ring at every prefill chunk, and dispatches the lone-lane speculative round to the DF2
+// chain. No env vars anywhere: every knob is one of the four CLI flags above.
+// ===========================================================================================
+
+/// The pack dimensions the DF2 artifact was trained against (trunk df2_round_compatible):
+/// hidden 5120 (Qwen3.8-Flash-Next backbone), vocab 248320 (the EXL3 pack's head), more than
+/// 61 backbone layers. A pack that disagrees cannot use the artifact: the ring reads the
+/// backbone's hidden stream and the selector's codebooks at these widths.
+pub(crate) const DF2_WANT_HIDDEN: usize = 5120;
+pub(crate) const DF2_WANT_VOCAB: usize = 248_320;
+pub(crate) const DF2_MIN_LAYERS: usize = 61;
+
+/// EXL3 mirror of main.rs `resolve_spec_source` -- the SAME parse, the SAME default
+/// (`dflash2-auto`, S8F), and the SAME error text, so a typo dies identically whichever
+/// backend the pack routes to. (main.rs already validates the flag before the exl3 dispatch;
+/// this mirror keeps the lib self-contained and the two checks can never disagree.)
+fn resolve_spec_source_exl3(args: &[String]) -> crate::batch::SpecSource {
+    use crate::batch::SpecSource;
+    match arg(args, "--spec-source").map(str::to_lowercase) {
+        None => SpecSource::DFlash2Auto,
+        Some(s) => match SpecSource::from_cli(&s) {
+            Some(src) => src,
+            None => {
+                eprintln!("--spec-source must be mtp|dspark|dflash2|dflash2-rq|dflash2-auto|dflash2-tree|none (got {s:?})");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// The boot-time load of the DF2 round, mirroring the trunk `load_df2_round_dir` (main.rs)
+/// for the single-process EXL3 path: borrow the served model's dequantized bf16 head + embed
+/// (`df2_boot_ptrs`), pin-load the artifact against the SAME sha policy the trunk uses
+/// (`--sha256` absent = the built-in published pin), attach the tap sink, and hand both sinks
+/// to the model so its forward taps hiddens for the draft ring (prime sink cols =
+/// `batch::PREFILL_CHUNK`, the window `df2_prime_window` consumes per prefill chunk).
+/// `ar` is None: this path is TP=1, the round is never sharded.
+fn df2_load_round(model: &mut Arc<FwdModel>, dir: &str, max_c: usize, sha_pin: Option<&str>)
+    -> Result<crate::dflash2::round::Df2Round> {
+    use crate::dflash2::capture::{Df2PrimeSink, Df2TapSink};
+    use crate::dflash2::round::{BorrowedW, Df2Round};
+    let (embed_ptr, head_ptr) = model.df2_boot_ptrs()?;
+    let head = BorrowedW::Bf16 { ptr: head_ptr };
+    let embed = BorrowedW::Bf16 { ptr: embed_ptr };
+    let mut round = Df2Round::load_tp_pinned(dir, Some(head), Some(embed), max_c, None, sha_pin)?;
+    let tap = std::sync::Arc::new(Df2TapSink::new(model.dev()));
+    round.attach_sink(&tap);
+    let prime = std::sync::Arc::new(Df2PrimeSink::new(model.dev(), crate::batch::PREFILL_CHUNK));
+    let m = Arc::get_mut(model)
+        .ok_or_else(|| anyhow::anyhow!("the model was already shared before the DF2 capture attach"))?;
+    m.set_df2_capture(Some(tap), Some(prime));
+    Ok(round)
+}
+
+fn parse_df2_block(v: Option<&str>) -> Result<usize> {
+    match v {
+        None => Ok(crate::dflash2::block()),
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n >= 2 => Ok(n),
+            _ => anyhow::bail!("--df2-block must be an integer >= 2 (got '{s}')"),
+        },
+    }
+}
+
+/// `--df2-round-shard on|off` -- the TP>2 round-shard frame. Parsed and REPORTED even though
+/// the EXL3 serve path is TP=1 (the flag never shards here): the engaged boot line carries
+/// its value, so an operator asking for it sees the truth instead of silence.
+fn parse_df2_round_shard(v: Option<&str>) -> Result<bool> {
+    match v {
+        None | Some("off") => Ok(false),
+        Some("on") => Ok(true),
+        Some(other) => anyhow::bail!("--df2-round-shard must be on or off (got '{other}')"),
+    }
+}
+
+/// The pure half of the boot gate: given the resolved source, the resolved --draft-dir, the
+/// loaded model's dims, the resolved --max-seq-len and the TP world, return None (ENGAGE) or
+/// Some(reason) (FALLBACK to pack MTP with exactly this reason in the boot line). Pure so the
+/// reason table is unit-testable on the host (see `df2_gate_reason_table` below); the load
+/// failure reason is produced by the caller (it needs the GPU).
+///
+/// Reasons (the boot line prints them verbatim inside the FALLBACK parens):
+///   `source`                          -- the resolved spec source is not a DFlash2 source
+///   `no --draft-dir`                  -- no artifact dir given (dflash2-auto default boots here)
+///   `dims hidden=<h>x5120 vocab=<v> layers=<l>` -- the pack is not the Flash-Next shape
+///   `ctx <got>><cap>`                 -- --max-seq-len beyond the DF2 ring's safe ceiling
+///   (RETIRED 2026-10-21, EXL27D item 2) `tp=<n>>1` -- the TP-DF2 leg now serves DF2 at TP>1
+pub(crate) fn df2_gate_reason(src: crate::batch::SpecSource, draft_dir: Option<&str>,
+                              hidden: usize, vocab: usize, layers: usize,
+                              max_c: usize, tp_world: usize) -> Option<String> {
+    if !crate::batch::is_df2_src(src) { return Some("source".into()); }
+    let Some(_) = draft_dir else { return Some("no --draft-dir".into()); };
+    // (a dir that does not exist / does not load is NOT this gate's business: it engages here
+    //  and the load produces the `load failed: <e>` FALLBACK reason — the brief's table.)
+    if hidden != DF2_WANT_HIDDEN || vocab != DF2_WANT_VOCAB || layers <= DF2_MIN_LAYERS {
+        return Some(format!("dims hidden={hidden}x{DF2_WANT_HIDDEN} vocab={vocab} layers={layers}"));
+    }
+    if max_c > crate::dflash2::MAX_CTX_SAFE {
+        return Some(format!("ctx {max_c}>{}", crate::dflash2::MAX_CTX_SAFE));
+    }
+    // EXL27D item 2 (2026-10-21): the `tp={n}>1` reason is RETIRED. The TP-DF2 leg ships
+    // the artifact and the head's argv to the node (TpConfig v12 `df2_draft_dir` /
+    // `exl3_mode`), both ranks run the identical scheduler (tp_lockstep agree covers the
+    // DF2 load outcome in the boot hash and the per-round accept/emitted words), so the
+    // chain is no longer a single-process contract. `tp_world` stays a parameter (the
+    // signature is pinned by the reason-table tests below) but no longer gates.
+    let _ = tp_world;
+    None
+}
+
+/// The engaged boot line, exactly as the owner's brief specifies it:
+/// `[exl3-serve] df2: ENGAGED draft=<dir> block=<n> round-shard=<on|off> (DFlash2 chain on EXL3, TP=1)`
+pub(crate) fn df2_boot_line_engaged(dir: &str, block: usize, shard: bool, tp: usize) -> String {
+    // EXL27D item 2: the world size is in the line — the receipt must say which topology
+    // the chain serves on (TP=1 stayed the literal before; a TP=2 boot printed "TP=1").
+    format!("[exl3-serve] df2: ENGAGED draft={dir} block={block} round-shard={} (DFlash2 chain on EXL3, TP={}; chain verify k<={} = the pack MTP wide-verify width)",
+            if shard { "on" } else { "off" }, tp, crate::exl3_forward::MTP_MAX_K)
+}
+
+/// The fallback boot line: `[exl3-serve] df2: FALLBACK to pack MTP (<reason>)`.
+pub(crate) fn df2_boot_line_fallback(reason: &str) -> String {
+    format!("[exl3-serve] df2: FALLBACK to pack MTP ({reason})")
+}
+
+// ---- DF2 counters (the /metrics series `exl3_df2_*`) ---------------------------------------
+// Promoted to Prometheus text by `df2_metrics_append` below. NOTE (metrics surface): the
+// /metrics route renders `crate::metrics::render()` and metrics.rs is outside this change's
+// file set, so the one-line hook that appends these series --
+//     crate::exl3_serve::df2_metrics_append(&mut o);
+// as the last statement of `metrics::render` before its final `render_toolcall(&mut o)` --
+// lands with the merge of this branch (owner-visible deviation; the counters themselves are
+// live NOW and the boot/once lines name the speculator, AGENTS SS4 "identical hashes is not
+// a liveness receipt"). The DF2 round/accept counts ALSO ride the existing generic series
+// (velogb10_spec_rounds_total & co.) because DF2 rounds feed the same per-request stats the
+// pack-MTP path reports (`Lane::log_stats` -> `crate::tel::add_spec`).
+static DF2_ENGAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DF2_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DF2_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DF2_FALLBACK_MTP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DF2_REANCHOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DF2_DDS_BYPASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mark the boot engaged (gauge 0/1; 1 exactly once per engaged boot).
+pub(crate) fn df2_mark_engaged() {
+    DF2_ENGAGED.store(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one served DF2 round and its accepted tokens. The FIRST round also logs the
+/// AGENTS §4 once line — which speculator actually served a round (an engaged boot whose
+/// rounds all bypass is visible here, not inferred from hashes).
+pub(crate) fn df2_count_round(accepted: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if DF2_ROUNDS.fetch_add(1, Relaxed) == 0 {
+        println!("[exl3-serve] df2: first round served by the DFlash2 chain (speculator=dflash2)");
+    }
+    DF2_ACCEPTED.fetch_add(accepted as u64, Relaxed);
+}
+
+/// Count one round that fell back to the pack-MTP chain although DF2 was engaged and the lane
+/// ran alone (the DF2 ring is stale for this lane -- see step_mtp's dispatch note).
+pub(crate) fn df2_count_fallback_mtp() {
+    DF2_FALLBACK_MTP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn df2_count_reanchor() {
+    DF2_REANCHOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one lone-lane round the DDS/adaptive branch kept (DF2 has no `keep` closure in the
+/// forward contract, so adaptive drafting is not trivially routable to it).
+pub(crate) fn df2_count_dds_bypass() {
+    DF2_DDS_BYPASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Append the `exl3_df2_*` series to a Prometheus text body (see the metrics-surface note
+/// above for the render hook).
+pub fn df2_metrics_append(o: &mut String) {
+    use std::sync::atomic::Ordering::Relaxed;
+    o.push_str("# HELP exl3_df2_engaged 1 if the EXL3 server booted with the DFlash2 chain engaged (0 = pack MTP).\n# TYPE exl3_df2_engaged gauge\n");
+    o.push_str(&format!("exl3_df2_engaged {}\n", DF2_ENGAGED.load(Relaxed)));
+    o.push_str("# HELP exl3_df2_rounds_total Lone-lane speculative rounds served by the DFlash2 chain.\n# TYPE exl3_df2_rounds_total counter\n");
+    o.push_str(&format!("exl3_df2_rounds_total {}\n", DF2_ROUNDS.load(Relaxed)));
+    o.push_str("# HELP exl3_df2_tokens_accepted_total Draft tokens the EXL3 verify accepted from the DFlash2 chain.\n# TYPE exl3_df2_tokens_accepted_total counter\n");
+    o.push_str(&format!("exl3_df2_tokens_accepted_total {}\n", DF2_ACCEPTED.load(Relaxed)));
+    o.push_str("# HELP exl3_df2_fallback_mtp_total Rounds that used the pack-MTP chain although DF2 was engaged (stale DF2 ring for the lane).\n# TYPE exl3_df2_fallback_mtp_total counter\n");
+    o.push_str(&format!("exl3_df2_fallback_mtp_total {}\n", DF2_FALLBACK_MTP.load(Relaxed)));
+    o.push_str("# HELP exl3_df2_reanchor_total Solo fallback rounds that rewound the DF2 ring to a lane behind the frontier (prefix-cached follow-up request).\n# TYPE exl3_df2_reanchor_total counter\n");
+    o.push_str(&format!("exl3_df2_reanchor_total {}\n", DF2_REANCHOR.load(Relaxed)));
+    o.push_str("# HELP exl3_df2_dds_bypass_total Lone-lane rounds kept on the DDS adaptive chain. Structural 0 since Fix1 (2026-10-16): an armed, ring-fresh DF2 chain preempts the adaptive branch; kept for continuity.\n# TYPE exl3_df2_dds_bypass_total counter\n");
+    o.push_str(&format!("exl3_df2_dds_bypass_total {}\n", DF2_DDS_BYPASS.load(Relaxed)));
+}
+
 struct Lane {
     pos: usize,          // next trunk position to write
     last_tok: u32,       // last committed token
@@ -62,6 +262,15 @@ struct Lane {
     // (request start / re-arm) — the re-probe path blends a RUNNING MEAN over the
     // first 64 of them (see mtp_reprobe::blend_cost_ema), never a one-round seed.
     ema_n: usize,
+    /// P18 SPEC8K: measured round-to-round WALL latency of this lane (ms): the end of one round to the
+    /// end of the next, so it contains the wait for the rounds of the other busy lanes, which
+    /// ema_ms (the time of one round, or for the lane of a packed round one SHARE of it) does not.
+    /// Read only by the Auto arm of use_shared_plain, whose job is to price one arm against the other:
+    /// both sides must be the aggregate that the n clients see. 0.0 until the second round of the lane.
+    ema_wall_ms: f64,
+    /// P18 SPEC8K: the instant round_account finished the previous round of this lane, the anchor for
+    /// ema_wall_ms.
+    last_wall: Option<std::time::Instant>,
     mtp_rounds: usize,
     wp23: Wp23Lane, // WP23: DDS cost-guard fit + per-width round counts (the [dds] line)
     // per-request round anatomy, logged at finish ([mtp-stats]): comparable to the reference implementation's
@@ -169,6 +378,14 @@ struct Exl3Scheduler {
     lanes: Vec<Option<Lane>>,
     eos: Vec<u32>,
     chunk: usize, // S-A3-f-b: prefill chunk width (tokens per forward sweep)
+    /// ISSUES[94] DF2: the loaded DFlash2 round (artifact + ring), present iff the boot gate
+    /// ENGAGED it. One shared round per scheduler: the DF2 chain is a single token stream, so
+    /// only a lane whose position matches the ring's `nprev` may run a DF2 round (the lone-lane
+    /// case by construction; every other lane/step runs the pack-MTP paths unchanged).
+    df2: Option<crate::dflash2::round::Df2Round>,
+    /// The chain-verify depth the DF2 round uses: k = --df2-block - 1 (default
+    /// `dflash2::block() - 1`).
+    df2_k: usize,
     /// `--prefill-interleave N` (public PR #23): scheduler steps run for the lanes already decoding
     /// after each non-final prefill chunk of a joining prompt. 0 (default) = none: the whole prompt
     /// prefills before the next step, exactly as before. Always 0 under TP (build_serve).
@@ -185,6 +402,21 @@ struct Exl3Scheduler {
     lane_quantum: usize,
     admit_ctr: u64,
     fcfs_rots: usize,
+    /// LANERES1 `--lane-reserve`: the lane-reservation policy. None = off = today's admission,
+    /// byte-for-byte (the run loop and the pick keep their original shapes).
+    reserve: Option<crate::lane_reserve::Cfg>,
+    /// The policy's forced-take limiter state (one per scheduler).
+    reserve_st: crate::lane_reserve::State,
+    /// LANERES2 `--kv-spill`: the SSD spill tier for evicted lane snapshots. None = off =
+    /// today's behavior, byte-for-byte (no capture, no restore, no counters).
+    spill: Option<crate::kv_spill::Store>,
+    /// The spill policy (cap, LRU, cost model); a zero-cap policy when the tier is off.
+    spill_pol: crate::kv_spill::Policy,
+    /// This scheduler's rank (0 on a single box): spill files are per-rank.
+    spill_rank: usize,
+    /// Per-slot release stamps (released_at, normal finish) for the policy. Stamped only while
+    /// the policy is on; read to build SlotViews and the forced-take log line.
+    rel: Vec<Option<(std::time::Instant, bool)>>,
     /// S-B9-CF-PACK4 `--lane-pack` (see step_packed): the mode, the packed verify's own scratch
     /// (Some only with the flag on), which regime families are captured [dense, sparse], the
     /// rotation counter, the skip-line budget, "a prefill is in flight" and the idle-line stats.
@@ -206,6 +438,22 @@ struct Exl3Scheduler {
     /// F4 (PACK5G finding 1): rounds riding the packed/serial arm at >=4 busy lanes since the
     /// last shared plain step, under `--lane-pack on` + Auto (the shared-cost probe; see step()).
     shared_probe_ctr: u32,
+    // S-C4XOVER: measured delivered rate per arm (tokens / ms of the rounds that ran),
+    // the honest basis of the Auto pick: both modelled inputs were biased at four busy
+    // lanes (the serial cycle estimate ~+30% optimistic vs delivery, the shared prior's
+    // learned scale ~-18% pessimistic), which pinned the policy to the slower arm.
+    spec_win_tok: [f64; 2],        // window accumulators: tokens the arm's rounds delivered
+    spec_win_ms: [f64; 2],         // ... the ms those rounds cost
+    spec_win_n: [u8; 2],           // ... the busiest lane count seen in the window
+    spec_win_acc: [u32; 2],        // ... rounds accumulated since the last fold
+    spec_arm_rate: [f64; 2],       // EWMA of delivered aggregate tok/ms (0 = never measured)
+    spec_arm_n: [u8; 2],           // busy lanes the rate was measured at (last fold's tag)
+    spec_arm_fold: [u64; 2],       // scheduler step of the last fold (freshness)
+    spec_est_pick: Option<bool>,   // S-C4XOVER v3: the estimate path's last pick (None before one)
+    spec_probe: Option<(u8, u32)>, // arm-rate probe window in flight: (arm, steps left)
+    spec_probe_ctr: u32,           // rounds since the last probe of the idle arm
+    spec_margin: f64,           // S-C4XOVER v2: last MEASURED arm margin (max/min - 1; 0 = none)
+    spec_margin_n: u8,          // ...and the busy count it was measured at (eager again on change)
     policy_logs: usize,
     ctrl_round: usize,
     /// S-B9-REL-MTPREPROBE: the re-probe schedule (shrunken by --mtp-reprobe-drill) and the
@@ -373,7 +621,7 @@ impl TpSync {
         // either way; `net::drill_plan` is the pure decision.
         let plan = crate::net::drill_plan(crate::opts::get(crate::opt!("tp-agree-drill")).as_deref(),
                                           crate::opts::get(crate::opt!("tp-width-drill")).as_deref(), true, Some((rank, world)));
-        for l in &plan.lines { crate::reprintln!("{l}"); }
+        for l in &plan.lines { crate::dreprintln!("{l}"); }
         TpSync { rank, world, deadline_ms, epoch_warns: 0, step: 0, ident: false, ident_bufs: 0, ident_bad: 0, agrees: 0,
                  pre_agrees: 0, ctl: Vec::new(), wp: WaitProf::default(), drill_width: plan.width, drill_hits: 0 }
     }
@@ -393,7 +641,7 @@ impl TpSync {
             Some(n) if n == m && self.drill_hits == 0 && m > self.rank as usize => {
                 self.drill_hits = 1;
                 let said = m - 1 - self.rank as usize;
-                eprintln!("[tp-agree] DRILL (one-shot, now spent): rank {} reports verify width {said} for a {m}-row round \
+                crate::deprintln!("[tp-agree] DRILL (one-shot, now spent): rank {} reports verify width {said} for a {m}-row round \
                            (lockstep step {}); from here on it reports the truth", self.rank, self.step);
                 said
             }
@@ -496,7 +744,7 @@ impl TpSync {
         let g0 = crate::net::traced_xchg_gen();
         let g = if crate::net::race_probe_hold_ms() > 0 {
             let g1 = crate::net::traced_gen_add(crate::net::probe_gen_delta(g0, e_last & 7));
-            eprintln!("[tp-race-probe] rank {}: pre-verify aligned xchg gen {g0} -> {g1} onto epoch {e_last} \
+            crate::deprintln!("[tp-race-probe] rank {}: pre-verify aligned xchg gen {g0} -> {g1} onto epoch {e_last} \
                        (device_epoch&7 = {}, gen&7 = {}), hold {} ms on rank 1",
                       self.rank, e_last & 7, g1 & 7, crate::net::race_probe_hold_ms());
             g1
@@ -557,7 +805,7 @@ impl TpSync {
         let g0 = crate::net::traced_xchg_gen();
         let g = if crate::net::race_probe_hold_ms() > 0 {
             let g1 = crate::net::traced_gen_add(crate::net::probe_gen_delta(g0, e_last & 7));
-            crate::reprintln!("[tp-race-probe] rank {}: pack pre-verify aligned xchg gen {g0} -> {g1} onto epoch {e_last} \
+            crate::dreprintln!("[tp-race-probe] rank {}: pack pre-verify aligned xchg gen {g0} -> {g1} onto epoch {e_last} \
                        (device_epoch&7 = {}, gen&7 = {}), hold {} ms on rank 1",
                       self.rank, e_last & 7, g1 & 7, crate::net::race_probe_hold_ms());
             g1
@@ -694,7 +942,7 @@ impl TpSync {
             self.ident_bufs += d.len() as u64;
             self.ident_bad += bad as u64;
             if bad > 0 && self.ident_bad as usize == bad {
-                eprintln!("[tp-ident] FIRST MISMATCH at {what} (lockstep step {step}, width {m}): {bad} of {} digests differ \
+                crate::deprintln!("[tp-ident] FIRST MISMATCH at {what} (lockstep step {step}, width {m}): {bad} of {} digests differ \
                            (logits rows 0..{m}, resid, taps; some rank differs from the head)", d.len());
             }
         }
@@ -702,7 +950,7 @@ impl TpSync {
         if !out.epoch_skew.is_empty() {
             self.epoch_warns += 1;
             if self.epoch_warns <= 5 || self.epoch_warns % 1000 == 0 {
-                eprintln!("[tp-round] EPOCH-PROBE at {what} (lockstep step {step}, #{}): device epoch differs from the head's on \
+                crate::deprintln!("[tp-round] EPOCH-PROBE at {what} (lockstep step {step}, #{}): device epoch differs from the head's on \
                            (rank, delta) {:?}", self.epoch_warns, out.epoch_skew);
             }
         }
@@ -1306,7 +1554,41 @@ fn shared_step_prior_ms(n: usize) -> f64 { 31.5 + 3.6 * n as f64 }
 /// then periodically, so both arms are priced from measurement and the comparison picks the
 /// cheaper of the two. Cadence counts rounds on the OTHER arm:
 const SHARED_PROBE_FIRST: u32 = 16;  // while the scale has never been learned (boot start)
-const SHARED_PROBE_EVERY: u32 = 128; // afterwards, beside the shared arm's own 1-in-128 serial refresh
+const SHARED_PROBE_EVERY: u32 = 128;
+/// P18 SPEC8K: weight of a new sample in the round-to-round WALL latency EMA of a lane
+/// (Lane::ema_wall_ms). The second round of a lane already measures the whole cycle under load, so
+/// this only smooths it.
+const WALL_EMA_W: f64 = 0.75;
+/// P18 SPEC8K: a wall gap past this multiple of the round it measured is a stall (a prefill on
+/// another lane, a TP seam, the idle gap between two requests), not the lateness of this lane.
+const WALL_STALL_X: f64 = 6.0;
+
+/// P18 SPEC8K: the ms that ONE lane contributes to the cycle time of the serial arm: the time from
+/// one round of the lane to its NEXT round, which is what its client waits, NOT the ms of the round
+/// itself. A packed round charges each lane one SHARE of the verify (lane_pack::lane_share_ms), so
+/// summing ema_ms over n lanes prices n rounds as if they all ran at once; the shared-batching arm
+/// then looks slower than a cycle that in truth is about n times longer (spec-lanes auto picked
+/// serial speculation for four busy lanes at 8K prose, where the shared plain step measured faster).
+/// ema_wall_ms holds the measured queueing, so this is the whole cycle for one lane; for a lone lane
+/// it equals ema_ms.
+// S-C4XOVER arm indices: 0 = the shared plain step arm, 1 = the serial speculation arm
+// (packed pairs where two lanes pack); they index the measured-rate arrays and the
+// /metrics arm labels (SPEC_LANES_TO), and pick as usize maps true->0 / false->1.
+pub(crate) const ARM_SHARED: usize = 0;
+pub(crate) const ARM_SERIAL: usize = 1;
+// S-C4XOVER cadences: a measured arm rate is FRESH for 512 scheduler steps at a busy
+// count within +-1 of now; the window folds every 8 accumulated rounds; the idle arm is
+// probed (a 4-step window of it) when its rate has gone stale, at most every 256
+// riding-arm rounds (16 while it has never been measured, so a boot converges in ~2 s).
+const SPEC_ARM_FRESH_STEPS: u64 = 512;
+const SPEC_ARM_N_TOL: i64 = 1;
+const SPEC_ARM_FOLD_EVERY: u32 = 8;
+const SPEC_ARM_PROBE_FIRST: u32 = 16;
+const SPEC_ARM_PROBE_EVERY: u32 = 256;
+const SPEC_ARM_PROBE_WIN: u32 = 4;
+pub(crate) fn serial_cycle_ms(ema_ms: f64, ema_wall_ms: f64) -> f64 {
+    if ema_wall_ms > 0.0 { ema_wall_ms } else { ema_ms }
+} // (was the note on the SHARED_PROBE_EVERY line)
 fn shared_probe_due(ctr: u32, scale_unlearned: bool) -> bool {
     ctr >= if scale_unlearned { SHARED_PROBE_FIRST } else { SHARED_PROBE_EVERY }
 }
@@ -1338,7 +1620,7 @@ impl Lane {
             format!(" seed={} arms={} toks={}", self.seed, self.arms.text(),
                     self.first_toks.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","))
         } else { String::new() };
-        crate::reprintln!("[mtp-stats] slot={slot} finish={reason} gen={} rounds={} drafted={} accepted={} ({:.1}%) \
+        crate::dreprintln!("[mtp-stats] slot={slot} finish={reason} gen={} rounds={} drafted={} accepted={} ({:.1}%) \
                    tok/round={:.2} ms/round={:.1} plain_steps={} temp={} ctrl={} off_events={} reprobes={} reprobe_ok={} packed={}{trace}",
                   self.generated, self.st_rounds, self.st_drafted, self.st_accepted,
                   100.0 * self.st_accepted as f64 / self.st_drafted.max(1) as f64,
@@ -1351,7 +1633,7 @@ impl Lane {
     /// HTTP side) — its slot is freed now; always leaves a [mtp-stats] finish=cancelled line.
     fn log_cancel(&self, slot: usize) {
         if self.st_rounds == 0 && self.st_plain == 0 {
-            crate::reprintln!("[mtp-stats] slot={slot} finish=cancelled gen={} rounds=0 plain_steps=0 temp={}",
+            crate::dreprintln!("[mtp-stats] slot={slot} finish=cancelled gen={} rounds=0 plain_steps=0 temp={}",
                       self.generated, self.temperature);
         } else {
             self.log_stats(slot, "cancelled");
@@ -1364,7 +1646,7 @@ impl Lane {
     fn log_wp23(&self, slot: usize) {
         if self.st_rounds == 0 { return; }
         let g = &self.wp23;
-        crate::reprintln!("[dds] slot={slot} widths={:?} c_hat={:.2} ms/draft (fit rounds {}) target={:.3}",
+        crate::dreprintln!("[dds] slot={slot} widths={:?} c_hat={:.2} ms/draft (fit rounds {}) target={:.3}",
                   g.widths, g.fit.slope(), g.fit.n, g.target);
     }
 
@@ -1389,7 +1671,7 @@ impl Lane {
         let text = tok.decode(tail_ids, false).unwrap_or_default();
         let n = text.chars().count();
         let tail: String = text.chars().skip(n.saturating_sub(200)).collect();
-        crate::reprintln!("[loop] detected slot={slot} period={} (detector {}) gen={} pos={} seed={} temp={} \
+        crate::dreprintln!("[loop] detected slot={slot} period={} (detector {}) gen={} pos={} seed={} temp={} \
                    top_p={} top_k={} min_p={} pen={:?} mtp={} prompt_hash={:016x} tail={:?}",
                   d.fundamental_period().map_or("-".into(), |p| p.to_string()),
                   d.period().map_or("-".into(), |p| p.to_string()),
@@ -1516,7 +1798,7 @@ impl Exl3Scheduler {
             let shown = if rows.len() > 16 {
                 format!("{:?} .. {:?}", &rows[..4], &rows[rows.len() - 6..])
             } else { format!("{rows:?}") };
-            crate::rprintln!("[exl3-serve] prefill grid slot={slot} n={} (pos {from}..{n}) C={c}: {nchunks} chunk(s), rows {shown}{}",
+            crate::drprintln!("[exl3-serve] prefill grid slot={slot} n={} (pos {from}..{n}) C={c}: {nchunks} chunk(s), rows {shown}{}",
                      n - from, if absorb.is_some() { " (absorb-tail)" } else { "" });
         }
         for end in grid {
@@ -1529,13 +1811,20 @@ impl Exl3Scheduler {
                     gone = t.head_flag(gone)?;
                 }
                 if gone {
-                    crate::rprintln!("[exl3-serve] prefill slot={slot} cancelled at pos {pos} of {n} (client gone)");
+                    crate::drprintln!("[exl3-serve] prefill slot={slot} cancelled at pos {pos} of {n} (client gone)");
                     return Ok(false);
                 }
             }
             let toks: Vec<i32> = prompt[pos..end].iter().map(|&t| t as i32).collect();
             self.model.prefill_chunk(psc, &toks, pos, slot, false, None)?;
             crate::metrics::sched_touch(); // H3: prefill chunk COMPLETE (long prefill stays live)
+            // ISSUES[94] DF2: prime the draft ring with this chunk's window — the prime sink
+            // captured the backbone hiddens of rows pos..end during the sweep that just
+            // finished (cols = what this chunk actually ran), so the ring is current for the
+            // lane's first speculative round after the prefill.
+            if let Some(round) = self.df2.as_mut() {
+                self.model.df2_prime_window(round, pos, end - pos)?;
+            }
             if aligned {
                 if let Some(st) = self.wp16.as_mut() {
                     st.extend(slot, &key[pos..end]);
@@ -1578,26 +1867,26 @@ impl Exl3Scheduler {
             }
         }
         if il_steps > 0 {
-            crate::rprintln!("[exl3-serve] prefill-interleave slot={slot}: {il_steps} scheduler step(s) at {il_points} of {} chunk boundaries, \
+            crate::drprintln!("[exl3-serve] prefill-interleave slot={slot}: {il_steps} scheduler step(s) at {il_points} of {} chunk boundaries, \
                               {il_ms:.1} ms of decode (not counted in the prefill line's ms / tok/s)", nchunks.saturating_sub(1));
         }
         // S-A3-f-d Item 2: serve-path prefill telemetry (TTFT's main term). With --prefill-interleave
         // the decode steps run between the chunks are taken out, so the line stays the prefill's own rate.
         let ms = tp.elapsed().as_secs_f64() * 1e3 - il_ms;
         let done = n - from;
-        crate::rprintln!("[exl3-serve] prefill slot={} n={} (pos {}..{}) in {:.1} ms ({:.0} tok/s, C={})",
+        crate::drprintln!("[exl3-serve] prefill slot={} n={} (pos {}..{}) in {:.1} ms ({:.0} tok/s, C={})",
                  slot, done, from, n, ms, if ms > 0.0 { done as f64 * 1e3 / ms } else { 0.0 }, c);
         if let Some(t) = tail {
-            crate::rprintln!("[exl3-serve] C1 tail slot={slot}: grid split + checkpoint at {t} (message boundary - {}; {nchunks} chunk(s){})",
+            crate::drprintln!("[exl3-serve] C1 tail slot={slot}: grid split + checkpoint at {t} (message boundary - {}; {nchunks} chunk(s){})",
                      crate::exl3_forward::TAIL_BACKOFF,
                      if realign && from % c != 0 { ", realigned to the C grid" } else { "" });
         } else if realign && from % c != 0 {
-            crate::rprintln!("[exl3-serve] C1 slot={slot}: run from {from} realigned to the C grid ({nchunks} chunk(s))");
+            crate::drprintln!("[exl3-serve] C1 slot={slot}: run from {from} realigned to the C grid ({nchunks} chunk(s))");
         }
         if !taken.is_empty() {
             if let Some(st) = self.wp16.as_ref() {
                 let per = self.model.ckpt_layout().bytes() as f64;
-                crate::rprintln!("[exl3-serve] WP16 slot={slot}: checkpoints taken at {taken:?}; slot holds {:?}; \
+                crate::drprintln!("[exl3-serve] WP16 slot={slot}: checkpoints taken at {taken:?}; slot holds {:?}; \
                           live {} x {:.0} MB = {:.2} GiB (allocated {} of cap {})",
                          st.positions(slot), st.live(), per / 1e6, st.live() as f64 * per / (1u64 << 30) as f64,
                          st.n_alloc, st.cap);
@@ -1656,7 +1945,7 @@ impl Exl3Scheduler {
     fn fail_step(&mut self, e: &anyhow::Error) {
         eprintln!("[exl3-serve] decode step failed: {e:#}");
         for s in 0..self.lanes.len() {
-            if let Some(lane) = self.lanes[s].take() {
+            if let Some(lane) = self.take_lane(s, false) {
                 let _ = lane.tx.send(TokEvent::Finish { reason: format!("error: {e}") });
             }
         }
@@ -1693,10 +1982,30 @@ impl Exl3Scheduler {
             return self.prefill_range(slot, prompt, key, 0, end, Some(tx), false, None, false);
         }
         let tail_on = self.wp16.is_some() && crate::exl3_forward::tail_ckpt_on();
-        let reuse = match &self.cache[slot] {
+        // LANERES2: this slot is being taken over by a different conversation when its cache
+        // does not prefix the incoming prompt — capture the victim's snapshot to the SSD spill
+        // tier BEFORE anything below resets/overwrites it. The D2H is the only in-round cost
+        // (~0.1 s per 0.5-GiB snapshot); the disk write is the async part.
+        if self.spill.is_some() {
+            if let Some(old) = self.cache[slot].clone() {
+                let own = old.len() <= end && key[..old.len()] == old[..];
+                if !own {
+                    self.spill_capture_slot(slot, &old);
+                }
+            }
+        }
+        let mut reuse = match &self.cache[slot] {
             Some(t) if t.len() <= end && key[..t.len()] == t[..] => t.len(),
             _ => 0,
         };
+        // LANERES2: own-snapshot miss — try the SSD spill tier; a hit restores rows 0..n + the
+        // snapshot state and the normal `reuse > 0` branch below runs unchanged. Cost-model
+        // gated; every miss/drop/error falls back to the plain prefill and is counted.
+        if reuse == 0 && self.spill.is_some() {
+            if let Some(n) = self.spill_restore_slot(slot, key, end) {
+                reuse = n;
+            }
+        }
         if self.psc.is_none() {
             self.psc = Some(self.model.prefill_scratch(psc_rows(self.chunk.max(1), self.tp.is_some()))?);
         }
@@ -1709,7 +2018,7 @@ impl Exl3Scheduler {
         let mut tracked = reuse == 0 && self.wp16.is_some();
         if reuse > 0 {
             self.model.restore_slot(slot, self.psc.as_mut().unwrap())?;
-            crate::rprintln!("[exl3-serve] prefix-cache hit slot={slot}: reuse {reuse} of {plen} prompt tokens");
+            crate::drprintln!("[exl3-serve] prefix-cache hit slot={slot}: reuse {reuse} of {plen} prompt tokens");
             // an unaligned grid from `reuse`: no checkpoint is taken in it, none above it survives.
             // C1: with tail checkpoints the run is tracked instead (realigned grid, tail split) when
             // the slot's checkpointed prefix is exactly prompt[..reuse].
@@ -1730,7 +2039,7 @@ impl Exl3Scheduler {
             // positional row < q (trunk/head KV, QSA planes) is the checkpointed prefix's own
             self.model.ckpt_restore(slot, self.psc.as_mut().unwrap(), ck)?;
             self.model.ckpt_poison_head_kv_from(slot, q)?; // PFX1 (b) poison gate only (no-op otherwise)
-            crate::rprintln!("[exl3-serve] WP16 checkpoint resume slot={slot}: resume at {q} of {plen} prompt tokens \
+            crate::drprintln!("[exl3-serve] WP16 checkpoint resume slot={slot}: resume at {q} of {plen} prompt tokens \
                       (LCP {lcp}, C={c}; {dropped} checkpoint(s) above dropped) — prefill {q}..{end}");
         } else {
             self.model.reset_slot_for_prefill(slot)?; // PFX1 (b): prefill_range from 0 head-fills
@@ -1790,7 +2099,7 @@ impl Exl3Scheduler {
             self.cache[x] = None; // the scratch slot's rows get overwritten
             if let Some(st) = self.wp16.as_mut() { st.clear_slot(x); }
         }
-        println!("[wp16-xcheck] slot={slot} resumed at {q}: fresh reference prefill 0..{end} into {} slot {x}",
+        crate::dprintln!("[wp16-xcheck] slot={slot} resumed at {q}: fresh reference prefill 0..{end} into {} slot {x}",
                  if x != slot { "scratch" } else { "the same (no free lane)" });
         model.reset_slot_for_prefill(x)?;
         self.prefill_range(x, prompt, prompt, 0, end, None, false, None, false)?;
@@ -1805,7 +2114,7 @@ impl Exl3Scheduler {
         model.ckpt_restore(slot, self.psc.as_mut().unwrap(), &r)?;
         if x != slot { model.reset_slot(x)?; }
         let exact = d.exact() && nl == 0 && id_r == id_f;
-        println!("[wp16-xcheck] slot={slot} resume {q} vs fresh (slot {x}) at plen {plen}: {}; first-token logits \
+        crate::dprintln!("[wp16-xcheck] slot={slot} resume {q} vs fresh (slot {x}) at plen {plen}: {}; first-token logits \
                   differ {nl}/{v} (argmax {id_r} vs {id_f}) -> {} ({:.0} ms)",
                  d.line(), if exact { "EXACT" } else { "MISMATCH" }, t0.elapsed().as_secs_f64() * 1e3);
         Ok(())
@@ -1895,7 +2204,7 @@ impl Exl3Scheduler {
             t.ident_bufs += digests.len() as u64;
             t.ident_bad += bad as u64;
             if bad > 0 && t.ident_bad as usize == bad {
-                eprintln!("[tp-ident] FIRST MISMATCH at {what} (lockstep step {step}, width {m}): {bad} of {} digests differ \
+                crate::deprintln!("[tp-ident] FIRST MISMATCH at {what} (lockstep step {step}, width {m}): {bad} of {} digests differ \
                            (logits rows 0..{m}, resid, taps)", digests.len());
             }
         }
@@ -1948,10 +2257,10 @@ impl Exl3Scheduler {
                     let closed = l.tx.is_closed();
                     let over = !closed && crate::server::stream_backlog_exceeded(l.tx.len()); // LR-5
                     if closed || over {
-                        let lane = self.lanes[s].take().unwrap();
+                        let lane = self.take_lane(s, false).unwrap();
                         if over {
                             crate::metrics::stream_backlog_cancel();
-                            crate::reprintln!("[exl3-serve] slot {s}: stream cancelled — unconsumed event backlog at the --stream-backlog-events limit (reader stalled; LR-5)");
+                            crate::dreprintln!("[exl3-serve] slot {s}: stream cancelled — unconsumed event backlog at the --stream-backlog-events limit (reader stalled; LR-5)");
                         }
                         lane.log_cancel(s);
                     }
@@ -1997,7 +2306,7 @@ impl Exl3Scheduler {
                 }
             }
             for &(s, steps, ev) in &armed {
-                crate::rprintln!("[exl3-serve] MTP re-probe (slot {s}): back ON after {steps} plain steps \
+                crate::drprintln!("[exl3-serve] MTP re-probe (slot {s}): back ON after {steps} plain steps \
 (off event {ev}; probe window {} rounds, a {:.0}% sustained loss turns it off again)",
                            self.reprobe_cfg.probe_window, 100.0 * self.reprobe_cfg.margin);
             }
@@ -2005,43 +2314,69 @@ impl Exl3Scheduler {
         // CF-P1e load-adaptive batching: past `--spec-lanes-max` busy lanes, serial speculative rounds stop
         // scaling (one lane per round), so every busy lane shares one batched plain step instead; the
         // lanes' MTP heads stay in sync (see step_plain's `sync_head`), so speculation resumes when load drops.
-        if mtp_on && self.use_shared_plain(&slots) {
+        // S-C4XOVER arm-rate probe (generalizes the F4 shared-cost probe): while one arm
+        // rides, the idle arm's MEASURED rate goes stale; at most every 256 riding rounds (16
+        // while it has never been measured) a 4-step window of the idle arm runs, refreshing
+        // its measured rate (and, for shared, the learned scale) so the pick below stays
+        // grounded in DELIVERY, not in the priors. Gated like F4 (lane packing on, Auto
+        // policy) but at >=2 busy lanes with at least one MTP-capable; pure scheduler-state
+        // decision (counters, rates, policy are rank-identical or adopted), so both TP ranks
+        // take it in the same step, like the re-probe arming above.
+        self.spec_probe_ctr = self.spec_probe_ctr.saturating_add(1);
+        let mut probe_force: Option<bool> = None;
+        if mtp_on && self.lane_pack.on() && self.spec_policy == SpecLanes::Auto && slots.len() >= 2
+            && slots.iter().any(|&s| self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some())) {
+            if let Some((arm, rem)) = self.spec_probe {
+                self.spec_probe = if rem <= 1 { None } else { Some((arm, rem - 1)) };
+                probe_force = Some(arm as usize == ARM_SHARED);
+                self.shared_probe_ctr = 0;
+            } else {
+                let riding = if self.shared_last { ARM_SHARED } else { ARM_SERIAL };
+                let idle = 1 - riding;
+                let first = self.spec_arm_rate[idle] <= 0.0;
+                let agrees = self.spec_est_pick == Some(riding == ARM_SHARED)
+                    && self.spec_margin >= 0.12 && (self.spec_margin_n as i64 - slots.len() as i64).abs() <= 1;
+                let backoff = if agrees { 8.0 }
+                              else if self.spec_margin >= 0.12 && (self.spec_margin_n as i64 - slots.len() as i64).abs() <= 1 { 4.0 }
+                              else if self.spec_margin >= 0.06 { 2.0 } else { 1.0 };
+                let every = (SPEC_ARM_PROBE_EVERY as f64 * backoff) as u32;
+                let due = self.spec_probe_ctr >= if first { SPEC_ARM_PROBE_FIRST } else { every };
+                if due && !self.arm_fresh(idle, slots.len()) {
+                    self.spec_probe = Some((idle as u8, SPEC_ARM_PROBE_WIN));
+                    self.spec_probe_ctr = 0;
+                    probe_force = Some(idle == ARM_SHARED);
+                    self.shared_probe_ctr = 0;
+                    crate::metrics::spec_lanes_probe(idle);
+                    if self.policy_logs < 64 {
+                        self.policy_logs += 1;
+                        crate::dreprintln!("[exl3-serve] spec-lanes auto: probing the {} arm for {} steps with {} busy lanes \
+                           (its measured rate went stale; the pick prices both arms by delivery)",
+                            if idle == ARM_SHARED { "shared plain" } else { "serial speculation" }, SPEC_ARM_PROBE_WIN, slots.len());
+                    }
+                }
+            }
+        }
+        if mtp_on && probe_force.unwrap_or_else(|| self.use_shared_plain(&slots)) {
             self.shared_streak += 1;
             self.shared_probe_ctr = 0; // a shared round ran: the scale just learned, no probe owed
             // Stale-estimate refresh: lanes' speculative-speed EMAs freeze while they ride shared steps, so every
             // 128th shared round one lane (rotating) runs a serial speculative round instead; the others skip
             // this iteration. ~0.5% of rounds; keeps the cost-based choice tracking the content.
-            if self.spec_policy == SpecLanes::Auto && self.shared_streak % 128 == 0 {
+            let refresh_every = if self.spec_margin >= 0.12 { 256 } else { 128 };
+            if probe_force.is_none() && self.spec_policy == SpecLanes::Auto && self.shared_streak % refresh_every == 0 {
                 let s = slots[(self.shared_streak / 128) % slots.len()];
                 if self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some()) {
-                    return self.step_mtp(s);
+                    // shared-refresh: slots.len() >= 2 in this arm, so the DF2 chain (a single
+                    // token stream) stays out of it — the pack-MTP round refreshes the EMA.
+                    return self.step_mtp(s, false);
                 }
             }
             crate::metrics::lane_pack_round(2); // arm = shared_plain
             return self.step_plain(&slots, true);
         }
         self.shared_streak = 0;
-        // S-B9-REL-FINALFIX F4: the shared-cost probe (see `shared_probe_due`). Only under
-        // `--lane-pack on` + the Auto policy at >=4 busy lanes: the flag-off arm (G2 byte
-        // identity) and the two-lane packed win (PACK5G c=2) never see it, and three lanes
-        // measured "nothing at three". The probe round is exactly what the shared arm runs
-        // (`step_plain(&slots, true)`, heads kept in sync), so every busy lane advances one
-        // token and `learn_shared_ms` seeds/refreshes `shared_scale`; from the next round the
-        // comparison above picks the cheaper arm by measurement. Pure lane-state decision
-        // (counter, scale and policy are lockstep-adopted or rank-identical), so both TP ranks
-        // take it in the same step, like the re-probe arming above.
-        if mtp_on && self.lane_pack.on() && self.spec_policy == SpecLanes::Auto && slots.len() >= 4
-            && shared_probe_due(self.shared_probe_ctr, self.shared_scale == 1.0) {
-            self.shared_probe_ctr = 0;
-            if self.policy_logs < 64 {
-                self.policy_logs += 1;
-                crate::reprintln!("[exl3-serve] spec-lanes auto: shared-step probe with {} busy lanes \
-                           (one shared plain step; the arm pick then prices both arms by measurement)", slots.len());
-            }
-            crate::metrics::lane_pack_round(2); // arm = shared_plain: this round IS one
-            return self.step_plain(&slots, true);
-        }
-        self.shared_probe_ctr = self.shared_probe_ctr.saturating_add(1);
+        // S-C4XOVER: F4's single-step shared probe is superseded by the arm-rate probe
+        // above (same idea, windowed, both directions, feeding measured rates).
         // S-B9-CF-PACK4 `--lane-pack on`: two packable busy lanes share ONE packed speculative
         // verify. `pack_plan` is None with the flag off or fewer than two busy lanes, so both of
         // those take the loops below untouched (off == master; a lone request never packs).
@@ -2068,7 +2403,7 @@ impl Exl3Scheduler {
             match front {
                 Some(s) => {
                     let before = self.lanes[s].as_ref().unwrap().generated;
-                    self.step_mtp(s)?;
+                    self.step_mtp(s, slots.len() == 1)?;
                     // step_mtp may have FINISHED this lane (stop / length / cancel / a dead client):
                     // it frees the slot (self.lanes[s] = None) before returning. The front lane is
                     // then simply gone — its turn ended early and the next step picks the next-oldest
@@ -2094,7 +2429,7 @@ impl Exl3Scheduler {
                         lane.admit_seq = seq; // re-stamped: the queue position IS the sequence number
                         self.fcfs_rots += 1; // TOTAL rotations; the first 16 are logged and the total is printed at a clean idle point
                         if self.fcfs_rots <= 16 {
-                            crate::reprintln!("[exl3-serve] lane-order fcfs: slot {s} used its quantum ({} tokens) \
+                            crate::dreprintln!("[exl3-serve] lane-order fcfs: slot {s} used its quantum ({} tokens) \
                                        and rotates to the back (rotation {}/16 logged)", self.lane_quantum, self.fcfs_rots);
                         }
                     }
@@ -2114,7 +2449,7 @@ impl Exl3Scheduler {
         for &s in &slots {
             let lane = self.lanes[s].as_ref().unwrap();
             if mtp_on && lane.mtp.is_some() {
-                self.step_mtp(s)?;
+                self.step_mtp(s, slots.len() == 1)?;
             } else {
                 plain.push(s);
             }
@@ -2178,7 +2513,7 @@ impl Exl3Scheduler {
         crate::metrics::lane_pack_skip(why.index());
         if self.pack_logs < 64 && crate::metrics::lane_pack_skips(why.index()) <= 8 {
             self.pack_logs += 1;
-            crate::reprintln!("[exl3-serve] lane-pack skip: {} (slot {s}; line {}/64, every skip is counted: /metrics \
+            crate::dreprintln!("[exl3-serve] lane-pack skip: {} (slot {s}; line {}/64, every skip is counted: /metrics \
 velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, why.label());
         }
     }
@@ -2207,7 +2542,7 @@ velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, wh
                 None => {
                     if let Some(why) = plan.skip_of(s) { self.note_skip(s, why); }
                     if self.lanes[s].as_ref().map_or(false, |l| l.mtp.is_some()) {
-                        self.step_mtp(s)?;
+                        self.step_mtp(s, false)?; // packed arm: never a lone lane
                     } else if self.lanes[s].is_some() {
                         plain.push(s);
                     }
@@ -2251,8 +2586,8 @@ velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, wh
         if af.ctrl != 3 && pair_owes_control(self.ctrl_round, per_a, per_b) {
             self.note_skip(sa, Skip::Control);
             self.note_skip(sb, Skip::Control);
-            self.step_mtp(sa)?;
-            return self.step_mtp(sb);
+            self.step_mtp(sa, false)?; // pair control: two lanes in this step
+            return self.step_mtp(sb, false);
         }
         self.pack_stats.in_round = true; // PACK4-REVIEW A3: cleared when the round completes
         let xcheck = crate::exl3_forward::a_xcheck_on();
@@ -2324,7 +2659,7 @@ velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, wh
                 let segs = [PreSeg::of(drafts[0].slot, drafts[0].p, drafts[0].b, &drafts[0].drafts, &drafts[0].samp, drafts[0].launched, drafts[0].wasted),
                             PreSeg::of(drafts[1].slot, drafts[1].p, drafts[1].b, &drafts[1].drafts, &drafts[1].samp, drafts[1].launched, drafts[1].wasted)];
                 let h = fnv32(0x5EED, crate::lane_pack::pre_words(&segs).iter().map(|&d| d as u32));
-                crate::rprintln!("[exl3-serve] lane-pack: round #{n}{}: slots {}+{} rows {}+{}={} pack hash {h:08x} head passes {}+{} wasted {}+{}",
+                crate::drprintln!("[exl3-serve] lane-pack: round #{n}{}: slots {}+{} rows {}+{}={} pack hash {h:08x} head passes {}+{} wasted {}+{}",
                                  self.tp.as_ref().map_or(String::new(), |t| format!(" (TP rank {})", t.rank)),
                                  drafts[0].slot, drafts[1].slot, drafts[0].drafts.len() + 1, drafts[1].drafts.len() + 1,
                                  crate::lane_pack::pack_rows_total(&segs), drafts[0].launched, drafts[1].launched,
@@ -2431,7 +2766,7 @@ every busy lane of this step fails with it, and every later round runs the seria
         self.pack_stats.printed = st.rounds;
         let curve: Vec<String> = st.by_r.iter().enumerate().filter(|(_, c)| c.0 > 0)
             .map(|(r, c)| format!("R{r}:{}x {:.1}ms {:.2}tok", c.0, c.1 / c.0 as f64, c.2 as f64 / c.0 as f64)).collect();
-        crate::rprintln!("[exl3-serve] lane-pack cost by width (rounds, graph-and-sync ms, tokens per round): {}", curve.join(" | "));
+        crate::drprintln!("[exl3-serve] lane-pack cost by width (rounds, graph-and-sync ms, tokens per round): {}", curve.join(" | "));
         let n = st.rounds.max(1) as f64;
         let skips: Vec<String> = crate::lane_pack::Skip::ALL.iter()
             .map(|w| (w.label(), crate::metrics::lane_pack_skips(w.index())))
@@ -2448,6 +2783,38 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
                      if skips.is_empty() { "none".to_string() } else { skips.join(", ") }))
     }
 
+    /// S-C4XOVER: fold one round's (tokens, ms) into its arm's measured-rate window; every
+    /// SPEC_ARM_FOLD_EVERY rounds the window rate folds into the arm's EWMA, tagged with the
+    /// busiest lane count it saw. Rank-identical by construction: fed from the same agreed
+    /// round-ms values the per-lane EMAs already use, on both TP ranks.
+    fn arm_acc(&mut self, arm: usize, tok: f64, ms: f64) {
+        if ms <= 0.0 || tok <= 0.0 { return; }
+        let n = self.lanes.iter().filter(|l| l.is_some()).count() as u8;
+        crate::metrics::spec_arm_charge(arm, ms, tok);
+        self.spec_win_tok[arm] += tok;
+        self.spec_win_ms[arm] += ms;
+        self.spec_win_n[arm] = self.spec_win_n[arm].max(n);
+        self.spec_win_acc[arm] += 1;
+        if self.spec_win_acc[arm] >= SPEC_ARM_FOLD_EVERY {
+            let rate = self.spec_win_tok[arm] / self.spec_win_ms[arm];
+            self.spec_arm_rate[arm] = if self.spec_arm_rate[arm] > 0.0 {
+                0.5 * self.spec_arm_rate[arm] + 0.5 * rate
+            } else { rate };
+            self.spec_arm_n[arm] = self.spec_win_n[arm];
+            self.spec_arm_fold[arm] = self.steps as u64;
+            self.spec_win_tok[arm] = 0.0;
+            self.spec_win_ms[arm] = 0.0;
+            self.spec_win_n[arm] = 0;
+            self.spec_win_acc[arm] = 0;
+            crate::metrics::spec_lanes_measured(arm, self.spec_arm_rate[arm] * 1e3);
+        }
+    }
+    /// S-C4XOVER: is this arm's measured rate fresh at this busy-lane count?
+    fn arm_fresh(&self, arm: usize, n: usize) -> bool {
+        self.spec_arm_rate[arm] > 0.0
+            && self.spec_arm_fold[arm].saturating_add(SPEC_ARM_FRESH_STEPS) > self.steps as u64
+            && (self.spec_arm_n[arm] as i64 - n as i64).abs() <= SPEC_ARM_N_TOL
+    }
     /// CF-P1e: do the busy lanes share one plain batched step this round (true) or run serial speculative rounds?
     /// `Auto` compares the estimated aggregate tokens/ms of the two arms (4% hysteresis): serial = the busy
     /// MTP-capable lanes' measured round speed (sum tokens / sum ms) plus one batched step for any MTP-off lanes;
@@ -2459,12 +2826,43 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
             SpecLanes::Never => false,
             SpecLanes::Over(k) => n > k,
             SpecLanes::Auto => {
+                // S-C4XOVER: measured delivered rates outrank the modelled estimates (both
+                // were biased at four busy lanes: the serial cycle estimate ~+30% optimistic
+                // vs delivery, the shared prior ~-18% pessimistic; together they pinned the
+                // pick to the slower arm, ~13% at c4). When both arms have a fresh measured
+                // rate at a compatible busy count, compare THOSE; the estimate path below is
+                // the fallback for an arm that has not run recently.
+                if self.arm_fresh(ARM_SERIAL, n) && self.arm_fresh(ARM_SHARED, n) {
+                    let (s_rate, h_rate) = (self.spec_arm_rate[ARM_SERIAL], self.spec_arm_rate[ARM_SHARED]);
+                    let pick = if h_rate > s_rate * 1.04 { true } else if s_rate > h_rate * 1.04 { false } else { self.shared_last };
+                    if pick != self.shared_last && self.policy_logs < 64 {
+                        self.policy_logs += 1;
+                        crate::dreprintln!("[exl3-serve] spec-lanes auto (measured): {} with {n} busy lanes \
+                           (serial speculation {:.0} tok/s delivered, one shared step {:.0} tok/s delivered)",
+                            if pick { "SHARED plain step" } else { "serial speculation" }, s_rate * 1e3, h_rate * 1e3);
+                    }
+                    self.spec_margin = if s_rate.min(h_rate) > 0.0 { s_rate.max(h_rate) / s_rate.min(h_rate) - 1.0 } else { 0.0 };
+                    self.spec_margin_n = n as u8;
+                    crate::metrics::spec_lanes_decision(s_rate * 1e3, h_rate * 1e3, self.shared_scale, n);
+                    if pick != self.shared_last {
+                        crate::metrics::spec_lanes_switch(pick as usize); // 0 = shared, 1 = serial
+                    }
+                    self.shared_last = pick;
+                    return pick;
+                }
                 let (mut tok, mut ms, mut capable, mut known) = (0.0f64, 0.0f64, 0usize, 0usize);
                 for &s in slots {
                     let l = self.lanes[s].as_ref().unwrap();
                     if l.mtp.is_some() {
                         capable += 1;
-                        if l.ema_tok > 0.0 && l.ema_ms > 0.0 { tok += l.ema_tok; ms += l.ema_ms; known += 1; }
+                        if l.ema_tok > 0.0 && l.ema_ms > 0.0 { tok += l.ema_tok;
+                            // P18 SPEC8K: price the serial arm by the measured CYCLE of the lane
+                            // (serial_cycle_ms) instead of the ms of its own round, which for a packed
+                            // lane is one SHARE of the verify. Both arms are then read, below, as the
+                            // aggregate tokens per second that the n clients see.
+                            ms += serial_cycle_ms(l.ema_ms, l.ema_wall_ms);
+                            known += 1;
+                        }
                     }
                 }
                 if capable == 0 { return false; }          // nothing speculates: the plain batch already runs
@@ -2475,14 +2873,22 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
                     tok += plain_only as f64;
                     ms += self.shared_scale * shared_step_prior_ms(plain_only);
                 }
-                let (serial_rate, shared_rate) = (tok / ms, n as f64 / shared_ms);
+                // P18 SPEC8K: both sides are the AGGREGATE tokens per second that the n clients
+                // see (n times a per-lane rate), which is the quantity the arm choice is about.
+                let (serial_rate, shared_rate) = (n as f64 * tok / ms, n as f64 / shared_ms);
                 let pick = if shared_rate > serial_rate * 1.04 { true } else if serial_rate > shared_rate * 1.04 { false } else { self.shared_last };
                 if pick != self.shared_last && self.policy_logs < 64 {
                     self.policy_logs += 1;
-                    crate::reprintln!("[exl3-serve] spec-lanes auto: {} with {n} busy lanes (serial speculation {:.0} tok/s est, \
-                               one shared step {:.0} tok/s est, scale {:.2})",
+                    crate::dreprintln!("[exl3-serve] spec-lanes auto: {} with {n} busy lanes (serial speculation {:.0} tok/s est, \
+                               one shared step {:.0} tok/s est, scale {:.2}, serial cycle {:.1} ms/lane)",
                               if pick { "SHARED plain step" } else { "serial speculation" },
-                              serial_rate * 1e3, shared_rate * 1e3, self.shared_scale);
+                              serial_rate * 1e3, shared_rate * 1e3, self.shared_scale, ms / n as f64);
+                }
+                // S-C4XOVER: the decision on /metrics (est gauges + flip counters; no behavior change).
+                self.spec_est_pick = Some(pick);
+                crate::metrics::spec_lanes_decision(serial_rate * 1e3, shared_rate * 1e3, self.shared_scale, n);
+                if pick != self.shared_last {
+                    crate::metrics::spec_lanes_switch(pick as usize); // 0 = shared, 1 = serial
                 }
                 self.shared_last = pick;
                 pick
@@ -2502,7 +2908,14 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
     /// One chain-verify round for one lane, with the §6 profitability control:
     /// every 128th round runs PLAIN as the control and the MTP path auto-disables
     /// (loudly) if its per-token cost loses to plain.
-    fn step_mtp(&mut self, s: usize) -> Result<()> {
+    /// ISSUES[94] DF2: `solo` = exactly ONE lane was active in this scheduler step (the serial
+    /// arms pass slots.len() == 1; the packed/pair/shared-refresh arms pass false). Only a
+    /// solo round may run the DFlash2 chain — the DF2 ring follows ONE token stream, so a
+    /// multi-lane step keeps the pack-MTP machinery — and only when the ring is current for
+    /// this lane (`nprev == p`): the prefill primed it and every DF2 round advanced it, but a
+    /// lane that prefilled while another lane held the ring is stale until its next prefill;
+    /// those rounds fall back to the pack MTP and count on `exl3_df2_fallback_mtp_total`.
+    fn step_mtp(&mut self, s: usize, solo: bool) -> Result<()> {
         crate::metrics::lane_pack_round(1); // arm = serial (a lone speculative lane round)
         let k = self.mtp_k;
         let af = crate::exl3_forward::a_flags();
@@ -2513,6 +2926,14 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
              lane.max_new.saturating_sub(lane.generated),
              if lane.ema_tok > 0.0 { lane.ema_ms / lane.ema_tok } else { 0.0 })
         };
+        if crate::exl3_forward::DF2_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                let nv = self.df2.as_ref().map(|r| r.nprev());
+                eprintln!("[df2trace] step_mtp s={s} solo={solo} p={p} nprev={nv:?} draft_conf={} df2_k={}",
+                          self.draft_conf, self.df2_k);
+            }
+        }
         let xcheck = crate::exl3_forward::a_xcheck_on();
         if xcheck {
             self.model.tap_xcheck_verify(&self.sc, s, tap_row)?; // WP03: was this lane's tap clobbered?
@@ -2537,7 +2958,7 @@ lane rounds outside a pack: {}", self.tp.as_ref().map_or(String::new(), |t| form
         {
             if kd < k_eff {
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| crate::rprintln!("[exl3-serve] per-row attention regime: a speculative round at position {p} stops at the \
+                ONCE.call_once(|| crate::drprintln!("[exl3-serve] per-row attention regime: a speculative round at position {p} stops at the \
 sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle it)"));
             }
             k_eff = kd;
@@ -2566,6 +2987,31 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
         self.model.set_penalties(&mut self.sc, &vec![pen; if plain_step { 1 } else { k + 1 }])?;
         let t0 = std::time::Instant::now();
         let g0 = self.model.graph_count(); // WP23: a round that captures a graph is not cost-fit
+        let mut df2_served = false;
+        // EXL27D-reanchor (hoisted): a second request on the same server may start at a
+        // position BEHIND the DF2 ring's frontier (its prefill came from the PREFIX
+        // CACHE, so df2_prime_window never ran; df2_reprime only ADVANCES). Left alone,
+        // every later request falls back to pack MTP forever (measured 2026-10-21:
+        // request 2 = 0 DF2 rounds, 843 MTP drafts). Rewind the frontier to just PAST
+        // this lane's position — `p`, not `p-1` — so the DF2 gate still misses THIS
+        // round: the adaptive round that serves it refreshes the tap sink at the lane's
+        // positions, and the Fix2 reprime advances the ring from there. The next round
+        // is a DF2 round with fresh conditioning. Ring rows over a shared prefix are
+        // exact (request 1 wrote them); a different prompt self-heals within a few
+        // rounds. Counted on `exl3_df2_reanchor_total`.
+        if !plain_step && solo && p >= 1
+            && self.df2.as_ref().map_or(false, |r| r.nprev() + 1 > p)
+        {
+            // rewind to `p-1` so the gate (nprev+1 == p) matches THIS round: the DF2
+            // round takes it directly. Its tap staging is one-request stale (the sink
+            // holds request 1's frontier hiddens) — that costs at most the first round's
+            // acceptance, never correctness: the verify always commits the target's own
+            // tokens. The round itself refreshes the sink; round 2 onwards is fully
+            // fresh. (Measured with rewind(p): the Fix2 reprime after an adaptive round
+            // lands one PAST the lane — 98 reanchors, 0 DF2 rounds — 2026-10-21.)
+            if let Some(r) = self.df2.as_mut() { r.rewind(p - 1); }
+            df2_count_reanchor();
+        }
         let (out, plain_ms, confs) = if plain_step {
             // plain round: consume b at p like a plain decode step. WP03: no draft pass runs, so
             // first write the head's row p KV-only (tap that predicted b, b), and after the step
@@ -2595,6 +3041,49 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
                 drafts: Vec::new(),
                 diag_ms: 0.0,
             }, ms, Vec::new())
+        } else if solo && self.df2.as_ref().is_some_and(|r| r.nprev() + 1 == p) {
+            // ISSUES[94] DF2 (Fix1, 2026-10-16): the DFlash2 chain round owns the solo
+            // speculative step whenever it is armed and its ring is fresh — INCLUDING under
+            // `draft_conf > 0`: the WP23 adaptive draft-stop is pack-MTP-head machinery (it
+            // reads the MTP head's per-position confidences through a keep hook the DF2 block
+            // drafter has no analog of), so the adaptive branch keeps serving only the lanes
+            // DF2 cannot (multi-lane rounds, stale ring). The DF2 round keeps the §6
+            // profitability control (plain control rounds still measure it) and returns the
+            // same MtpRoundOut, so `round_account` / `round_emit` are the MTP path's. The
+            // plain CONTROL round above is untouched — the DF2 economics are still measured
+            // against it.
+            let k_df2 = self.df2_k.min(crate::exl3_forward::MTP_MAX_K);
+            // EXL27D-RQ (item 1): a sampled lane re-stages its sampler rows at the DF2
+            // verify width (k_df2+1; the shared staging above sized the MTP depth k_eff —
+            // a mismatch would stage fewer ratio rows than the verify judges) and drafts
+            // through the sampled selector walk. sel_seeds = rng(seed, DF2_SEL, j) per
+            // position — the trunk lane's exact convention (batch.rs df2_lane_step_sample_rq);
+            // tau = the staged draft temperature (--draft-temperature or the request's).
+            let rq2 = if rq_ratio { self.rq_stage(s) } else { None };
+            if rq_ratio {
+                let (rows_df2, seed) = {
+                    let l = self.lanes[s].as_ref().unwrap();
+                    (l.samp_rows(k_df2 + 1), l.seed)
+                };
+                self.model.set_spec_sampling(&mut self.sc, &rows_df2, rq2)?;
+                self.model.set_penalties(&mut self.sc, &vec![pen; k_df2 + 1])?;
+                let seeds: Vec<u32> = (0..crate::dflash2::levels())
+                    .map(|j| crate::batch::rng_u32(seed, crate::batch::RNG_DOM_DF2_SEL, j))
+                    .collect();
+                let tau = rq2.map(|r| r.tau).unwrap_or(1.0);
+                let o = self.model.df2_round(&mut self.sc, self.df2.as_mut().unwrap(), s, k_df2, b, p,
+                                             Some((seeds.as_slice(), tau)),
+                                             [t0, t0, t0])?;
+                df2_count_round(o.a);
+                df2_served = true;
+                (o, 0.0, Vec::new())
+            } else {
+                let o = self.model.df2_round(&mut self.sc, self.df2.as_mut().unwrap(), s, k_df2, b, p,
+                                             None, [t0, t0, t0])?;
+                df2_count_round(o.a);
+                df2_served = true;
+                (o, 0.0, Vec::new())
+            }
         } else if self.draft_conf > 0.0 {
             // API-parity DDS: draft until the running product of calibrated per-position
             // acceptance estimates falls below the target (the reference implementation's -dds -dc), then verify
@@ -2626,8 +3115,26 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             self.cal.decay_step();
             (o, 0.0, confs)
         } else {
+            if solo && self.df2.is_some() {
+                // DF2 engaged but the ring is stale for this lane (`nprev != p`: the lane
+                // prefilled while another lane held the chain, or the artifact never primed
+                // this window): the pack MTP serves the round and the fallback is COUNTED —
+                // `exl3_df2_fallback_mtp_total` — never a silent skip.
+                df2_count_fallback_mtp();
+            }
             (self.model.mtp_round(&mut self.sc, head, s, k_eff, b, p, tap_row)?, 0.0, Vec::new())
         };
+        // EXL27C-DF2-Fix2: after any NON-DF2 solo round (plain/control, adaptive or MTP
+        // fallback), re-prime the DF2 ring from the taps that round's target forward captured
+        // (every solo forward writes the staging sink), so the next solo round is DF2 again
+        // instead of falling back forever. `df2_round` advanced the ring for its own rounds.
+        if solo && self.df2.is_some() && !df2_served {
+            if let Some(r) = self.df2.as_mut() {
+                if let Err(e) = self.model.df2_reprime(r, out.a + 1) {
+                    eprintln!("[exl3-serve] df2 reprime after fallback round failed: {e}");
+                }
+            }
+        }
         // WP24: the dump / XCHECK host diagnostics are not round cost (they would trip the §6
         // per-request auto-off on a diagnostics run); 0 when off.
         let ms = (t0.elapsed().as_secs_f64() * 1e3 - out.diag_ms).max(0.0);
@@ -2659,6 +3166,27 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
     fn round_account(&mut self, s: usize, out: &crate::exl3_forward::MtpRoundOut, ms: f64, plain_ms: f64,
                      captured: bool, control: bool, plain_step: bool, rq_ratio: bool, xcheck: bool, packed: bool) -> Result<()> {
         let k = self.mtp_k;
+        // P18 SPEC8K: sample the real round-to-round latency of the lane (queueing included) for the
+        // load-adaptive choice of arm. Once per lane per round, here, whichever arm the round ran
+        // (serial speculation, a packed pair, a shared plain step): this is the single point that every
+        // arm reaches with the ms of its own round.
+        if !captured {
+            let now = std::time::Instant::now();
+            let lane = self.lanes[s].as_mut().unwrap();
+            if let Some(prev) = lane.last_wall {
+                let wall = (now - prev).as_secs_f64() * 1e3;
+                if wall > 0.0 && wall <= WALL_STALL_X * ms.max(1.0) {
+                    lane.ema_wall_ms = if lane.ema_wall_ms <= 0.0 { wall } else {
+                        WALL_EMA_W * lane.ema_wall_ms + (1.0 - WALL_EMA_W) * wall
+                    };
+                }
+            }
+            lane.last_wall = Some(now);
+        }
+        // S-C4XOVER: every round_account call is a serial-arm round (a lone speculative
+        // round, a packed pair's lane share, or its plain control): fold its delivery
+        // (emitted tokens, round ms) into the arm's measured rate.
+        self.arm_acc(ARM_SERIAL, out.emitted.len() as f64, ms);
         if xcheck {
             self.model.tap_xcheck_record(&self.sc, s, out.tap_row)?;
         }
@@ -2750,7 +3278,7 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
                 // --mtp-reprobe=off: the previous one-way rule, exactly (2% margin, no confirm,
                 // no re-arm — the frozen pre-fix behaviour for A/B and for users who want it).
                 if lane.mtp_rounds >= 64 && ema_plain > 0.0 && cost > ema_plain * 1.02 {
-                    crate::reprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
+                    crate::dreprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
                            {:.2} tok/round) vs plain {:.2} after {} rounds (AGENTS §6, per-request)",
                            cost, lane.ema_ms, lane.ema_tok, ema_plain, lane.mtp_rounds);
                     // the lane is at a clean seam (round committed, last_tok unconsumed at
@@ -2772,7 +3300,7 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
                         lane.force_control = true;
                     }
                     RV::Off => {
-                        crate::reprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
+                        crate::dreprintln!("[exl3-serve] MTP off for this request (slot {s}): {:.2} ms/tok ({:.1} ms/round, \
 {:.2} tok/round) vs plain {:.2} after {} rounds (AGENTS §6; re-probe in {} plain steps)",
                                    cost, lane.ema_ms, lane.ema_tok, plain_ref, lane.mtp_rounds, cfg.backoff_base);
                         lane.mtp = None;
@@ -2786,7 +3314,7 @@ probe rounds; off again (next probe in {next_b} plain steps)", cost, plain_ref, 
                         lane.reprobe.went_off(out.tap_row, true, &cfg);
                     }
                     RV::ProbeSucceeded => {
-                        crate::reprintln!("[exl3-serve] MTP re-probe OK (slot {s}): stayed on {} probe rounds at {:.2} \
+                        crate::dreprintln!("[exl3-serve] MTP re-probe OK (slot {s}): stayed on {} probe rounds at {:.2} \
 ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, cfg.backoff_base);
                         lane.reprobe.probe_ok(&cfg);
                     }
@@ -2843,7 +3371,7 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
             // the head's next sweep ships the cancel instead (rank-local drops would desync).
             let sent = self.lanes[s].as_ref().map_or(false, |lane| lane.tx.send(crate::batch::TokEvent::Tok(t)).is_ok());
             if !sent && self.tp.is_none() {
-                if let Some(lane) = self.lanes[s].take() {
+                if let Some(lane) = self.take_lane(s, false) {
                     lane.log_cancel(s);
                 }
                 return Ok(());
@@ -2853,7 +3381,7 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
                 // item 5(a): emitted[j] is the choice of the round's logits row j (verify row j, or
                 // row 0 of a plain step) — still in sc.logits: the re-prime after a verify is KV-only
                 if reason == "stop" { self.send_stop_info(s, packed_row0.map_or(j, |r0| r0 + j), t, packed_row0.is_some()); }
-                if let Some(lane) = self.lanes[s].take() {
+                if let Some(lane) = self.take_lane(s, crate::lane_reserve::normal_finish(&reason)) {
                     if reason == "loop_detected" { lane.log_loop(s, &self.tok); }
                     lane.log_stats(s, &reason);
                     self.model.dump_expert_hist(); // TP-I #6 diagnostic (no-op unless --tp-ep-hist)
@@ -2898,7 +3426,7 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
             Some((p, rank)) => { let _ = lane.tx.send(TokEvent::StopInfo { p: p as f32, rank, sampled: samp.is_some() }); }
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| crate::rprintln!("[exl3-serve] stop_p unavailable for a request (slot {s}, logits row {row}, token {tok}, {:?}): \
+                ONCE.call_once(|| crate::drprintln!("[exl3-serve] stop_p unavailable for a request (slot {s}, logits row {row}, token {tok}, {:?}): \
 the [gen] line says stop_p=na", stats));
             }
         }
@@ -2940,6 +3468,14 @@ the [gen] line says stop_p=na", stats));
         if sync_head || reprobe_primes {
             let model = self.model.clone();
             if let Some(head) = model.mtp.as_ref() {
+                // S-C4PRIMEA: collect the step's primeable lanes. When EVERY lane has a real
+                // tap row and there are >= 2, ONE batched call (xq_gather_tap_rows + a single
+                // re-prime pass at m = lanes + xq_attn_kv_prefill_pairs) replaces the per-lane
+                // mtp_plain_prime loop. Any other shape (a sentinel tap, a skipped lane, one
+                // lane) runs the VERBATIM legacy loop below — byte-identical to the old code,
+                // which is also what the control site and solo re-probe steps keep running.
+                let mut lanes: Vec<(usize, i32, usize, usize)> = Vec::with_capacity(slots.len());
+                let mut batch_ok = prime_batch_on();
                 for &s in slots {
                     let (b, p, tr) = { let l = self.lanes[s].as_ref().unwrap(); (l.last_tok as i32, l.pos, l.mtp) };
                     let tr = tr.or({
@@ -2947,8 +3483,40 @@ the [gen] line says stop_p=na", stats));
                         let l = self.lanes[s].as_ref().unwrap();
                         if l.reprobe.keep_primed() { Some(l.reprobe.prime_tap_row) } else { None }
                     });
-                    if let Some(tap_row) = tr {
-                        model.mtp_plain_prime(&mut self.sc, head, s, b, p, tap_row)?;
+                    match tr {
+                        Some(tap_row) if tap_row != usize::MAX => lanes.push((s, b, p, tap_row)),
+                        _ => batch_ok = false,
+                    }
+                }
+                batch_ok = batch_ok && lanes.len() >= 2 && lanes.len() <= 16; // re-prime width cap; mtp_plain_prime_batched re-checks vs the scratch width
+                if batch_ok {
+                    if prime_batch_xcheck_take() {
+                        // S-C4PRIMEA: ONE-TIME-per-boot GPU identity gate on the real path:
+                        // the legacy per-lane head-KV rows vs the batched bytes of the same rows.
+                        for &(s, b, p, tr) in &lanes { model.mtp_plain_prime(&mut self.sc, head, s, b, p, tr)?; }
+                        let want = model.head_kv_row_bytes(&mut self.sc, head, &lanes)?;
+                        model.mtp_plain_prime_batched(&mut self.sc, head, &lanes)?;
+                        let got = model.head_kv_row_bytes(&mut self.sc, head, &lanes)?;
+                        let same = want == got;
+                        eprintln!("[prime-batch] XCHECK {}: {} lanes, {} head-KV row bytes, per-lane == batched",
+                                  if same { "PASS" } else { "FAIL" }, lanes.len(), got.len());
+                        anyhow::ensure!(same, "prime-batch identity xcheck FAILED (first batched call this boot)");
+                    } else {
+                        model.mtp_plain_prime_batched(&mut self.sc, head, &lanes)?;
+                    }
+                    crate::metrics::prime_batch_round(lanes.len() as u64);
+                    prime_batch_boot_log(lanes.len());
+                } else {
+                    for &s in slots {
+                        let (b, p, tr) = { let l = self.lanes[s].as_ref().unwrap(); (l.last_tok as i32, l.pos, l.mtp) };
+                        let tr = tr.or({
+                            // an off rearmable lane: its saved tap row (0 once a primed step snapshotted)
+                            let l = self.lanes[s].as_ref().unwrap();
+                            if l.reprobe.keep_primed() { Some(l.reprobe.prime_tap_row) } else { None }
+                        });
+                        if let Some(tap_row) = tr {
+                            model.mtp_plain_prime(&mut self.sc, head, s, b, p, tap_row)?;
+                        }
                     }
                 }
             }
@@ -2991,10 +3559,19 @@ the [gen] line says stop_p=na", stats));
             // TP-C: lockstep on the batched plain step's emitted ids (no wall-clock decision here)
             let w: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
             let (ms, _, _) = self.tp_round("plain-step", 0, slots.len(), &w, own_ms, 0.0, false, false)?;
-            if sync_head { self.learn_shared_ms(slots.len(), ms); }
+            if sync_head {
+                self.learn_shared_ms(slots.len(), ms);
+                // S-C4XOVER: a shared plain step delivers one token to every busy lane;
+                // fold it into the shared arm's measured rate (2+ lanes: a lone-lane
+                // sync step is a reprobe control, not the shared arm at work).
+                if slots.len() >= 2 { self.arm_acc(ARM_SHARED, slots.len() as f64, ms); }
+            }
             plain_ms_head = ms;
         } else {
-            if sync_head { self.learn_shared_ms(slots.len(), own_ms); }
+            if sync_head {
+                self.learn_shared_ms(slots.len(), own_ms);
+                if slots.len() >= 2 { self.arm_acc(ARM_SHARED, slots.len() as f64, own_ms); }
+            }
             plain_ms_head = own_ms;
         }
         if let Some(g) = self.gate.as_mut() { g.plain += slots.len() as u64; }
@@ -3078,7 +3655,7 @@ the [gen] line says stop_p=na", stats));
             if lane.tx.send(TokEvent::Tok(t)).is_err() && !tp_on {
                 // WP02: the client is gone — cancel now, free the slot
                 lane.log_cancel(s);
-                self.lanes[s] = None;
+                self.release_lane(s, false);
                 continue;
             }
             if finish {
@@ -3088,7 +3665,7 @@ the [gen] line says stop_p=na", stats));
                 self.model.dump_esel_hist(); // S-A3-o diagnostic (no-op unless --exl3-esel-hist)
                 self.model.dump_route_log(); // CF-P1e step 0 diagnostic (no-op unless --exl3-route-log)
                 let _ = lane.tx.send(TokEvent::Finish { reason: reason.to_string() });
-                self.lanes[s] = None;
+                self.release_lane(s, crate::lane_reserve::normal_finish(reason));
                 self.model.dhead_request_report(); // DHEADP fallback line (penalized requests) + DHEAD XCHECK lines (when on)
             }
         }
@@ -3114,16 +3691,16 @@ the [gen] line says stop_p=na", stats));
                 // Clean idle point: report the TOTAL number of fcfs rotations this scheduler made
                 // (the per-rotation log caps at 16 lines; G1 needs the true count).
                 if self.lane_order == LaneOrder::Fcfs && self.fcfs_rots > rots_printed {
-                    crate::rprintln!("[exl3-serve] lane-order fcfs idle: {rots_printed}->{} total rotations", self.fcfs_rots);
+                    crate::drprintln!("[exl3-serve] lane-order fcfs idle: {rots_printed}->{} total rotations", self.fcfs_rots);
                     rots_printed = self.fcfs_rots;
                 }
                 // 9a(iii): the lazily captured mixed-step graphs, whenever their number grew
                 if let Some(line) = mixed_graphs_idle_line(mixed_printed, crate::metrics::mixed_step_graphs(), self.width) {
-                    crate::rprintln!("{line}");
+                    crate::drprintln!("{line}");
                     mixed_printed = crate::metrics::mixed_step_graphs();
                 }
                 self.publish_kv(); // issue #24: the idle value (lanes freed outside a step included)
-                if let Some(line) = self.pack_idle_line() { crate::rprintln!("{line}"); } // S-B9-CF-PACK4
+                if let Some(line) = self.pack_idle_line() { crate::drprintln!("{line}"); } // S-B9-CF-PACK4
                 crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                 match rx.blocking_recv() {
                     Some(req) => waiting.push_back(req),
@@ -3131,9 +3708,75 @@ the [gen] line says stop_p=na", stats));
                 }
             }
             while let Ok(req) = rx.try_recv() {
+                // MAXBATCH1: an arrival beyond what the cap can run at once — every lane busy,
+                // or the queue already holds the overflow (a burst on an idle box lands here
+                // too: all 12 drain before admission runs). Count it (the cap's engagement
+                // counter; the 2026-10-21 soak showed the lanes-already-full-only test misses
+                // exactly those bursts).
+                if self.lanes.iter().filter(|l| l.is_some()).count() + waiting.len() >= self.lanes.len() {
+                    crate::metrics::over_cap_queued();
+                }
                 waiting.push_back(req);
             }
             while self.fatal.is_none() && self.lanes.iter().any(|l| l.is_none()) {
+                if self.reserve.is_some() {
+                    // LANERES1: plan-driven admission — snapshot-first, reservations, bounded
+                    // patience, rate-limited forced takes. Same queue, same rx; only WHICH
+                    // waiting request goes to WHICH lane changes, and only while the policy is
+                    // on (--lane-reserve). Off = the original body below, byte-for-byte.
+                    while let Ok(req) = rx.try_recv() {
+                        // MAXBATCH1: over-cap arrival (beyond what the cap runs at once) — count it.
+                        if self.lanes.iter().filter(|l| l.is_some()).count() + waiting.len() >= self.lanes.len() {
+                            crate::metrics::over_cap_queued();
+                        }
+                        waiting.push_back(req);
+                    }
+                    if !waiting.is_empty() {
+                        waiting.retain(|r| !r.tx.is_closed());
+                    }
+                    let now = std::time::Instant::now();
+                    let slots = self.slot_views();
+                    let wvs: Vec<crate::lane_reserve::WaitView> = waiting.iter().map(|r| crate::lane_reserve::WaitView {
+                        arrived_at: r.received_at,
+                        own_slot: self.own_snapshot_slot(&r.prompt),
+                    }).collect();
+                    let Some(cfg) = self.reserve else { unreachable!("checked above") };
+                    match crate::lane_reserve::plan(&cfg, &mut self.reserve_st, now, &slots, &wvs) {
+                        crate::lane_reserve::Plan::Admit { waiting_index, allowed, kind } => {
+                            if let Some(req) = waiting.remove(waiting_index) {
+                                if req.tx.is_closed() {
+                                    continue;
+                                }
+                                self.admit_scoped(req, &allowed, kind);
+                                crate::metrics::lane_reserve_waiting(waiting.len() as u64);
+                            }
+                        }
+                        crate::lane_reserve::Plan::Wait { until } => {
+                            crate::metrics::lane_reserve_waiting(waiting.len() as u64);
+                            if self.lanes.iter().any(|l| l.is_some()) {
+                                break; // a round is running; re-plan after the next step
+                            }
+                            // Every lane free but reserved: bounded blocking wait for a new
+                            // request or the next deadline (20 ms tick; no engine work exists).
+                            loop {
+                                if self.fatal.is_some() { break; }
+                                if until.map_or(false, |d| std::time::Instant::now() >= d) { break; }
+                                match rx.try_recv() {
+                                    Ok(req) => {
+                                        // MAXBATCH1: over-cap arrival (beyond what the cap runs at once) — count it.
+                                        if self.lanes.iter().filter(|l| l.is_some()).count() + waiting.len() >= self.lanes.len() {
+                                            crate::metrics::over_cap_queued();
+                                        }
+                                        waiting.push_back(req);
+                                        break;
+                                    }
+                                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                                }
+                            }
+                        }
+                    }
+                    continue; // re-plan from the top of this while
+                }
                 let Some(req) = waiting.pop_front() else { break };
                 if req.tx.is_closed() {
                     continue;
@@ -3223,34 +3866,185 @@ the [gen] line says stop_p=na", stats));
         let psc = self.psc.as_mut().unwrap();
         psc.vis_img = Some(img);
         psc.vis_src = src;
-        crate::rprintln!("[exl3-serve] VIS-2 slot={slot}: {} image(s), {n_img} image tokens in a {plen}-token prompt; rope delta {delta}",
+        crate::drprintln!("[exl3-serve] VIS-2 slot={slot}: {} image(s), {n_img} image tokens in a {plen}-token prompt; rope delta {delta}",
                  req.image_spans.len());
         // VIS-3: the QSA indexer ropes its pooled keys through the same per-slot map, so an image
         // request runs past the dense window like text (no generated-token cap)
         Ok((key, usize::MAX))
     }
 
+    // ---------------------------------------------------------- LANERES2: --kv-spill
+    /// Capture `slot`'s snapshot (the EVICTED conversation's — the caller checked the incoming
+    /// prompt does not extend it) into the spill store. Never fails the round: a capture or
+    /// store error counts as a recompute-miss and the snapshot is simply lost (today's
+    /// behavior). Key = FNV-1a of the cached tokens, so a later request whose prompt extends
+    /// them finds it by prefix scan. The disk write is async (the store's writer thread).
+    fn spill_capture_slot(&mut self, slot: usize, old: &[u32]) {
+        let Some(st) = self.spill.as_ref() else { return };
+        let key = crate::kv_spill::conv_key(old);
+        let tokens = old.len() as u64;
+        // Pre-check the queue budget BEFORE the GiB-scale capture exists: a refusal here is
+        // free; one after the D2H transiently pumps ~4 GB through malloc and can cross the
+        // box's memwatch floor under churn (the b5x10 lesson).
+        {
+            let st = self.spill.as_ref().unwrap();
+            if st.pending.load(std::sync::atomic::Ordering::Relaxed) + tokens * crate::kv_spill::KV_BYTES_PER_TOKEN
+                > st.max_pending
+            {
+                crate::drprintln!("[kv-spill] capture refused: queue over budget (est {} bytes)", tokens * crate::kv_spill::KV_BYTES_PER_TOKEN);
+                crate::metrics::kv_spill_miss_recompute();
+                return;
+            }
+        }
+        let mut buf = Vec::new();
+        if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
+            crate::metrics::kv_spill_miss_recompute();
+            crate::drprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+            return;
+        }
+        crate::kv_spill::finalize_header(&mut buf, tokens);
+        match st.put_prebuilt(key, self.spill_rank, buf) {
+            Ok(bytes) => {
+                for v in self.spill_pol.put(key, bytes, tokens) {
+                    st.remove(v, self.spill_rank);
+                }
+                crate::metrics::kv_spill_write(bytes, tokens);
+            }
+            Err(e) => {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[exl3-serve] kv spill: store put failed ({e}); snapshot dropped");
+            }
+        }
+    }
+
+    /// Own-snapshot miss: try the spill store. Returns the restored token count (the new
+    /// `reuse`) or None (miss / cost-model drop / any error — re-prefill, counted). The read
+    /// is synchronous in the admission path, like the prefill it replaces, only ~50x shorter.
+    fn spill_restore_slot(&mut self, slot: usize, key: &[u32], end: usize) -> Option<usize> {
+        if self.spill.is_none() || self.spill_pol.is_empty() {
+            return None;
+        }
+        let st = self.spill.as_ref().unwrap();
+        let Some((conv, _)) = self.spill_pol.lookup(key, crate::kv_spill::NVME_READ_BPS, crate::kv_spill::PREFILL_TPS) else {
+            crate::metrics::kv_spill_miss_recompute();
+            return None;
+        };
+        let payload = match st.get(conv, self.spill_rank) {
+            Ok((_, p)) => p,
+            Err(_) => {
+                self.spill_pol.remove(conv);
+                st.remove(conv, self.spill_rank);
+                crate::metrics::kv_spill_miss_recompute();
+                return None;
+            }
+        };
+        let n = match self.model.spill_restore(slot, &payload) {
+            Ok(n) => n,
+            Err(e) => {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[exl3-serve] kv spill: restore failed slot={slot} ({e}); re-prefill");
+                return None;
+            }
+        };
+        self.spill_pol.remove(conv);
+        st.remove(conv, self.spill_rank);
+        crate::metrics::kv_spill_hit(n as u64);
+        crate::drprintln!("[exl3-serve] kv spill: restored slot={slot}: {n} of {end} prompt tokens (read {} MiB)", payload.len() >> 20);
+        Some(n)
+    }
+
+    // ---------------------------------------------------------- LANERES1: --lane-reserve
+    /// The SlotViews the policy reads, built fresh at every plan/pick: busy, snapshot present,
+    /// release time + normal-ness of the last release.
+    fn slot_views(&self) -> Vec<crate::lane_reserve::SlotView> {
+        (0..self.lanes.len()).map(|i| crate::lane_reserve::SlotView {
+            busy: self.lanes[i].is_some(),
+            has_snapshot: self.cache[i].is_some(),
+            released_at: self.rel[i].map(|(t, _)| t),
+            normal_finish: self.rel[i].map_or(false, |(_, n)| n),
+        }).collect()
+    }
+
+    /// WP16 resume depth per slot for THIS prompt (0 = no grid / no usable checkpoint) — the
+    /// second branch of the owner-change victim order.
+    fn wp16_depths(&self, prompt: &[u32]) -> Vec<usize> {
+        let end = prompt.len().saturating_sub(1);
+        (0..self.lanes.len()).map(|i| self.wp16.as_ref()
+            .map_or(0, |st| st.resume_point(i, prompt, end, self.chunk.max(1)).0)).collect()
+    }
+
+    /// The pick block's prompt-end hit test over FREE lanes (same test, same (len, slot) max):
+    /// the "own slot" a waiting request is admitted into first under --lane-reserve.
+    fn own_snapshot_slot(&self, prompt: &[u32]) -> Option<usize> {
+        (0..self.lanes.len()).filter(|&i| self.lanes[i].is_none())
+            .filter_map(|i| match &self.cache[i] {
+                Some(t) if t.len() < prompt.len() && prompt[..t.len()] == t[..] => Some((t.len(), i)),
+                _ => None,
+            }).max().map(|(_, i)| i)
+    }
+
+    /// LANERES1: every lane release of the single-box paths goes through one helper so no site
+    /// is missed. `normal` = the request completed its turn (stop / length / a stop string / a
+    /// tool call / loop-detected); only a normal release is eligible for a reservation. Cancels,
+    /// errors and failed prefills never reserve. No stamping while the policy is off.
+    fn release_lane(&mut self, s: usize, normal: bool) {
+        self.lanes[s] = None;
+        if self.reserve.is_some() {
+            self.rel[s] = Some((std::time::Instant::now(), normal));
+        }
+    }
+
+    /// `release_lane` for the sites that still need the lane (`take()`): stamp, then hand over.
+    fn take_lane(&mut self, s: usize, normal: bool) -> Option<Lane> {
+        let lane = self.lanes[s].take();
+        if lane.is_some() && self.reserve.is_some() {
+            self.rel[s] = Some((std::time::Instant::now(), normal));
+        }
+        lane
+    }
+
     fn admit(&mut self, req: BatchRequest) {
-        self.admit_req(req);
+        self.admit_req(req, None);
         // issue #24: the prefill (if any) is over — the lane now carries its own position, or the
         // admit failed / was cancelled and the slot is free again.
         self.kv_pf = None;
         self.publish_kv();
     }
 
-    fn admit_req(&mut self, req: BatchRequest) {
+    /// LANERES1: `admit` through the reservation policy — the pick is restricted to `allowed`,
+    /// `kind` drives the counter and the log line. Same post-conditions as `admit`.
+    fn admit_scoped(&mut self, req: BatchRequest, allowed: &[usize], kind: crate::lane_reserve::Kind) {
+        self.admit_req(req, Some((allowed, kind)));
+        self.kv_pf = None;
+        self.publish_kv();
+    }
+
+    fn admit_req(&mut self, req: BatchRequest, scoped: Option<(&[usize], crate::lane_reserve::Kind)>) {
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
         // then a lane with no snapshot, then any free lane.
+        // LANERES1: with the reservation policy on (`scoped`), every candidate list is restricted
+        // to the policy's `allowed` lanes, and the fallback after the snapshot hit is the
+        // policy's victim order (empty > deepest WP16 > least recently released) instead of
+        // "slot 0". `scoped == None` keeps today's pick byte-for-byte.
         let pick = {
             let free: Vec<usize> = (0..self.lanes.len()).filter(|&i| self.lanes[i].is_none()).collect();
+            let free: Vec<usize> = match scoped {
+                Some((allowed, _)) => free.into_iter().filter(|i| allowed.contains(i)).collect(),
+                None => free,
+            };
             let hit = free.iter().copied().filter_map(|i| match &self.cache[i] {
                 Some(t) if t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..] => Some((t.len(), i)),
                 _ => None,
             }).max();
             hit.map(|(_, i)| i)
-                // WP16: else the free lane whose checkpoints resume this prompt deepest
                 .or_else(|| {
+                    // LANERES1: a scoped admit that did not come through the snapshot-hit arm
+                    // picks its owner-change victim among the allowed lanes only.
+                    if scoped.is_some() {
+                        return crate::lane_reserve::victim(&free, &self.slot_views(), &self.wp16_depths(&req.prompt));
+                    }
+                    // WP16: else the free lane whose checkpoints resume this prompt deepest
                     let st = self.wp16.as_ref()?;
                     let end = req.prompt.len().saturating_sub(1);
                     free.iter().copied()
@@ -3269,6 +4063,29 @@ the [gen] line says stop_p=na", stats));
                 return;
             }
         };
+        if let Some((_, kind)) = scoped {
+            crate::metrics::lane_reserve_admit(match kind {
+                crate::lane_reserve::Kind::Own => 0,
+                crate::lane_reserve::Kind::Unreserved => 1,
+                crate::lane_reserve::Kind::Forced => 2,
+            });
+            match kind {
+                crate::lane_reserve::Kind::Own => {
+                    let snap = self.cache[free].as_ref().map_or(0, |t| t.len());
+                    crate::drprintln!("[exl3-serve] lane-reserve: own slot={free} ({snap} of {} prompt tokens)", req.prompt.len());
+                }
+                crate::lane_reserve::Kind::Unreserved => {
+                    crate::drprintln!("[exl3-serve] lane-reserve: unreserved slot={free}");
+                }
+                crate::lane_reserve::Kind::Forced => {
+                    let waited = t_admit.duration_since(req.received_at).as_secs_f32();
+                    let victim_age = self.rel[free].map_or("never ran".to_string(), |(t, _)| {
+                        format!("{:.0} s ago", t_admit.duration_since(t).as_secs_f32())
+                    });
+                    crate::drprintln!("[exl3-serve] lane-reserve: forced slot={free} after {waited:.0} s (victim released {victim_age})");
+                }
+            }
+        }
         if req.schema.is_some() {
             let _ = req.tx.send(TokEvent::Finish {
                 reason: "error: json-schema constraint not supported on the exl3 serve path yet".into(),
@@ -3347,7 +4164,7 @@ the [gen] line says stop_p=na", stats));
         let pen = crate::exl3_forward::PenParams::new(req.rep_penalty, req.presence_penalty,
                                                       req.frequency_penalty, self.pen_range, self.pen_range);
         if pen.is_some() {
-            crate::reprintln!("[exl3-serve] penalties slot={free}: {pen:?} (window {} + {} tokens)", self.pen_range, self.pen_range);
+            crate::dreprintln!("[exl3-serve] penalties slot={free}: {pen:?} (window {} + {} tokens)", self.pen_range, self.pen_range);
         }
         let staged = match pen {
             Some(_) => self.model.pen_seed(&mut self.sc, free, &req.prompt[..plen - 1])
@@ -3404,12 +4221,12 @@ the [gen] line says stop_p=na", stats));
         if req.tx.send(TokEvent::Tok(last)).is_err() && self.tp.is_none() {
             // WP02: the client is gone — no lane (the prefix snapshot stays valid). TP-D: under TP
             // the lane is created on every rank and the head's next sweep cancels it.
-            crate::reprintln!("[mtp-stats] slot={free} finish=cancelled gen=1 rounds=0 plain_steps=0 temp={}", req.temperature);
+            crate::dreprintln!("[mtp-stats] slot={free} finish=cancelled gen=1 rounds=0 plain_steps=0 temp={}", req.temperature);
             return;
         }
         // WP04-v2: engine-side TTFT (receipt = the handler's hand-off, AFTER tokenization and
         // template rendering), so a client TTFT can be split into HTTP/tokenizer vs engine time.
-        crate::rprintln!("[exl3-serve] first token slot={free} {:.1} ms after receipt (queued {:.1} ms)",
+        crate::drprintln!("[exl3-serve] first token slot={free} {:.1} ms after receipt (queued {:.1} ms)",
                  req.received_at.elapsed().as_secs_f64() * 1e3,
                  t_admit.duration_since(req.received_at).as_secs_f64() * 1e3);
         if max_new <= 1 {
@@ -3473,6 +4290,8 @@ the [gen] line says stop_p=na", stats));
             ema_ms: 0.0,
             ema_tok: 0.0,
             ema_n: 0,
+            ema_wall_ms: 0.0,
+            last_wall: None,
             mtp_rounds: 0,
             // TP-I #7: a TP lane's cost prior is the TP=2 one (dds_prior; TP=1 = 6.0 unchanged)
             wp23: Wp23Lane { fit: CostFit::with_prior(dds_prior_w(self.tp_world())), ..Default::default() },
@@ -3522,12 +4341,12 @@ impl Exl3Scheduler {
         if self.lanes.iter().all(|l| l.is_none()) {
             // S-B9-CF-PACK5: the packed arm's counters on the node too (its mirror loop never reaches
             // the head's idle-point line); printed once per change, so the head's own call is a no-op
-            if let Some(line) = self.pack_idle_line() { crate::rprintln!("{line}"); }
+            if let Some(line) = self.pack_idle_line() { crate::drprintln!("{line}"); }
             if let Some(t) = self.tp.as_mut() {
-                crate::rprintln!("[tp-serve] rank {} idle after control step {step_no}: lockstep agrees {} ok, pre-verify agrees {} ok{}",
+                crate::drprintln!("[tp-serve] rank {} idle after control step {step_no}: lockstep agrees {} ok, pre-verify agrees {} ok{}",
                          t.rank, t.agrees, t.pre_agrees,
                          if t.ident { format!(", graphed digests {} compared, {} differ", t.ident_bufs, t.ident_bad) } else { String::new() });
-                crate::rprintln!("{}", t.wp.line(t.rank)); // H5: twin of the line above - never direct on a served path
+                crate::drprintln!("{}", t.wp.line(t.rank)); // H5: twin of the line above - never direct on a served path
                 t.wp = WaitProf::default();
             }
         }
@@ -3545,7 +4364,7 @@ impl Exl3Scheduler {
             for p in payloads { s.write_all(p)?; }
             s.flush()?;
         }
-        crate::rprintln!("[exl3-serve] VIS-4: shipped {} image payload(s), {:.1} MB to {} node(s) in {:.1} ms",
+        crate::drprintln!("[exl3-serve] VIS-4: shipped {} image payload(s), {:.1} MB to {} node(s) in {:.1} ms",
                  payloads.len(), total as f64 / 1e6, t.ctl.len(), t0.elapsed().as_secs_f64() * 1e3);
         Ok(())
     }
@@ -3595,7 +4414,7 @@ impl Exl3Scheduler {
     fn run_tp_head(mut self, mut rx: UnboundedReceiver<BatchRequest>, streams: Vec<std::net::TcpStream>) -> Result<()> {
         use crate::tp_serve::{ServingMsg, StepEvents, TpEvent, WireRequest};
         if let Ok(m) = crate::cpu_affinity::current_thread_affinity() {
-            println!("[exl3-serve] TP head scheduler thread cpu mask: {}", crate::cpu_affinity::format_cpu_list(&m));
+            crate::dprintln!("[exl3-serve] TP head scheduler thread cpu mask: {}", crate::cpu_affinity::format_cpu_list(&m));
         }
         self.tp.as_mut().context("run_tp_head without TP state")?.ctl = streams;
         let mut waiting: std::collections::VecDeque<BatchRequest> = std::collections::VecDeque::new();
@@ -3603,22 +4422,22 @@ impl Exl3Scheduler {
         let mut rots_printed = 0usize;
         let mut mixed_printed = 0u64;
         let fast_ctl = crate::opts::var(crate::opt!("exl3-tp-fastctl")).map_or(true, |v| v != "0");
-        println!("[exl3-serve] TP control: {}", if fast_ctl { "step-go over RDMA while live, TCP Step only with events (TP-E)" }
+        crate::dprintln!("[exl3-serve] TP control: {}", if fast_ctl { "step-go over RDMA while live, TCP Step only with events (TP-E)" }
                  else { "TCP Step every step (--exl3-tp-fastctl=0)" });
         loop {
             if waiting.is_empty() && self.lanes.iter().all(|l| l.is_none()) {
                 // Clean idle point (TP twin of the single-process loop): total fcfs rotations.
                 if self.lane_order == LaneOrder::Fcfs && self.fcfs_rots > rots_printed {
-                    crate::rprintln!("[exl3-serve] lane-order fcfs idle: {rots_printed}->{} total rotations", self.fcfs_rots);
+                    crate::drprintln!("[exl3-serve] lane-order fcfs idle: {rots_printed}->{} total rotations", self.fcfs_rots);
                     rots_printed = self.fcfs_rots;
                 }
                 // 9a(iii): the lazily captured mixed-step graphs, whenever their number grew
                 if let Some(line) = mixed_graphs_idle_line(mixed_printed, crate::metrics::mixed_step_graphs(), self.width) {
-                    crate::rprintln!("{line}");
+                    crate::drprintln!("{line}");
                     mixed_printed = crate::metrics::mixed_step_graphs();
                 }
                 self.publish_kv(); // issue #24: the idle value (lanes freed outside a step included)
-                if let Some(line) = self.pack_idle_line() { crate::rprintln!("{line}"); } // S-B9-CF-PACK4
+                if let Some(line) = self.pack_idle_line() { crate::drprintln!("{line}"); } // S-B9-CF-PACK4
                 crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                 match rx.blocking_recv() {
                     Some(req) => waiting.push_back(req),
@@ -3642,7 +4461,7 @@ impl Exl3Scheduler {
                              || crate::server::stream_backlog_exceeded(l.tx.len()) => { // LR-5
                         if !l.tx.is_closed() {
                             crate::metrics::stream_backlog_cancel();
-                            crate::reprintln!("[exl3-serve] slot {s}: stream cancelled — unconsumed event backlog at the --stream-backlog-events limit (reader stalled; LR-5; Cancel shipped to the mirrors)");
+                            crate::dreprintln!("[exl3-serve] slot {s}: stream cancelled — unconsumed event backlog at the --stream-backlog-events limit (reader stalled; LR-5; Cancel shipped to the mirrors)");
                         }
                         events.push(TpEvent::Cancel { lane: s });
                         free += 1;
@@ -3734,7 +4553,7 @@ impl Exl3Scheduler {
         let mut step_no: u64 = 0;
         let mut admitted: u64 = 0;
         let fast_ctl = crate::opts::var(crate::opt!("exl3-tp-fastctl")).map_or(true, |v| v != "0");
-        crate::rprintln!("[exl3-serve] TP control (node): {}", if fast_ctl { "step-go over RDMA while live (TP-E)" } else { "TCP Step every step" });
+        crate::drprintln!("[exl3-serve] TP control (node): {}", if fast_ctl { "step-go over RDMA while live (TP-E)" } else { "TCP Step every step" });
         loop {
             let live = self.lanes.iter().any(|l| l.is_some());
             if fast_ctl && live {
@@ -3758,7 +4577,7 @@ impl Exl3Scheduler {
                     Err(e) => {
                         // H7: END-OF-LIFE line — direct print; the node exits right after the
                         // return and no logq flush can be guaranteed there.
-                        eprintln!("[exl3-serve] TP node: head control stream closed ({e:#}) — session over after {step_no} steps, {admitted} requests");
+                        crate::deprintln!("[exl3-serve] TP node: head control stream closed ({e:#}) — session over after {step_no} steps, {admitted} requests");
                         return Ok(());
                     }
                 }
@@ -3766,7 +4585,7 @@ impl Exl3Scheduler {
             match msg {
                 ServingMsg::Shutdown => {
                     // H7: END-OF-LIFE line — direct print (same reason as the closed-stream line).
-                    eprintln!("[exl3-serve] TP node: Shutdown from the head after {step_no} steps, {admitted} requests");
+                    crate::deprintln!("[exl3-serve] TP node: Shutdown from the head after {step_no} steps, {admitted} requests");
                     return Ok(());
                 }
                 ServingMsg::Step(se) => {
@@ -3894,7 +4713,7 @@ fn tp_ident_knob(s: &mut Exl3Scheduler) {
     if crate::opts::var(crate::opt!("exl3-tp-ident")).map_or(false, |v| v == "1") {
         if let Some(t) = s.tp.as_mut() {
             t.ident = true;
-            println!("[exl3-serve] TP ident digests ON (--exl3-tp-ident=1, diagnostic): logits rows + resid + taps compared across ranks every lockstep point");
+            crate::dprintln!("[exl3-serve] TP ident digests ON (--exl3-tp-ident=1, diagnostic): logits rows + resid + taps compared across ranks every lockstep point");
         }
     }
 }
@@ -3974,7 +4793,7 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
     let h = fnv32(0xB007, w.iter().copied());
     let rank = s.tp.as_ref().map_or(0, |t| t.rank);
     let world = s.tp.as_ref().map_or(2, |t| t.world);
-    println!("[exl3-serve] TP={world} rank {rank}: boot config hash {h:08x} (width {} chunk {} k {} dds {} prefix {} wp16 cap {} tail {} tune {tune} \
+    crate::dprintln!("[exl3-serve] TP={world} rank {rank}: boot config hash {h:08x} (width {} chunk {} k {} dds {} prefix {} wp16 cap {} tail {} tune {tune} \
               dds-guard prior {} ms/draft (--tp-dds-prior; TP=1 6.0) prefill-overlap {} vp-sampled {}{})",
              s.width, s.chunk, s.mtp_k, s.draft_conf, s.prefix_on, s.wp16.as_ref().map_or(0, |st| st.cap),
              crate::exl3_forward::tail_ckpt_on(), dds_prior_w(s.tp_world()),
@@ -3983,7 +4802,7 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
              if crate::exl3_forward::xtp::seq_parallel_on() {
                  format!(" seq-parallel {}", crate::exl3_forward::xtp::seq_parallel_desc(crate::exl3_forward::xtp::seq_parallel_code()))
              } else { String::new() });
-    println!("[exl3-serve] TP={world} rank {rank}: options {} (spmd digest {})", crate::opts::set_summary(),
+    crate::dprintln!("[exl3-serve] TP={world} rank {rank}: options {} (spmd digest {})", crate::opts::set_summary(),
              spmd.map_or("none".to_string(), |d| format!("{d:08x}")));
     if world > 2 {
         // TP-4D: world > 2 — every rank's hash through the head hub (probe-tolerant, unbounded: the four model
@@ -4030,7 +4849,7 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
     watch.disarm(&streams);
     for (i, s) in streams.iter_mut().enumerate() {
         match crate::tp_serve::recv_serving(s).context("node Ready")? {
-            crate::tp_serve::ServingMsg::Ready => println!("[exl3-serve] TP node rank {} READY (mirror armed)", i + 1),
+            crate::tp_serve::ServingMsg::Ready => crate::dprintln!("[exl3-serve] TP node rank {} READY (mirror armed)", i + 1),
             other => anyhow::bail!("expected Ready from node rank {}, got {other:?}", i + 1),
         }
     }
@@ -4063,7 +4882,7 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
             println!("[exl3-serve] TP={world} serving: head-authoritative Step/Cancel/Admit(seed) + HeadFlag, hub lockstep agree per \
                       seam/round + pre-verify — some TP=1 §1b features are OFF / INERT / refused at world {world}; per-feature state on the \
                       next line, table in PLAN/TP-4D_REPORT.md");
-            println!("[exl3-serve] TP={world} features: graphs {graphs}; MTP {mtp}; DDS {dds}; prefix cache {}; WP16 {}; WP27 forks not \
+            crate::dprintln!("[exl3-serve] TP={world} features: graphs {graphs}; MTP {mtp}; DDS {dds}; prefix cache {}; WP16 {}; WP27 forks not \
                       world-gated (--wp27-off / --wp27-forks / PDL decide); TP-H greedy vocab-parallel head {}; sampled / penalized / \
                       ratio-rule rows = {}; sharded MTP-head screen {}; decode \
                       transport {}; prefill transport {}; prefill overlap {}; sequence-parallel prefill {}; EP deal '{}'; pre-verify \
@@ -4087,7 +4906,7 @@ pub fn run_tp_head_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
                      xtp::ep_deal_kind());
         }
         // TP-4D: the API startup line names the world, the lockstep protocol and the rank/host map
-        println!("[exl3-serve] TP={world} API up: head = rank 0; {}; lockstep = head-hub (one merged op per point, per-wait \
+        crate::dprintln!("[exl3-serve] TP={world} API up: head = rank 0; {}; lockstep = head-hub (one merged op per point, per-wait \
                   deadline {} ms — --tp-lockstep-timeout-ms); Step/Cancel/Admit/HeadFlag over {} node control streams",
                  TP_RANK_MAP.get().map_or("rank/host map unavailable".to_string(), |m| m.join("; ")),
                  parts.sched.tp.as_ref().map_or(0, |t| t.deadline_ms), world - 1);
@@ -4131,7 +4950,7 @@ pub fn run_tp_node_serve(args: &[String], model_dir: &str, ctx: crate::tp::TpCon
     };
     set_worker_mask(tp_worker_mask(&cpu_mask, true, node_world));
     crate::tp_serve::send_serving(&mut stream, &crate::tp_serve::ServingMsg::Ready)?;
-    println!("[exl3-serve] TP node: mirror armed (Ready sent) — waiting for the head's steps");
+    crate::dprintln!("[exl3-serve] TP node: mirror armed (Ready sent) — waiting for the head's steps");
     sched.tp.as_mut().context("node without TP state")?.ctl = vec![stream];
     sched.run_tp_mirror()
 }
@@ -4160,7 +4979,7 @@ pub fn parse_spec_sampling(args: &[String]) -> Result<(bool, Option<f32>)> {
     };
     // (SURFACE2 item 4: nothing is drafted with speculation switched off, so the mode is not announced)
     if (spec_ratio || draft_temp.is_some()) && !crate::exl3_forward::mtp_disabled_by_opt() {
-        println!("[exl3-serve] spec sampling: {} (draft temperature {}){}",
+        crate::dprintln!("[exl3-serve] spec sampling: {} (draft temperature {}){}",
                  if spec_ratio { "ratio (real-q: sampled drafts on the full draft-slice head — on DHEAD when the DHEAD-RQ line says so, accept min(1, p/q'))" } else { "match" },
                  draft_temp.map_or("= request temperature".to_string(), |t| t.to_string()),
                  if !spec_ratio && draft_temp.is_some() { " — --draft-temperature only applies with --spec-sampling ratio" } else { "" });
@@ -4213,6 +5032,13 @@ pub fn fit_plan(p: FitParts, lanes: usize, avail: u64, mode: &str, max_pos: usiz
     Ok(with_table <= avail)
 }
 
+/// MAXBATCH1: the largest lane count `<= width` whose memory plan fits — `fit_plan` Ok (the auto
+/// arm accepts the n-gram table landing on SSD, exactly like an un-fitted boot). None when not
+/// even one lane fits (the refusal case: nothing can be served on this box at this context).
+pub fn fit_max_lanes(p: FitParts, width: usize, avail: u64, mode: &str, max_pos: usize) -> Option<usize> {
+    (1..=width).rev().find(|&n| fit_plan(p, n, avail, mode, max_pos).is_ok())
+}
+
 fn suggest(p: FitParts, lanes: usize, avail: u64, max_pos: usize) -> String {
     let room = avail.saturating_sub(p.weights + p.fixed + p.floor);
     let mut out = String::new();
@@ -4238,10 +5064,31 @@ pub enum CtxLimit {
     Packing,
 }
 
-/// The rope extension factor of the EXL3 forward. It computes plain RoPE per step, with no YaRN (the
-/// `--rope-yarn-factor` option reaches only the NVFP4 `GpuModel` tables), so the trained window is
-/// the rope ceiling. A YaRN port for EXL3 passes its factor to `clamp_ctx` instead of this constant.
-pub const EXL3_ROPE_FACTOR: f64 = 1.0;
+/// The YaRN factor the EXL3 serve honours for `model_dir`: `--rope-yarn-factor` wins, then
+/// the shipped TpConfig (TP node), then the pack config's `rope_scaling` block (YARN1). One
+/// precedence rule with the Config-based `qwen::resolved_yarn` (shared `qwen::pick_yarn`).
+pub fn yarn_factor(model_dir: &str) -> f64 {
+    let (f, _) = crate::qwen::pick_yarn(
+        crate::opts::var(crate::opt!("rope-yarn-factor")).ok().and_then(|v| v.parse::<f32>().ok()),
+        crate::tp::tp_config().map(|c| c.rope_yarn_factor),
+        pack_yarn_from_config(model_dir),
+    );
+    f as f64
+}
+
+/// The pack config's own YaRN factor — `rope_scaling {type: "yarn", factor}` from the same
+/// config.json `native_window` opens (None = the pack ships no YaRN block).
+fn pack_yarn_from_config(model_dir: &str) -> Option<f32> {
+    let raw = std::fs::read(std::path::Path::new(model_dir).join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let t = cfg.get("text_config").unwrap_or(&cfg);
+    let rs = t.get("rope_scaling")?;
+    let is_yarn = rs.get("type").and_then(|v| v.as_str())
+        .map_or(false, |s| s.eq_ignore_ascii_case("yarn"));
+    if !is_yarn { return None; }
+    rs.get("factor").and_then(|v| v.as_f64())
+        .map(|f| f as f32).filter(|f| f.is_finite() && *f >= 1.0)
+}
 
 /// The widest `--max-seq-len` the EXL3 packings carry: `max_pos = max_seq_len + decode_headroom`
 /// must stay below `MAX_POS_PACKED`.
@@ -4273,7 +5120,7 @@ fn native_window(model_dir: &str) -> Option<usize> {
 }
 
 /// One line naming the limit that trimmed `asked` to `eff` (pure: the text is unit-tested).
-fn clamp_ctx_message(asked: usize, eff: usize, why: CtxLimit, native: Option<usize>, rope_factor: f64) -> String {
+pub fn clamp_ctx_message(asked: usize, eff: usize, why: CtxLimit, native: Option<usize>, rope_factor: f64) -> String {
     let limit = match why {
         CtxLimit::Rope if rope_factor > 1.0 =>
             format!("the model's trained window {} x rope factor {rope_factor}", native.unwrap_or(0)),
@@ -4290,20 +5137,37 @@ fn clamp_ctx_message(asked: usize, eff: usize, why: CtxLimit, native: Option<usi
 /// trimmed value in `TpConfig.max_seq_len`.
 pub fn clamp_max_seq_len(model_dir: &str, max_seq_len: usize) -> usize {
     let (eff, msg) = resolve_max_seq_len(model_dir, max_seq_len);
-    if let Some(m) = msg { crate::rprintln!("{m}"); }
+    if let Some(m) = msg { crate::drprintln!("{m}"); }
     eff
 }
 
 /// `clamp_max_seq_len` without the log line: (window, the line to print when it was trimmed).
 pub fn resolve_max_seq_len(model_dir: &str, max_seq_len: usize) -> (usize, Option<String>) {
     let native = native_window(model_dir);
-    let (eff, why) = clamp_ctx(max_seq_len, native, EXL3_ROPE_FACTOR);
-    (eff, why.map(|w| clamp_ctx_message(max_seq_len, eff, w, native, EXL3_ROPE_FACTOR)))
+    let yarn = yarn_factor(model_dir);
+    let (eff, why) = clamp_ctx(max_seq_len, native, yarn);
+    (eff, why.map(|w| clamp_ctx_message(max_seq_len, eff, w, native, yarn)))
 }
 
 #[cfg(test)]
 mod ctx_clamp_tests {
     use super::*;
+
+    /// YARN1: the pack config's own rope_scaling feeds the factor (native 262144 x 2 = 524288,
+    /// still under the packing ceiling). The flag/TP precedence is unit-tested at
+    /// qwen::yarn_tests; this covers the config-file source only.
+    #[test]
+    fn the_pack_rope_scaling_raises_the_ceiling() {
+        let dir = std::env::temp_dir().join(format!("gb10_yarn_clamp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        std::fs::write(dir.join("config.json"),
+            r#"{"text_config":{"max_position_embeddings":262144,"rope_scaling":{"type":"yarn","factor":2.0}}}"#).unwrap();
+        // 400_000 is UNDER the 524_288 ceiling: served as asked, no trim. 600_000 trims to it.
+        assert_eq!(clamp_max_seq_len(d, 400_000), 400_000);
+        assert_eq!(clamp_max_seq_len(d, 600_000), 524_288);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     const W: usize = 262_144; // the Qwen3.8 family's trained window
 
@@ -4436,12 +5300,61 @@ pub fn fit_parts(model_dir: &str, max_pos: usize, world: usize, head: bool, kv_b
     // at 1 lane and 14.8 GB at 8 lanes after the boot (scratch, prefill scratch, graphs, vendor workspaces, staging),
     // + the prefix-checkpoint pool, which grows to its cap while serving.
     let fixed = 15_000_000_000 + (ckpt_gb * (1u64 << 30) as f64) as u64;
-    let floor_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
+    // MAXBATCH1 (2026-10-21, .12, 27B EXL3 3.05, TP=1, posture ctx 262144, 8-lane clamp): serving-time memory
+    // grew ~6.4 GB BEYOND this model under one 32-concurrency cell (CUDA-graph captures at mixed widths,
+    // prefix/snapshot churn, the queue) and MemAvailable fell to 4.4 GB — the memwatch emergency exit fired and
+    // the server died mid-traffic. The 5 GB watchdog floor is the EMERGENCY bar (box protection), not a serving
+    // plan. The serve fit reserves the owner's §5 serving-headroom bar instead: ~20 GB free per box on a serving
+    // posture ("lower is good"); the watchdog keeps its own floor as the last resort below that.
+    let watch_gb: f64 = crate::opts::var(crate::opt!("mem-watchdog-gb")).ok().and_then(|v| v.parse().ok()).unwrap_or(5.0);
+    let floor_gb = watch_gb.max(20.0);
     Some(FitParts { weights, table, per_lane, fixed, floor: (floor_gb * 1e9) as u64 })
 }
 
 /// The served `--prefill-chunk` default (owner 2026-10-02, v0.7.1: steady 4,095-row chunks, TP-4X1).
 pub const DEFAULT_PREFILL_CHUNK: usize = 4095;
+
+
+/// EXL27 (owner scope add 2026-10-16): single-file EXL3 packs (one model.safetensors, no
+/// model.safetensors.index.json) are SUPPORTED, not refused (§1b-bis 8). We synthesize the
+/// one-shard index from the safetensors header — exactly what HF emits for a 1-shard model —
+/// so the standard indexed-pack path serves them unchanged. Returns true if an index was written.
+pub fn ensure_singlefile_index(dir: &str) -> std::io::Result<bool> {
+    use std::io::Read;
+    let p = std::path::Path::new(dir.trim_end_matches('/'));
+    let idx = p.join("model.safetensors.index.json");
+    let st = p.join("model.safetensors");
+    if idx.exists() || !st.exists() {
+        return Ok(false);
+    }
+    let mut f = std::fs::File::open(&st)?;
+    let mut hlen = [0u8; 8];
+    f.read_exact(&mut hlen)?;
+    let n = u64::from_le_bytes(hlen) as usize;
+    if n == 0 || n > 128_000_000 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad safetensors header length"));
+    }
+    let mut hdr = vec![0u8; n];
+    f.read_exact(&mut hdr)?;
+    let v: serde_json::Value = serde_json::from_slice(&hdr)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("header JSON: {e}")))?;
+    let mut wm = serde_json::Map::new();
+    for k in v.as_object().map(|o| o.keys()).into_iter().flatten() {
+        if k == "__metadata__" {
+            continue;
+        }
+        wm.insert(k.clone(), serde_json::Value::String("model.safetensors".to_string()));
+    }
+    if wm.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no tensors in header"));
+    }
+    let total = std::fs::metadata(&st)?.len();
+    let out = serde_json::json!({ "metadata": { "total_size": total }, "weight_map": wm });
+    let tmp = p.join(".model.safetensors.index.json.tmp-exl27");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&out)?)?;
+    std::fs::rename(&tmp, &idx)?; // atomic: no partial index is ever observed
+    Ok(true)
+}
 
 /// Detection: a dir is an EXL3 pack iff quantization_config.json exists and the safetensors
 /// index carries `.trellis` entries (the A3 spec's quadruple manifest).
@@ -4467,6 +5380,9 @@ struct ServeParts {
     cpu_aff: (Option<Vec<usize>>, String),
     exit_on_fatal: bool,
     rx: UnboundedReceiver<BatchRequest>,
+    /// OUT1: what the one SERVING line needs at listen time (tp, ctx, batch, kv, prefix,
+    /// mtp-head-present, mtp-off).
+    boot_facts: (u32, usize, usize, String, bool, bool, bool, bool),
 }
 
 /// Boot the EXL3 HTTP server (TP=1). Mirrors run_server's serving surface.
@@ -4489,7 +5405,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     let otel_cfg = crate::otel::config_from_args(
         |f| arg(args, &format!("--{f}")).map(|s| s.to_string()));
     if let Some(cfg) = &otel_cfg {
-        if let Err(e) = cfg.hostport() { eprintln!("[otel] {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 1); } // H7
+        if let Err(e) = cfg.hostport() { crate::deprintln!("[otel] {e}"); crate::logq::flush_and_exit(std::time::Duration::from_millis(300), 1); } // H7
     }
     // S-B9-CF-PACK4: --lane-pack, parsed before the model load. F10 (owner 2026-10-12): the registry default is
     // ON, so the mode is resolved from the TYPED value (this head's argv; the node re-parses the head's argv) and
@@ -4505,14 +5421,28 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     let port: u16 = arg(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(8000);
     // Public PR #21: trim --max-seq-len to what the engine can address (the trained window, then the
     // 20-bit packings) and say which limit applied; an unclamped wider window used to boot.
+    // YARN1: set the trunk YaRN factor BEFORE both — the load (the EXL3 tables build at load)
+    // and the clamp (its rope ceiling is native x factor). The EXL3 TP node re-parses this
+    // same argv and the value also ships in TpConfig, so both ranks resolve identically.
+    if let Some(f) = arg(args, "--rope-yarn-factor") {
+        let f: f32 = f.parse().map_err(|_| anyhow::anyhow!(
+            "--rope-yarn-factor must be a finite number >= 1.0 (got {f:?})"))?;
+        if !f.is_finite() || f < 1.0 {
+            anyhow::bail!("--rope-yarn-factor must be a finite number >= 1.0 (got {f})");
+        }
+        crate::opts::set(crate::opt!("rope-yarn-factor"), f.to_string());
+    }
+    let st_config = crate::boot_report::Stage::begin("config");
     let max_seq_len: usize = clamp_max_seq_len(model_dir, arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096));
     // F2 (owner 2026-10-10): at most 16 requests are served at once; a larger --max-batch boots
     // with 16 and further requests wait in the queue (--max-waiting semantics unchanged).
-    let (width, raw_width) = resolved_max_batch(args);
+    // MAXBATCH1: `width` is `mut` — the memory fit below may boot it down to the largest lane
+    // count that fits (§1b-bis#8 boot-anyway; the context length is never silently cut).
+    let (mut width, raw_width) = resolved_max_batch(args);
     crate::metrics::set_max_batch_requested(raw_width);
     if raw_width > width {
-        crate::reprintln!("[exl3-serve] --max-batch {raw_width}: this server serves at most {EXL3_MAX_LANES} \
-                           requests at the same time; using {width}; further requests wait in the queue");
+        crate::boot_report::notice(&format!("[exl3-serve] --max-batch {raw_width}: this server serves at most {EXL3_MAX_LANES} \
+                           requests at the same time; using {width}; further requests wait in the queue"));
     }
     // (backstop: the TP entry points resolve the same cap before any network step,
     // `tp_lane_width_refusal`; 16 always fits the pairwise agree width)
@@ -4521,7 +5451,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     if tp_rank.is_none() {
         for l in crate::net::drill_plan(crate::opts::get(crate::opt!("tp-agree-drill")).as_deref(),
                                         crate::opts::get(crate::opt!("tp-width-drill")).as_deref(), true, None).lines {
-            crate::reprintln!("{l}");
+            crate::boot_report::notice(&l);
         }
     }
     let max_pos = max_seq_len + crate::batch::decode_headroom(false);
@@ -4551,6 +5481,26 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         anyhow::ensure!(matches!(v, "f32" | "f16" | "fp8" | "q8"), "--kv-cache must be f32, f16, fp8 or q8");
         crate::opts::set(crate::opt!("kv-cache"), v);
     }
+    // --spec-source <s> (ISSUES[94]): the mirror of the trunk resolve_spec_source (main.rs) —
+    // same value set (mtp|dspark|dflash2|dflash2-rq|dflash2-auto|dflash2-tree|none), same
+    // default (dflash2-auto), same error text — parsed HERE so the EXL3 serve path honors what
+    // it was asked for instead of silently ignoring the DF2 family. CLI flags only, never env.
+    let df2_src = resolve_spec_source_exl3(args);
+    // --draft-dir <dir>: the DFlash2 artifact directory, the same flag the NVFP4 serving path
+    // takes. (main's pre-dispatch resolve_draft_dir already exits on an explicit
+    // artifact-REQUIRING source with no dir; dflash2-auto — the default — without a dir is the
+    // silent-ignore case this gate fixes, with a loud FALLBACK line.)
+    let df2_draft_dir = arg(args, "--draft-dir").map(str::to_string);
+    // --df2-block <n>: the artifact's block size (default: dflash2::block(), 8; 16 on the wide
+    // selector artifact). The round's chain-verify depth is k = block - 1.
+    let mut df2_block = parse_df2_block(arg(args, "--df2-block"))?;
+    if args.iter().any(|a| a == "--df2-trace") {
+        crate::exl3_forward::DF2_TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("[exl3-serve] df2: trace on (--df2-trace: stage syncs, rounds slower)");
+    }
+    // --df2-round-shard on|off (default off): the TP>2-only round sharding — parsed for flag
+    // parity and shown on the DF2 boot line; it never applies on this TP=1 path.
+    let df2_shard = parse_df2_round_shard(arg(args, "--df2-round-shard"))?;
     let kv_fmt = crate::exl3_forward::kv_fmt_from_opts();
     anyhow::ensure!(kv_fmt != crate::exl3_forward::KV_Q4X,
                     "[kv-cache]=q4x is the WP25 probe's deliberately broken control; it is never served");
@@ -4572,7 +5522,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             mtp_k: crate::exl3_forward::mtp_depth_default(),
             row_regime: crate::exl3_forward::row_regime_on(),
             a_ctrl_old: crate::exl3_forward::a_flags().ctrl == 2,
-            fcfs: LaneOrder::parse(arg(args, "--lane-order").map(str::trim).filter(|v| !v.is_empty()))? == LaneOrder::Fcfs,
+            fcfs: LaneOrder::parse(crate::opt_or_arg(args, "--lane-order").as_deref().map(str::trim).filter(|v| !v.is_empty()))? == LaneOrder::Fcfs,
         }));
     }
     // --reasoning-effort / --thinking: the server-wide thinking defaults, as on the NVFP4 server.
@@ -4592,6 +5542,43 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // a bad value fails before the load; applied after it (the load's threads keep every core).
     let cpu_aff = crate::cpu_affinity::resolve(
         crate::cpu_affinity::AffinityMode::parse(arg(args, "--cpu-affinity"))?)?;
+    // MAXBATCH1 (owner ruling 2026-10-10 §1b-bis#8: "support it properly or fall back gracefully —
+    // no refusals"): resolve the memory fit BEFORE the tune table is selected (the table is keyed
+    // by the lane count that will actually serve). An asked lane count that does not fit memory
+    // BOOTS ANYWAY on the nearest thing that works — the largest lane count that fits at the
+    // asked context — with ONE clear line: what was asked, what it does instead, why. The context
+    // length is never silently cut (full-context serving is the READY bar; a lane waits instead).
+    // CF-P1d keeps its teeth: the refusal remains when not even ONE lane fits, with the
+    // arithmetic and what to change (that boot could not serve anything at all).
+    {
+        let kvb = match kv_name { "f32" => 4.0, "f16" => 2.0, "fp8" => 1.0, _ => 1.0625 };
+        let mode = match crate::opts::var(crate::opt!("ple-ram")).as_deref() { Ok("on") | Ok("ram") => "ram", Ok("off") | Ok("ssd") => "ssd", _ => "auto" };
+        let world = tp_world.max(1) as usize;
+        if let Some(parts) = fit_parts(model_dir, max_pos, world, tp_rank.map_or(true, |r| r == 0), kvb, wp16_gb) {
+            let avail = std::fs::read_to_string("/proc/meminfo").ok()
+                .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))
+                    .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(0) * 1024;
+            if avail > 0 {
+                if let Err(ref msg) = fit_plan(parts, width, avail, mode, max_pos) {
+                    if let Some(n) = fit_max_lanes(parts, width, avail, mode, max_pos) {
+                        let gb = |b: u64| b as f64 / 1e9;
+                        crate::boot_report::notice(&format!(
+                            "[exl3-serve] --max-batch {raw_width}: {width} lanes do not fit memory at this context length on this box \
+                             ({avail_g:.1} GB available; asked-for plan: weights {w_g:.1} GB + {width} x {pl_g:.2} GB per-lane KV + {fx_g:.1} GB \
+                             working memory + {fl_g:.1} GB serving headroom); booting with {n} lanes — the most that fit (the context length is \
+                             kept); further requests wait in the queue",
+                            avail_g = gb(avail), w_g = gb(parts.weights), pl_g = gb(parts.per_lane),
+                            fx_g = gb(parts.fixed), fl_g = gb(parts.floor)));
+                        width = n;
+                    } else {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+    }
     // TUNE T0 (PLAN/AUTOTUNE_DESIGN.md §7): resolve + freeze the tune table BEFORE the load (Load-scope
     // knobs are read there). --tune-table auto (default: a matching table from ./tune/, S section) |
     // off (built-in defaults) | <path>; --tune-draft on also applies section D (draft-only);
@@ -4620,35 +5607,59 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         tune::boot(&tune::BootReq { sel, model_dir, posture, profile_mhz, draft_on,
                                     tp: tp_world });
     }
-    // CF-P1d: refuse BEFORE a minute-long load when the configuration cannot fit (with the arithmetic and what to
-    // change), instead of a watchdog exit half-way through the boot.
-    {
-        let kvb = match kv_name { "f32" => 4.0, "f16" => 2.0, "fp8" => 1.0, _ => 1.0625 };
-        let mode = match crate::opts::var(crate::opt!("ple-ram")).as_deref() { Ok("on") | Ok("ram") => "ram", Ok("off") | Ok("ssd") => "ssd", _ => "auto" };
-        let world = tp_world.max(1) as usize;
-        if let Some(parts) = fit_parts(model_dir, max_pos, world, tp_rank.map_or(true, |r| r == 0), kvb, wp16_gb) {
-            let avail = std::fs::read_to_string("/proc/meminfo").ok()
-                .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))
-                    .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
-                .unwrap_or(0) * 1024;
-            if avail > 0 {
-                if let Err(msg) = fit_plan(parts, width, avail, mode, max_pos) {
-                    eprintln!("error: {msg}");
-                    std::process::exit(2);
+    // (CF-P1d + MAXBATCH1: the memory fit ran above, before the tune table — boot-anyway clamp.)
+    st_config.ok();
+    let st_weights = crate::boot_report::Stage::begin("weights");
+    if crate::boot_report::debug() {
+        crate::dprintln!("[exl3-serve] {who}: loading EXL3 pack {model_dir} (width {width}, max_pos {max_pos}, kv-cache {kv_name})");
+    }
+    let mut model = FwdModel::load_tp(model_dir, width, max_pos, tp)?;
+    st_weights.ok();
+    // ---- ISSUES[94]: the DFlash2 (DF2) boot gate + round load. Exactly ONE line per boot —
+    // ENGAGED or FALLBACK with the reason — and a load failure is a FALLBACK, never a dead
+    // boot (the pack MTP this server already has serves every request unchanged).
+    let mut df2: Option<crate::dflash2::round::Df2Round> = None;
+    match df2_gate_reason(df2_src, df2_draft_dir.as_deref(), model.cfg.hidden_size,
+                          model.cfg.vocab_size, model.cfg.num_layers, max_seq_len,
+                          tp_world as usize) {
+        Some(reason) => println!("{}", df2_boot_line_fallback(&reason)),
+        None => {
+            // EXL27C: the unsharded round kernel's ring band is structurally 8 rows
+            // (write_kv_b ring rows [RING, RING+8)); block 16 is the SHARDED (TP) shape.
+            // Unsharded TP=1 boots clamp to 8 with one clear line (sanitizer: gqa_attn_band_ring_b
+            // OOB __shared__ writes at block 16 unsharded, 2026-10-16).
+            if !df2_shard && df2_block > 8 {
+                crate::dflash2::set_block(8).ok();
+                println!("[exl3-serve] df2: --df2-block {df2_block} without --df2-round-shard runs block 8 unsharded (the round kernel's band width)");
+                df2_block = 8;
+            }
+            // sha_pin: None = the built-in published pin (load_tp_pinned applies it), the
+            // trunk's --sha256 handling exactly (Some("off") disables, Some(hex) pins).
+            let pin = arg(args, "--sha256");
+            let dir = df2_draft_dir.clone().unwrap_or_default();
+            match df2_load_round(&mut model, &dir, max_seq_len, pin) {
+                Ok(r) => {
+                    println!("{}", df2_boot_line_engaged(&dir, df2_block, df2_shard, tp_world as usize));
+                    df2_mark_engaged();
+                    df2 = Some(r);
                 }
+                Err(e) => println!("{}", df2_boot_line_fallback(&format!("load failed: {e:#}"))),
             }
         }
     }
-    println!("[exl3-serve] {who}: loading EXL3 pack {model_dir} (width {width}, max_pos {max_pos}, kv-cache {kv_name})");
-    let model = FwdModel::load_tp(model_dir, width, max_pos, tp)?;
+    let df2_k = (df2_block - 1).min(crate::exl3_forward::MTP_MAX_K);
     // SURFACE2 item 4: the boot lines that describe HOW this server speculates print only when it
     // does. With --mtp off (or the hatch) the WP23 DDS line, the lane-order line, the shared-step
     // line and the spec-sampling line described rounds that never run.
     let spec_live = spec_live(model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt());
     if let Some(line) = head_loaded_line(model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt()) {
-        println!("{line}");
+        if crate::boot_report::debug() {
+            crate::dprintln!("{line}");
+        }
     }
+    let st_tok = crate::boot_report::Stage::begin("tokenizer");
     let tok = QwenTokenizer::from_file(&format!("{}/tokenizer.json", model_dir.trim_end_matches('/')))?;
+    st_tok.ok();
     // Stop tokens = the §3 union: generation_config eos (int or list) + tokenizer/config eos.
     let cfg_eos: u32 = {
         let cfg: serde_json::Value = serde_json::from_str(
@@ -4657,7 +5668,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         cfg.get("eos_token_id").and_then(|e| e.as_u64()).unwrap_or(248046) as u32
     };
     let eos = tok.stop_token_ids(cfg_eos);
-    println!("[exl3-serve] stop_ids={eos:?}");
+    crate::dprintln!("[exl3-serve] stop_ids={eos:?}");
 
     let mtp_k = crate::exl3_forward::mtp_depth_default();
     // API-parity DDS: dynamic draft stop (the reference implementation's -dds -dc 0.6). CLI --draft-confidence <p>;
@@ -4714,14 +5725,14 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     crate::server::validate_penalties(Some(default_rep_penalty), Some(default_presence_penalty),
                                       Some(default_frequency_penalty), None)
         .map_err(|e| anyhow::anyhow!("server penalty defaults: {e}"))?;
-    println!("[exl3-serve] loop detector {} ; penalty window {pen_range} + {pen_range} tokens \
+    crate::dprintln!("[exl3-serve] loop detector {} ; penalty window {pen_range} + {pen_range} tokens \
               (defaults rep {default_rep_penalty} presence {default_presence_penalty} frequency {default_frequency_penalty})",
              match loop_cfg { Some((w, r)) => format!("ON (window {w}, min reps {r})"), None => "OFF".into() });
     // S-B9-REL-INTEG (AGENTS 1b-bis): a penalized request never joins a packed verify, and a request that sends no
     // penalty field INHERITS these server defaults. Say so at boot, where the operator chose the flags.
     if lane_pack.on() {
         if let Some(w) = lane_pack_penalty_warning(default_rep_penalty, default_presence_penalty, default_frequency_penalty) {
-            crate::rprintln!("{w}");
+            crate::drprintln!("{w}");
         }
     }
     let tok = Arc::new(tok);
@@ -4756,7 +5767,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     let exit_on_fatal = crate::opts::var(crate::opt!("exit-on-fatal")).map_or(true, |v| v != "0");
     let inject_panic: Option<usize> = crate::opts::var(crate::opt!("inject-panic-steps")).ok().and_then(|v| v.parse().ok());
     if let Some(n) = inject_panic {
-        eprintln!("[exl3-serve] DIAGNOSTIC: --inject-panic-steps={n} — injected scheduler fault at decode step {n}");
+        crate::deprintln!("[exl3-serve] DIAGNOSTIC: --inject-panic-steps={n} — injected scheduler fault at decode step {n}");
     }
     let _ = crate::exl3_forward::a_flags(); // log any GB10_A_* diagnostic escape at boot
     // WP04: --graph-precapture on|off (default on) — capture every decode graph the served config
@@ -4771,7 +5782,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     if precapture {
         model.precapture_decode_graphs(&mut sc, width, mtp_k, draft_conf > 0.0)?;
     } else {
-        println!("[exl3-serve] graph precapture OFF (--graph-precapture off): decode graphs capture lazily");
+        crate::dprintln!("[exl3-serve] graph precapture OFF (--graph-precapture off): decode graphs capture lazily");
     }
     // S-B9-CF-PACK4 `--lane-pack on`: the packed verify's own 16-row scratch and its graph family
     // (every exact width R = 4..16, each reachable regime), captured NOW — the served arm never
@@ -4796,7 +5807,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         }
         if !pack_blockers.is_empty() {
             let why = pack_blockers.join("; ");
-            crate::rprintln!("[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: {why}; requests are served without packed rounds (--lane-pack off silences this line)");
+            crate::drprintln!("[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: {why}; requests are served without packed rounds (--lane-pack off silences this line)");
             crate::lane_pack::record_boot_pack(Some(why.clone()));
             lane_pack = crate::lane_pack::LanePack::Off;
         }
@@ -4829,7 +5840,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
         });
         match built {
             Err(why) => {
-                crate::rprintln!("[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: {why}; requests are served without packed rounds (--lane-pack off silences this line)");
+                crate::drprintln!("[exl3-serve] lane packing (--lane-pack, on by default) is NOT ACTIVE on this boot: {why}; requests are served without packed rounds (--lane-pack off silences this line)");
                 crate::lane_pack::record_boot_pack(Some(why));
                 lane_pack = crate::lane_pack::LanePack::Off;
                 (None, [false, false], false)
@@ -4837,13 +5848,13 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             Ok((scp, ready, n, graph_mb, note, cap_s, f1)) => {
                 crate::lane_pack::record_boot_pack(Some(String::new()));
                 if tp_rank.is_some() {
-                    crate::rprintln!("[exl3-serve] lane-pack under TP: sampled requests {} (--lane-pack-sampled-tp {})",
+                    crate::drprintln!("[exl3-serve] lane-pack under TP: sampled requests {} (--lane-pack-sampled-tp {})",
                                      if sampled_ok { "JOIN packed rounds (the pack ran them at TP=2 on one pair, 2026-10-10; TP=4 was exercised by hand, no gate chain)" } else { "run alone; only greedy requests pack" },
                                      if sampled_ok { "on" } else { "off" });
                 }
                 let f2 = free();
                 let fam_names: Vec<&str> = fams.iter().map(|f| f.label()).collect();
-                crate::rprintln!("[exl3-serve] lane-pack ON (the default; --lane-pack off turns it off){}: two requests share ONE packed speculative verify per round \
+                crate::drprintln!("[exl3-serve] lane-pack ON (the default; --lane-pack off turns it off){}: two requests share ONE packed speculative verify per round \
 (three busy = one pair + one rotating lone round); {}; penalized requests and requests with images do not; \
 draft chain: {}; packed scratch {:.0} MB + {n} packed verify graphs captured in {cap_s:.2} s, {graph_mb:+.0} MB \
 (exact widths R = {}..{}, families: {}; {note}), {:.2} GiB of device memory in all (the graph delta is cuMemGetInfo-noisy; \
@@ -4860,7 +5871,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
                 // the TP boot agree compares its count and digest (a rank holding a different set refuses
                 // to boot instead of letting `pack_plan` decide rank-locally)
                 let (gn, gh, gdesc) = model.pack_graph_set(&scp, &fams);
-                crate::rprintln!("[exl3-serve] lane-pack packed graph set{}: {gn} graphs [{gdesc}] digest {gh:08x}; dense ready {}, sparse ready {}",
+                crate::drprintln!("[exl3-serve] lane-pack packed graph set{}: {gn} graphs [{gdesc}] digest {gh:08x}; dense ready {}, sparse ready {}",
                          if tp_rank.is_some() { format!(" (TP={tp_world} rank {})", tp_rank.unwrap_or(0)) } else { String::new() },
                          ready[0], ready[1]);
                 (Some(scp), ready, sampled_ok)
@@ -4879,18 +5890,18 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         let cap_bytes = (wp16_gb * (1u64 << 30) as f64) as u64;
         let cap = if per > 0 { (cap_bytes / per) as usize } else { 0 };
         if !prefix_on {
-            println!("[exl3-serve] WP16 prefix checkpoints OFF (--prefix-cache off)");
+            crate::dprintln!("[exl3-serve] WP16 prefix checkpoints OFF (--prefix-cache off)");
             None
         } else if crate::exl3_forward::wp16_off() {
-            println!("[exl3-serve] WP16 prefix checkpoints OFF (--wp16-off=1 — diagnostic escape: the prompt-end \
+            crate::dprintln!("[exl3-serve] WP16 prefix checkpoints OFF (--wp16-off=1 — diagnostic escape: the prompt-end \
                       snapshot only, today's behaviour)");
             None
         } else if cap == 0 {
-            println!("[exl3-serve] WP16 prefix checkpoints OFF (--prefix-ckpt-mem-gb {wp16_gb} holds no {:.1} MB checkpoint)",
+            crate::dprintln!("[exl3-serve] WP16 prefix checkpoints OFF (--prefix-ckpt-mem-gb {wp16_gb} holds no {:.1} MB checkpoint)",
                      per as f64 / 1e6);
             None
         } else {
-            println!("[exl3-serve] WP16 prefix checkpoints ON: {}; cap {wp16_gb} GiB (--prefix-ckpt-mem-gb; default 4 is a \
+            crate::dprintln!("[exl3-serve] WP16 prefix checkpoints ON: {}; cap {wp16_gb} GiB (--prefix-ckpt-mem-gb; default 4 is a \
                       placeholder — the owner sets the final default) = {cap} checkpoint(s) = {:.2} GiB at most, \
                       allocated lazily, LRU across slots, kept across a conversation's cache-hit turns. Taken at chunk \
                       ends of aligned prefills (grid from 0 or from an aligned checkpoint; never after a prompt-end \
@@ -4905,7 +5916,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     // C1: tail (message-boundary) checkpoints — opt-in, output-changing (registry prefix.tail_ckpt, N).
     let tail_ckpt_boot = wp16.is_some() && crate::exl3_forward::tail_ckpt_on();
     if tail_ckpt_boot {
-        println!("[exl3-serve] C1 tail checkpoints ON (prefix.tail_ckpt = {} / --prefix-tail-ckpt=1|2: {}; OUTPUT-CHANGING, \
+        crate::dprintln!("[exl3-serve] C1 tail checkpoints ON (prefix.tail_ckpt = {} / --prefix-tail-ckpt=1|2: {}; OUTPUT-CHANGING, \
                   owner consent): every prefill also checkpoints at its message boundary (the prompt without its \
                   generation prompt) minus {} tokens when that saves >= {} tokens over the C grid point below it; runs \
                   are realigned to the C grid; the next chat turn resumes there",
@@ -4915,11 +5926,11 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
                  } else { "only splits absorbed into an existing chunk boundary" },
                  crate::exl3_forward::TAIL_BACKOFF, crate::exl3_forward::TAIL_MIN_GAIN);
     } else if crate::exl3_forward::tail_ckpt_on() {
-        println!("[exl3-serve] C1 tail checkpoints requested but WP16 checkpoints are off — ignored");
+        crate::dprintln!("[exl3-serve] C1 tail checkpoints requested but WP16 checkpoints are off — ignored");
     }
     let wp16_xcheck = wp16.is_some() && crate::exl3_forward::wp16_xcheck_on();
     if wp16_xcheck {
-        println!("[exl3-serve] WP16 XCHECK ON (--wp16-xcheck=1, diagnostic): every checkpoint resume also prefills \
+        crate::dprintln!("[exl3-serve] WP16 XCHECK ON (--wp16-xcheck=1, diagnostic): every checkpoint resume also prefills \
                   fresh from 0 into a scratch slot ({}) and bit-compares GDN S / conv / PLE ring + hist / head-fill \
                   carry and the first-token logits ([wp16-xcheck] lines)",
                  if width > 1 { "a free lane's slot" } else { "--max-batch 1: the resumed slot itself, then the resumed state is restored" });
@@ -4934,20 +5945,20 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         vision_boot(model_dir, vision_fail_gemm_armed())
     } else {
         let sec = mrope_section_of(model_dir);
-        println!("[exl3-serve] vision (node): mrope section {sec:?}; image rows arrive from the head");
+        crate::dprintln!("[exl3-serve] vision (node): mrope section {sec:?}; image rows arrive from the head");
         (None, None, sec)
     };
     // CF-P1d: every lane's KV, the scratch, graphs and the vision tower now exist — `--ple-ram auto` decides RAM vs
     // SSD for the n-gram table on the memory that is actually left (each rank for itself; identical output either way).
     model.ple_promote_auto()?;
-    let spec_policy = SpecLanes::parse(arg(args, "--spec-lanes-max"))?;
+    let spec_policy = SpecLanes::parse(crate::opt_or_arg(args, "--spec-lanes-max").as_deref())?;
     // CF-FCFS: --lane-order reaches every rank through the SPMD option registry (Scope::Spmd), so
     // the head's value is installed on the nodes before the scheduler is built. The `arg()` read is
     // the TP=1 path's own value; under TP both ranks see the head's shipped value (identical).
-    let lane_order = LaneOrder::parse(arg(args, "--lane-order")
+    let lane_order = LaneOrder::parse(crate::opt_or_arg(args, "--lane-order").as_deref()
                                       .map(str::trim)
                                       .filter(|v| !v.is_empty()))?;
-    let lane_quantum = match arg(args, "--lane-quantum") {
+    let lane_quantum = match crate::opt_or_arg(args, "--lane-quantum").as_deref() {
         None => 256,
         Some(v) if v.trim().is_empty() => 256,
         Some(v) => v.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("--lane-quantum: {e}"))?,
@@ -4959,9 +5970,9 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     // parses the same argv and resolves 0, so the node needs nothing and the lockstep is untouched.
     let (interleave, il_line) = resolve_prefill_interleave(
         parse_prefill_interleave(arg(args, "--prefill-interleave"))?, tp_rank.is_some(), chunk);
-    if let Some(line) = il_line { crate::rprintln!("{line}"); }
+    if let Some(line) = il_line { crate::drprintln!("{line}"); }
     if width > 1 && spec_live {
-        println!("[exl3-serve] load-adaptive batching (--spec-lanes-max): {} (--max-batch {width})", match spec_policy {
+        crate::dprintln!("[exl3-serve] load-adaptive batching (--spec-lanes-max): {} (--max-batch {width})", match spec_policy {
             SpecLanes::Auto => "auto — each round picks serial speculation or ONE shared plain step by estimated aggregate tokens/s".to_string(),
             SpecLanes::Over(k) => format!("one shared plain step with more than {k} busy lanes, serial speculation otherwise"),
             SpecLanes::Never => "off — always serial speculative rounds".to_string(),
@@ -4975,13 +5986,56 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     } else {
         crate::mtp_reprobe::ReProbeCfg::default()
     };
+    // LANERES1: --lane-reserve R --lane-reserve-patience P --lane-reserve-swap S. A single-box
+    // admission policy: under TP the head ships every admit to the nodes, so the policy is
+    // inactive there (one boot line). Default R=0 = today's admission, byte-for-byte.
+    let lr_r = crate::opts::ranged(crate::opt!("lane-reserve")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
+    let lr_p = crate::opts::ranged(crate::opt!("lane-reserve-patience")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
+    let lr_s = crate::opts::ranged(crate::opt!("lane-reserve-swap")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
+    let reserve_cfg = if lr_r > 0 && tp_rank.is_none() {
+        Some(crate::lane_reserve::Cfg::on(lr_r, lr_p, lr_s))
+    } else {
+        None
+    };
+    // LANERES2: --kv-spill <auto|off|PATH> --kv-spill-gb N. An SSD spill tier for evicted lane
+    // snapshots: a hard eviction is captured to NVMe (async writer thread) and restored on the
+    // conversation's next arrival when the read beats the re-prefill (kv_spill::Policy::lookup).
+    // Default auto = /tmp/gb10_kv_spill; --kv-spill-gb 0 or "off" = today's behavior.
+    // TP>=2: node-side capture needs the node command set — NOT active in this build (one boot
+    // line says so; every eviction re-prefills and is counted). Single-box: fully active.
+    let ks_mode = crate::opts::var(crate::opt!("kv-spill")).map(|v| v.to_string()).unwrap_or_else(|_| "auto".to_string());
+    let ks_gb = crate::opts::ranged(crate::opt!("kv-spill-gb")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
+    let (spill_on, spill_dir) = if tp_rank.is_some() || ks_mode == "off" || ks_gb == 0 {
+        (false, String::new())
+    } else {
+        let d = if ks_mode == "auto" { "/tmp/gb10_kv_spill".to_string() } else { ks_mode.clone() };
+        (true, d)
+    };
+    let (spill_store, spill_pol) = if spill_on {
+        let st = crate::kv_spill::Store::spawn_with(std::path::PathBuf::from(&spill_dir),
+            std::cmp::min(std::cmp::max((ks_gb << 30) / 4, 4 << 30), 6 << 30))
+            .map_err(|e| anyhow::anyhow!("kv-spill: cannot create {spill_dir}: {e}"))?;
+        (Some(st), crate::kv_spill::Policy::new(ks_gb << 30))
+    } else {
+        (None, crate::kv_spill::Policy::new(0))
+    };
+    crate::rprintln!("{}", if spill_on {
+        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text-only snapshots; restores when the NVMe read beats the re-prefill it replaces)", tp_rank.unwrap_or(0))
+    } else if tp_rank.is_some() && ks_mode != "off" && ks_gb > 0 {
+        "[exl3-serve] kv spill: requested but TP>=2 node-side capture is not wired in this build — running without the tier (admission unchanged; evictions re-prefill and count on /metrics)".to_string()
+    } else {
+        "[exl3-serve] kv spill: off (--kv-spill off or --kv-spill-gb 0: today's admission, byte-for-byte)".to_string()
+    });
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave, psc: Some(psc0),
+        df2, df2_k,
         mtp_k, spec_policy, lane_order, lane_quantum, admit_ctr: 0, fcfs_rots: 0,
         lane_pack, scp, pack_ready, pack_sampled, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(),
         reprobe_on, reprobe_cfg,
-        shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        reserve: reserve_cfg, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
+        spill: spill_store, spill_pol, spill_rank: tp_rank.map(|r| r as usize).unwrap_or(0),
+        shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
         prefix_on, cache: (0..width).map(|_| None).collect(),
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
@@ -4989,7 +6043,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), mrope_section, vis_seam: None, kv_pf: None,
     };
     if width > 1 && spec_live {
-        println!("[exl3-serve] serial lane order (--lane-order): {}{}", lane_order.name(),
+        crate::dprintln!("[exl3-serve] serial lane order (--lane-order): {}{}", lane_order.name(),
                  if lane_order == LaneOrder::Fcfs {
                      format!(" — run to completion, one lane at a time, FCFS by admission order, \
                               quantum {} generated tokens (--lane-quantum)", lane_quantum)
@@ -4999,15 +6053,21 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         // after the lane-order line: `speculation_boot_lines_follow_the_switch` pins that line directly behind its guard
         crate::rprintln!("[exl3-serve] packed speculative verify (--lane-pack): {}", lane_pack.name());
     }
+    // LANERES1: one line for the lane-reservation posture (active, off, or inactive under TP).
+    match reserve_cfg {
+        Some(c) => crate::rprintln!("[exl3-serve] lane reservation: R {} s, patience {} s, swap {} s (--lane-reserve: keep a conversation's lane and its prefix cache; andrei.gnezdilov's design)", c.reserve.as_secs(), c.patience.as_secs(), c.swap.as_secs()),
+        None if tp_rank.is_some() && lr_r > 0 => crate::rprintln!("[exl3-serve] lane reservation: INACTIVE under TP (--lane-reserve {lr_r} ignored: the head ships every admit; single-box only) — admission unchanged"),
+        None => crate::rprintln!("[exl3-serve] lane reservation: off (--lane-reserve 0: today's admission, byte-for-byte)"),
+    }
     println!("[exl3-serve] liveness: sticky CUDA error / scheduler thread crash -> {}",
              if exit_on_fatal { "exit 70 (--exit-on-fatal, default)" } else { "engine DEAD, /health 503 (--exit-on-fatal off)" });
-    println!("[exl3-serve] prefill chunk width = {chunk} tokens/sweep (wide-M)");
+    crate::dprintln!("[exl3-serve] prefill chunk width = {chunk} tokens/sweep (wide-M)");
     if let Some(line) = mtp_banner(model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt(), mtp_k, draft_conf) {
-        println!("{line}");
+        crate::dprintln!("{line}");
     }
     // WP23: depth 6/7 posture (both parts default on iff k > 5; --exl3-mtp-k=5 = the K5 build).
     if spec_live && draft_conf > 0.0 {
-        println!("[exl3-serve] WP23 DDS: depth ceiling k={mtp_k} (max {}), depth-keyed bins {}, cost guard {} \
+        crate::dprintln!("[exl3-serve] WP23 DDS: depth ceiling k={mtp_k} (max {}), depth-keyed bins {}, cost guard {} \
                   (target = max({draft_conf}, clamp(c_hat*tok/ms, 0.15, 0.8)) after 16 rounds, c_hat seeded 6.0 ms/draft; \
                   --exl3-dds-depth-bins / --exl3-dds-guard = 0|1 force)",
                  crate::exl3_forward::MTP_MAX_K,
@@ -5063,7 +6123,11 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         stop_ids: eos,
         otel,
     };
-    Ok(ServeParts { sched, state, port, cpu_aff, exit_on_fatal, rx: srx })
+    let df2_engaged = sched.df2.is_some();
+    Ok(ServeParts { sched, state, port, cpu_aff, exit_on_fatal, rx: srx,
+                    boot_facts: (tp_world, max_seq_len, width, kv_name.to_string(), prefix_on,
+                                 model.mtp.is_some(), crate::exl3_forward::mtp_off_by_opt().is_some(),
+                                 df2_engaged) })
 }
 
 /// VIS-2: the text config's interleaved mrope_section (None = the model declares no interleaved mrope).
@@ -5097,7 +6161,7 @@ fn vision_boot(model_dir: &str, fail_first_gemm: bool) -> (Option<Arc<crate::vis
         Err(e) => { println!("[exl3-serve] vision: geometry probe failed ({e:#}) — text-only"); return (None, None, None); }
     }
     let Some(sec) = mrope_section_of(model_dir) else {
-        println!("[exl3-serve] vision: the text config declares no interleaved mrope_section — text-only");
+        crate::dprintln!("[exl3-serve] vision: the text config declares no interleaved mrope_section — text-only");
         return (None, None, None);
     };
     let t0 = std::time::Instant::now();
@@ -5108,10 +6172,10 @@ fn vision_boot(model_dir: &str, fail_first_gemm: bool) -> (Option<Arc<crate::vis
     let gpu = match cudarc::driver::CudaDevice::new(0).map_err(anyhow::Error::from)
         .and_then(|d| crate::vision_gpu::GpuVisualTower::new_with_drill(d, &tower, fail_first_gemm)) {
         Ok(g) => g,
-        Err(e) => { println!("[exl3-serve] vision: GPU tower unavailable ({e:#}) — text-only"); return (None, None, None); }
+        Err(e) => { crate::dprintln!("[exl3-serve] vision: GPU tower unavailable ({e:#}) — text-only"); return (None, None, None); }
     };
     let d = tower.dims;
-    println!("[exl3-serve] vision ON: tower from {}: {} blocks x {} wide -> {} ({:.1} s); images resized to a longer side <= {} px \
+    crate::dprintln!("[exl3-serve] vision ON: tower from {}: {} blocks x {} wide -> {} ({:.1} s); images resized to a longer side <= {} px \
               (--image-max-edge), mrope section {sec:?}; QSA indexer pooled keys follow the image positions (VIS-3)",
              tower.source, d.depth, d.hidden, d.out_hidden, t0.elapsed().as_secs_f64(),
              if tower.preproc.max_edge == 0 { "unlimited".to_string() } else { tower.preproc.max_edge.to_string() });
@@ -5135,7 +6199,7 @@ fn tp_worker_mask(m: &Option<Vec<usize>>, tp: bool, world: i32) -> Option<Vec<us
 /// would inherit its one-core mask and serialize on core 9; they re-pin to this mask instead.
 fn set_worker_mask(m: Option<Vec<usize>>) {
     if let Some(m) = m {
-        println!("[exl3-serve] TP: scheduler pinned to core 9; spawned host workers use cpus {}",
+        crate::dprintln!("[exl3-serve] TP: scheduler pinned to core 9; spawned host workers use cpus {}",
                  crate::cpu_affinity::format_cpu_list(&m));
         crate::cpu_affinity::set_worker_mask(m);
     }
@@ -5146,14 +6210,14 @@ fn set_worker_mask(m: Option<Vec<usize>>) {
 /// on a thread pinned to core 9 (the TP launch-thread rule), and the HTTP/worker threads keep the
 /// big-core mask minus the launch (9) and proxy (19) cores.
 fn serve_http(parts: ServeParts, tp_ctl: Option<Vec<std::net::TcpStream>>) -> Result<()> {
-    let ServeParts { sched, state, port, cpu_aff, exit_on_fatal, rx: srx } = parts;
+    let ServeParts { sched, state, port, cpu_aff, exit_on_fatal, rx: srx, boot_facts } = parts;
     let model_name = state.model_name.clone();
     // v0.7.3 ("tel"): the ONE sender task rides THIS runtime (serve_http is head/TP=1 only).
     let otel_sink = state.otel.clone();
     // HOST / RO-7: pin THIS thread (it runs the HTTP runtime below) to the big cores BEFORE the
     // scheduler thread is spawned — a new thread inherits its creator's mask (Linux), and so do
     // the threads either of them spawns later (prefill PLE workers, tokio's blocking pool).
-    println!("[exl3-serve] {}", cpu_aff.1);
+    crate::dprintln!("[exl3-serve] {}", cpu_aff.1);
     let mask = tp_worker_mask(&cpu_aff.0, tp_ctl.is_some(), tp_ctl.as_ref().map_or(1, |c| c.len() as i32 + 1));
     if let Some(cpus) = mask.as_ref() {
         if let Err(e) = crate::cpu_affinity::pin_current_thread(cpus) {
@@ -5196,8 +6260,23 @@ fn serve_http(parts: ServeParts, tp_ctl: Option<Vec<std::net::TcpStream>>) -> Re
         if let Some(sink) = otel_sink { tokio::spawn(crate::otel::run_sender(sink)); }
         let app = create_router(state);
         let listener = crate::server::http_listen(port).await;
-        println!("[exl3-serve] listening on {} (model id: {model_name})",
-                 listener.local_addr().map_or_else(|_| format!("port {port}"), |a| a.to_string()));
+        let url_l = listener.local_addr().map_or_else(|_| format!("port {port}"), |a| a.to_string());
+        if crate::boot_report::debug() {
+            println!("[exl3-serve] listening on {url_l} (model id: {model_name})");
+        }
+        {
+            let (tp_w, ctx, batch, kv_name, prefix_on, mtp_head, mtp_off, df2_on) = &boot_facts;
+            crate::boot_report::serving(&crate::boot_report::ServingLine {
+                family: "exl3", model: &model_name, tp: *tp_w, ctx: *ctx, batch: *batch,
+                kv: kv_name, prefix: if *prefix_on { "on" } else { "off" },
+                mtp: if !*mtp_head { "none" } else if *mtp_off { "off" } else { "auto" },
+                // ISSUES[94]: the DF2 chain is the engaged speculator — the SERVING line says
+                // so (dflash2), the pack MTP otherwise.
+                spec: if *df2_on { "dflash2" } else if *mtp_head && !*mtp_off { "mtp" } else { "plain" },
+                port,
+                url: if url_l.starts_with("port ") { format!("http://0.0.0.0:{port}") } else { format!("http://{url_l}") },
+            });
+        }
         // WP02: TCP_NODELAY — an SSE token event is a few dozen bytes; Nagle held them for the ACK
         axum::serve(listener, app).tcp_nodelay(true).await.unwrap();
     });
@@ -5317,7 +6396,7 @@ fn wp24_gate_arm(sched: &mut Exl3Scheduler, arm: GateArm, prompt: &[u32], t: f32
 /// owner's config (T 1.0, top_p 0.95) only, as the first rung of the ladder.
 pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
     let num = |name: &str, d: usize| -> Result<usize> {
-        match arg(args, name) {
+        match crate::opt_or_arg(args, name) {
             None => Ok(d),
             Some(v) => v.parse().map_err(|_| anyhow::anyhow!("{name} must be an integer")),
         }
@@ -5346,7 +6425,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
         anyhow::bail!("WP24 gate: {} is set — the MTP arms need the head", off.flag());
     }
     let max_pos = max_seq_len + crate::batch::decode_headroom(false);
-    println!("WP24 served gate: loading {model_dir} (width {width}, max_pos {max_pos}, kv-cache {})",
+    crate::dprintln!("WP24 served gate: loading {model_dir} (width {width}, max_pos {max_pos}, kv-cache {})",
              crate::exl3_forward::kv_fmt_name(crate::exl3_forward::kv_fmt_from_opts()));
     let model = FwdModel::load(model_dir, width, max_pos)?;
     anyhow::ensure!(model.mtp.is_some(), "WP24 gate: the pack has no MTP draft head");
@@ -5374,11 +6453,14 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
         crate::mtp_reprobe::ReProbeCfg::default()
     };
     let mut sched = Exl3Scheduler {
+        spill: None, spill_pol: crate::kv_spill::Policy::new(0), spill_rank: 0,
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos, chunk, interleave: 0, psc: Some(psc0),
+        df2: None, df2_k: crate::dflash2::block() - 1, // run_spec probe path: no DF2 artifact
         mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0,
         lane_pack: crate::lane_pack::LanePack::Off, scp: None, pack_ready: [false, false], pack_sampled: false, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(),
-        reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf, cal: DraftCal::new(),
+        reserve: None, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: None, pen_range: 1024, spec_ratio: false, draft_temp, gate: None, tok: tok.clone(), tp: None,
@@ -5396,7 +6478,7 @@ fn wp24_gate_conditions(sched: &mut Exl3Scheduler, prompt: &[u32], text: &str, t
     let mtp_k = sched.mtp_k;
     sched.draft_conf = draft_conf;
     sched.draft_temp = draft_temp;
-    println!("WP24 served gate: prompt {} tokens {:?}; {trials} trials x 3 arms (plain | ratio | match) per condition, \
+    crate::dprintln!("WP24 served gate: prompt {} tokens {:?}; {trials} trials x 3 arms (plain | ratio | match) per condition, \
               {positions} positions, top_k {top_k}, {n_seeds} seeds, DDS {draft_conf}, depth {mtp_k}, draft temperature {}",
              prompt.len(), text.chars().take(60).collect::<String>(),
              draft_temp.map_or("= T".to_string(), |x| x.to_string()));
@@ -5450,23 +6532,23 @@ fn wp24_gate_conditions(sched: &mut Exl3Scheduler, prompt: &[u32], text: &str, t
                         100.0 * s.accepted as f64 / s.drafted.max(1) as f64,
                         (s.accepted + s.rounds) as f64 / s.rounds.max(1) as f64, a.secs)
             };
-            println!("  [served] T={t} top_p={top_p} seed#{si}: n={trials}/arm | GATE ratio-vs-plain z[pos 1..{positions}, pair 2-3] = {} | \
+            crate::dprintln!("  [served] T={t} top_p={top_p} seed#{si}: n={trials}/arm | GATE ratio-vs-plain z[pos 1..{positions}, pair 2-3] = {} | \
                       CONTROL match-vs-plain z = {} | NEG d0-vs-plain-x2 z={:+.1} ({} d0) | ratio: {} | match: {} | plain {:.0} s{} -> {}",
                      fz(&zr), fz(&zm), neg.1, ratio.stats.d0.len(), arm(&ratio), arm(&matc), plain.secs,
                      if signals { "" } else { " | SUCCESS SIGNALS MISSING (ratio rounds / drafts)" },
                      if ok { "PASS" } else if !ctrl_ok { "FAIL (control failed: harness suspect)" } else { "FAIL" });
             if conds == 1 {
                 let per = t_all.elapsed().as_secs_f64();
-                println!("  [served] projected total ~{:.0} min ({total} conditions at {:.0} s each)", per * total as f64 / 60.0, per);
+                crate::dprintln!("  [served] projected total ~{:.0} min ({total} conditions at {:.0} s each)", per * total as f64 / 60.0, per);
             }
         }
     }
     if !neg_rejected {
-        println!("  [served] negative control never rejected: the gate had no power to see q' != p on this prompt");
-        println!("RESULT: SERVED_GATE_NO_POWER");
+        crate::dprintln!("  [served] negative control never rejected: the gate had no power to see q' != p on this prompt");
+        crate::dprintln!("RESULT: SERVED_GATE_NO_POWER");
         return Ok(false);
     }
-    println!("RESULT: {} ({conds} conditions{}, {:.1} min)",
+    crate::dprintln!("RESULT: {} ({conds} conditions{}, {:.1} min)",
              if all_ok { "SERVED_DISTRIBUTION_OK (ratio-mode MTP emits the plain sampler's law at every tested position)" }
              else { "SERVED_DISTRIBUTION_MISMATCH" },
              if quick { ", --quick: T 1.0 / top_p 0.95 only — run without --quick for the full gate" } else { "" },
@@ -5802,13 +6884,13 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     // "TP=2 rank N" at world 2 (the label the gate scripts grep), "TP=4 rank N" at world 4
     let who = if tp_on { format!("TP={world} rank {rank}") } else { "TP=1".to_string() };
     if o.prefix { crate::opts::set(crate::opt!("exl3-prefix"), "1"); }
-    println!("[tpspec] {who}: program {} — {} prompt(s) {:?}; loading {model_dir} (width {}, max_pos {max_pos}, kv-cache {})",
+    crate::dprintln!("[tpspec] {who}: program {} — {} prompt(s) {:?}; loading {model_dir} (width {}, max_pos {max_pos}, kv-cache {})",
              o.to_mode(), prompts.len(), prompts.iter().map(|(n, p)| format!("{n}:{}", p.len())).collect::<Vec<_>>(),
              o.width, crate::exl3_forward::kv_fmt_name(crate::exl3_forward::kv_fmt_from_opts()));
     let t_load = std::time::Instant::now();
     let model = FwdModel::load_tp(model_dir, o.width, max_pos, attach)?;
     anyhow::ensure!(model.mtp.is_some(), "spec: the pack has no MTP draft head");
-    println!("[tpspec] {who}: loaded in {:.1}s (trunk per rank: {} q / {} kv heads, GDN {} k / {} v heads)",
+    crate::dprintln!("[tpspec] {who}: loaded in {:.1}s (trunk per rank: {} q / {} kv heads, GDN {} k / {} v heads)",
              t_load.elapsed().as_secs_f32(), model.tc.num_heads, model.tc.num_kv_heads,
              model.tc.lin_num_k_heads, model.tc.lin_num_v_heads);
     let tok = QwenTokenizer::from_file(&format!("{}/tokenizer.json", model_dir.trim_end_matches('/')))?;
@@ -5833,11 +6915,14 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
         crate::mtp_reprobe::ReProbeCfg::default()
     };
     let mut sched = Exl3Scheduler {
+        spill: None, spill_pol: crate::kv_spill::Policy::new(0), spill_rank: 0,
         model: model.clone(), sc, width,
         lanes: (0..width).map(|_| None).collect(), eos: eos.clone(), chunk, interleave: 0, psc: Some(psc0),
+        df2: None, df2_k: crate::dflash2::block() - 1, // this path loads no DF2 artifact
         mtp_k, spec_policy: SpecLanes::Never, lane_order: LaneOrder::Rr, lane_quantum: 256, admit_ctr: 0, fcfs_rots: 0,
         lane_pack: crate::lane_pack::LanePack::Off, scp: None, pack_ready: [false, false], pack_sampled: false, pack_rot: 0, pack_logs: 0, in_prefill: false, pack_stats: PackStats::default(),
-        reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
+        reprobe_on, reprobe_cfg, shared_scale: 1.0, shared_last: false, shared_streak: 0, shared_probe_ctr: 0, spec_win_tok: [0.0; 2], spec_win_ms: [0.0; 2], spec_win_n: [0; 2], spec_win_acc: [0; 2], spec_arm_rate: [0.0; 2], spec_arm_n: [0; 2], spec_arm_fold: [0; 2], spec_probe: None, spec_probe_ctr: 0, spec_est_pick: None, spec_margin: 0.0, spec_margin_n: 0, policy_logs: 0, ctrl_round: 0, ema_plain: 0.0, draft_conf: 0.4, cal: DraftCal::new(),
+        reserve: None, reserve_st: crate::lane_reserve::State::new(), rel: (0..width).map(|_| None).collect(),
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: Some((300, 3)), pen_range: 1024, spec_ratio: true, draft_temp: None, gate: None, tok: tok.clone(),
@@ -5847,7 +6932,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let mut arms = vec![SpecArm::Plain];
     if o.dds { arms.push(SpecArm::Dds); }
     arms.extend(o.depths.iter().map(|&d| SpecArm::Fixed(d)));
-    println!("[tpspec] {who}: arms {:?} x {} reps, gen {} greedy (thinking-off chat ids), served depth {mtp_k}, DDS 0.4, \
+    crate::dprintln!("[tpspec] {who}: arms {:?} x {} reps, gen {} greedy (thinking-off chat ids), served depth {mtp_k}, DDS 0.4, \
               prefix cache {}, loop detect (300, 3), precapture done ({} graphs)",
              arms.iter().map(|a| a.name()).collect::<Vec<_>>(), o.reps, o.gen, if o.prefix { "on" } else { "off" },
              model.graph_count());
@@ -5896,9 +6981,9 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
                     let body: Vec<u32> = r.toks.iter().copied().filter(|x| !eos.contains(x)).collect();
                     let t = tok.decode(&body, true).unwrap_or_default();
                     let (hd, tl): (String, String) = (t.chars().take(160).collect(), t.chars().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect());
-                    println!("TPSPEC-TEXT {who} {name}: head {hd:?} ... tail {tl:?}");
+                    crate::dprintln!("TPSPEC-TEXT {who} {name}: head {hd:?} ... tail {tl:?}");
                 }
-                println!("TPSPEC {who} rep {rep} {name} {:<5} n={n} ({}) ids {:016x} text {} | {} | rounds {} drafted {} accepted {} \
+                crate::dprintln!("TPSPEC {who} rep {rep} {name} {:<5} n={n} ({}) ids {:016x} text {} | {} | rounds {} drafted {} accepted {} \
                           tok/round {tpr:.3} ms/round {mpr:.2} ctrl {} plain {} | {tps:.1} tok/s ({:.1} s)",
                          arm.name(), r.reason, fnv64(&r.toks), text_sha(&r.toks),
                          if arm == SpecArm::Plain { if same { "plain (rep-stable)".to_string() } else { "PLAIN DIFFERS FROM REP 0".to_string() } }
@@ -5907,20 +6992,20 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
             }
         }
         if let Some(t) = sched.tp.as_ref() {
-            println!("[tpspec] {who} rep {rep}: lockstep agrees {} ok (agree_ext tripwire armed; proxy watchdog 10 s){}",
+            crate::dprintln!("[tpspec] {who} rep {rep}: lockstep agrees {} ok (agree_ext tripwire armed; proxy watchdog 10 s){}",
                      t.agrees, if t.ident_bufs > 0 { format!("; G-T1-b graphed digests {} compared, {} differ", t.ident_bufs, t.ident_bad) } else { String::new() });
         }
     }
-    println!("TPSPEC {who} SUMMARY (mean over {} reps; DDS/fixed: tok/round | ms/round | tok/s; plain: ms/token | tok/s):", o.reps);
+    crate::dprintln!("TPSPEC {who} SUMMARY (mean over {} reps; DDS/fixed: tok/round | ms/round | tok/s; plain: ms/token | tok/s):", o.reps);
     for ((name, arm), v) in &acc {
         let k = v.len() as f64;
         let m = |f: fn(&(f64, f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / k;
         let mn = |f: fn(&(f64, f64, f64)) -> f64| v.iter().map(f).fold(f64::INFINITY, f64::min);
         let mx = |f: fn(&(f64, f64, f64)) -> f64| v.iter().map(f).fold(f64::NEG_INFINITY, f64::max);
         if arm == "plain" {
-            println!("  {name:<7} {arm:<5} ms/token {:.2} (min {:.2} max {:.2}) | {:.1} tok/s", m(|x| x.1), mn(|x| x.1), mx(|x| x.1), m(|x| x.2));
+            crate::dprintln!("  {name:<7} {arm:<5} ms/token {:.2} (min {:.2} max {:.2}) | {:.1} tok/s", m(|x| x.1), mn(|x| x.1), mx(|x| x.1), m(|x| x.2));
         } else {
-            println!("  {name:<7} {arm:<5} tok/round {:.3} (min {:.3} max {:.3}) | ms/round {:.2} (min {:.2} max {:.2}) | {:.1} tok/s",
+            crate::dprintln!("  {name:<7} {arm:<5} tok/round {:.3} (min {:.3} max {:.3}) | ms/round {:.2} (min {:.2} max {:.2}) | {:.1} tok/s",
                      m(|x| x.0), mn(|x| x.0), mx(|x| x.0), m(|x| x.1), mn(|x| x.1), mx(|x| x.1), m(|x| x.2));
         }
     }
@@ -5928,10 +7013,10 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
     let (sp_ok, sp_bad) = (crate::exl3_forward::xtp::SPINE_OK.load(std::sync::atomic::Ordering::Relaxed),
                            crate::exl3_forward::xtp::SPINE_BAD.load(std::sync::atomic::Ordering::Relaxed));
     if tp_on {
-        println!("[tpspec] {who}: graphs captured {} ; TP-SPINE audit {sp_ok} graphs OK, {sp_bad} discarded (a discarded shape runs eager)",
+        crate::dprintln!("[tpspec] {who}: graphs captured {} ; TP-SPINE audit {sp_ok} graphs OK, {sp_bad} discarded (a discarded shape runs eager)",
                  model.graph_count());
     }
-    println!("G-T1-e {who}: {} — {n_cmp} requests compared ({n_bad} differ) over {} prompt(s) x {} arm(s) x {} rep(s), gen {} ({:.1} min)",
+    crate::dprintln!("G-T1-e {who}: {} — {n_cmp} requests compared ({n_bad} differ) over {} prompt(s) x {} arm(s) x {} rep(s), gen {} ({:.1} min)",
              if e_ok { "LOSSLESS_OK (every spec arm == plain, byte-identical; plain rep-stable)" } else { "MISMATCH" },
              prompts.len(), arms.len(), o.reps, o.gen, t_all.elapsed().as_secs_f64() / 60.0);
     let mut samp_ok = true;
@@ -5953,7 +7038,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
             // finish the gate's last rep at different times); every rank prints the same per-rank table
             let all = crate::net::exchange_u32s_all(&[all_ok as u32, t.agrees as u32], 4)?;
             let (ok, line) = tpspec_fold(&all, t.rank as usize, agrees);
-            println!("[tpspec] {who}: {line} (graphed digests {ident_bufs} compared, {ident_bad} differ)");
+            crate::dprintln!("[tpspec] {who}: {line} (graphed digests {ident_bufs} compared, {ident_bad} differ)");
             all_ok &= ok;
         } else {
             let peer = crate::net::exchange_u32s(&[all_ok as u32, t.agrees as u32], 4)?;
@@ -6360,6 +7445,32 @@ mod fit_tests {
         assert!(e.contains("--tp 2"), "{e}");
     }
 
+    /// MAXBATCH1: the boot-anyway clamp. The same arithmetic fit_plan refuses with becomes the
+    /// answer to "what is the largest lane count that BOOTS": the .12 refusal of 2026-10-21
+    /// (16 lanes, 262K context, 125.5 GB box) resolves to 8 lanes, the table landing on SSD
+    /// exactly like a plain boot that only fits on SSD. None is reserved for "not even one lane
+    /// can serve" — the one refusal CF-P1d keeps — and a forced `--ple-ram ram` is honoured
+    /// (the explicit user demand), not silently downgraded to SSD.
+    #[test]
+    fn fit_max_lanes_picks_the_largest_lane_count_that_boots() {
+        use super::fit_max_lanes;
+        // The .12 2026-10-21 boot: weights 53.2, working 19.3, floor 5.0, per-lane 5.61 at 262145.
+        let p = FitParts { weights: 53_200_000_000, table: 33_000_000_000, per_lane: 5_610_000_000,
+                           fixed: 19_300_000_000, floor: 5_000_000_000 };
+        assert_eq!(fit_max_lanes(p, 16, 125_500_000_000, "auto", 262145), Some(8),
+                   "the refused boot clamps to the 8 lanes that fit (9 lanes = 127.5 GB > 125.5)");
+        // A generous box: nothing is clamped away, the table fits in RAM.
+        assert_eq!(fit_max_lanes(p, 6, 200 * G, "auto", 262145), Some(6));
+        // The clamp never exceeds the asked width.
+        assert_eq!(fit_max_lanes(p, 4, 200 * G, "auto", 262145), Some(4));
+        // Weights alone overflow: None — CF-P1d's refusal (use --tp 2) survives.
+        assert_eq!(fit_max_lanes(FitParts { weights: 110 * G, ..p }, 16, 124 * G, "ssd", 131072), None);
+        // Forced --ple-ram ram with a table that cannot sit in RAM: no lane count satisfies the
+        // explicit demand → None keeps the refusal; auto on the same box boots 5 lanes.
+        assert_eq!(fit_max_lanes(p, 16, 110 * G, "ram", 262145), None);
+        assert_eq!(fit_max_lanes(p, 16, 110 * G, "auto", 262145), Some(5));
+    }
+
     /// The real Flash-Next 3.05 pack, where present: the estimate must bracket the 2026-10-02 measurement on .14
     /// (per lane at 131K ~2.8 GB measured; device weights ~53 GB; table 32.6 GB).
     #[test]
@@ -6370,6 +7481,9 @@ mod fit_tests {
         assert!((2_600_000_000..3_300_000_000).contains(&p.per_lane), "{p:?}");
         assert!((50 * G..56 * G).contains(&p.weights), "{p:?}");
         assert!((32 * G..34 * G).contains(&p.table), "{p:?}");
+        // MAXBATCH1: the serve fit reserves the §5 serving-headroom bar (>= 20 GB), not the 5 GB
+        // emergency-watchdog floor — a 2026-10-21 .12 boot at the 5 GB floor rode it and died mid-sweep.
+        assert!(p.floor >= 20 * G, "serve-fit floor must reserve the serving headroom: {p:?}");
     }
 }
 
@@ -6522,28 +7636,34 @@ mod spec_lanes_tests {
         assert!(due(128, false) && due(1000, false));
     }
 
-    /// F4: the probe sits between the shared arm's return and `pack_plan`, gated on
-    /// `--lane-pack on` + the Auto policy + >=4 busy lanes, and runs the shared arm's own step
-    /// (not a new path). Flag-off boots (G2 byte identity), `Never`/`Over` policies, and
-    /// two-lane packed rounds (the PACK5G c=2 win, G4/G7 identity) never reach it.
+    /// S-C4XOVER: the arm-rate probe (which generalizes F4's shared-cost probe) sits BEFORE
+    /// the arm pick (it can force either arm for a few steps), gated on `--lane-pack on` +
+    /// the Auto policy + >=2 busy lanes with at least one MTP-capable lane, and only starts
+    /// when the idle arm's measured rate has gone stale. A forced-shared window runs the
+    /// shared arm's own step (not a new path) and the 128th-round refresh stays off while a
+    /// probe window is in flight. Flag-off boots (G2 byte identity), `Never`/`Over` policies
+    /// and single-lane steps never reach it.
     #[test]
-    fn the_shared_probe_is_flag_on_auto_four_lanes_and_before_pack_plan() {
+    fn the_arm_rate_probe_is_flag_on_auto_two_lanes_and_preempts_the_pick() {
         let src = include_str!("exl3_serve.rs");
-        let arm = src.find("if mtp_on && self.use_shared_plain(&slots) {").expect("shared arm in step()");
-        let step = &src[arm..];
-        let probe = step.find("shared_probe_due(self.shared_probe_ctr").expect("probe call in step()");
-        let pack = step.find("if let Some(plan) = self.pack_plan(&slots)").expect("pack_plan in step()");
-        assert!(probe < pack, "the probe must preempt pack_plan when due");
-        let gate = &step[..probe];
-        assert!(gate.contains("self.lane_pack.on() && self.spec_policy == SpecLanes::Auto && slots.len() >= 4"),
-                "the gate names the flag, the policy and the four lanes");
-        let probe_block = &step[probe..pack];
-        assert!(probe_block.contains("crate::metrics::lane_pack_round(2)"),
-                "the probe counts itself as a shared_plain round on /metrics");
-        assert!(probe_block.contains(&["return self.", "step_plain(&slots, true);"].concat()),
-                "the probe runs the shared arm's own step");
-        assert!(gate.contains("self.shared_streak = 0;"),
-                "the probe sits after the streak reset (so learn_shared_ms can seed at streak 0)");
+        let pick = src.find("if mtp_on && probe_force.unwrap_or_else(|| self.use_shared_plain(&slots)) {")
+            .expect("arm pick in step()");
+        let probe = src.find("S-C4XOVER arm-rate probe").expect("probe block in step()");
+        assert!(probe < pick, "the probe preempts the arm pick when due");
+        let gate = &src[probe..pick];
+        assert!(gate.contains("self.lane_pack.on() && self.spec_policy == SpecLanes::Auto && slots.len() >= 2"),
+                "the gate names the flag, the policy and the two lanes");
+        assert!(gate.contains("l.mtp.is_some()"),
+                "the gate requires an MTP-capable lane (else the plain batch already runs)");
+        assert!(gate.contains("if due && !self.arm_fresh(idle, slots.len()) {"),
+                "a probe only starts when the idle arm's measured rate is stale");
+        let branch = &src[pick..pick + 1600];
+        assert!(branch.contains("crate::metrics::lane_pack_round(2); // arm = shared_plain"),
+                "a forced-shared probe counts itself as a shared_plain round on /metrics");
+        assert!(branch.contains(&["return self.", "step_plain(&slots, true);"].concat()),
+                "a forced-shared probe runs the shared arm's own step");
+        assert!(branch.contains("probe_force.is_none() && self.spec_policy == SpecLanes::Auto && self.shared_streak % refresh_every == 0"),
+                "the 128th-round refresh is suppressed while a probe window is in flight");
     }
 }
 
@@ -6863,7 +7983,7 @@ mod mtp_switch_tests {
                               ("load-adaptive batching (--spec-lanes-max)", "if width > 1 && spec_live {"),
                               ("serial lane order (--lane-order)", "if width > 1 && spec_live {"),
                               ("spec sampling: {} (draft temperature", "&& !crate::exl3_forward::mtp_disabled_by_opt() {")] {
-            let print = ["println!(\"[exl3-serve] ", line].concat();
+            let print = ["crate::dprintln!(\"[exl3-serve] ", line].concat();
             assert_eq!(src.matches(print.as_str()).count(), 1, "one `{line}` boot line");
             let before = &src[..src.find(print.as_str()).unwrap()];
             let guard_line = before.lines().rev().nth(1).unwrap();
@@ -7133,7 +8253,7 @@ mod stop_info_tests {
         };
         for (shape, row) in [("peaked", synth_row(1, V, -1.5, 2.6, true)), ("flat", synth_row(2, V, 0.0, 3.0, false))] {
             let distinct = row.iter().collect::<std::collections::HashSet<_>>().len();
-            println!("row {shape}: {V} logits, {distinct} distinct f16 values");
+            crate::dprintln!("row {shape}: {V} logits, {distinct} distinct f16 values");
             let cases: [(&str, Option<SampParams>, usize); 7] = [
                 ("greedy (softmax at T=1)", None, 7),
                 ("T=0.7 top_k=20 top_p=0.8", samp_opt(0.7, 0.8, 20, 0.0), 7),
@@ -7147,7 +8267,7 @@ mod stop_info_tests {
                 let (new_min, new_med, got) = time(&|| stop_token_stats(&row, tok, sp.as_ref()));
                 let (old_min, old_med, want) = time(&|| stop_token_stats_reference(&row, tok, sp.as_ref()));
                 assert_eq!(got.map(|(p, r)| (p.to_bits(), r)), want.map(|(p, r)| (p.to_bits(), r)), "{name}: not bit-exact");
-                println!("  {name:<38} reference min {old_min:7.3} med {old_med:7.3} ms | now min {new_min:7.3} med {new_med:7.3} ms | (p, rank) = {got:?}");
+                crate::dprintln!("  {name:<38} reference min {old_min:7.3} med {old_med:7.3} ms | now min {new_min:7.3} med {new_med:7.3} ms | (p, rank) = {got:?}");
             }
         }
     }
@@ -7204,7 +8324,7 @@ mod lane_pack_wiring_tests {
         let sp = &sp[..sp.find("\n    }\n").unwrap()];
         // the fallback's serial rounds run BEFORE the flag is raised; the packed part raises it and
         // lowers it on completion
-        let fallback = sp.find(["return self.", "step_mtp(sb);"].concat().as_str()).expect("the control-cadence fallback");
+        let fallback = sp.find(["return self.", "step_mtp(sb, false);"].concat().as_str()).expect("the control-cadence fallback");
         let raise = sp.find("self.pack_stats.in_round = true;").expect("flag raised");
         let lower = sp.find("self.pack_stats.in_round = false;").expect("flag lowered");
         assert!(fallback < raise && raise < lower);
@@ -8015,8 +9135,34 @@ mod agree16b_tests {
         let n = body(serve, "pub fn run_tp_node_serve(", "\nfn ");
         before(&n, "tp_lane_width_refusal(args, node_world as u32)?", "tp_attach(ctx)", "run_tp_node_serve");
         let b = body(serve, "fn build_serve(", "\nfn ");
-        before(&b, "let (width, raw_width) = resolved_max_batch(args);", "tp_lane_width_fits(tp_world, width)", "build_serve (the 16-lane cap, then the backstop)");
+        before(&b, "let (mut width, raw_width) = resolved_max_batch(args);", "tp_lane_width_fits(tp_world, width)", "build_serve (the 16-lane cap, then the backstop)");
         before(&b, "tp_lane_width_fits(tp_world, width)", "FwdModel::load", "build_serve (the backstop, before the load)");
+    }
+
+    /// MAXBATCH1: the boot-anyway memory clamp is pinned in the source — it runs in `build_serve`
+    /// BEFORE the tune table is selected (the table is keyed by the lane count that will serve),
+    /// it reassigns `width` to the clamped count, and the CF-P1d exit(2) refusal survives ONLY
+    /// for the nothing-fits arm. The over-cap arrival hooks ride every rx arrival site.
+    #[test]
+    fn the_memory_fit_clamps_lanes_before_the_tune_table_and_keeps_the_nothing_fits_refusal() {
+        let src = include_str!("exl3_serve.rs");
+        let code = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let body = |src: &str, from: &str, to: &str| -> String {
+            let a = src.find(from).unwrap_or_else(|| panic!("{from} not found"));
+            let b = src[a + from.len()..].find(to).unwrap_or_else(|| panic!("{to} not found after {from}")) + a + from.len();
+            code(&src[a..b])
+        };
+        let b = body(src, "fn build_serve(", "\nfn ");
+        let clamp = b.find("fit_max_lanes(parts, width, avail, mode, max_pos)").expect("the clamp call in build_serve");
+        let tune = b.find("tune::boot(&tune::BootReq").expect("the tune table boot");
+        assert!(clamp < tune, "the clamp runs before the tune table is picked (the table is keyed by the serving lane count)");
+        let reassign = b.find("width = n;").expect("the clamped lane count is assigned to width");
+        assert!(reassign > clamp, "the reassignment follows the clamp");
+        assert!(b[clamp..].contains("std::process::exit(2)"), "the nothing-fits refusal survives (CF-P1d's teeth)");
+        // The queue path F2 boots counts its over-cap arrivals: the three rx arrival sites in the
+        // scheduler (top of loop, the reserve branch, the Plan::Wait arm) all carry the hook.
+        assert!(src.matches("crate::metrics::over_cap_queued()").count() >= 3,
+                "expected >= 3 over_cap_queued hooks, found {}", src.matches("crate::metrics::over_cap_queued()").count());
     }
 }
 
@@ -8095,5 +9241,129 @@ mod lane_pack_penalty_warning_tests {
         let code = &src[..src.find("mod lane_pack_penalty_warning_tests").unwrap()];
         let at = code.find("if let Some(w) = lane_pack_penalty_warning(").expect("the call");
         assert!(code[..at].trim_end().ends_with("if lane_pack.on() {"), "the warning is only for a boot with the arm on");
+    }
+}
+
+// ---- S-C4PRIMEA: --exl3-prime-batch (default on; "0"/"off" disables) — batch the shared
+// step's per-lane mtp_plain_prime head-row writes into ONE gather + ONE re-prime pass.
+// --exl3-prime-batch-xcheck (default on): the FIRST batched call per boot bit-compares the
+// legacy per-lane head-KV rows against the batched ones on the real path (one-time cost).
+fn prime_batch_on() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        !matches!(crate::opts::var(crate::opt!("exl3-prime-batch")).as_deref(), Ok("0") | Ok("off"))
+    })
+}
+fn prime_batch_xcheck_take() -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if matches!(crate::opts::var(crate::opt!("exl3-prime-batch-xcheck")).as_deref(), Ok("0") | Ok("off")) {
+        return false;
+    }
+    !DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+fn prime_batch_boot_log(lanes: usize) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::deprintln!("PRIME-BATCH armed: shared-step head-row primes batched ({lanes} lanes this step; \
+xq_gather_tap_rows + ONE re-prime pass + xq_attn_kv_prefill_pairs; --exl3-prime-batch off disables)");
+    }
+}
+
+// ---- ISSUES[94] DF2 gate tests: the reason table is host-pure (df2_gate_reason touches no
+// GPU and no filesystem), so the flag-parse fallback outcomes are pinned here exactly as the
+// boot line prints them. A non-existent dir is NOT a gate reason: it engages and fails at the
+// LOAD (reason `load failed: <e>`), which needs the GPU and cannot be tested on the host.
+#[cfg(test)]
+mod df2_gate_tests {
+    use super::*;
+    use crate::batch::SpecSource;
+
+    const DIR: Option<&str> = Some("/a/df2/artifact/dir");
+
+    #[test]
+    fn df2_gate_engages_every_dflash2_source_on_the_27b_pack_shape() {
+        for src in [SpecSource::DFlash2, SpecSource::DFlash2Rq, SpecSource::DFlash2Auto,
+                    SpecSource::DFlash2Tree] {
+            assert_eq!(df2_gate_reason(src, DIR, 5120, 248_320, 62, 262_144, 1), None,
+                       "{src:?} + dir + dims + ctx within the pin must ENGAGE");
+        }
+    }
+
+    #[test]
+    fn df2_gate_source_wins_over_everything() {
+        // a non-DF2 source never engages, even with a dir, the right dims and a sane ctx
+        for src in [SpecSource::Mtp, SpecSource::Dspark, SpecSource::Plain] {
+            assert_eq!(df2_gate_reason(src, DIR, 5120, 248_320, 62, 262_144, 1).as_deref(),
+                       Some("source"), "{src:?}");
+        }
+        // the flag's own parse: unknown values die with the trunk's exact error text; the
+        // default (no flag) is dflash2-auto, so a plain boot is a DF2-class boot that falls
+        // back on the missing artifact, not on `source`.
+        let mut args: Vec<String> = vec!["gb10_inference".into(), "--model-dir".into(), "/m".into()];
+        assert!(matches!(resolve_spec_source_exl3(&args), SpecSource::DFlash2Auto));
+        args.push("--spec-source".into()); args.push("dflash2-tree".into());
+        assert!(matches!(resolve_spec_source_exl3(&args), SpecSource::DFlash2Tree));
+        args.push("--spec-source=wharrgarbl".into());
+        // (the error path eprintln!s and exits(1): not exercised here — it is the same text
+        // main.rs prints, pinned by that file's own tests.)
+    }
+
+    #[test]
+    fn df2_gate_missing_dir_is_the_default_boot_reason() {
+        // dflash2-auto default + no --draft-dir: the old silent-ignore case, now a reason
+        assert_eq!(df2_gate_reason(SpecSource::DFlash2Auto, None, 5120, 248_320, 62, 262_144, 1).as_deref(),
+                   Some("no --draft-dir"));
+        // every DF2-class source without a dir says the same thing
+        for src in [SpecSource::DFlash2, SpecSource::DFlash2Rq, SpecSource::DFlash2Tree] {
+            assert_eq!(df2_gate_reason(src, None, 5120, 248_320, 62, 262_144, 1).as_deref(),
+                       Some("no --draft-dir"));
+        }
+    }
+
+    #[test]
+    fn df2_gate_dims_reason_reports_got_and_want() {
+        assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 3072, 248_320, 62, 262_144, 1).as_deref(),
+                   Some("dims hidden=3072x5120 vocab=248320 layers=62"));
+        assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 5120, 151_936, 62, 262_144, 1).as_deref(),
+                   Some("dims hidden=5120x5120 vocab=151936 layers=62"));
+        // layers must be MORE than 61: the Flash-Next backbone
+        assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 5120, 248_320, 61, 262_144, 1).as_deref(),
+                   Some("dims hidden=5120x5120 vocab=248320 layers=61"));
+    }
+
+    #[test]
+    fn df2_gate_ctx_and_tp_reasons() {
+        // one past the artifact's safe ceiling
+        assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 5120, 248_320, 62, 262_145, 1).as_deref(),
+                   Some("ctx 262145>262144"));
+        // EXL27D item 2: the tp reason is RETIRED — a TP boot ENGAGES like TP=1 (the
+        // TP-DF2 leg ships the artifact + argv; both ranks run the identical scheduler)
+        assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 5120, 248_320, 62, 262_144, 2), None,
+                   "tp=2 must ENGAGE now (the single-process contract is retired)");
+    }
+
+    #[test]
+    fn df2_boot_lines_are_verbatim() {
+        assert_eq!(df2_boot_line_engaged("/d", 8, false, 1),
+                   "[exl3-serve] df2: ENGAGED draft=/d block=8 round-shard=off (DFlash2 chain on EXL3, TP=1; chain verify k<=7 = the pack MTP wide-verify width)");
+        assert_eq!(df2_boot_line_engaged("/d2", 16, true, 2),
+                   "[exl3-serve] df2: ENGAGED draft=/d2 block=16 round-shard=on (DFlash2 chain on EXL3, TP=2; chain verify k<=7 = the pack MTP wide-verify width)");
+        assert_eq!(df2_boot_line_fallback("source"),
+                   "[exl3-serve] df2: FALLBACK to pack MTP (source)");
+        assert_eq!(df2_boot_line_fallback("no --draft-dir"),
+                   "[exl3-serve] df2: FALLBACK to pack MTP (no --draft-dir)");
+        assert_eq!(df2_boot_line_fallback("load failed: no such file"),
+                   "[exl3-serve] df2: FALLBACK to pack MTP (load failed: no such file)");
+    }
+
+    #[test]
+    fn df2_metrics_render_carries_the_exact_series_names() {
+        let mut o = String::new();
+        df2_metrics_append(&mut o);
+        for series in ["exl3_df2_engaged ", "exl3_df2_rounds_total ",
+                       "exl3_df2_tokens_accepted_total ", "exl3_df2_fallback_mtp_total ",
+                       "exl3_df2_dds_bypass_total "] {
+            assert!(o.contains(series), "missing series `{series}` in:\n{o}");
+        }
     }
 }

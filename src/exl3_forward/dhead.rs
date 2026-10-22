@@ -286,22 +286,22 @@ impl DHead {
         let xc_conf = dev.htod_sync_copy(&[0f32])?;
         dev.synchronize()?;
         let p = if dheadp_off() {
-            println!("DHEADP: off (--dheadp-off=1) — penalized drafts keep the old draft head");
+            crate::dprintln!("DHEADP: off (--dheadp-off=1) — penalized drafts keep the old draft head");
             None
         } else {
             match DHeadP::build(dev, nblk, s) {
                 Ok(p) => Some(p),
-                Err(e) => { println!("DHEADP: NOT built ({e:#}) — penalized drafts keep the old draft head"); None }
+                Err(e) => { crate::dprintln!("DHEADP: NOT built ({e:#}) — penalized drafts keep the old draft head"); None }
             }
         };
         let rq = tune::get_cur(&T_SPEC_RATIO_DHEAD) != 0; // A5-L4 (N, Load)
         let xc_list = dev.htod_sync_copy(&vec![0u32; (MTP_MAX_K + 1) * crate::wp24::RQ_ROW])?;
         if rq {
-            println!("DHEAD-RQ: spec.ratio_dhead=1 — unpenalized real-q (ratio) draft passes run DHEAD + xq_rq_draft_dh \
+            crate::dprintln!("DHEAD-RQ: spec.ratio_dhead=1 — unpenalized real-q (ratio) draft passes run DHEAD + xq_rq_draft_dh \
                       (q' over the exactly rescored candidate blocks; distribution-exact, seeded sampled bytes change \
                       vs the full-slice q'; penalized real-q passes keep the full-slice head)");
         }
-        println!("DHEAD: draft head = {bits}-bit screen ({:.1} MB/pass vs {:.1} MB EXL3 slice) + exact rescore \
+        crate::dprintln!("DHEAD: draft head = {bits}-bit screen ({:.1} MB/pass vs {:.1} MB EXL3 slice) + exact rescore \
                   of <= {tmax} candidate blocks (margin {delta} sigma, K-splits {s}); +{:.1} MB device, built in {:.0} ms \
                   (--dhead-off=1 = old head)",
                  (nwords * 4) as f64 / 1e6, (q.tr.len() * 2) as f64 / 1e6,
@@ -372,7 +372,7 @@ impl DHeadP {
         // REAL zeros (AGENTS §2.2): the split / done counters re-arm themselves from here on
         let pws = dev.htod_sync_copy(&vec![0u32; total])?;
         dev.synchronize()?;
-        println!("DHEADP: penalized drafts (monotone params) = DHEAD screen + exact penalized rescore of C1, then every \
+        crate::dprintln!("DHEADP: penalized drafts (monotone params) = DHEAD screen + exact penalized rescore of C1, then every \
                   block with screen bound >= the best penalized C1 logit (cap {cap}, above it all blocks); pass-B grid \
                   {s} x {g}; +{:.1} MB device (--dheadp-off=1 = old head)", (total * 4) as f64 / 1e6);
         Ok(DHeadP { pws, cap, g, seen: AtomicBool::new(false), stat0: std::sync::Mutex::new([0; 8]) })
@@ -574,11 +574,11 @@ impl FwdModel {
         st.hard += (outside > 0 || (sum_n - 1.0).abs() > 1e-3) as u64;
         if (outside > 0 || (sum_n - 1.0).abs() > 1e-3 || (exact && new_id != full_id)) && st.printed < 32 {
             st.printed += 1;
-            println!("RQDH_XCHECK pass {i}: HARD served draft {new_id} full {full_id} exact {exact} outside-ids {outside} \
+            crate::dprintln!("RQDH_XCHECK pass {i}: HARD served draft {new_id} full {full_id} exact {exact} outside-ids {outside} \
                       sum q' {sum_n:.6} | served {:?} | full {:?}", &kn[..kn.len().min(6)], &kf[..kf.len().min(6)]);
         }
         if st.passes % 256 == 0 {
-            println!("RQDH_XCHECK running: {}", st.line());
+            crate::dprintln!("RQDH_XCHECK running: {}", st.line());
         }
         Ok(())
     }
@@ -709,13 +709,13 @@ impl FwdModel {
         st.bound_bad += (!bound_ok) as u64;
         if (!agree || ((in_c1 || in_c2) && !conf_eq) || !bound_ok) && st.printed < 32 {
             st.printed += 1;
-            println!("DHEADP_XCHECK pass {i}: new id {new_id} conf {new_conf} | old id {old_id} conf {old_conf} | old block {ob} \
+            crate::dprintln!("DHEADP_XCHECK pass {i}: new id {new_id} conf {new_conf} | old id {old_id} conf {old_conf} | old block {ob} \
                       in C1 {in_c1} in C2 {in_c2} | L {lval} C1 {ns} C2 {n2} qualifying {nqual} flags {fl:#x} \
                       bound-mirror {} C2 {:?}", if bound_ok { "ok" } else { "MISMATCH" },
                      &c2[..c2.len().min(8)]);
         }
         if st.passes % 256 == 0 {
-            println!("DHEADP_XCHECK running: {}", st.line());
+            crate::dprintln!("DHEADP_XCHECK running: {}", st.line());
         }
         Ok(())
     }
@@ -768,12 +768,12 @@ impl FwdModel {
         st.rank_hist[bucket] += 1;
         if (!agree || (captured && !conf_eq)) && st.printed < 32 {
             st.printed += 1;
-            println!("DHEAD_XCHECK pass {i}: new id {new_id} conf {new_conf} | old id {old_id} conf {old_conf} | \
+            crate::dprintln!("DHEAD_XCHECK pass {i}: new id {new_id} conf {new_conf} | old id {old_id} conf {old_conf} | \
                       old block {ob} captured {captured} screen-rank {rank} candidates {ns} qualified {nq} {:?}",
                      &cands[..ns.min(8)]);
         }
         if st.passes % 256 == 0 {
-            println!("DHEAD_XCHECK running: {}", st.line());
+            crate::dprintln!("DHEAD_XCHECK running: {}", st.line());
         }
         Ok(())
     }
@@ -794,7 +794,7 @@ impl FwdModel {
                         let d: Vec<u32> = (0..8).map(|j| now[j].wrapping_sub(s0[j])).collect();
                         *s0 = now;
                         if d[0] > 0 {
-                            crate::rprintln!("DHEADP request: penalized draft passes {} | expanded {} (+{:.2} blocks/expansion) | \
+                            crate::drprintln!("DHEADP request: penalized draft passes {} | expanded {} (+{:.2} blocks/expansion) | \
                                       FALLBACKS {} (all-block rescore: over-cap {}, non-monotone {}, degenerate {}; {} blocks) | \
                                       unpenalized-row passes {}",
                                      d[0], d[1], d[2] as f64 / d[1].max(1) as f64, d[3] + d[4] + d[5], d[3], d[4], d[5],
@@ -807,13 +807,13 @@ impl FwdModel {
         }
         if !dhead_xcheck() { return; }
         if let Some(st) = XSTATS.lock().unwrap().take() {
-            if st.passes > 0 { crate::rprintln!("DHEAD_XCHECK request: {}", st.line()); }
+            if st.passes > 0 { crate::drprintln!("DHEAD_XCHECK request: {}", st.line()); }
         }
         if let Some(st) = PSTATS.lock().unwrap().take() {
-            if st.passes > 0 { crate::rprintln!("DHEADP_XCHECK request: {}", st.line()); }
+            if st.passes > 0 { crate::drprintln!("DHEADP_XCHECK request: {}", st.line()); }
         }
         if let Some(st) = RQSTATS.lock().unwrap().take() {
-            if st.passes > 0 { crate::rprintln!("RQDH_XCHECK request: {}", st.line()); }
+            if st.passes > 0 { crate::drprintln!("RQDH_XCHECK request: {}", st.line()); }
         }
     }
 }
@@ -1093,7 +1093,7 @@ mod tests {
             if c1_best.0 != reference.0 { needed += 1; }
             if fl & DHP_F_FB != 0 { fallbacks += 1; } else if !c2.is_empty() { expanded += 1; }
         }
-        println!("dheadp bound test: {trials} trials, expansion needed (C1 alone wrong) {needed}, \
+        crate::dprintln!("dheadp bound test: {trials} trials, expansion needed (C1 alone wrong) {needed}, \
                   expanded {expanded}, fallbacks {fallbacks}");
         assert!(needed > 0 && expanded > 0, "the synthetic heads never exercised the expansion");
     }

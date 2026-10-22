@@ -412,7 +412,7 @@ impl DflashDrafter {
         unsafe { blas.set_stream(Some(&stream))?; }
 
         // Load the batch kernels this module uses (gpu_batch.ptx, verified against this binary).
-        let bptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
+        let bptx = Ptx::from_src(crate::ptx_embed::GPU_BATCH);
         let bfnames = ["write_kv_prefill", "write_kv_b", "add_residual_b", "silu_mul_b",
             "embed_gather_b", "gemm_binv_b", "gemm_binv_f32_b", "kernel_build_id"];
         dev.load_ptx(bptx, "gpu_batch", &bfnames)?;
@@ -423,7 +423,7 @@ impl DflashDrafter {
                 .with_context(|| format!("gpu_batch.{n} not in ptx"))?);
         }
         // The DFlash-specific kernels (src/ptx/gpu_dflash.ptx): reference-exact bf16 rounding.
-        let dptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_dflash.ptx")?);
+        let dptx = Ptx::from_src(crate::ptx_embed::GPU_DFLASH);
         // `load_ptx` needs 'static names, and a name that is missing from the PTX is a LOUD load
         // failure (never a silent fallback). The tiled list MUST match the
         // `DFLASH_TILED_KERNEL(...)` instantiations in kernels/gpu_dflash.cu; the gate in
