@@ -67,7 +67,7 @@ Expected output:
 
 ```
 [node-resident] supervisor up on port 29500 — one process per head session; kill this process to stop the node
-[node] gx10-1dcd ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
+[node] spark-node ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
 ```
 
 At this point the node is waiting for the head to launch.
@@ -157,7 +157,7 @@ During the head bring-up you should see lines like:
 
 ```
 [tp] config installed: world=2 shard_mixers=true shard_mtp=true graph=false ... mxfp4=true ...
-[head] gx10-c9c4 — building manifest for ~/models/hy3-nvfp4 (world 2) ...
+[head] spark-head — building manifest for ~/models/hy3-nvfp4 (world 2) ...
 [head] manifest 'hy3-nvfp4': 19 artifacts, 169.59 GB
 [head] node-b (rank 1) READY — model at ~/.cache/gb10_tp/models/hy3-nvfp4 (0.00 GB in 0.0s = 0.00 GB/s)
 [head] shipped config to node-b (rank 1/2)

@@ -83,8 +83,9 @@ and the like) overrides the config key: the remap is then absent, which is cosme
 Prebuilt binaries ship as **Release assets** (the GitHub-native way — git history stays
 source-only). Per release, three files:
 
-- `velogb10-vX.Y.Z-gb10-sm121.tar.gz` — `gb10_inference` + `src/ptx/{gpu_batch,gpu_kernels}.ptx`
-  (required at runtime) + `run_tp_{node,server}.sh`
+- `velogb10-vX.Y.Z-gb10-sm121.tar.gz` — `gb10_inference` + `run_tp_{node,server}.sh`.
+  Kernels are EMBEDDED in the binary (EMB1): nothing at runtime reads PTX from disk
+  (strace-verified 2026-10-26: 420 opens on a boot from a binary-only dir, 0 .ptx).
 - `SHA256SUMS.txt` — checksum of the tarball (`sha256sum -c` to verify)
 - `PROVENANCE.txt` — build date/toolchain, source stable-build sha, gate status, contents
 
@@ -92,9 +93,7 @@ Cut from the deployed stable build:
 
 ```bash
 REL=velogb10-releases/vX.Y.Z
-mkdir -p "$REL/velogb10/src/ptx"
 cp /path/to/stable_build/gb10_inference "$REL/velogb10/"
-cp /path/to/stable_build/src/ptx/{gpu_batch,gpu_kernels}.ptx "$REL/velogb10/src/ptx/"
 cp scripts/run_tp_{node,server}.sh "$REL/velogb10/"
 (cd "$REL" && tar czf velogb10-vX.Y.Z-gb10-sm121.tar.gz velogb10 \
    && sha256sum velogb10-vX.Y.Z-gb10-sm121.tar.gz > SHA256SUMS.txt)
@@ -110,9 +109,3 @@ artifact attestations once Actions are in use.
 Pushes use a repo-scoped SSH **deploy key** (write access), not a personal account. The key on the
 release machine lives at `~/.ssh/velogb10_deploy` with the `github-velogb10` host alias in
 `~/.ssh/config`; the remote is `git@github-velogb10:<owner>/veloGB10.git`.
-
-## Public-side scrub additions (v0.7.5)
-
-- `src/opts.rs`: the inline-assert example path `/home/x/--weird-path` → `/models/x/--weird-path`.
-- `src/naive/drafter_cpu.rs`: `concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/naive/drafter")`
-  → `"tests/fixtures/naive/drafter"` (runtime-relative; the fixture itself does not ship).
