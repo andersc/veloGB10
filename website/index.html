@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>veloGB10 — GB10-optimized LLM inference engine</title>
+<meta name="description" content="veloGB10 is a from-scratch Rust + CUDA inference engine for NVIDIA GB10 systems (DGX Spark and compatible): NVFP4 tensor-core serving, bitwise-lossless MTP speculation, and TP=2/TP=4 as a speed mode.">
+<link rel="canonical" href="https://veloengine.ai/">
+<meta property="og:site_name" content="veloGB10 by veloEngine">
+<meta property="og:type" content="website">
+<meta property="og:title" content="veloGB10 — GB10-optimized LLM inference engine">
+<meta property="og:description" content="A from-scratch Rust + CUDA inference engine for NVIDIA GB10 systems: NVFP4 tensor-core serving, bitwise-lossless MTP speculation, and TP=2/TP=4 as a speed mode.">
+<meta property="og:url" content="https://veloengine.ai/">
+<meta property="og:image" content="https://veloengine.ai/assets/img/velogb10/tp4_min_max.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="assets/css/site.css">
+<link rel="icon" type="image/svg+xml" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 4l9 16 9-16" fill="none" stroke="%235b8cff" stroke-width="2.6" stroke-linecap="round"/><path d="M8.5 4l3.5 6.2L15.5 4" fill="none" stroke="%238392ff" stroke-width="2.2" stroke-linecap="round"/></svg>'>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container">
+    <a class="brand" href="index.html">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M3 4l9 16 9-16" stroke="#5b8cff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M8.5 4l3.5 6.2L15.5 4" stroke="#8392ff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      veloGB10 <span class="sub">by veloEngine</span>
+    </a>
+    <div class="nav-links">
+      <a href="index.html" class="active">Overview</a>
+      <a href="#engineering">Engineering</a>
+      <a href="#traces">Throughput</a>
+      <a href="docs/index.html">Docs</a>
+      <a href="https://velobenchmark.com" rel="noopener">VeloBenchmark</a>
+      <a class="nav-cta" href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" style="padding-bottom:40px">
+  <div class="container">
+    <span class="eyebrow">Apache-2.0 · Rust + CUDA · NVIDIA GB10</span>
+    <div class="hero-grid" style="gap:44px">
+      <div>
+        <h1>veloGB10</h1>
+        <p class="lede">A from-scratch Rust + CUDA inference engine for one to four GB10
+          machines — NVIDIA DGX Spark and compatible OEM systems. Built for a hand-selected
+          set of large models (Qwen3.5/3.6/3.8 family, Tencent Hy3, KAT-Coder), each ported,
+          measured and gated on real hardware before it ships. No Python runtime, no
+          framework serving stack: one binary plus its PTX kernels.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="docs/index.html">Documentation</a>
+          <a class="btn btn-ghost" href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">Repository</a>
+          <a class="btn btn-ghost" href="https://velobenchmark.com" rel="noopener">Benchmark it with VeloBenchmark</a>
+        </div>
+        <div class="chips">
+          <span class="chip"><b>sm_121</b> Grace Blackwell</span>
+          <span class="chip"><b>128 GB</b> unified LPDDR5x</span>
+          <span class="chip"><b>~255 GB/s</b> measured bandwidth</span>
+          <span class="chip"><b>TP=2 / TP=4</b> speed mode</span>
+        </div>
+      </div>
+      <div>
+        <table style="width:100%;border-collapse:collapse;font-size:.9rem">
+          <thead>
+            <tr><th style="text-align:left;font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--faint);padding:8px 10px;border-bottom:1px solid var(--line-2)">QWEN3.8 27B NVFP4 + DFLASH 2</th>
+                <th style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--faint);padding:8px 10px;border-bottom:1px solid var(--line-2)">avg</th>
+                <th style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--faint);padding:8px 10px;border-bottom:1px solid var(--line-2)">peak</th>
+                <th style="text-align:right;font-family:var(--mono);font-size:11px;color:var(--faint);padding:8px 10px;border-bottom:1px solid var(--line-2)">sustained</th></tr>
+          </thead>
+          <tbody style="font-family:var(--mono)">
+            <tr><td style="padding:9px 10px;border-bottom:1px solid var(--line)">Single node</td><td style="text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)">&gt;40 tok/s</td><td style="text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)">~100</td><td style="text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)">~70</td></tr>
+            <tr><td style="padding:9px 10px;border-bottom:1px solid var(--line)">TP=2</td><td style="text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)">~56 tok/s</td><td style="text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)">~105</td><td style="text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)">~85</td></tr>
+            <tr><td style="padding:9px 10px">TP=4</td><td style="text-align:right;padding:9px 10px">~85 tok/s</td><td style="text-align:right;padding:9px 10px">~150</td><td style="text-align:right;padding:9px 10px">~125</td></tr>
+          </tbody>
+        </table>
+        <div class="frame-cap">Single-stream decode, greedy. Averages span content types; peaks and sustained rates are reached on code generation.</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="section" id="engineering">
+  <div class="container">
+    <div class="section-head">
+      <span class="eyebrow">Engineering</span>
+      <h2>Subordinate to the memory bandwidth</h2>
+      <p>The DGX Spark has one scarce resource: ~255 GB/s of sustainable memory bandwidth.
+         Every design decision in veloGB10 is about spending it well — fewer bytes, not
+         fewer kernel launches.</p>
+    </div>
+    <div class="grid-3">
+      <div class="card">
+        <h3>Engineered to the roofline</h3>
+        <p>~94% GEMM- and weight-bandwidth-bound, tuned as such: on 9B the LM head sustains
+           229 GB/s — 90% of the machine's measured pure-read ceiling. NVFP4 tensor-core
+           GEMMs, fused projections, frequency-ranked draft vocabularies.</p>
+      </div>
+      <div class="card">
+        <h3>Bitwise-lossless speculation</h3>
+        <p>The serving GEMM runs one fixed shape, so decode and verify execute identical
+           instruction sequences and greedy MTP speculation is exactly lossless — same
+           tokens, same bytes. Gated under statistical process control, not pass/fail
+           coin flips.</p>
+      </div>
+      <div class="card">
+        <h3>TP as a speed mode</h3>
+        <p>Two or four GB10 boxes decode a single request measurably <em>faster</em>, not
+           just bigger. Zero-config nodes (the head ships weights, settings and
+           calibration at sync) and a per-step agreement guard that aborts loudly on any
+           divergence.</p>
+      </div>
+      <div class="card">
+        <h3>Hybrid-native long context</h3>
+        <p>GatedDeltaNet layers carry a fixed-size recurrent state, so KV grows only on
+           periodic full-attention layers. Native GDN checkpoints make prefix caching
+           (~99% prefill skip on hits) and lossless rollback work on the hybrid
+           architecture. Up to 256K context on the 27B.</p>
+      </div>
+      <div class="card">
+        <h3>OpenAI-compatible server</h3>
+        <p>Streaming, tool calling with schema-aware argument coercion, seedable sampling,
+           continuous batching, prefix caching, reasoning-effort levels, vision on a GPU
+           tower — plus <code>/v1/tokenize</code> endpoints for exact benchmark prompt
+           construction.</p>
+      </div>
+      <div class="card">
+        <h3>Live telemetry out</h3>
+        <p>The engine's <code>--otel-*</code> flags stream per-token generation telemetry
+           (OTLP/HTTP-JSON) straight into <a href="https://velobenchmark.com" rel="noopener">VeloBenchmark</a>'s
+           receiver — the same live instruments you see on chat, fed by the engine
+           itself. Drops rather than blocks; absent flag means zero cost.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="traces">
+  <div class="container">
+    <div class="section-head">
+      <span class="eyebrow">Live traces</span>
+      <h2>Throughput, straight from the engine</h2>
+      <p>Tokens-per-second traces pulled from the engine's live stats panel while serving
+         Qwen3.8-27B NVFP4 + DFlash 2 — the full spread of a session (where throughput
+         bottoms out and where it tops out), per deployment mode.</p>
+    </div>
+    <div class="grid-3">
+      <figure style="margin:0">
+        <img src="assets/img/velogb10/single_min_max.png" alt="Single-node throughput trace" style="width:100%;border:1px solid var(--line-2);border-radius:8px">
+        <figcaption class="img-cap">single node · mixed ~26 tok/s, code-heavy ~70</figcaption>
+      </figure>
+      <figure style="margin:0">
+        <img src="assets/img/velogb10/tp2_min_max.png" alt="TP=2 throughput trace" style="width:100%;border:1px solid var(--line-2);border-radius:8px">
+        <figcaption class="img-cap">TP=2 · mixed ~38, sustained ~85</figcaption>
+      </figure>
+      <figure style="margin:0">
+        <img src="assets/img/velogb10/tp4_min_max.png" alt="TP=4 throughput trace" style="width:100%;border:1px solid var(--line-2);border-radius:8px">
+        <figcaption class="img-cap">TP=4 · mixed ~51, sustained ~125</figcaption>
+      </figure>
+    </div>
+    <p style="margin-top:18px;color:var(--muted)">Every trace, the SGLang comparisons and the
+      8-hour endurance soak are in the <a href="docs/index.html">documentation</a>.</p>
+  </div>
+</section>
+
+<section class="section" id="models">
+  <div class="container grid-2">
+    <div>
+      <span class="eyebrow">Supported models</span>
+      <h2>One binary, a deliberate list</h2>
+      <p style="color:var(--muted)">Model families are added deliberately rather than
+        generically: each is ported, measured and gated on GB10 hardware before it ships.
+        The model is a directory, not a build.</p>
+      <table>
+        <thead><tr><th>Model</th><th>Architecture / recipe</th></tr></thead>
+        <tbody>
+          <tr><td>Qwen3.5 0.8B–9B</td><td>dense hybrid, NVFP4 mixed/full</td></tr>
+          <tr><td>Qwen3.6 27B</td><td>dense hybrid, NVFP4 full</td></tr>
+          <tr><td>Qwen3.6 35B-A3B</td><td>MoE hybrid, NVFP4 full</td></tr>
+          <tr><td>Qwen3.5 122B-A10B</td><td>MoE hybrid, NVFP4 mixed / GDN4</td></tr>
+          <tr><td>Qwen3.8 27B</td><td>dense hybrid, NVFP4 + DFlash 2, 256K</td></tr>
+          <tr><td>Tencent Hy3 295B-A21B</td><td>pure-GQA MoE, NVFP4</td></tr>
+          <tr><td>KAT-Coder-V2.5-Dev</td><td>35B-A3B MoE hybrid, code specialist</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="setup">
+      <span class="eyebrow">Getting it running</span>
+      <h2>Release binary or source</h2>
+      <p style="color:var(--muted)">Prebuilt packages on the releases page include the
+        inference binary, the required PTX kernels, SHA-256 checksums and build provenance
+        notes — no compiling required on a DGX Spark. From source it is
+        <code>cargo build --release</code> with the CUDA toolkit present.</p>
+      <pre><code># single node, single user (maximum speed)
+./gb10_inference --server --model-dir=/path/to/model \
+  --port=9000 --max-seq-len=32768 --max-batch=1 \
+  --prefix-cache=on --mtp=auto
+
+# two nodes, TP=2 (peer first: zero configuration)
+./gb10_inference --node --port 29500            # second GB10
+./gb10_inference --server --model-dir=... --tp \
+  --nodes &lt;peer-ip&gt;:29500 --port=9000           # head</code></pre>
+      <p style="margin-top:18px"><a href="docs/setup-qwen27b.html">Full setup guide: single node, TP=2, TP=4 →</a></p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="foot-grid">
+      <div>
+        <a class="brand" href="index.html" style="margin-bottom:14px">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M3 4l9 16 9-16" stroke="#5b8cff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M8.5 4l3.5 6.2L15.5 4" stroke="#8392ff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          veloGB10 <span class="sub">by veloEngine</span>
+        </a>
+        <p>A from-scratch Rust + CUDA inference engine for NVIDIA GB10 systems —
+           DGX Spark and compatible OEM boxes. Built in the open, measured on real
+           hardware.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <a href="#engineering">Engineering</a>
+        <a href="#traces">Throughput traces</a>
+        <a href="#models">Supported models</a>
+        <a href="#setup">Getting it running</a>
+      </div>
+      <div>
+        <h4>Documentation</h4>
+        <a href="docs/index.html">Docs home</a>
+        <a href="docs/setup-qwen27b.html">Qwen3.8-27B setup</a>
+        <a href="docs/endurance.html">Endurance report</a>
+        <a href="docs/changelog.html">Changelog</a>
+      </div>
+      <div>
+        <h4>Source</h4>
+        <a href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">veloGB10 (Apache-2.0)</a>
+        <a href="https://velobenchmark.com" rel="noopener">VeloBenchmark (AGPL-3.0)</a>
+        <a href="mailto:stav@scalarflow.co.uk">stav@scalarflow.co.uk</a>
+      </div>
+    </div>
+    <div class="foot-base">
+      <span>© 2026 Stav Katsoulis</span>
+      <span>veloGB10 Apache-2.0 · veloengine.ai</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

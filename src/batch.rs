@@ -524,6 +524,21 @@ pub const PREFILL_CHUNK: usize = 8192;
 pub const RING_CKPT_STRIDE: usize = 512;
 pub const RING_CKPT_K: usize = 16;
 
+/// PREHARD1 [ISSUES 104]: the serve-path lane cap the trunk (NVFP4, non-EXL3) scheduler shares
+/// with the EXL3 server (MAXBATCH1's `EXL3_MAX_LANES`). One authority: `EXL3_MAX_LANES` is this
+/// constant. At most this many lanes serve at once; a larger `--max-batch` BOOTS ANYWAY at the cap
+/// with one clear line, and further requests wait in the queue (owner ruling 2026-10-10 §1b-bis#8:
+/// apply and show, never refuse).
+pub const SERVE_MAX_LANES: usize = 16;
+
+/// PREHARD1 [ISSUES 104]: how many of `busy + waiting` sit beyond what the lane cap can run at
+/// once (pure; the delta of this between loop samples is the over-cap arrival count — a burst on
+/// an idle box lands exactly like MAXBATCH1's soak counted it: arrivals minus the lanes that
+/// could take them).
+pub(crate) fn over_cap_excess(busy: usize, waiting: usize, cap: usize) -> usize {
+    (busy + waiting).saturating_sub(cap)
+}
+
 const MTP_EVAL_WINDOW: u64 = 128;
 /// First window after activation (and after each re-probe): catch a losing head quickly.
 const MTP_EVAL_FIRST: u64 = 32;
@@ -1689,6 +1704,20 @@ impl BatchScheduler {
         s
     }
 
+    /// PREHARD1 [ISSUES 104]: count over-cap arrivals since the last sample. The trunk scheduler
+    /// has no VecDeque queue — requests beyond the cap wait IN the channel (plus the TP head's
+    /// `pending`) — so the observable is the backlog: every request present above `max_batch`
+    /// (busy lanes + in-flight cursor + waiting) is an over-cap arrival; count the NEW ones (the
+    /// delta since the last sample). Called once per loop iteration from both serve loops
+    /// (`run`, `run_tp_head`); the series is the same
+    /// `velogb10_over_cap_arrivals_total{disposition="queued"}` the EXL3 server counts.
+    fn count_over_cap_arrivals(busy: usize, waiting: usize, cap: usize, last_excess: &mut usize) {
+        let excess = over_cap_excess(busy, waiting, cap);
+        let d = excess.saturating_sub(*last_excess);
+        if d > 0 { crate::metrics::over_cap_queued_n(d as u64); }
+        *last_excess = excess;
+    }
+
     /// Run the scheduler loop until the request channel closes and no lanes remain.
     ///
     /// PLAN/SCHEDULER_2LANE_WORKDOC.md §3.1/§3.3 — the two-lane (cursor) loop. Shape per iteration:
@@ -1705,6 +1734,7 @@ impl BatchScheduler {
     /// most one window (12.6 s), and the window formula itself is unchanged (§3.2).
     pub async fn run(mut self) {
         self.tp_drill_notice();   // S-B9-CF-AGREE16B (W3): a lockstep drill flag at TP=1 is INERT, said once
+        let mut oc_last: usize = 0; // PREHARD1 [ISSUES 104]: over-cap arrival accounting state
         loop {
             // F8 diagnosis (temporary, --loop-trace): split the wall around decode_step so the
             // serve-vs-bench per-step gap (261 vs 188 ms) can be attributed.
@@ -1734,6 +1764,9 @@ impl BatchScheduler {
                     None => break,
                 }
             }
+            // PREHARD1 [ISSUES 104]: over-cap arrival accounting (waiting = the channel backlog).
+            Self::count_over_cap_arrivals(self.num_active() + usize::from(self.pf.is_some()),
+                                          self.rx.len(), self.max_batch, &mut oc_last);
             // One window of the in-flight prefill (no-op when nothing is prefilling).
             self.pf_advance();
             let b = self.num_active();
@@ -1884,6 +1917,7 @@ impl BatchScheduler {
         // no tokens and no error. The 2-lane bar caught exactly that: lane 1 was admitted never,
         // and its client saw the body end 1.5 s in.
         let mut pending: Vec<BatchRequest> = Vec::new();
+        let mut oc_last: usize = 0; // PREHARD1 [ISSUES 104]: over-cap arrival accounting state
         loop {
             let mut events: Vec<crate::tp_serve::TpEvent> = Vec::new();
             if !closed {
@@ -1907,6 +1941,10 @@ impl BatchScheduler {
                     }
                 }
             }
+            // PREHARD1 [ISSUES 104]: over-cap arrival accounting (waiting = pending + channel
+            // backlog — the TP head owns both halves of the trunk queue).
+            Self::count_over_cap_arrivals(self.num_active() + usize::from(self.pf.is_some()),
+                                          pending.len() + self.rx.len(), self.max_batch, &mut oc_last);
             // AT MOST ONE admission per step, and its `Admit` event is shipped in THIS step's event
             // list — the mirror admits exactly what the wire says, so the two ranks can never hold a
             // different number of cursors. (Draining several requests and admitting them all, as the
@@ -3093,6 +3131,7 @@ impl BatchScheduler {
                       policy_active, src, df2_live, dflash_live, dspark_live, mtp_live);
         }
         if df2_live {
+            crate::metrics::df2_round();
             let lane = self.lanes[0].as_ref().unwrap();
             // Second line of defence for the shared-ring class (see admission): a lane whose ring
             // frontier is not its own position never enters the round (its asserts would kill the
@@ -5340,12 +5379,12 @@ impl BatchScheduler {
                 let lo = main_pos.saturating_sub(2);
                 let mut rk = Vec::new();
                 let mut rv = Vec::new();
-                for li in 0..crate::dflash2::N_LAYERS {
+                for li in 0..crate::dflash2::n_layers() {
                     if let Ok((k, v)) = df2.dump_ring_rows(li, lo, main_pos + 8) {
                         rk.push(k); rv.push(v);
                     }
                 }
-                if rk.len() == crate::dflash2::N_LAYERS { d.record_ring_rows(self.df2_stat_steps, &rk, &rv); }
+                if rk.len() == crate::dflash2::n_layers() { d.record_ring_rows(self.df2_stat_steps, &rk, &rv); }
             }
         }
 
@@ -5941,12 +5980,12 @@ impl BatchScheduler {
                 let lo = main_pos.saturating_sub(2);
                 let mut rk = Vec::new();
                 let mut rv = Vec::new();
-                for li in 0..crate::dflash2::N_LAYERS {
+                for li in 0..crate::dflash2::n_layers() {
                     if let Ok((k, v)) = df2.dump_ring_rows(li, lo, main_pos + 8) {
                         rk.push(k); rv.push(v);
                     }
                 }
-                if rk.len() == crate::dflash2::N_LAYERS { d.record_ring_rows(self.df2_stat_steps, &rk, &rv); }
+                if rk.len() == crate::dflash2::n_layers() { d.record_ring_rows(self.df2_stat_steps, &rk, &rv); }
             }
         }
 
@@ -6146,12 +6185,12 @@ impl BatchScheduler {
                 let lo = main_pos.saturating_sub(2);
                 let mut rk = Vec::new();
                 let mut rv = Vec::new();
-                for li in 0..crate::dflash2::N_LAYERS {
+                for li in 0..crate::dflash2::n_layers() {
                     if let Ok((k, v)) = df2.dump_ring_rows(li, lo, main_pos + 8) {
                         rk.push(k); rv.push(v);
                     }
                 }
-                if rk.len() == crate::dflash2::N_LAYERS { d.record_ring_rows(self.df2_stat_steps, &rk, &rv); }
+                if rk.len() == crate::dflash2::n_layers() { d.record_ring_rows(self.df2_stat_steps, &rk, &rv); }
             }
         }
 
@@ -6714,5 +6753,55 @@ mod df2_carry {
     #[test]
     fn non_df2_source_never_carries() {
         assert!(!df2_carry_ok(ON, false, 2048, 2440, SLOT_A, Some(SLOT_A), 2240, FULL));
+    }
+}
+
+/// PREHARD1 [ISSUES 104]: the trunk serve cap mirrors MAXBATCH1's EXL3 cap — same constant, same
+/// queue semantics, wired at the trunk parse site and both trunk serve loops.
+#[cfg(test)]
+mod prehard1_serve_cap_tests {
+    #[test]
+    fn serve_max_lanes_is_16_and_matches_the_exl3_cap() {
+        assert_eq!(crate::batch::SERVE_MAX_LANES, 16);
+        assert_eq!(crate::exl3_serve::EXL3_MAX_LANES, crate::batch::SERVE_MAX_LANES,
+            "one authority: the EXL3 and trunk lane caps must not diverge");
+    }
+
+    #[test]
+    fn over_cap_excess_counts_arrivals_like_the_maxbatch1_soak() {
+        use crate::batch::over_cap_excess;
+        assert_eq!(over_cap_excess(16, 0, 16), 0, "at the cap: nothing over");
+        assert_eq!(over_cap_excess(16, 5, 16), 5, "5 waiting beyond 16 busy lanes");
+        assert_eq!(over_cap_excess(0, 12, 5), 7,
+            "a burst on an idle box: arrivals minus the lanes that could take them (MAXBATCH1 soak semantics)");
+        assert_eq!(over_cap_excess(3, 0, 16), 0, "saturating: never negative");
+        assert_eq!(over_cap_excess(0, 0, 16), 0);
+    }
+
+    /// The wiring is pinned in the source, MAXBATCH1-style: the trunk parse caps --max-batch at
+    /// SERVE_MAX_LANES, records the requested width on its gauge, prints the applies-and-shows
+    /// line, the W3 kv_lane_check sees the CLAMPED width, and BOTH trunk serve loops
+    /// (run, run_tp_head) carry the over-cap accounting.
+    #[test]
+    fn trunk_serve_path_applies_and_shows_the_cap() {
+        let main_src = include_str!("main.rs");
+        let cap = main_src.find("let max_batch = max_batch_raw.min(gb10_inference::batch::SERVE_MAX_LANES);")
+            .expect("the trunk parse caps --max-batch at SERVE_MAX_LANES");
+        let req = main_src.find("set_max_batch_requested(max_batch_raw)")
+            .expect("the requested gauge is set on the trunk path");
+        assert!(req > cap, "the gauge line follows the clamp");
+        assert!(main_src.contains("further requests wait in the queue"),
+            "the applies-and-shows boot line");
+        let kv = main_src.find("kv_lane_check(").expect("kv_lane_check call");
+        assert!(kv > cap, "the KV x lane check sees the clamped width");
+        let self_src = include_str!("batch.rs");
+        // Assemble the needle so this test's own literal cannot match itself.
+        let needle = ["count_over_cap_", "arrivals(self.num_", "active()"].concat();
+        assert_eq!(self_src.matches(&needle).count(), 2,
+            "exactly the two trunk serve loops (run + run_tp_head) carry the hook");
+        assert!(self_src.contains("self.rx.len()"),
+            "the TP1 hook samples the channel backlog");
+        assert!(self_src.contains("pending.len() + self.rx.len()"),
+            "the TP hook adds the pending queue");
     }
 }

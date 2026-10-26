@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>veloGB10 documentation — veloengine.ai</title>
+<meta name="description" content="Complete veloGB10 documentation: design and benchmarks, Qwen3.8-27B and Hy3 setup guides, TP cache management, the 8-hour endurance report and the changelog.">
+<link rel="canonical" href="https://veloengine.ai/docs/">
+<meta property="og:site_name" content="veloGB10 by veloEngine">
+<meta property="og:type" content="website">
+<meta property="og:title" content="veloGB10 documentation">
+<meta property="og:description" content="Design, benchmarks, setup guides, TP cache management, the endurance soak and the changelog.">
+<meta property="og:url" content="https://veloengine.ai/docs/">
+<meta property="og:image" content="https://veloengine.ai/assets/img/velogb10/tp4_min_max.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="../assets/css/site.css">
+<link rel="icon" type="image/svg+xml" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 4l9 16 9-16" fill="none" stroke="%235b8cff" stroke-width="2.6" stroke-linecap="round"/><path d="M8.5 4l3.5 6.2L15.5 4" fill="none" stroke="%238392ff" stroke-width="2.2" stroke-linecap="round"/></svg>'>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container">
+    <a class="brand" href="../index.html">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M3 4l9 16 9-16" stroke="#5b8cff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M8.5 4l3.5 6.2L15.5 4" stroke="#8392ff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      veloGB10 <span class="sub">by veloEngine</span>
+    </a>
+    <div class="nav-links">
+      <a href="../index.html">Overview</a>
+      <a href="../index.html#engineering">Engineering</a>
+      <a href="../index.html#traces">Throughput</a>
+      <a href="index.html" class="active">Docs</a>
+      <a href="https://velobenchmark.com" rel="noopener">VeloBenchmark</a>
+      <a class="nav-cta" href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" style="padding-bottom:40px">
+  <div class="container narrow">
+    <span class="eyebrow">Documentation</span>
+    <h1>veloGB10, fully documented</h1>
+    <p class="lede">Everything below is the complete reference: the design and measured
+      throughput, the per-model setup guides, tensor-parallel cache management, the
+      8-hour endurance soak and the changelog. The same documents the repository ships
+      with, rendered for reading.</p>
+  </div>
+</header>
+
+<section class="section" style="border-top:0;padding-top:0">
+  <div class="container grid-2">
+    <div class="card">
+      <h3 style="margin-top:0;font-size:1.35rem">Start here</h3>
+      <ul style="color:var(--muted);font-size:.93rem;padding-left:20px;margin:0;line-height:2">
+        <li><a href="index.html">Overview</a> — design, supported models, measured throughput, CLI reference, roadmap</li>
+        <li><a href="setup-qwen27b.html">Qwen3.8-27B setup</a> — single node, TP=2 and TP=4, quantisation, gates</li>
+        <li><a href="setup-hy3.html">Hy3 setup</a> — Tencent Hy3 295B-A21B on one or two GB10 boxes</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;font-size:1.35rem">Operating it</h3>
+      <ul style="color:var(--muted);font-size:.93rem;padding-left:20px;margin:0;line-height:2">
+        <li><a href="cache.html">TP cache management</a> — what the node cache holds, sizing, clearing it</li>
+        <li><a href="endurance.html">Endurance report</a> — an 8-hour continuous soak, measured</li>
+        <li><a href="changelog.html">Changelog</a> — release notes, newest first</li>
+      </ul>
+    </div>
+  </div>
+  <div class="container" style="margin-top:22px">
+    <div class="band">
+      <div>
+        <h2>Measure it, don't take the numbers on faith</h2>
+        <p>veloGB10 emits per-token OpenTelemetry, and
+           <a href="https://velobenchmark.com" rel="noopener">VeloBenchmark</a> — the
+           benchmarking console it was built alongside — turns that stream into the same
+           live instruments, test suites and reports it uses for any other engine.</p>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <a class="btn btn-primary" href="https://velobenchmark.com" rel="noopener">velobenchmark.com</a>
+        <a class="btn btn-ghost" href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">Repository</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="foot-grid">
+      <div>
+        <a class="brand" href="../index.html" style="margin-bottom:14px">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M3 4l9 16 9-16" stroke="#5b8cff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M8.5 4l3.5 6.2L15.5 4" stroke="#8392ff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          veloGB10 <span class="sub">by veloEngine</span>
+        </a>
+        <p>A from-scratch Rust + CUDA inference engine for NVIDIA GB10 systems —
+           DGX Spark and compatible OEM boxes. Built in the open, measured on real
+           hardware.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <a href="../index.html#engineering">Engineering</a>
+        <a href="../index.html#traces">Throughput traces</a>
+        <a href="../index.html#models">Supported models</a>
+        <a href="../index.html#setup">Getting it running</a>
+      </div>
+      <div>
+        <h4>Documentation</h4>
+        <a href="index.html">Docs home</a>
+        <a href="setup-qwen27b.html">Qwen3.8-27B setup</a>
+        <a href="endurance.html">Endurance report</a>
+        <a href="changelog.html">Changelog</a>
+      </div>
+      <div>
+        <h4>Source</h4>
+        <a href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">veloGB10 (Apache-2.0)</a>
+        <a href="https://velobenchmark.com" rel="noopener">VeloBenchmark (AGPL-3.0)</a>
+        <a href="mailto:stav@scalarflow.co.uk">stav@scalarflow.co.uk</a>
+      </div>
+    </div>
+    <div class="foot-base">
+      <span>© 2026 Stav Katsoulis</span>
+      <span>veloGB10 Apache-2.0 · veloengine.ai</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

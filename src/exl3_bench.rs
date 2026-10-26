@@ -431,25 +431,28 @@ fn pick_modules(pack: &Exl3Pack) -> Vec<ModuleMeta> {
     };
     let mut out = Vec::new();
     if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Expert && m.bits == 3 && m.name.ends_with("gate_proj")
+        m.class == TensorClass::Expert && m.k2 / 2 == 3 && m.name.ends_with("gate_proj")
     }) {
         out.push(m);
     }
     if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Expert && m.bits == 3 && m.name.ends_with("down_proj")
+        m.class == TensorClass::Expert && m.k2 / 2 == 3 && m.name.ends_with("down_proj")
     }) {
         out.push(m);
     }
     if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Dense && m.bits == 5 && m.n == 10240
+        m.class == TensorClass::Dense && m.k2 / 2 == 5 && m.n == 10240
     }) {
         out.push(m);
+    }
+    if let Some(m) = find(&|m: &ModuleMeta| m.k2 == 3 && m.class == TensorClass::Dense) {
+        out.push(m); // P7-1P5: fractional K=1.5 body quad (dense packs have no experts)
     }
     if let Some(m) = find(&|m: &ModuleMeta| m.class == TensorClass::LmHead) {
         out.push(m);
     }
     if let Some(m) = find(&|m: &ModuleMeta| {
-        m.class == TensorClass::Mtp && m.bits == 4 && m.k == 2560 && m.n == 2560
+        m.class == TensorClass::Mtp && m.k2 / 2 == 4 && m.k == 2560 && m.n == 2560
     }) {
         out.push(m);
     }
@@ -728,7 +731,7 @@ pub fn probe_kernel_decode(dir: &str) -> Result<()> {
         let t0 = std::time::Instant::now();
         let raw = m.trellis.read_bytes(&pack.dir)?;
         let trellis = le_i16(&raw);
-        let ref_w = decode_trellis_host(&trellis, kb, nb, m.bits);
+        let ref_w = decode_trellis_host(&trellis, kb, nb, m.k2);
         let t_ref = t0.elapsed();
 
         let d_tr = dev.htod_sync_copy(&raw)?;
@@ -743,7 +746,7 @@ pub fn probe_kernel_decode(dir: &str) -> Result<()> {
                         block_dim: (32, 1, 1),
                         shared_mem_bytes: 0,
                     },
-                    (&d_tr, &d_rc, &mut d_out, nb as i32, m.bits as i32),
+                    (&d_tr, &d_rc, &mut d_out, nb as i32, m.k2 as i32),
                 )
                 .context("launch exl3_decode_dump")?;
         }
@@ -758,7 +761,7 @@ pub fn probe_kernel_decode(dir: &str) -> Result<()> {
                 f8.launch_on_stream(&stream,
                     LaunchConfig { grid_dim: ((kb * nb / 8) as u32, 1, 1), block_dim: (256, 1, 1),
                                    shared_mem_bytes: 0 },
-                    (&d_tr, &d_rc, &mut d_out8, nb as i32, m.bits as i32))
+                    (&d_tr, &d_rc, &mut d_out8, nb as i32, m.k2 as i32))
                     .context("launch exl3_decode_dump8")?;
             }
             dev.synchronize()?;
@@ -784,7 +787,7 @@ pub fn probe_kernel_decode(dir: &str) -> Result<()> {
         println!(
             "  {:<28} b={} {:>5}x{:<6} {:>9} blocks  mism {}  (ref {:?}, gpu {:?})",
             m.name.rsplit('.').take(3).collect::<Vec<_>>().join("."),
-            m.bits,
+            m.k2 / 2,
             m.k,
             m.n,
             kb * nb,
@@ -837,7 +840,7 @@ pub fn probe_gemm(dir: &str, widths: &[usize], slab_cols: usize) -> Result<()> {
         // arithmetic; the full matrix is the BENCH's job).
         let raw = m.trellis.read_bytes(&pack.dir)?;
         let (trb, n_eff) = if m.class == TensorClass::LmHead {
-            slab_trellis(&raw, m.k / 16, m.n / 16, m.bits, Some(slab_cols))
+            slab_trellis(&raw, m.k / 16, m.n / 16, m.k2 / 2, Some(slab_cols))
         } else {
             (raw.clone(), m.n)
         };
@@ -852,7 +855,7 @@ pub fn probe_gemm(dir: &str, widths: &[usize], slab_cols: usize) -> Result<()> {
 
         // correctness once at width 4 (covers padded rows), then binv across widths.
         let k = m.k;
-        let bits = m.bits;
+        let bits = m.k2 / 2;
         let tr_bits: Vec<u16> = trb
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -2513,7 +2516,7 @@ fn probe_ks_p(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
         }
         if md.k % 128 != 0 || md.n % 128 != 0 { continue; }
         if crate::exl3_forward::chain_ks(md.k as i32, md.n as i32) <= 1 { continue; }
-        let e = shapes.entry((md.k, md.n, md.bits)).or_default();
+        let e = shapes.entry((md.k, md.n, md.k2 / 2)).or_default();
         if e.len() < 2 { e.push(md); }
     }
     if shapes.is_empty() {
@@ -2667,10 +2670,10 @@ fn probe_wp21(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
     let mut shapes: BTreeMap<(usize, usize, usize), Vec<&ModuleMeta>> = BTreeMap::new();
     for md in &pack.modules {
         if matches!(md.class, TensorClass::LmHead | TensorClass::Ngram) || md.name.contains(".mlp.experts.") { continue; }
-        if md.k % 128 != 0 || md.n % 128 != 0 || !(3..=5).contains(&md.bits) { continue; }
+        if md.k % 128 != 0 || md.n % 128 != 0 || !(3..=5).contains(&(md.k2 / 2)) { continue; }
         let ks = crate::exl3_forward::chain_ks(md.k as i32, md.n as i32) as usize;
         if ks <= 1 || (md.k / 16) % ks != 0 { continue; }
-        let e = shapes.entry((md.k, md.n, md.bits)).or_default();
+        let e = shapes.entry((md.k, md.n, md.k2 / 2)).or_default();
         if e.len() < 2 { e.push(md); }
     }
     if shapes.is_empty() {
@@ -2682,7 +2685,7 @@ fn probe_wp21(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
             tr: dev.htod_sync_copy(&rd16(md.trellis.read_bytes(&pack.dir)?))?,
             suh: dev.htod_sync_copy(&le_f16_bits(&md.suh.read_bytes(&pack.dir)?))?,
             svh: dev.htod_sync_copy(&le_f16_bits(&md.svh.read_bytes(&pack.dir)?))?,
-            k: md.k, n: md.n, bits: md.bits,
+            k: md.k, n: md.n, bits: md.k2 / 2,
             ks: crate::exl3_forward::chain_ks(md.k as i32, md.n as i32) as usize,
         })
     };
@@ -2950,8 +2953,8 @@ fn probe_dense(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> 
     for md in &pack.modules {
         if matches!(md.class, TensorClass::LmHead | TensorClass::Ngram) || md.name.contains(".mlp.experts.") { continue; }
         let ks = crate::exl3_forward::chain_ks(md.k as i32, md.n as i32) as usize;
-        if !dn::dks_member_ok(md.k, md.n, ks) || !(3..=5).contains(&md.bits) { continue; }
-        let e = shapes.entry((md.k, md.n, md.bits)).or_default();
+        if !dn::dks_member_ok(md.k, md.n, ks) || !(3..=5).contains(&(md.k2 / 2)) { continue; }
+        let e = shapes.entry((md.k, md.n, md.k2 / 2)).or_default();
         if e.len() < 2 { e.push(md); }
     }
     if shapes.is_empty() {
@@ -2963,7 +2966,7 @@ fn probe_dense(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> 
             tr: dev.htod_sync_copy(&rd16(md.trellis.read_bytes(&pack.dir)?))?,
             suh: dev.htod_sync_copy(&le_f16_bits(&md.suh.read_bytes(&pack.dir)?))?,
             svh: dev.htod_sync_copy(&le_f16_bits(&md.svh.read_bytes(&pack.dir)?))?,
-            k: md.k, n: md.n, bits: md.bits,
+            k: md.k, n: md.n, bits: md.k2 / 2,
             ks: crate::exl3_forward::chain_ks(md.k as i32, md.n as i32) as usize,
         })
     };
@@ -5125,13 +5128,13 @@ pub fn probe_wide(dir: &str, ms: &[usize], mts: &[usize], slab_cols: usize) -> R
     for m in pick_modules(&pack) {
         let raw = m.trellis.read_bytes(&pack.dir)?;
         let (trb, n_eff) = if m.class == TensorClass::LmHead {
-            slab_trellis(&raw, m.k / 16, m.n / 16, m.bits, Some(slab_cols))
+            slab_trellis(&raw, m.k / 16, m.n / 16, m.k2 / 2, Some(slab_cols))
         } else {
             (raw.clone(), m.n)
         };
         let suh = le_f16_bits(&m.suh.read_bytes(&pack.dir)?);
         let k = m.k;
-        let bits = m.bits;
+        let bits = m.k2 / 2;
         let tr_bits: Vec<u16> = trb
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -5468,7 +5471,7 @@ pub fn bench_wide(dir: &str, ms: &[usize], mt: usize, iters: usize) -> Result<()
                             mm as i32,
                             m.k as i32,
                             m.n as i32,
-                            m.bits as i32,
+                            m.k2 as i32,
                             mt as i32,
                         ),
                     )
@@ -5491,7 +5494,7 @@ pub fn bench_wide(dir: &str, ms: &[usize], mt: usize, iters: usize) -> Result<()
             println!(
                 "  {:<10} b={} K={:<5} N={:<6}  M={:<5} {:>7.1} GB/s  {:>9.0} rows/s  {:>7.2} ms",
                 label,
-                m.bits,
+                m.k2 / 2,
                 m.k,
                 m.n,
                 mm,
@@ -5536,7 +5539,7 @@ pub fn probe_xchain(dir: &str, x_path: &str, y_path: &str, module: &str) -> Resu
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    let mut chain = run_chain(&dev, &tr_bits, &suh, &svh, &x, rows, m.k, m.n, m.bits)?;
+    let mut chain = run_chain(&dev, &tr_bits, &suh, &svh, &x, rows, m.k, m.n, m.k2 / 2)?;
     let y = dev.dtoh_sync_copy(&chain.d_y)?;
     let mut out = Vec::with_capacity(y.len() * 2);
     for v in &y {
@@ -5545,7 +5548,7 @@ pub fn probe_xchain(dir: &str, x_path: &str, y_path: &str, module: &str) -> Resu
     std::fs::write(y_path, &out).with_context(|| format!("write {y_path}"))?;
     println!(
         "XCHAIN_WRITE module={module} bits={} K={} N={} rows={} y={}",
-        m.bits, m.k, m.n, rows, y_path
+        m.k2 / 2, m.k, m.n, rows, y_path
     );
     Ok(())
 }
@@ -5587,7 +5590,7 @@ pub fn bench_ladder(
         .modules
         .iter()
         .filter(|m| matches!(m.class, TensorClass::Dense))
-        .filter(|m| m.k >= 1024 && m.n >= 128 && seen.insert((m.k, m.n, m.bits)))
+        .filter(|m| m.k >= 1024 && m.n >= 128 && seen.insert((m.k, m.n, m.k2 / 2)))
         .collect();
     mods.sort_by_key(|m| (m.class == TensorClass::LmHead, m.n, m.k));
     for m in &mods {
@@ -5595,7 +5598,7 @@ pub fn bench_ladder(
             println!("# skip {} class={:?} k={} n={} (> --exl3-ladder-skip-n)", m.name, m.class, m.k, m.n);
             continue;
         }
-        println!("# module {} class={:?} k={} n={} bits={}", m.name, m.class, m.k, m.n, m.bits);
+        println!("# module {} class={:?} k={} n={} bits={}", m.name, m.class, m.k, m.n, m.k2 / 2);
         for k in [m.k, m.k / 2] {
             let kb = k / 16;
             if kb == 0 || k % 16 != 0 {
@@ -5614,7 +5617,7 @@ pub fn bench_ladder(
             if nb == 0 {
                 continue;
             }
-            let tr_bytes = (kb * nb * 8 * m.bits * 2) as f64;
+            let tr_bytes = (kb * nb * 8 * m.k2 / 2 * 2) as f64;
             // DRAM-cold rotation: J copies of the trellis, J*tr_bytes >= ~192 MB, so every
             // rotated launch reads memory L2 no longer holds (a single tensor < L2 would make
             // the plain loop measure the L2-warm rate -- the S-C4STEP5 E1 trap).
@@ -5622,7 +5625,9 @@ pub fn bench_ladder(
                 .max(2)
                 .min(((1536usize * 1024 * 1024) as f64 / tr_bytes).floor() as usize)
                 .max(2);
-            let tru16: Vec<u16> = vec![0x6B8Du16; kb * nb * 8 * m.bits];
+            // ring words are u32 (WRING = 8*BITS per row): allocate u16 x2 of the old formula
+            // (the 2x-undersized buffer walked off the end on down_proj k=17408, 2.0bpw crash)
+            let tru16: Vec<u16> = vec![0x6B8Du16; kb * nb * 8 * m.k2 / 2 * 2];
             let d_trs: Vec<_> = (0..j).map(|_| dev.htod_sync_copy(&tru16).map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?;
             for &ks in &ks_all {
                 if kb % ks != 0 || ks == 0 {
@@ -5651,13 +5656,13 @@ pub fn bench_ladder(
                                     f_fx.clone().launch_on_stream(
                                         &stream, cfg,
                                         (d_tr, &d_xh, &d_ws, &d_svh, &d_y, &d_cnt,
-                                         mm as i32, k as i32, m.n as i32, m.bits as i32),
+                                         mm as i32, k as i32, m.n as i32, m.k2 as i32),
                                     )?;
                                 } else {
                                     f_probe.clone().launch_on_stream(
                                         &stream, cfg,
                                         (d_tr, &d_xh, &d_ws, &d_svh, &d_y, &d_cnt,
-                                         mm as i32, k as i32, m.n as i32, m.bits as i32, mode, wkb),
+                                         mm as i32, k as i32, m.n as i32, m.k2 as i32, mode, wkb),
                                     )?;
                                 }
                             }
@@ -5681,12 +5686,12 @@ pub fn bench_ladder(
                     let gbs = tr_bytes / t_n / 1e9;
                     println!(
                         "  {:<26} {:>6} b{} k={:<5} n={:<6} ks={} gx={:<4} m={:<2} | norm {:>7.3} ms {:>6.1} GB/s | alias {:>7.3} ms ({:>5.1}%) | stub {:>7.3} ms ({:>5.1}%)",
-                        m.name, format!("{:?}/{}", m.class, jrot), m.bits, k, m.n, ks, m.n / 128, mm,
+                        m.name, format!("{:?}/{}", m.class, jrot), m.k2 / 2, k, m.n, ks, m.n / 128, mm,
                         t_n * 1e3, gbs, t_a * 1e3, 100.0 * (t_n - t_a) / t_n, t_s * 1e3, 100.0 * (t_n - t_s) / t_n
                     );
                     json.push_str(&format!(
                         "{{\"name\":\"{}\",\"class\":\"{:?}\",\"bits\":{},\"k\":{},\"n\":{},\"ks\":{},\"gx\":{},\"m\":{},\"ms_norm\":{:.6},\"gbs_norm\":{:.2},\"ms_alias\":{:.6},\"ms_stub\":{:.6},\"tr_bytes\":{:.0}}},\n",
-                        m.name, m.class, m.bits, k, m.n, ks, m.n / 128, mm, t_n * 1e3, gbs, t_a * 1e3, t_s * 1e3, tr_bytes
+                        m.name, m.class, m.k2 / 2, k, m.n, ks, m.n / 128, mm, t_n * 1e3, gbs, t_a * 1e3, t_s * 1e3, tr_bytes
                     ));
                 }
             }
@@ -5735,7 +5740,7 @@ pub fn bench_gemm(
         for wd in widths {
             let x = synth_x(*wd, m.k, 0xBEEF);
             let mut chain =
-                run_chain(&dev, &tr_bits, &suh, &svh, &x, *wd, m.k, m.n, m.bits)?;
+                run_chain(&dev, &tr_bits, &suh, &svh, &x, *wd, m.k, m.n, m.k2 / 2)?;
             let ref stream = fork_blocking_stream(&dev);
             let gf = |n: &str| {
                 dev.get_func(MODULE, n)
@@ -5786,7 +5791,7 @@ pub fn bench_gemm(
             println!(
                 "  {:<20} b={} W={:<2}  gemm {:>7.3} ms  {:>7.1} GB/s (trellis) | chain {:>7.3} ms  {:>7.1} GB/s",
                 label,
-                m.bits,
+                m.k2 / 2,
                 wd,
                 best_g * 1e3,
                 tr_bytes / best_g / 1e9,
@@ -5796,17 +5801,17 @@ pub fn bench_gemm(
             let _ = aux_bytes;
             if m.class == TensorClass::LmHead {
                 // W3/LMH: the persistent kernel on the full head at this width
-                bench_lmh(&dev, &chain.d_tr, &chain.d_svh, m.k, m.n, m.bits, *wd, iters, tr_bytes, "lm_head")?;
+                bench_lmh(&dev, &chain.d_tr, &chain.d_svh, m.k, m.n, m.k2 / 2, *wd, iters, tr_bytes, "lm_head")?;
             }
         }
         if m.class == TensorClass::LmHead {
             // W3/LMH: the 65,536-id draft slice (the MTP draft pass's head)
-            let (trd, nd) = slab_trellis(&raw, m.k / 16, m.n / 16, m.bits, Some(65536));
+            let (trd, nd) = slab_trellis(&raw, m.k / 16, m.n / 16, m.k2 / 2, Some(65536));
             let trd16: Vec<u16> = trd.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             let d_draft = dev.htod_sync_copy(&trd16)?;
             let d_svh_draft = dev.htod_sync_copy(&svh[..nd])?;
             for wd in widths {
-                bench_lmh(&dev, &d_draft, &d_svh_draft, m.k, nd, m.bits, *wd, iters,
+                bench_lmh(&dev, &d_draft, &d_svh_draft, m.k, nd, m.k2 / 2, *wd, iters,
                           (trd.len()) as f64, "draft 65536")?;
             }
         }
@@ -5820,7 +5825,7 @@ pub fn bench_gemm(
         let mods: Vec<ModuleMeta> = pack
             .modules
             .iter()
-            .filter(|m| m.class == TensorClass::Expert && m.bits == 3 && m.name.ends_with(suffix))
+            .filter(|m| m.class == TensorClass::Expert && m.k2 / 2 == 3 && m.name.ends_with(suffix))
             .take(ge)
             .cloned()
             .collect();
@@ -5862,7 +5867,7 @@ pub fn bench_gemm(
             "  grouped {:>9} x{}  b={} K={:<5} N={:<6}  ({:.1} MB/launch)",
             suffix,
             mods.len(),
-            m0.bits,
+            m0.k2 / 2,
             m0.k,
             m0.n,
             tr_bytes_total / 1e6
@@ -5896,7 +5901,7 @@ pub fn bench_gemm(
                             *wd as i32,
                             m0.k as i32,
                             m0.n as i32,
-                            m0.bits as i32,
+                            (m0.k2 / 2) as i32,
                         ),
                     )
                     .unwrap();

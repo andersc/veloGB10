@@ -83,6 +83,38 @@ __device__ __forceinline__ uint16_t exl3_dq_t(const uint32_t* __restrict__ ring,
     return exl3_dq_from(ring, (int)(i0 % w), (int)(i1 % w), sf);
 }
 
+// W1 (docs/EXL3_FRAC_K_SPEC.md): fractional K = KA + 0.5 window math. Weight pairs
+// consume bits2 = 2*KA+1 bits (even-weight window KA bits, odd-weight KA+1); within the
+// 8-window group the top window w7 ENDS at e7 = ((g>>1)+4)*bits2 + 128*bits2 (g = t & ~7),
+// and weight t (j = t & 7) has its 16-bit window END at e7 - [(7-j)*KA + ((14-j)>>1) - 3].
+// The tile ring is 4*bits2 uint32 words (= 8*k2 uint16 = the trellis last dim).
+template <int KA>
+__device__ __forceinline__ int exl3_half_b1(int t) {
+    const int g = t & ~7, j = t & 7;
+    const int bits2 = 2 * KA + 1;
+    return ((g >> 1) + 4) * bits2 + 128 * bits2 - (((7 - j) * KA) + ((14 - j) >> 1) - 3);
+}
+
+// Runtime-ka form (decode_dump path); the templated bodies use exl3_half_b1<KA>.
+__device__ __forceinline__ uint16_t exl3_dq_t_half(const uint32_t* __restrict__ ring,
+                                                   int t, int ka) {
+    const int bits2 = 2 * ka + 1;
+    const int g = t & ~7, j = t & 7;
+    const int e7 = ((g >> 1) + 4) * bits2 + 128 * bits2;
+    const int b1 = e7 - (((7 - j) * ka) + ((14 - j) >> 1) - 3);
+    const int b0 = b1 - 16;
+    const int i0 = b0 >> 5;
+    const int i1 = (b1 - 1) >> 5;
+    const int sf = ((i1 + 1) << 5) - b1;
+    const unsigned w = (unsigned)(4 * bits2);
+    return exl3_dq_from(ring, (int)(i0 % w), (int)(i1 % w), sf);
+}
+
+// k2-dispatching decode (k2 = 2*K + half): the single entry the runtime-arg kernels use.
+__device__ __forceinline__ uint16_t exl3_dq_k2(const uint32_t* __restrict__ ring, int t, int k2) {
+    return (k2 & 1) ? exl3_dq_t_half(ring, t, k2 >> 1) : exl3_dq_t(ring, t, k2 >> 1);
+}
+
 // ---------------------------------------------------------------------------
 // Kernel 1: decode gate (G-A3-1 through the kernel path).
 // One warp per 16x16 trellis block; thread lane decodes t in {lane + 32*step}.
@@ -216,14 +248,14 @@ extern "C" __global__ void exl3_decode_dump(const uint16_t* __restrict__ trellis
     const int b = blockIdx.x;                 // trellis block = kb*nb + n
     const int lane = threadIdx.x & 31;
     const uint32_t* __restrict__ ring =
-        (const uint32_t*)(trellis + (size_t)b * (16 * bits));
+        (const uint32_t*)(trellis + (size_t)b * (8 * bits));   // bits arg = k2
     const int kb = b / nb, nbk = b % nb;
     uint16_t* __restrict__ orow = wout + (size_t)kb * 16 * (nb * 16) + nbk * 16;
 
     #pragma unroll
     for (int step = 0; step < 8; ++step) {
         const int t = lane + 32 * step;
-        const uint16_t v = exl3_dq_t(ring, t, bits);
+        const uint16_t v = exl3_dq_k2(ring, t, bits);
         const int rc = rc_of_t[t];
         orow[(rc >> 4) * (nb * 16) + (rc & 15)] = v;
     }
@@ -245,15 +277,15 @@ extern "C" __global__ void __launch_bounds__(256) exl3_decode_dump8(
     const int nb8 = nb >> 3;
     const int kb = blockIdx.x / nb8, n0 = (blockIdx.x - kb * nb8) * 8;
     s_rc[threadIdx.x] = rc_of_t[threadIdx.x];
-    const int ww = bits * 8;
+    const int ww = 4 * bits;   // bits arg = k2
     const uint32_t* __restrict__ ring =
-        (const uint32_t*)(trellis + ((size_t)kb * nb + n0 + warp) * (16 * bits));
+        (const uint32_t*)(trellis + ((size_t)kb * nb + n0 + warp) * (8 * bits));
     for (int i = lane; i < ww; i += 32) s_ring[warp][i] = __ldg(ring + i);
     __syncthreads();
     #pragma unroll
     for (int step = 0; step < 8; ++step) {
         const int t = lane + 32 * step;
-        const uint16_t v = exl3_dq_t(s_ring[warp], t, bits);
+        const uint16_t v = exl3_dq_k2(s_ring[warp], t, bits);
         const int rc = s_rc[t];
         s_tile[rc >> 4][warp * 16 + (rc & 15)] = v;
     }
@@ -383,7 +415,7 @@ extern "C" __global__ void exl3_had_svh_x2(const __half* __restrict__ yraw0, con
 // ---------------------------------------------------------------------------
 // Kernel 4: the fused GEMM. Template on bits (compile-time ring width).
 // ---------------------------------------------------------------------------
-template <int BITS>
+template <int BITS, bool HALF = false>
 __device__ __forceinline__ void exl3_gemm_body(const uint16_t* __restrict__ trellis,
                                                const __half* __restrict__ xh,
                                                __half* __restrict__ yraw,
@@ -397,6 +429,8 @@ __device__ __forceinline__ void exl3_gemm_body(const uint16_t* __restrict__ trel
     const int nb_col = cta_n / 16 + warp;      // this warp's trellis column
     const int KB = K >> 4;                     // k16 steps (one trellis block each)
     const int nb = N >> 4;
+    constexpr int WRING = HALF ? (4 * (2 * BITS + 1)) : (8 * BITS);   // ring words per 16x16 tile
+    constexpr int W16 = HALF ? (8 * (2 * BITS + 1)) : (16 * BITS);    // uint16 words per tile
 
     // ---- hoisted per-lane slot constants (loop-invariant across the K loop).
     // slot = h*4 + s:  B-fragment (m16n8k16, .col): lane l holds
@@ -412,11 +446,11 @@ __device__ __forceinline__ void exl3_gemm_body(const uint16_t* __restrict__ trel
             const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
             const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1)
                               + 4 * (c >> 3) + 32 * (c & 1);
-            const int b1 = (t + 257) * BITS;
+            const int b1 = HALF ? exl3_half_b1<BITS>(t) : (t + 257) * BITS;
             const int i0 = (b1 - 16) >> 5;
             const int i1 = (b1 - 1) >> 5;
-            s_i0m[h * 4 + s] = i0 % (BITS * 8);
-            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_i0m[h * 4 + s] = i0 % WRING;
+            s_i1m[h * 4 + s] = i1 % WRING;
             s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
         }
     }
@@ -432,8 +466,8 @@ __device__ __forceinline__ void exl3_gemm_body(const uint16_t* __restrict__ trel
     // `(size_t)kb * nb + nb_col) * (16 * BITS)` every k-step; the address advances by
     // a CONSTANT word stride per step, so carry one 64-bit pointer instead.
     const uint32_t* __restrict__ ring =
-        (const uint32_t*)(trellis + ((size_t)0 * nb + nb_col) * (16 * BITS));
-    const size_t ring_kstride = (size_t)nb * 8u * BITS;  // uint32 words per k16 step
+        (const uint32_t*)(trellis + ((size_t)0 * nb + nb_col) * W16);
+    const size_t ring_kstride = (size_t)nb * (HALF ? (4u * (2 * BITS + 1)) : (8u * BITS));  // uint32 words per k16 step
 
     for (int kb = 0; kb < KB; ++kb) {
         // ---- stage A tile [16 x 16] (rows >= M zero) ----
@@ -669,10 +703,12 @@ extern "C" __global__ void exl3_hmma_gemm(const uint16_t* __restrict__ trellis,
                                           int M, int K, int N, int bits) {
     XQ_PDL_ENTRY();
     switch (bits) {
-        case 3: exl3_gemm_body<3>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
-        case 4: exl3_gemm_body<4>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
-        case 5: exl3_gemm_body<5>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
-        EXL3_CASE6(case 6: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;)
+        case 3: exl3_gemm_body<1, true>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;  // K=1.5
+        case 4: exl3_gemm_body<2>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;  // K=2.0
+        case 6: exl3_gemm_body<3>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
+        case 8: exl3_gemm_body<4>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
+        case 10: exl3_gemm_body<5>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;
+        EXL3_CASE6(case 12: exl3_gemm_body<6>(trellis, xh, yraw, M, K, N, (int)blockIdx.x); break;)
         default: break; // loader refuses other rates before we ever get here
     }
 }
@@ -734,8 +770,10 @@ extern "C" __global__ void exl3_hmma_gemm(const uint16_t* __restrict__ trellis,
 
 __host__ __device__ __forceinline__ int lmh_smem_bytes(int bits, int mrows, int nst, int k) {
     return nst * LMH_KSTEP * LMH_WARPS * 32 * bits          // trellis ring
-           + (mrows == 8 ? 8 * (k + 8) * 2 : 0)             // A-once rows (m <= 8)
            + mrows * LMH_EP_LD * 2;                         // fused-Hadamard epilogue tile
+    // W9b: the m8 A-once block is GONE — at G==T each CTA walks A once, so __ldg from global
+    // (the m16 path) is strictly cheaper than 8*(k+8)*2 bytes of staging that pushed b6_m8_s6
+    // over the 101376 B opt-in cap and forced the WP20 fallback on every verify round.
 }
 
 __device__ __forceinline__ void lmh_cp16_ef(unsigned dst, const void* src, unsigned long long pol) {
@@ -787,8 +825,7 @@ __device__ __forceinline__ void exl3_lmh_body(const uint16_t* __restrict__ trell
     const int SK = K + 8;
 
     unsigned char* ring = lmh_sm;
-    __half* sa = (__half*)(lmh_sm + NST * STB);
-    __half* ep = (__half*)(lmh_sm + NST * STB + (MROWS == 8 ? 8 * SK * 2 : 0));
+    __half* ep = (__half*)(lmh_sm + NST * STB);
     const unsigned ring_u = (unsigned)__cvta_generic_to_shared(ring);
 
     // Host/device layout tripwire (TRIPWIRE_SPEC §3.4 class): a launch with less dynamic smem
@@ -816,15 +853,7 @@ __device__ __forceinline__ void exl3_lmh_body(const uint16_t* __restrict__ trell
         c_dst[i] = g * KROW + r * 16;
     }
 
-    // ---- prologue: A-once (m <= 8, group 0 with slot 0), then slots 0..NST-2 ----
-    if (MROWS == 8) {
-        const unsigned sa_u = (unsigned)__cvta_generic_to_shared(sa);
-        const int vpr = K >> 3;
-        for (int i = tid; i < M * vpr; i += LMH_THREADS) {
-            const int r = i / vpr, c = i - r * vpr;
-            lmh_cp16(sa_u + (unsigned)((r * SK + c * 8) * 2), xh + (size_t)r * K + c * 8);
-        }
-    }
+    // ---- prologue: trellis slots 0..NST-2 (W9b: A-once staging removed) ----
     const unsigned char* trb = (const unsigned char*)trellis;
     int p_tile = (int)blockIdx.x, p_ks = 0, p_slot = 0, p_i = 0;
     #pragma unroll 1
@@ -917,13 +946,7 @@ __device__ __forceinline__ void exl3_lmh_body(const uint16_t* __restrict__ trell
                 }
             }
             uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
-            if (MROWS == 8) {
-                if (live0) {
-                    const __half* ar = sa + gid * SK + kb * 16 + 2 * tig;
-                    a0 = *(const uint32_t*)ar;
-                    a2 = *(const uint32_t*)(ar + 8);
-                }
-            } else {
+            {   // W9b: A from global for BOTH classes (live1 covers the m16 second half)
                 const __half* ar = xh + (size_t)gid * K + kb * 16 + 2 * tig;
                 if (live0) {
                     a0 = __ldg((const unsigned int*)ar);
@@ -2752,10 +2775,10 @@ extern "C" __global__ void __launch_bounds__(256) xq_dh_build(
     unsigned word = 0u;
     for (int kl = 0; kl < G; ++kl) {
         const int k = g * G + kl, kb = k >> 4, r = k & 15;
-        const uint32_t* ring = reinterpret_cast<const uint32_t*>(tr + ((size_t)kb * nb16 + n16) * (16 * bits));
+        const uint32_t* ring = reinterpret_cast<const uint32_t*>(tr + ((size_t)kb * nb16 + n16) * (8 * bits));
         const int l = 8 * ((cc >> 1) & 3) + ((r & 7) >> 1);                          // tmap(r, cc)
         const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1) + 4 * (cc >> 3) + 32 * (cc & 1);
-        const float w = __half2float(__ushort_as_half(exl3_dq_t(ring, t, bits)));
+        const float w = __half2float(__ushort_as_half(exl3_dq_k2(ring, t, bits)));
         int q = (int)floorf(w * inv_dq + 0.5f * (float)L);
         q = max(0, min(L - 1, q));
         const int b = kl / cpb, j = kl - b * cpb;
@@ -2908,10 +2931,11 @@ extern "C" __global__ void __launch_bounds__(128, 12) xq_dh_screen(
 
 // Exact per-split partials of one candidate block: exl3_gemm_body's slot constants, decode and
 // m16n8k16 mma (A = the one live row, zero elsewhere), ring words from smem.
-template <int BITS>
+template <int BITS, bool HALF = false>
 __device__ __forceinline__ void dh_rescore_mma(const uint32_t* __restrict__ ringw,
                                                const unsigned* __restrict__ sx2, int R, int lane,
                                                float (&acc)[2][4]) {
+    constexpr int WRING = HALF ? (4 * (2 * BITS + 1)) : (8 * BITS);
     int s_i0m[8], s_i1m[8], s_sf[8];
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -2921,18 +2945,18 @@ __device__ __forceinline__ void dh_rescore_mma(const uint32_t* __restrict__ ring
             const int c = 8 * h + (lane >> 2);
             const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
             const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1) + 4 * (c >> 3) + 32 * (c & 1);
-            const int b1 = (t + 257) * BITS;
+            const int b1 = HALF ? exl3_half_b1<BITS>(t) : (t + 257) * BITS;
             const int i0 = (b1 - 16) >> 5;
             const int i1 = (b1 - 1) >> 5;
-            s_i0m[h * 4 + s] = i0 % (BITS * 8);
-            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_i0m[h * 4 + s] = i0 % WRING;
+            s_i1m[h * 4 + s] = i1 % WRING;
             s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
         }
     }
     const bool live = (lane >> 2) == 0;              // gid 0 = row 0, the only live A row
     const int tig = lane & 3;
     for (int row = 0; row < R; ++row) {
-        const uint32_t* ring = ringw + row * (8 * BITS);
+        const uint32_t* ring = ringw + row * WRING;
         uint32_t bfrag[2][2];
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -3102,12 +3126,12 @@ extern "C" __global__ void __launch_bounds__(256, 3) xq_dh_rescore(
     // ---- 2. exact partial of candidate cb over k16 rows [sp R, (sp + 1) R) ----
     const int R = (K >> 4) / S, kb0 = sp * R;
     const int nb16 = N >> 4;
-    const int U4 = 2 * bits;                          // 16-B chunks per trellis block (32 * bits B)
+    const int U4 = bits; // k2: uint4 chunks per trellis row (== 2*BITS integer, == 2KA+1 half)                          // 16-B chunks per trellis block (32 * bits B)
     const int rowu4 = 8 * U4;                         // one k16 row of the 8 column blocks
     for (int idx = tid; idx < R * rowu4; idx += 256) {
         const int row = idx / rowu4, rem = idx - row * rowu4;
         const int w = rem / U4, q = rem - w * U4;
-        const uint4* src = reinterpret_cast<const uint4*>(tr + ((size_t)(kb0 + row) * nb16 + (size_t)cb * 8) * (16 * bits));
+        const uint4* src = reinterpret_cast<const uint4*>(tr + ((size_t)(kb0 + row) * nb16 + (size_t)cb * 8) * (8 * bits));
         s_ring4[(w * R + row) * U4 + q] = __ldcs(src + rem);
     }
     {
@@ -3122,13 +3146,12 @@ extern "C" __global__ void __launch_bounds__(256, 3) xq_dh_rescore(
         for (int r = 0; r < 4; ++r) acc[h][r] = 0.f;
     const uint32_t* ringw = reinterpret_cast<const uint32_t*>(s_ring4 + warp * R * U4);
     switch (bits) {
-        case 2: dh_rescore_mma<2>(ringw, s_x2, R, lane, acc); break;
-        case 3: dh_rescore_mma<3>(ringw, s_x2, R, lane, acc); break;
-        case 4: dh_rescore_mma<4>(ringw, s_x2, R, lane, acc); break;
-        case 5: dh_rescore_mma<5>(ringw, s_x2, R, lane, acc); break;
-        case 6: dh_rescore_mma<6>(ringw, s_x2, R, lane, acc); break;
-        case 7: dh_rescore_mma<7>(ringw, s_x2, R, lane, acc); break;
-        case 8: dh_rescore_mma<8>(ringw, s_x2, R, lane, acc); break;
+        case 4: dh_rescore_mma<2>(ringw, s_x2, R, lane, acc); break;
+        case 3: dh_rescore_mma<1, true>(ringw, s_x2, R, lane, acc); break;
+        case 6: dh_rescore_mma<3>(ringw, s_x2, R, lane, acc); break;
+        case 8: dh_rescore_mma<4>(ringw, s_x2, R, lane, acc); break;
+        case 10: dh_rescore_mma<5>(ringw, s_x2, R, lane, acc); break;
+        case 12: dh_rescore_mma<6>(ringw, s_x2, R, lane, acc); break;
         default: break;
     }
     if ((lane >> 2) == 0) {                           // row 0 of the two n8 tiles: cols 16w + 8h + 2tig
@@ -4415,12 +4438,12 @@ __device__ __forceinline__ int dh_rank1(unsigned m, int* s_w, int* s_p, int* s_t
 __device__ __forceinline__ void dh_part(const uint16_t* __restrict__ tr, int cb, int kb0, int R, int nb16,
                                         int bits, uint4* s_ring4, const unsigned* s_x2, float (&acc)[2][4]) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int U4 = 2 * bits;
+    const int U4 = bits; // k2: uint4 chunks per trellis row (== 2*BITS integer, == 2KA+1 half)
     const int rowu4 = 8 * U4;
     for (int idx = tid; idx < R * rowu4; idx += 256) {
         const int row = idx / rowu4, rem = idx - row * rowu4;
         const int w = rem / U4, q = rem - w * U4;
-        const uint4* src = reinterpret_cast<const uint4*>(tr + ((size_t)(kb0 + row) * nb16 + (size_t)cb * 8) * (16 * bits));
+        const uint4* src = reinterpret_cast<const uint4*>(tr + ((size_t)(kb0 + row) * nb16 + (size_t)cb * 8) * (8 * bits));
         s_ring4[(w * R + row) * U4 + q] = __ldcs(src + rem);
     }
     __syncthreads();
@@ -4430,13 +4453,12 @@ __device__ __forceinline__ void dh_part(const uint16_t* __restrict__ tr, int cb,
         for (int r = 0; r < 4; ++r) acc[h][r] = 0.f;
     const uint32_t* ringw = reinterpret_cast<const uint32_t*>(s_ring4 + warp * R * U4);
     switch (bits) {
-        case 2: dh_rescore_mma<2>(ringw, s_x2, R, lane, acc); break;
-        case 3: dh_rescore_mma<3>(ringw, s_x2, R, lane, acc); break;
-        case 4: dh_rescore_mma<4>(ringw, s_x2, R, lane, acc); break;
-        case 5: dh_rescore_mma<5>(ringw, s_x2, R, lane, acc); break;
-        case 6: dh_rescore_mma<6>(ringw, s_x2, R, lane, acc); break;
-        case 7: dh_rescore_mma<7>(ringw, s_x2, R, lane, acc); break;
-        case 8: dh_rescore_mma<8>(ringw, s_x2, R, lane, acc); break;
+        case 4: dh_rescore_mma<2>(ringw, s_x2, R, lane, acc); break;
+        case 3: dh_rescore_mma<1, true>(ringw, s_x2, R, lane, acc); break;
+        case 6: dh_rescore_mma<3>(ringw, s_x2, R, lane, acc); break;
+        case 8: dh_rescore_mma<4>(ringw, s_x2, R, lane, acc); break;
+        case 10: dh_rescore_mma<5>(ringw, s_x2, R, lane, acc); break;
+        case 12: dh_rescore_mma<6>(ringw, s_x2, R, lane, acc); break;
         default: break;
     }
 }
@@ -12176,13 +12198,15 @@ extern "C" __global__ void xq_router_combine(const float* __restrict__ ws,
 // ---- split-K chain body: identical decode/staging to exl3_gemm_body, but the
 // K loop runs over this block's [kb0, kb1) slice and the epilogue writes FP32
 // partials to ws[ks_id][m][n] (layout [ks][M][N]). grid (tiles, KS).
-template <int BITS>
+template <int BITS, bool HALF = false>
 __device__ __forceinline__ void exl3_gemm_body_ks(const uint16_t* __restrict__ trellis,
                                                   const __half* __restrict__ xh,
                                                   float* __restrict__ ws,
                                                   int M, int K, int N, int cta_tile,
                                                   int kb0, int kb1, int ks_id) {
+    constexpr int WRING = HALF ? (4 * (2 * BITS + 1)) : (8 * BITS);
     __shared__ __half sa[16][16];
+    __shared__ __half sa2[16][16]; // S-KFIX1: 2-tile pipeline second staging tile (+512 B)
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -12201,11 +12225,11 @@ __device__ __forceinline__ void exl3_gemm_body_ks(const uint16_t* __restrict__ t
             const int l = 8 * ((c >> 1) & 3) + ((r & 7) >> 1);
             const int t = 8 * l + (r & 1) + 2 * ((r >> 3) & 1)
                               + 4 * (c >> 3) + 32 * (c & 1);
-            const int b1 = (t + 257) * BITS;
+            const int b1 = HALF ? exl3_half_b1<BITS>(t) : (t + 257) * BITS;
             const int i0 = (b1 - 16) >> 5;
             const int i1 = (b1 - 1) >> 5;
-            s_i0m[h * 4 + s] = i0 % (BITS * 8);
-            s_i1m[h * 4 + s] = i1 % (BITS * 8);
+            s_i0m[h * 4 + s] = i0 % WRING;
+            s_i1m[h * 4 + s] = i1 % WRING;
             s_sf[h * 4 + s] = ((i1 + 1) << 5) - b1;
         }
     }
@@ -12217,10 +12241,77 @@ __device__ __forceinline__ void exl3_gemm_body_ks(const uint16_t* __restrict__ t
         for (int r = 0; r < 4; ++r) acc[h][r] = 0.0f;
 
     const uint32_t* __restrict__ ring =
-        (const uint32_t*)(trellis + ((size_t)kb0 * nb + nb_col) * (16 * BITS));
-    const size_t ring_kstride = (size_t)nb * 8u * BITS;
+        (const uint32_t*)(trellis + ((size_t)kb0 * nb + nb_col) * (HALF ? (8 * (2 * BITS + 1)) : (16 * BITS)));
+    const size_t ring_kstride = (size_t)nb * (HALF ? (4u * (2 * BITS + 1)) : (8u * BITS));
 
-    for (int kb = kb0; kb < kb1; ++kb) {
+    // S-KFIX1: 2-tile software pipeline (2026-10-18, the 1.5bpw per-call deficit):
+    // one barrier pair per TWO tiles; tile+1's ring dequant is issued in the same block as
+    // tile's, so its latency hides under tile's mma. Tile order and the per-tile mma pair
+    // order are unchanged => the accumulation sequence is BITWISE IDENTICAL to the 1-tile
+    // loop (probe-binv contract). Odd tail runs the original 1-tile body.
+    int kb = kb0;
+    for (; kb + 1 < kb1; kb += 2) {
+        {
+            const int row = tid >> 4, col = tid & 15;
+            const bool live0 = (row < M) && (kb * 16 + col < K);
+            sa[row][col] = live0 ? xh[(size_t)row * K + kb * 16 + col]
+                                 : __ushort_as_half(0);
+            const bool live1 = (row < M) && ((kb + 1) * 16 + col < K);
+            sa2[row][col] = live1 ? xh[(size_t)row * K + (kb + 1) * 16 + col]
+                                  : __ushort_as_half(0);
+        }
+        __syncthreads();
+
+        const uint32_t* ring1 = ring + ring_kstride;
+        uint32_t bf0[2][2], bf1[2][2];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint16_t r0 = exl3_dq_from(ring,  s_i0m[h*4+0], s_i1m[h*4+0], s_sf[h*4+0]);
+            const uint16_t r1 = exl3_dq_from(ring,  s_i0m[h*4+1], s_i1m[h*4+1], s_sf[h*4+1]);
+            const uint16_t r2 = exl3_dq_from(ring,  s_i0m[h*4+2], s_i1m[h*4+2], s_sf[h*4+2]);
+            const uint16_t r3 = exl3_dq_from(ring,  s_i0m[h*4+3], s_i1m[h*4+3], s_sf[h*4+3]);
+            bf0[h][0] = (uint32_t)r0 | ((uint32_t)r1 << 16);
+            bf0[h][1] = (uint32_t)r2 | ((uint32_t)r3 << 16);
+            const uint16_t u0 = exl3_dq_from(ring1, s_i0m[h*4+0], s_i1m[h*4+0], s_sf[h*4+0]);
+            const uint16_t u1 = exl3_dq_from(ring1, s_i0m[h*4+1], s_i1m[h*4+1], s_sf[h*4+1]);
+            const uint16_t u2 = exl3_dq_from(ring1, s_i0m[h*4+2], s_i1m[h*4+2], s_sf[h*4+2]);
+            const uint16_t u3 = exl3_dq_from(ring1, s_i0m[h*4+3], s_i1m[h*4+3], s_sf[h*4+3]);
+            bf1[h][0] = (uint32_t)u0 | ((uint32_t)u1 << 16);
+            bf1[h][1] = (uint32_t)u2 | ((uint32_t)u3 << 16);
+        }
+        ring += 2 * ring_kstride;
+
+        const int gid = lane >> 2, tig = lane & 3;
+        const uint32_t a0 = *(const uint32_t*)&sa[gid][2 * tig];
+        const uint32_t a1 = *(const uint32_t*)&sa[gid + 8][2 * tig];
+        const uint32_t a2 = *(const uint32_t*)&sa[gid][2 * tig + 8];
+        const uint32_t a3 = *(const uint32_t*)&sa[gid + 8][2 * tig + 8];
+        const uint32_t c0 = *(const uint32_t*)&sa2[gid][2 * tig];
+        const uint32_t c1 = *(const uint32_t*)&sa2[gid + 8][2 * tig];
+        const uint32_t c2 = *(const uint32_t*)&sa2[gid][2 * tig + 8];
+        const uint32_t c3 = *(const uint32_t*)&sa2[gid + 8][2 * tig + 8];
+
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[h][0]), "+f"(acc[h][1]), "+f"(acc[h][2]), "+f"(acc[h][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(bf0[h][0]), "r"(bf0[h][1]));
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[h][0]), "+f"(acc[h][1]), "+f"(acc[h][2]), "+f"(acc[h][3])
+                : "r"(c0), "r"(c1), "r"(c2), "r"(c3),
+                  "r"(bf1[h][0]), "r"(bf1[h][1]));
+        }
+        __syncthreads();
+    }
+    for (; kb < kb1; ++kb) {
         {
             const int row = tid >> 4, col = tid & 15;
             const bool live = (row < M) && (kb * 16 + col < K);
@@ -12289,10 +12380,12 @@ extern "C" __global__ void exl3_hmma_gemm_ks(const uint16_t* __restrict__ trelli
     const int kb1 = kb0 + chunk;
     XQ_PDL_ENTRY();
     switch (bits) {
-        case 3: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        case 4: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        case 5: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
+        case 6: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 3: exl3_gemm_body_ks<1, true>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 4: exl3_gemm_body_ks<2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;  // K=2.0
+        case 8: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 10: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        EXL3_CASE6(case 12: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
         default: break;
     }
 }
@@ -12312,10 +12405,12 @@ extern "C" __global__ void exl3_hmma_gemm_ks_x2(const uint16_t* __restrict__ tr0
     const int kb1 = kb0 + chunk;
     XQ_PDL_ENTRY();
     switch (bits) {
-        case 3: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        case 4: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        case 5: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
-        EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
+        case 6: exl3_gemm_body_ks<3>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 3: exl3_gemm_body_ks<1, true>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 4: exl3_gemm_body_ks<2>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;  // K=2.0
+        case 8: exl3_gemm_body_ks<4>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        case 10: exl3_gemm_body_ks<5>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;
+        EXL3_CASE6(case 12: exl3_gemm_body_ks<6>(trellis, xh, ws, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;)
         default: break;
     }
 }
@@ -12439,10 +12534,12 @@ __device__ __forceinline__ void exl3_ks_fixup(const float* __restrict__ ws,
 #define EXL3_FX_MEMBER(TR, XH, WS, SVH, Y, CNT)                                                     \
     do {                                                                                            \
         switch (bits) {                                                                             \
-            case 3: exl3_gemm_body_ks<3>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
-            case 4: exl3_gemm_body_ks<4>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
-            case 5: exl3_gemm_body_ks<5>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
-            EXL3_CASE6(case 6: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;) \
+            case 6: exl3_gemm_body_ks<3>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            case 3: exl3_gemm_body_ks<1, true>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            case 4: exl3_gemm_body_ks<2>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            case 8: exl3_gemm_body_ks<4>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            case 10: exl3_gemm_body_ks<5>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break; \
+            EXL3_CASE6(case 12: exl3_gemm_body_ks<6>(TR, XH, WS, M, K, N, (int)blockIdx.x, kb0, kb1, (int)blockIdx.y); break;) \
             default: break;                                                                         \
         }                                                                                           \
         exl3_ks_fixup(WS, SVH, Y, CNT, M, N);                                                       \
@@ -12463,7 +12560,7 @@ extern "C" __global__ void __launch_bounds__(256) exl3_hmma_gemm_ks_fx(const uin
     XQ_PDL_ENTRY();
     EXL3_FX_MEMBER(trellis, xh, ws, svh, y, cnt);
 }
-extern "C" __global__ void __launch_bounds__(256) exl3_hmma_gemm_ks_fx_x2(const uint16_t* __restrict__ tr0, const uint16_t* __restrict__ tr1,
+extern "C" __global__ void __launch_bounds__(256, 4) exl3_hmma_gemm_ks_fx_x2(const uint16_t* __restrict__ tr0, const uint16_t* __restrict__ tr1,
                                                    const __half* __restrict__ xh0, const __half* __restrict__ xh1,
                                                    float* __restrict__ ws0, float* __restrict__ ws1,
                                                    const __half* __restrict__ svh0, const __half* __restrict__ svh1,
@@ -14848,16 +14945,18 @@ extern "C" __global__ void xq_qsa_h2b(__nv_bfloat16* __restrict__ out, const __h
 // convert element types, so the capture is this kernel instead (the documented
 // choice; see the exl27c_fwd report).
 //
-// The LIVE-RESIDUAL slice read is elements [r*pitch + 0, r*pitch + h) of each token
-// row — stream 0, offset 0. Evidence: (a) the 27B EXL3 packs are Family::Qwen35 with
-// hc_count = 1 (exl3.rs "the plain residual recipe rides hc_count=1"), so the staging
-// row IS the single live residual; (b) the trunk's own S4F tap passes h (NOT
-// resid_width()) as the source row stride into the resid_width()-wide residual — the
-// stream-0 slice — which is the whole row exactly because the 27B trunk is hc_count=1.
+// FLASHNEXT-DF2-B (2026-10-23): the tap is the MEAN OVER THE hc STREAMS of the token's
+// row — elements [r*pitch + s*h + c] for s in [0, hc) — not stream 0. The DFlash2
+// drafters are trained on "completed, zero-based layer outputs, averaged over the four
+// hyper-connection streams" (the artifact's own SGLang patch, qwen38-dflash2-capture.patch:
+// hidden_states.unflatten(-1, (hc_count, hidden)).mean(dim=-2)). On the hc_count=1 packs
+// (27B, Ornith) the mean of one stream IS the stream (acc/1.0f is exact) — bit-identical
+// to the old stream-0 read; on the hc_count=4 qwen4_exp trunk (Flash-Next) stream 0 alone
+// was a different feature from the one the drafter learned (acceptance 1.41/round).
 //
 // dst is the sink staging, row-major [cols][TAP_CONCAT_DIM] (the same bytes
 // capture_cols_into produces): token r's tap-li slice lands at
-// dst[r*dst_pitch + tap_li*h + c] = bf16(src[r*pitch + c]).
+// dst[r*dst_pitch + tap_li*h + c] = bf16(mean_s src[r*pitch + s*h + c]).
 //
 // Grid-stride over n*h elements, block 256. One launch per tap layer per round,
 // stream-ordered on the compute stream (AGENTS §2.3), fixed addresses (the sink's
@@ -14866,14 +14965,18 @@ extern "C" __global__ void xq_qsa_h2b(__nv_bfloat16* __restrict__ out, const __h
 extern "C" __global__ void xq_df2_tap_cvt(__nv_bfloat16* __restrict__ dst,
                                           const float* __restrict__ src,
                                           long long n_elems, int h, long long pitch,
-                                          int tap_li, long long dst_pitch) {
+                                          int tap_li, long long dst_pitch, int hc) {
     XQ_PDL_ENTRY();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const long long gs = (long long)gridDim.x * blockDim.x;
     for (; i < n_elems; i += gs) {
         const long long r = i / h;
         const int c = (int)(i % h);
-        dst[r * dst_pitch + (long long)tap_li * h + c] = xq_f2b(src[r * pitch + c]);
+        const float* row = src + r * pitch + c;
+        // ascending stream order, f32 accumulate, one bf16 rounding (torch mean semantics)
+        float acc = row[0];
+        for (int s = 1; s < hc; ++s) acc += row[(long long)s * h];
+        dst[r * dst_pitch + (long long)tap_li * h + c] = xq_f2b(acc / (float)hc);
     }
 }
 

@@ -54,6 +54,22 @@ pub struct WireRequest {
     pub image_bytes: u64,
     #[serde(default)]
     pub image_digest: u64,
+    /// LANERES3: the reservation policy's scoping for THIS admit, decided by the head
+    /// (`lane_reserve::plan`) and shipped so the node's lane pick is the head's pick:
+    /// `admit_req`'s choice is a pure function of replicated state, but the policy's
+    /// `allowed` set restricts it, and both ranks must restrict identically or their
+    /// slot tables diverge. `None` = unscoped (policy off / baseline admission).
+    #[serde(default)]
+    pub reserve: Option<Scoping>,
+}
+
+/// LANERES3: the head-decided admission scoping that rides `WireRequest::reserve`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Scoping {
+    /// Lane indices `admit_req` may pick from (the policy's `allowed` set).
+    pub allowed: Vec<usize>,
+    /// `lane_reserve::Kind` as its discriminant (0 own / 1 unreserved / 2 forced).
+    pub kind: u8,
 }
 
 /// VIS-4: the image rows of a request as the TP wire carries them (fp16 = the precision the splice
@@ -123,6 +139,21 @@ pub enum ServingMsg {
     /// program point and adopts the head's value, so both ranks stop (or continue) the SPMD
     /// prefill at the same chunk.
     HeadFlag { v: bool },
+    /// FLASHNEXT-DF2-117 (ISSUES 117): the HEAD's sampled DFlash2 draft for one solo round — the drawn
+    /// draft tokens, their drawn weights and the selector walk's full candidate table (per position:
+    /// the 16 candidate ids + their softmax weights, f32 as bits) — shipped to every node at the same
+    /// program point of the same step. A replicated drafter drawing its own multinomial on residuals
+    /// that differ across ranks in the low bits produced different drafts (rank divergence at the
+    /// lockstep agree); with ONE draft and ONE proposal law on every rank the real-q verify is
+    /// rank-identical. `lane`/`p` are the tripwire: a node at another lane or position is out of step.
+    Df2Draft { lane: u32, p: u64, tokens: Vec<u32>, q_rows: Vec<u32>, cand_tok: Vec<u32>, cand_q: Vec<u32> },
+    /// LANERES3: one lockstep bit of the spill tier. Sent by EVERY rank at the same
+    /// admission-phase program point (capture: my local snapshot write succeeded;
+    /// restore: my local snapshot read succeeded), send+recv rendezvous, verdict =
+    /// the AND of all ranks — so the replicated spill policy only ever records keys
+    /// whose local disk state every rank agrees on. A disk that diverged can never
+    /// desync the pair: the key is dropped everywhere and counted.
+    SpillFlag { ok: bool },
 }
 
 impl From<&BatchRequest> for WireRequest {
@@ -145,6 +176,7 @@ impl From<&BatchRequest> for WireRequest {
             image_spans: r.image_spans.clone(),
             image_bytes: 0,   // set by the head when it ships the rows (exl3_serve)
             image_digest: 0,
+            reserve: None, // LANERES3: set by the head when the plan scoped the admit
         }
     }
 }
@@ -188,4 +220,57 @@ pub fn send_serving(w: &mut impl std::io::Write, m: &ServingMsg) -> anyhow::Resu
 /// Receive one serving message. An `Err` here (clean EOF included) means the session is over.
 pub fn recv_serving(r: &mut impl std::io::Read) -> anyhow::Result<ServingMsg> {
     crate::cluster::recv_json(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LANERES3: an old head's wire frames (no `reserve` field) still decode with scoping
+    /// absent — the baseline admission path — while a scoped frame round-trips exactly.
+    #[test]
+    fn wire_request_reserve_serde_default_none() {
+        let old = serde_json::json!({
+            "prompt": [1, 2, 3], "max_new": 8, "temperature": 1.0, "top_p": 0.95,
+            "top_k": 20, "rep_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+            "seed": 7, "ckpt_at": null, "domain": "General",
+        });
+        let w: WireRequest = serde_json::from_value(old).expect("old frame decodes");
+        assert!(w.reserve.is_none(), "old frames must decode without scoping");
+        let scoped = WireRequest {
+            reserve: Some(Scoping { allowed: vec![2, 3], kind: 0 }),
+            ..w
+        };
+        let s = serde_json::to_string(&scoped).unwrap();
+        let back: WireRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.reserve, Some(Scoping { allowed: vec![2, 3], kind: 0 }));
+    }
+
+    /// FLASHNEXT-DF2-117: the head's sampled draft frame round-trips exactly (f32 weights ride as bits).
+    #[test]
+    fn df2_draft_frame_serde_round_trips_exactly() {
+        let q = [0.5f32, 0.25, 1e-7, 0.0];
+        let m = ServingMsg::Df2Draft { lane: 3, p: 811, tokens: vec![13, 4844, 6088], q_rows: q.iter().map(|x| x.to_bits()).collect(),
+                                       cand_tok: vec![1, 2, 3, 4], cand_q: q.iter().map(|x| x.to_bits()).collect() };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("Df2Draft"), "{s}");
+        match serde_json::from_str::<ServingMsg>(&s).unwrap() {
+            ServingMsg::Df2Draft { lane, p, tokens, q_rows, cand_tok, cand_q } => {
+                assert_eq!((lane, p, tokens, cand_tok), (3, 811, vec![13, 4844, 6088], vec![1, 2, 3, 4]));
+                assert_eq!(q_rows.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>(), q);
+                assert_eq!(cand_q.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>(), q);
+            }
+            other => panic!("decoded {other:?}"),
+        }
+    }
+    /// LANERES3: the spill tier's control bit serializes on the same stream as the other
+    /// control frames (a node that receives one mid-admit must be able to name it).
+    #[test]
+    fn spill_flag_serde() {
+        let m = ServingMsg::SpillFlag { ok: true };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("SpillFlag"), "{s}");
+        let back: ServingMsg = serde_json::from_str(&s).unwrap();
+        matches!(back, ServingMsg::SpillFlag { ok: true });
+    }
 }

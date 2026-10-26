@@ -183,6 +183,8 @@ struct Quad {
     suh: CudaSlice<u16>,
     svh: CudaSlice<u16>,
     bits: i32,
+    /// Half-bit units (2*K + half): the kernel-side switch index. bits = k2/2 floor.
+    k2: i32,
     k: i32,
     n: i32,
     // S-A3-f-f ITEM 2: K-split factor for the m<=16 decode chain (grid (N/128, ks)).
@@ -381,6 +383,40 @@ fn gdn_tc_min_rows() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::opts::var(crate::opt!("exl3-gdn-tc-min")).ok()
         .and_then(|v| v.parse().ok()).unwrap_or(64))
+}
+
+/// LANERES2 spill payload version. 2 = ISSUES 122 (every plane captured whole, byte strides); 3 = ISSUES 123 (the
+/// position planes carry only the rows the conversation uses, `spill_rows`). Files of another version are dropped at
+/// the restore check (graceful re-prefill); version-1 files held 1/4 of each f32 and 1/2 of each u16 per-slot plane.
+pub(crate) const SPILL_PAYLOAD_VERSION: u32 = 3;
+
+/// One slot's region of a `[width x per_slot]` device plane: (byte address, byte length). `elems` = the plane's
+/// element count, `elem_bytes` = size_of the element type (ISSUES 122: the stride must be in BYTES).
+pub(crate) fn spill_slot_region(base: u64, elems: usize, elem_bytes: usize, width: usize, slot: usize) -> (u64, usize) {
+    let bytes = (elems / width) * elem_bytes;
+    (base + (slot * bytes) as u64, bytes)
+}
+
+/// ISSUES 123: the rows a snapshot of `tokens` cached positions carries on every POSITION plane (trunk KV, raw indexer
+/// keys): through the end of the `ratio`-row block that holds position `tokens` — the restore resumes at `tokens`, rows
+/// at or past it are rewritten before they are read, and a pooled block is recomputed from all `ratio` raw rows of its
+/// block, so that whole block is carried bit for bit as an own-lane hit has it. Capped at `max_pos`.
+pub(crate) fn spill_rows(tokens: usize, ratio: usize, max_pos: usize) -> usize {
+    let r = ratio.max(1);
+    ((tokens + 1).div_ceil(r) * r).min(max_pos)
+}
+
+/// ISSUES 123: one slot's first `rows` rows of a `[width][segs][rows_cap][row_bytes]` device plane (`plane_bytes` total):
+/// one (byte address, byte length) region per segment. Err if the plane is not that shape.
+pub(crate) fn spill_row_regions(base: u64, plane_bytes: usize, width: usize, slot: usize, rows_cap: usize,
+                                row_bytes: usize, rows: usize) -> Result<Vec<(u64, usize)>> {
+    anyhow::ensure!(width > 0 && slot < width && rows_cap > 0 && row_bytes > 0 && rows <= rows_cap,
+                    "spill: bad region request (width {width}, slot {slot}, rows {rows} of {rows_cap}, row {row_bytes} B)");
+    let slot_bytes = plane_bytes / width;
+    let seg_bytes = rows_cap * row_bytes;
+    anyhow::ensure!(plane_bytes % width == 0 && slot_bytes % seg_bytes == 0 && slot_bytes > 0,
+                    "spill: a {plane_bytes}-byte plane is not [{width}][segs][{rows_cap}][{row_bytes}]");
+    Ok((0..slot_bytes / seg_bytes).map(|g| (base + (slot * slot_bytes + g * seg_bytes) as u64, rows * row_bytes)).collect())
 }
 
 /// Prefix-cache snapshot buffers, laid out like the live per-slot state they copy.
@@ -582,6 +618,8 @@ struct MoeLayer {
     /// CF-P1g: the experts' trellis bit width K (3 = the 3.05 pack, 4 = the 4.05 pack). The WP20 / A-once fast paths are
     /// K = 3 only so far; every other width runs the K-generic kernels (xq_gemm_grouped_xh, the pf entries).
     bits: usize,
+    /// P7-1P5: k2 = 2K (+1 fractional) — the arg exl3_reconstruct/dump8 take.
+    k2: usize,
     /// TP-A: expert-parallel shard of this layer's ROUTED experts (None = all experts resident,
     /// the TP=1 layout and the replicated T1 MTP head). Sharding is a tensor property: the forward
     /// keys the EP route filter + partial combine + all-reduce off THIS field, never off `world`.
@@ -902,8 +940,7 @@ impl Wp05Stage {
 // at pass i clears the threshold. Exactness (the trajectory cannot move):
 //  - pass i+1's inputs are unchanged by launching it early: the same graph, after pass i in stream
 //    order; its only host-side inputs (draft_meta, slot_ids, penalty rows) were staged before
-//    pass 0 (slot_ids only in the QSA-live regime; in the dense regime it keeps whatever the last
-//    launch left — still fixed for the whole round), and the readback/keep of pass i never write
+//    pass 0 (slot_ids = the lane's slot in every regime since ISSUES 128), and the readback/keep of pass i never write
 //    device memory. So every conf/draft, hence every `keep` decision (called with the same
 //    (i, conf) sequence), is bit-identical.
 //  - when the DDS stops at i with pass i+1 in flight ("wasted"), its PERSISTENT writes — the head's
@@ -912,9 +949,9 @@ impl Wp05Stage {
 //    i -> save -> pass i+1 -> restore -> verify), bit for bit. The K|V rows are the lane's slot
 //    (xq_draft_setup stages sc.slots from draft_meta); the raw-key row and the pooled block are
 //    addressed ON DEVICE through slot_ids[0], the exact slot the pass's qsa_key_write_b /
-//    qsa_pool_update_b use — in the dense regime of a multi-lane server that can be ANOTHER lane's
-//    slot (a pre-existing base behaviour, left untouched here; HOST only guarantees that a wasted
-//    pass leaves no trace of its own wherever the pass wrote). Its SCRATCH writes (sc.toks/pos/slots
+//    qsa_pool_update_b use — the lane's own slot (before ISSUES 128 a dense round of a multi-lane
+//    server could leave ANOTHER lane's slot there; HOST only guarantees that a wasted pass leaves
+//    no trace of its own wherever the pass wrote). Its SCRATCH writes (sc.toks/pos/slots
 //    row 0, sc.resid, sc.cos, the chain/attention/MoE/logit scratch, dconf[i+1], d_dev[i+1],
 //    sc.argmax) are the same buffers the last real pass writes; the verify at width i+1 rewrites
 //    toks/pos/slots/slot_ids (upload), resid (xq_embed_resid, first launch), cos (xq_cos_gather),
@@ -2103,6 +2140,31 @@ impl PleDev {
         Ok(())
     }
 
+    /// PERFFIX1: start the SSD reads of these rows NOW (posix_fadvise WILLNEED: the kernel queues them all at once)
+    /// so the sequential `fetch_row` preads that follow find them in the page cache instead of each waiting for its
+    /// own drive round trip (TP=1 posture, table on SSD: ~128 preads per verify round were ~2.5 ms of host time
+    /// with the GPU idle). Advisory only: errors are ignored, nothing is read here, the bytes `fetch_row` returns are
+    /// unchanged. No-op for the RAM-resident table.
+    fn prefetch_rows(&self, uids: &[i64]) {
+        if self.ram.get().is_some() { return; }
+        use std::os::unix::io::AsRawFd;
+        let rb = self.row_bytes as i64;
+        for &uid in uids {
+            let shard = (uid / self.rows_per_shard) as usize;
+            if shard >= self.shards.len() { continue; }
+            let off = self.shard_data_off[shard] as i64 + (uid - shard as i64 * self.rows_per_shard) * rb;
+            // SAFETY: a valid fd and an advisory range; the call reads or writes no memory of ours.
+            unsafe { libc::posix_fadvise(self.shards[shard].as_raw_fd(), off, rb, libc::POSIX_FADV_WILLNEED); }
+        }
+    }
+
+    /// PERFFIX1: `prefetch_rows` for the 16 rows of each n-gram history.
+    fn prefetch_h3s(&self, h3s: &[[i32; 3]]) {
+        if self.ram.get().is_some() { return; }
+        let uids: Vec<i64> = h3s.iter().flat_map(|h| self.ngram_uids(h)).collect();
+        self.prefetch_rows(&uids);
+    }
+
     /// One 102-byte trellis row (RAM table or pread) — the pre-WP05 fetch, unchanged.
     fn fetch_row(&self, uid: i64, raw: &mut [u8; PLE_ROW_MAX]) -> Result<()> {
         use std::os::unix::fs::FileExt;
@@ -2423,6 +2485,10 @@ pub struct FwdModel {
     // (Type deviation from the brief's plain `Option<...>`: documented in the report.)
     df2_head_bf16: std::sync::Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
     df2_embed_bf16: std::sync::Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    /// S-EXL3-DF2Q: the quantized (NVFP4-mma) twin of `df2_head_bf16` — the coarse stage of the
+    /// two-stage df2 head (gpu.rs `build_df2_q_head` recipe, ported 2026-10-18). Plain bf16
+    /// borrow costs ~126 ms/round through `gemm_binv_b`; coarse-NVFP4 + exact bf16 re-rank ~3 ms.
+    df2_q_head: std::sync::OnceLock<Option<(cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<f32>)>>,
 }
 // CUstream is an opaque handle; the stream is created by this model, used only from
 // the owning scheduler thread, and destroyed with the device. Same contract as
@@ -4048,6 +4114,14 @@ fn recon_min_rows() -> usize {
 /// bits-generic, which is why the default `--exl3-recon-min 17` is safe for the 4.05 pack's 6-bit modules.
 pub(crate) fn wide_trellis_supports_bits(bits: usize) -> bool { (3..=5).contains(&bits) }
 
+/// P7-1P5 W2 loader capability audit: widths with real decode bodies in this build.
+/// K = 3..=6 (k2 6, 8, 10, 12). Fractional K (odd k2) lands with this branch's W3/W4
+/// kernels; 7/8-bit (k2 14/16) have no bodies in either PTX module and refuse here —
+/// a width without a body must never reach a `default: break` switch (S-B9-REL-INTEG D1).
+pub(crate) fn quad_k2_supported(k2: usize) -> bool {
+    matches!(k2, 3 | 4 | 6 | 8 | 10 | 12)
+}
+
 /// The pipelined prefill MoE expert kernels (`xq_moe_pf*`, `--pf-moe-kernel`) decode 3- and 4-bit trellises only.
 pub(crate) fn moe_pf_kernel_supports_bits(bits: usize) -> bool { matches!(bits, 3 | 4) }
 
@@ -4914,16 +4988,16 @@ pub fn probe_lt_rows(cs: &[usize], shapes_sel: &str) -> Result<()> {
 /// expert slice offset (same in-tree u64-pointer launch convention as
 /// exl3_hmma_gemm_wide's MoE calls).
 fn exl3_reconstruct(l: &Launcher, tr: u64, rc: u64,
-                    ws: u64, k: i32, n: i32, bits: i32) -> Result<()> {
+                    ws: u64, k: i32, n: i32, k2: i32) -> Result<()> {
     let kb = (k as u32) / 16;
     let nb = (n as u32) / 16;
-    if nb % 8 == 0 && bits <= 8 && crate::opts::var(crate::opt!("exl3-dump8")).map_or(true, |v| v != "0") {
+    if nb % 8 == 0 && k2 <= 16 && crate::opts::var(crate::opt!("exl3-dump8")).map_or(true, |v| v != "0") {
         // S-A3-u G: coalesced strip reconstruct — same bytes (gated in --probe-exl3-kernel).
         return xqlaunch!(l, "exl3_decode_dump8", (kb * nb / 8, 1, 1), (256, 1, 1), 0,
-                         (tr, rc, ws, nb as i32, bits));
+                         (tr, rc, ws, nb as i32, k2));
     }
     xqlaunch!(l, "exl3_decode_dump", (kb * nb, 1, 1), (32, 1, 1), 0,
-             (tr, rc, ws, nb as i32, bits))
+             (tr, rc, ws, nb as i32, k2))
 }
 
 /// S-A3-n F3: dynamic smem for the A-once GEMM body (`exl3_gemm_body_a1`, taken by
@@ -5740,7 +5814,7 @@ pub(crate) const LMH_KSTEP: usize = 4;
 
 /// Mirror of lmh_smem_bytes() in kernels/exl3_bench.cu (the kernel traps if launched short).
 pub(crate) fn lmh_smem_bytes(bits: usize, mrows: usize, nst: usize, k: usize) -> usize {
-    nst * LMH_KSTEP * 8 * 32 * bits + if mrows == 8 { 8 * (k + 8) * 2 } else { 0 } + mrows * 136 * 2
+    nst * LMH_KSTEP * 8 * 32 * bits + mrows * 136 * 2  // W9b: m8 A-once term removed (kernel reads A via __ldg)
 }
 
 fn lmh_entry(bits: usize, mrows: usize, nst: usize) -> Option<&'static str> {
@@ -5885,7 +5959,7 @@ fn lmh_xcheck_run(l: &Launcher, q: &Quad, xh: &CudaSlice<u16>, got: &CudaSlice<u
     let n = q.n as usize;
     let mut yr = l.dev.alloc_zeros::<u16>(m * n)?;
     xqlaunch!(l, "exl3_hmma_gemm", ((q.n as u32) / 128, 1, 1), (256, 1, 1), 0,
-              (&q.tr, xh, &mut yr, m as i32, q.k, q.n, q.bits))?;
+              (&q.tr, xh, &mut yr, m as i32, q.k, q.n, q.k2))?;
     let refv = if fused {
         let mut yo = l.dev.alloc_zeros::<u16>(m * n)?;
         xqlaunch!(l, "exl3_had_svh", (m as u32 * (q.n as u32 / 128), 1, 1), (32, 1, 1), 0,
@@ -6073,7 +6147,7 @@ fn wp21_synth(len: usize, seed: u64) -> Vec<u16> {
 fn wp21_old_single(l: &Launcher, q: &Quad, xh: &CudaSlice<u16>, yraw: &mut CudaSlice<u16>,
                    y: &mut CudaSlice<u16>, m: usize, ws: &CudaSlice<f32>) -> Result<()> {
     xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-             (&q.tr, xh, ws, m as i32, q.k, q.n, q.bits))?;
+             (&q.tr, xh, ws, m as i32, q.k, q.n, q.k2))?;
     let mn = (m * q.n as usize) as u32;
     xqlaunch!(l, "exl3_ks_combine", ((mn + 255) / 256, 1, 1), (256, 1, 1), 0,
              (ws, &mut *yraw, m as i32, q.n, q.ks as i32))?;
@@ -6089,7 +6163,7 @@ fn wp21_old_pair(l: &Launcher, q0: &Quad, q1: &Quad, xh0: &CudaSlice<u16>, xh1: 
                  y0: &mut CudaSlice<u16>, y1: &mut CudaSlice<u16>, m: usize) -> Result<()> {
     let (k, n) = (q0.k, q0.n);
     xqlaunch!(l, "exl3_hmma_gemm_ks_x2", ((n as u32) / 128, q0.ks, 2), (256, 1, 1), 0,
-             (&q0.tr, &q1.tr, xh0, xh1, ws0, ws1, m as i32, k, n, q0.bits))?;
+             (&q0.tr, &q1.tr, xh0, xh1, ws0, ws1, m as i32, k, n, q0.k2))?;
     let mn = (m * n as usize) as u32;
     xqlaunch!(l, "exl3_ks_combine_x2", ((mn + 255) / 256, 1, 2), (256, 1, 1), 0,
              (ws0, ws1, &mut *yraw0, &mut *yraw1, m as i32, n, q0.ks as i32))?;
@@ -6146,7 +6220,7 @@ fn wp21_launch_fx_x2(l: &Launcher, q0: &Quad, q1: &Quad, xh0: &CudaSlice<u16>, x
         *y0.device_ptr() as u64, *y1.device_ptr() as u64,
         *q0.cnt.device_ptr() as u64, *q1.cnt.device_ptr() as u64,
     ];
-    wp21_fx_x2_raw(l.stream.stream, p, m, q0.k, q0.n, q0.bits, q0.ks)
+    wp21_fx_x2_raw(l.stream.stream, p, m, q0.k, q0.n, q0.k2, q0.ks)
 }
 
 fn wp21_cnt_nonzero(l: &Launcher, q: &Quad) -> Result<usize> {
@@ -6236,7 +6310,7 @@ fn wp21_sweep_single(l: &Launcher, q: &Quad) -> Result<()> {
         xqlaunch!(l, "exl3_had_suh", (m as u32 * (q.k as u32 / 128), 1, 1), (32, 1, 1), 0,
                  (&x, &q.suh, &mut xh, q.k))?;
         xqlaunch!(l, "exl3_hmma_gemm_ks_fx", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                 (&q.tr, &xh, &ws, &q.svh, &mut ya, &q.cnt, m as i32, q.k, q.n, q.bits))?;
+                 (&q.tr, &xh, &ws, &q.svh, &mut ya, &q.cnt, m as i32, q.k, q.n, q.k2))?;
         l.dev.synchronize()?;
         cnt_bad += wp21_cnt_nonzero(l, q)?;
         wp21_old_single(l, q, &xh, &mut yraw, &mut yb, m, &ws)?;
@@ -6479,7 +6553,7 @@ fn psk_xcheck_single(l: &Launcher, q: &Quad, xh: u64, ws: &CudaSlice<f32>, m: us
     let need = q.ks as usize * m * q.n as usize;
     let twin = l.dev.alloc_zeros::<f32>(need)?;       // every entry is written by the old kernel
     xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-             (&q.tr, xh, &twin, m as i32, q.k, q.n, q.bits))?;
+             (&q.tr, xh, &twin, m as i32, q.k, q.n, q.k2))?;
     l.dev.synchronize()?;
     let mut newp = vec![0f32; need];
     l.dev.dtoh_sync_copy_into(&ws.slice(0..need), &mut newp)?;
@@ -6937,12 +7011,12 @@ fn exl3_chain_impl(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlic
                 // are not launched; bitwise the same y). --wp21-off=1 = the path below.
                 wp21_occupancy_once(l);
                 xqlaunch!(l, "exl3_hmma_gemm_ks_fx", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                         (&q.tr, &*xh, ws, &q.svh, &mut *y, &q.cnt, m as i32, q.k, q.n, q.bits))?;
+                         (&q.tr, &*xh, ws, &q.svh, &mut *y, &q.cnt, m as i32, q.k, q.n, q.k2))?;
                 if wp21_xcheck() { wp21_check_single(l, q, xh, yraw, y, m, ws)?; }
                 return Ok(());
             } else {
                 xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                         (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.bits))?;
+                         (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.k2))?;
             }
             let mn = (m * q.n as usize) as u32;
             xqlaunch!(l, "exl3_ks_combine", ((mn + 255) / 256, 1, 1), (256, 1, 1), 0,
@@ -6961,7 +7035,7 @@ fn exl3_chain_impl(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlic
                 lmh_xcheck_run(l, q, &*xh, got, m, svh_done)?;
             }
         } else {
-            xqlaunch!(l, "exl3_hmma_gemm", ((q.n as u32) / 128, 1, 1), (256, 1, 1), 0, (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.bits))?;
+            xqlaunch!(l, "exl3_hmma_gemm", ((q.n as u32) / 128, 1, 1), (256, 1, 1), 0, (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.k2))?;
         }
     } else {
         chain_wide_gemm(l, q, xh, yraw, m, rb)?;
@@ -7000,9 +7074,9 @@ fn chain_wide_gemm(l: &Launcher, q: &Quad, xh: &mut CudaSlice<u16>, yraw: &mut C
         let recon = match rb {
             Some(r) if !wide_trellis_supports_bits(q.bits as usize) => {
                 if WIDE_FALLBACK_NOTE.set(()).is_ok() {
-                    crate::drprintln!("[exl3] --exl3-recon-min {rmin}: this pack has {}-bit modules the wide trellis kernel \
-cannot decode (3-, 4- and 5-bit only); those modules serve through the reconstruct + cuBLASLt arm, whatever the option says",
-                                     q.bits);
+                    crate::drprintln!("[exl3] --exl3-recon-min {rmin}: this pack has K={:.1} modules the wide trellis kernel \
+cannot decode (K 3, 4, 5 only); those modules serve through the reconstruct + cuBLASLt arm, whatever the option says",
+                                     q.k2 as f32 / 2.0);
                 }
                 crate::metrics::exl3_recon_forced(q.bits);
                 Some(r)
@@ -7014,7 +7088,7 @@ cannot decode (3-, 4- and 5-bit only); those modules serve through the reconstru
             let need = (q.k as usize) * (q.n as usize);
             anyhow::ensure!(need <= r.ws_len,
                 "recon staging too small: need {need} have {}", r.ws_len);
-            exl3_reconstruct(l, *q.tr.device_ptr() as u64, r.rc, r.ws, q.k, q.n, q.bits)?;
+            exl3_reconstruct(l, *q.tr.device_ptr() as u64, r.rc, r.ws, q.k, q.n, q.k2)?;
             exl3_lt_matmul(l, r.ws, *xh.device_ptr() as u64, *yraw.device_ptr() as u64,
                            q.k as usize, q.n as usize, m, false, r.ltws, r.ltws_len)?;
         } else {
@@ -7174,7 +7248,7 @@ impl FwdModel {
                 tr: dev.htod_sync_copy(&tr)?,
                 suh: dev.htod_sync_copy(&le_f16_bits(&m.suh.read_bytes(pack_dir)?))?,
                 svh: dev.htod_sync_copy(&le_f16_bits(&m.svh.read_bytes(pack_dir)?))?,
-                bits: m.bits as i32,
+                bits: (m.k2 / 2) as i32, k2: m.k2 as i32,
                 k: qk,
                 n: qn,
                 ks: chain_ks(qk, qn),
@@ -7200,23 +7274,23 @@ impl FwdModel {
             let suh = le_f16_bits(&m.suh.read_bytes(pack_dir)?);
             let svh = le_f16_bits(&m.svh.read_bytes(pack_dir)?);
             let (kb, nb) = (m.k / 16, m.n / 16);
-            anyhow::ensure!(tr.len() == kb * nb * 16 * m.bits && suh.len() == m.k && svh.len() == m.n,
-                "{name}: trellis/suh/svh shapes do not match k={} n={} bits={}", m.k, m.n, m.bits);
+            anyhow::ensure!(tr.len() == kb * nb * 8 * m.k2 && suh.len() == m.k && svh.len() == m.n,
+                "{name}: trellis/suh/svh shapes do not match k={} n={} bits={}", m.k, m.n, m.k2 / 2);
             let rr = match rows { Some(r) => xtp::r16(r)?, None => vec![(0, kb)] };
             let cc = match cols { Some(c) => xtp::r16(c)?, None => vec![(0, nb)] };
             anyhow::ensure!(rr.iter().all(|&(_, b)| b <= kb) && cc.iter().all(|&(_, b)| b <= nb),
                 "{name}: slice outside k={} n={}", m.k, m.n);
-            let t2 = xtp::slice_trellis(&tr, nb, m.bits, &rr, &cc);
+            let t2 = xtp::slice_trellis(&tr, nb, m.k2, &rr, &cc);
             let suh2: Vec<u16> = rr.iter().flat_map(|&(a, b)| (a * 16..b * 16).map(|i| suh[i])).collect();
             let svh2: Vec<u16> = cc.iter().flat_map(|&(a, b)| (a * 16..b * 16).map(|i| svh[i])).collect();
             let (qk, qn) = (suh2.len() as i32, svh2.len() as i32);
-            anyhow::ensure!(t2.len() == (qk as usize / 16) * (qn as usize / 16) * 16 * m.bits,
+            anyhow::ensure!(t2.len() == (qk as usize / 16) * (qn as usize / 16) * 8 * m.k2,
                 "{name}: sliced trellis {} words != {}x{} blocks", t2.len(), qk / 16, qn / 16);
             Ok(Quad {
                 tr: dev.htod_sync_copy(&t2)?,
                 suh: dev.htod_sync_copy(&suh2)?,
                 svh: dev.htod_sync_copy(&svh2)?,
-                bits: m.bits as i32,
+                bits: (m.k2 / 2) as i32, k2: m.k2 as i32,
                 k: qk,
                 n: qn,
                 // TP-I #8: a TP-sliced quad may take the TP split-K target (unset = chain_ks)
@@ -7290,10 +7364,11 @@ impl FwdModel {
                 for q in [&mut g, &mut u, &mut d] { q.ks = dense_chain_ks(q.k, q.n); }
                 let one = || -> Result<CudaSlice<u16>> { Ok(dev.htod_sync_copy(&[0u16])?) };
                 let bits = g.bits as usize;
+                let gk2 = g.k2 as usize;
                 return Ok(MoeLayer {
                     router: one()?, sg: one()?, gu_tr: one()?, d_tr: one()?,
                     suh_gu: one()?, svh_gu: one()?, suh_d: one()?, svh_d: one()?,
-                    sh_gate: g, sh_up: u, sh_down: d, gu_words: 0, d_words: 0, bits, ep: None, li, dense: true,
+                    sh_gate: g, sh_up: u, sh_down: d, gu_words: 0, d_words: 0, bits, k2: gk2, ep: None, li, dense: true,
                     split: None,
                 });
             }
@@ -7325,7 +7400,7 @@ impl FwdModel {
                 let (mut g_tr, mut u_tr, mut d_tr) = (Vec::new(), Vec::new(), Vec::new());
                 let (mut suh_g, mut suh_u, mut suh_d) = (Vec::with_capacity(ne * h), Vec::with_capacity(ne * h), Vec::with_capacity(ne * mi));
                 let (mut svh_g, mut svh_u, mut svh_d) = (Vec::with_capacity(ne * mi), Vec::with_capacity(ne * mi), Vec::with_capacity(ne * h));
-                let (mut g_words, mut d_words, mut ebits) = (0u64, 0u64, 0usize);
+                let (mut g_words, mut d_words, mut ebits, mut ek2) = (0u64, 0u64, 0usize, 0usize);
                 for &e in &local {
                     let q = |w: &str| -> Result<&ModuleMeta> {
                         modules.get(format!("{p}.experts.{e}.{w}").as_str()).copied()
@@ -7334,9 +7409,10 @@ impl FwdModel {
                     let (g, u, d) = (q("gate_proj")?, q("up_proj")?, q("down_proj")?);
                     anyhow::ensure!(g.k == h && u.k == h && g.n == mi && u.n == mi && d.k == mi && d.n == h,
                                     "expert geometry mismatch @{tag} e{e}");
-                    anyhow::ensure!(g.bits == u.bits && g.bits == d.bits && (ebits == 0 || ebits == g.bits),
+                    anyhow::ensure!(g.k2 / 2 == u.k2 / 2 && g.k2 / 2 == d.k2 / 2 && (ebits == 0 || ebits == g.k2 / 2),
                                     "expert bit widths differ within a layer @{tag} e{e}");
-                    ebits = g.bits;
+                    ebits = g.k2 / 2;
+                    ek2 = g.k2 as usize;
                     g_tr.extend(rd16(g.trellis.read_bytes(pack_dir)?));
                     u_tr.extend(rd16(u.trellis.read_bytes(pack_dir)?));
                     d_tr.extend(rd16(d.trellis.read_bytes(pack_dir)?));
@@ -7346,8 +7422,8 @@ impl FwdModel {
                     svh_g.extend(le_f16_bits(&g.svh.read_bytes(pack_dir)?));
                     svh_u.extend(le_f16_bits(&u.svh.read_bytes(pack_dir)?));
                     svh_d.extend(le_f16_bits(&d.svh.read_bytes(pack_dir)?));
-                    g_words = ((h / 16) * (mi / 16) * 16 * g.bits) as u64;
-                    d_words = ((mi / 16) * (h / 16) * 16 * d.bits) as u64;
+                    g_words = ((h / 16) * (mi / 16) * 16 * g.k2 / 2) as u64;
+                    d_words = ((mi / 16) * (h / 16) * 16 * d.k2 / 2) as u64;
                 }
                 let nl = local.len();
                 anyhow::ensure!(g_tr.len() == nl * g_words as usize && u_tr.len() == g_tr.len()
@@ -7372,7 +7448,7 @@ impl FwdModel {
                                             None => get_quad(&format!("{p}.shared_expert.up_proj"))? },
                     sh_down: match sh_split { Some(r) => get_quad_sl(&format!("{p}.shared_expert.down_proj"), Some(&[r]), None, false)?,
                                               None => get_quad(&format!("{p}.shared_expert.down_proj"))? },
-                    gu_words: g_words, d_words, bits: ebits, li, dense: false,
+                    gu_words: g_words, d_words, bits: ebits, k2: ek2, li, dense: false,
                     ep: match ep_rank {
                         Some((r, w)) => {
                             let mut e = xtp::EpShard::new(&dev, ne, r, w, &local, &tag,
@@ -7406,7 +7482,7 @@ impl FwdModel {
             };
             let mut gu_words = 0u64;
             let mut d_words = 0u64;
-            let mut ebits = 0usize;
+            let (mut ebits, mut ek2) = (0usize, 0usize);
             let mut gu_tr_h: Vec<u16> = Vec::new();
             let mut d_tr_h: Vec<u16> = Vec::new();
             let mut suh_gu_h: Vec<u16> = Vec::with_capacity(ne * 2560);
@@ -7422,10 +7498,10 @@ impl FwdModel {
                 let d = modules
                     .get(format!("{p}.experts.{e}.down_proj").as_str())
                     .with_context(|| format!("expert {e} down ({p}.experts.{e}.down_proj) missing @{tag}{shard_tag}"))?;
-                if g.bits != u.bits || g.n != mi || u.n != mi || d.k != mi {
+                if g.k2 / 2 != u.k2 / 2 || g.n != mi || u.n != mi || d.k != mi {
                     bail!("expert geometry mismatch @{tag} e{e}");
                 }
-                let gw = 16 * g.bits;
+                let gw = 16 * g.k2 / 2;
                 let kb = g.k / 16;
                 let gnb = g.n / 16;
                 let g_tr: Vec<u16> = g
@@ -7456,9 +7532,10 @@ impl FwdModel {
                 suh_d_h.extend(le_f16_bits(&d.suh.read_bytes(pack_dir)?));
                 svh_d_h.extend(le_f16_bits(&d.svh.read_bytes(pack_dir)?));
                 gu_words = (kb * gnb * 2 * gw) as u64;
-                d_words = ((d.k / 16) * (d.n / 16) * 16 * d.bits) as u64;
-                if ebits != 0 && (ebits != g.bits || ebits != d.bits) { bail!("expert bit widths differ within a layer @{tag} e{e}"); }
-                ebits = g.bits;
+                d_words = ((d.k / 16) * (d.n / 16) * 16 * d.k2 / 2) as u64;
+                if ebits != 0 && (ebits != g.k2 / 2 || ebits != d.k2 / 2) { bail!("expert bit widths differ within a layer @{tag} e{e}"); }
+                ebits = g.k2 / 2;
+                    ek2 = g.k2 as usize;
             }
             Ok(MoeLayer {
                 router: get_plain_f16(&format!("{p}.gate.weight"))?,
@@ -7482,6 +7559,7 @@ impl FwdModel {
                 gu_words,
                 d_words,
                 bits: ebits,
+                k2: ek2,
                 li,
                 dense: false,
                 split: None,
@@ -8287,7 +8365,7 @@ impl FwdModel {
                     tr: tr2,
                     suh: suh2,
                     svh: svh2,
-                    bits: lm_head.bits,
+                    bits: lm_head.bits, k2: lm_head.k2,
                     k: lm_head.k,
                     n: n2,
                     ks: chain_ks(lm_head.k, n2),
@@ -8396,7 +8474,7 @@ impl FwdModel {
                           (&mut suh2, &lm_head.suh, lm_head.suh.len() as i64, 0i64, 0i64))?;
                 l0.dev.synchronize()?;
                 let q = Quad {
-                    tr: tr2, suh: suh2, svh: svh2, bits: lm_head.bits, k: lm_head.k, n: n_sh,
+                    tr: tr2, suh: suh2, svh: svh2, bits: lm_head.bits, k2: lm_head.k2, k: lm_head.k, n: n_sh,
                     ks: chain_ks(lm_head.k, n_sh), lmh: true,
                     cnt: dev.htod_sync_copy(&vec![0u32; ((n_sh.max(0) as usize) / 128).max(1)])?, // explicit zero
                     rowpar: false,
@@ -8511,6 +8589,7 @@ impl FwdModel {
             df2_prime: None,
             df2_head_bf16: std::sync::Mutex::new(None),
             df2_embed_bf16: std::sync::Mutex::new(None),
+            df2_q_head: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -9157,6 +9236,19 @@ impl FwdModel {
             None => return Ok(()),
         };
         let mut hist = self.ple_hist.lock().unwrap();
+        // PERFFIX1: queue every SSD row of this step at once (the ring advanced on a copy exactly as the loop below
+        // advances it); no-op for the RAM table
+        if ple.ram.get().is_none() {
+            let mut sim = hist.clone();
+            let h3s: Vec<[i32; 3]> = (0..m).map(|q| {
+                let s = slots[q];
+                let h = [sim[s * 2], sim[s * 2 + 1], toks[q]];
+                sim[s * 2] = sim[s * 2 + 1];
+                sim[s * 2 + 1] = toks[q];
+                h
+            }).collect();
+            ple.prefetch_h3s(&h3s);
+        }
         for q in 0..m {
             // S-A3-e FIX: the n-gram ring is PER-SLOT (batch row q is the launch position).
             let s = slots[q];
@@ -11321,14 +11413,14 @@ impl FwdModel {
             // Zero-cost when the sink is unarmed. Under TP every rank holds the full token
             // rows, so the taps are rank-identical (the trunk captures on all ranks too).
             if self.df2_sink.is_some() && m <= crate::dflash2::block()
-                && self.cfg.hidden_size == crate::dflash2::HIDDEN {
-                if let Some(kk) = crate::dflash2::TAP_LAYERS.iter().position(|&x| x == li) {
+                && self.cfg.hidden_size == crate::dflash2::geom().hidden {
+                if let Some(kk) = crate::dflash2::geom().tap_layers.iter().position(|&x| x == li) {
                     if hc_pend.is_some() { self.hc_flush(&l, sc, m, &mut hc_pend)?; }
                     crate::dflash2::capture::capture_cols_f32(
                         &self.dev, l.stream, self.df2_sink.as_ref().unwrap(),
                         *sc.resid.device_ptr() as u64,
                         self.cfg.hc_count.max(1) * self.cfg.hidden_size,
-                        self.cfg.hidden_size, m, kk)?;
+                        self.cfg.hidden_size, self.cfg.hc_count.max(1), m, kk)?;
                 }
             }
             if li == 0 {
@@ -13390,45 +13482,45 @@ impl FwdModel {
     /// of this slot are the conversation's own); the recurrent state is read from the snapshot
     /// buffers snapshot_slot filled at the end of the last prefill — and restored the same way,
     /// so the existing restore_slot path keeps working unchanged.
-    fn spill_regions(&self, slot: usize) -> Result<Vec<(u64, usize)>> {
+    fn spill_regions(&self, slot: usize, tokens: usize) -> Result<Vec<(u64, usize)>> {
         let snap = self.snap.as_ref().context("prefix snapshots not allocated (--prefix-cache off)")?;
         let w = self.width;
         anyhow::ensure!(slot < w, "spill: slot {slot} >= width {w}");
         let mut v: Vec<(u64, usize)> = Vec::new();
-        let stride = |len: usize| len / w;
+        // ISSUES 122: BYTE offsets and lengths (u8 KV, u16 QSA keys/pool + PLE ring, f32 GDN conv/S + head-fill carry).
+        fn push<T>(v: &mut Vec<(u64, usize)>, p: &CudaSlice<T>, w: usize, slot: usize) -> usize {
+            let (at, bytes) = spill_slot_region(*p.device_ptr() as u64, p.len(), std::mem::size_of::<T>(), w, slot);
+            v.push((at, bytes));
+            bytes
+        }
+        // ISSUES 123: the POSITION planes carry only the rows the conversation uses (`spill_rows`): a 4K-token snapshot
+        // was the whole 262K-position lane (2.75 GB per rank at TP=4). The recurrent state planes stay whole (per slot).
+        let ratio = if self.cfg.has_indexer() { self.cfg.indexer_compress_ratio } else { 1 };
+        let rows = spill_rows(tokens, ratio, self.max_pos);
+        let kv_rb = kv_rowbytes(self.kv_fmt, self.tc.head_dim);
         for l in &self.k_cache {
-            let s = stride(l.len());
-            anyhow::ensure!(s > 0, "spill: empty k_cache plane");
-            v.push((*l.device_ptr() as u64 + (slot * s) as u64, s));
+            let r = spill_row_regions(*l.device_ptr() as u64, l.len(), w, slot, self.max_pos, kv_rb, rows)?;
+            anyhow::ensure!(r.len() == 2 * self.tc.num_kv_heads, "spill: KV plane has {} segments, want 2 x {}", r.len(), self.tc.num_kv_heads);
+            v.extend(r);
         }
+        let hdx_b = self.cfg.indexer_head_dim * 2; // bf16 rows
         for l in &self.qsa_keys {
-            let s = stride(l.len());
-            if s > 0 { v.push((*l.device_ptr() as u64 + (slot * s) as u64, s)); }
+            if l.len() == 0 { continue; }
+            v.extend(spill_row_regions(*l.device_ptr() as u64, l.len() * 2, w, slot, self.max_pos, hdx_b, rows)?);
         }
+        let nblk = self.max_pos.div_ceil(ratio).max(1);
         for l in &self.qsa_pool {
-            let s = stride(l.len());
-            if s > 0 { v.push((*l.device_ptr() as u64 + (slot * s) as u64, s)); }
+            if l.len() == 0 { continue; }
+            v.extend(spill_row_regions(*l.device_ptr() as u64, l.len() * 2, w, slot, nblk, hdx_b, rows.div_ceil(ratio).min(nblk))?);
         }
-        for sn in &snap.conv {
-            let s = stride(sn.len());
-            v.push((*sn.device_ptr() as u64 + (slot * s) as u64, s));
-        }
-        for sn in &snap.s {
-            let s = stride(sn.len());
-            v.push((*sn.device_ptr() as u64 + (slot * s) as u64, s));
-        }
-        {
-            let s = stride(snap.ple.len());
-            v.push((*snap.ple.device_ptr() as u64 + (slot * s) as u64, s));
-        }
-        {
-            let s = stride(snap.carry.len());
-            v.push((*snap.carry.device_ptr() as u64 + (slot * s) as u64, s));
-        }
+        for sn in &snap.conv { push(&mut v, sn, w, slot); }
+        for sn in &snap.s { push(&mut v, sn, w, slot); }
+        push(&mut v, &snap.ple, w, slot);
+        push(&mut v, &snap.carry, w, slot);
         Ok(v)
     }
 
-    /// LANERES2 (`--kv-spill`): serialize slot's prefix snapshot into `out` (GB10SPIL v1):
+    /// LANERES2 (`--kv-spill`): serialize slot's prefix snapshot into `out` (GB10SPIL, payload version SPILL_PAYLOAD_VERSION):
     /// 8B magic, u32 version, u64 tokens, u64 region count, u64 payload bytes, the raw regions
     /// in spill_regions order, then the 2 host PLE ring ids. Bit-exact by construction: every
     /// region is a memcpy of the exact device words the serving path reads. TEXT-ONLY: the
@@ -13441,10 +13533,14 @@ impl FwdModel {
     pub fn spill_capture(&self, slot: usize, tokens: usize, out: &mut Vec<u8>) -> Result<()> {
         let snap = self.snap.as_ref().context("prefix snapshots not allocated")?;
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
-        let regions = self.spill_regions(slot)?;
+        let regions = self.spill_regions(slot, tokens)?;
         let total: usize = regions.iter().map(|(_, b)| *b).sum();
         out.clear();
-        out.resize(36, 0); // reserved: kv_spill::finalize_header fills it (single-copy capture)
+        out.reserve(72 + total + 8);
+        out.resize(72, 0); // LANERES3: outer 36B (kv_spill::finalize_header) + inner 36B
+        // body header (GB10SPIL) that spill_restore parses — LANERES2 shipped the capture
+        // without it (restores never engaged on hardware, so every restore would have
+        // died "bad magic/length"; first exercised by LANERES3's TP tier).
         // order: retire ALL device work (the planes' writers run on the compute stream) before
         // the NULL-stream DtoH reads them; device-wide is stronger than stream sync and this
         // path is rare + dominated by the next prefill.
@@ -13463,6 +13559,12 @@ impl FwdModel {
                 left -= n;
             }
         }
+        // the inner body header the restore parses (magic, ver=1, tokens, nreg, total):
+        out[36..44].copy_from_slice(b"GB10SPIL");
+        out[44..48].copy_from_slice(&SPILL_PAYLOAD_VERSION.to_le_bytes());
+        out[48..56].copy_from_slice(&(tokens as u64).to_le_bytes());
+        out[56..64].copy_from_slice(&(regions.len() as u64).to_le_bytes());
+        out[64..72].copy_from_slice(&(total as u64).to_le_bytes());
         let h = snap.hist.lock().unwrap();
         out.extend_from_slice(&h[slot * 2].to_le_bytes());
         out.extend_from_slice(&h[slot * 2 + 1].to_le_bytes());
@@ -13475,26 +13577,44 @@ impl FwdModel {
     /// the snapshot's hist. Any mismatch (magic/version/shape — a different model or flag set
     /// captured the file) is an Err: the caller falls back to re-prefill and counts it; the
     /// server never refuses a request over a spilled snapshot.
-    pub fn spill_restore(&self, slot: usize, file: &[u8]) -> Result<usize> {
-        // file = the finalize_header layout: outer 36B header, then the capture body (its own
-        // reserved 36B header: MAGIC, ver, tokens, nreg, total, regions..., hist 8B).
-        anyhow::ensure!(file.len() >= 72, "spill: file too short");
-        let bytes = &file[36..];
+    /// LANERES3: the parse-only half of `spill_restore` — validates a payload (magic,
+    /// version, shape against THIS model's regions) without touching GPU state, so the
+    /// TP tier can agree the PARSE outcome across ranks before either side restores: a
+    /// payload one rank cannot parse is dropped everywhere (graceful re-prefill), never
+    /// a post-agree fatal. Returns the payload's token count.
+    pub fn spill_restore_check(&self, slot: usize, payload: &[u8]) -> Result<usize> {
+        // payload = Store::get's payload (the OUTER file header is already stripped):
+        // inner GB10SPIL header (36B), the regions, then the 8B hist tail. Both TP callers
+        // pass exactly this; treating it as the whole file double-strips 36B and rejects
+        // every capture (lr3dbg receipt, 2026-10-22).
+        anyhow::ensure!(payload.len() >= 44, "spill: file too short");
+        let bytes = payload;
         anyhow::ensure!(bytes.len() >= 44 && &bytes[0..8] == b"GB10SPIL", "spill: bad magic/length");
         let ver = u32::from_le_bytes(bytes[8..12].try_into()?);
-        anyhow::ensure!(ver == 1, "spill: payload version {ver}");
+        anyhow::ensure!(ver == SPILL_PAYLOAD_VERSION, "spill: payload version {ver}, this build reads {SPILL_PAYLOAD_VERSION} \
+                        (older files: dropped, re-prefill)");
         let tokens = u64::from_le_bytes(bytes[12..20].try_into()?) as usize;
         let nreg = u64::from_le_bytes(bytes[20..28].try_into()?) as usize;
         let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
         anyhow::ensure!(bytes.len() == 36 + total + 8, "spill: payload length mismatch");
         anyhow::ensure!(tokens > 0 && tokens <= self.max_pos, "spill: tokens {tokens} out of range");
-        let regions = self.spill_regions(slot)?;
+        let regions = self.spill_regions(slot, tokens)?;
         anyhow::ensure!(regions.len() == nreg, "spill: region count {} != {nreg}", regions.len());
         anyhow::ensure!(total == regions.iter().map(|(_, b)| *b).sum::<usize>(),
                         "spill: payload bytes {total} != this model's regions (flags/model changed since capture)");
+        Ok(tokens)
+    }
+
+    pub fn spill_restore(&self, slot: usize, payload: &[u8]) -> Result<usize> {
+        // payload = Store::get's payload: the capture body (its own 36B header: MAGIC, ver,
+        // tokens, nreg, total), then the regions, then the 8B hist tail.
+        let tokens = self.spill_restore_check(slot, payload)?;
+        let bytes = payload;
+        let total = u64::from_le_bytes(bytes[28..36].try_into()?) as usize;
         self.dev.synchronize()?;
         const CHUNK: usize = 64 << 20;
         let mut pin = PinnedHost::new(&self.dev, CHUNK.min(total.max(16)))?;
+        let regions = self.spill_regions(slot, tokens)?; // LANERES3: re-derive (the check validated them)
         let mut off = 36usize;
         for (dst, dbytes) in &regions {
             let mut left = *dbytes;
@@ -13663,19 +13783,42 @@ impl FwdModel {
     /// BEFORE `inject_dev` (batch.rs:4974: the round must re-base its staging on THIS round's
     /// taps before the ring advances, or later drafts condition on stale features); (4)
     /// `inject_dev(out.a + 1)` advances the drafter's ring over the accepted span.
+    /// FLASHNEXT-DF2-117: the sampled selector walk alone (no verify) — what the HEAD runs and ships
+    /// under TP, and what a single box runs before its own `df2_round`. Refreshes the block positions
+    /// first (the ring attention reads `pos_blk`; see EXL27C-Fix4 in `df2_round`).
+    pub fn df2_draft_sample(&self, round: &mut crate::dflash2::round::Df2Round, b: u32, seeds: &[u32], tau: f32)
+                            -> Result<crate::dflash2::round::Df2SampleOut> {
+        round.refresh_block_pos()?;
+        round.draft_round_dev_sample(b, seeds, tau)
+    }
+
+    /// FLASHNEXT-DF2-117 (greedy twin): the greedy draft alone — the captured round graph's replay (or the
+    /// eager zeroed-ints path) — what the HEAD runs and ships under TP. The greedy top-1 also flips
+    /// across ranks on a near-tie (TP=2: one round in ~1,500; TP=4: within ~700), so greedy drafts are
+    /// head-authoritative too.
+    pub fn df2_draft_greedy(&self, round: &mut crate::dflash2::round::Df2Round, b: u32) -> Result<Vec<u32>> {
+        round.refresh_block_pos()?;
+        round.draft_round_graph(b)
+    }
+
+    /// `sample`: FLASHNEXT-DF2-117 — a draft drawn earlier (`df2_draft_sample` / `df2_draft_greedy`, this rank's
+    /// or the head's shipped one); with `rq` Some it REPLACES the walk here, so every rank verifies
+    /// one draft with one proposal law. None with `rq` Some = draw here (the pre-117 single-box path).
     pub fn df2_round(&self, sc: &mut Scratch, round: &mut crate::dflash2::round::Df2Round,
                      slot: usize, k: usize, b: i32, p: usize,
-                     rq: Option<(&[u32], f32)>,
+                     rq: Option<(&[u32], f32)>, sample: Option<crate::dflash2::round::Df2SampleOut>,
                      t: [std::time::Instant; 3]) -> Result<MtpRoundOut> {
         use std::sync::atomic::Ordering::Relaxed;
         let tr = DF2_TRACE.load(Relaxed);
         if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] draft begin k={k} b={b} p={p}"); }
+        let mut ttr = std::time::Instant::now();
         // EXL27C-Fix4: the trunk refreshes pos_blk before EVERY draft (batch.rs x5;
         // round.rs:1450 'Callers must refresh_block_pos() first'). Without it pos_blk holds
         // stale/garbage absolute positions and the ring attention (gqa_attn_band_ring_b)
         // maps wild rows: sanitizer OOB __shared__ scores writes + CUDA_ERROR_ILLEGAL_ADDRESS
         // (2026-10-16, .14, block 8 and 16 alike).
-        round.refresh_block_pos()?;
+        // PERFFIX1: skipped when this rank's draft (df2_draft_sample / df2_draft_greedy) already refreshed this frontier.
+        round.refresh_block_pos_if_stale()?;
         // EXL27D-RQ (item 1, 2026-10-21): a SAMPLED lane (sc.rq_mode 2 — --spec-sampling
         // ratio, the default) drafts through the S5F2 sampled selector walk (the vendor
         // CandidateSelector.sample_path multinomial at tau) and stages the walk's candidate
@@ -13688,21 +13831,32 @@ impl FwdModel {
         // 4.1–5.5 acceptance length at the same sampling parameters).
         let (drafts, samp_out) = match rq {
             Some((seeds, tau)) => {
-                let out = round.draft_round_dev_sample(b as u32, seeds, tau)?;
+                let out = match sample { Some(o) => o, None => round.draft_round_dev_sample(b as u32, seeds, tau)? };
                 let drafts: Vec<i32> = out.tokens.iter().take(k).map(|&tk| tk as i32).collect();
                 (drafts, Some(out))
             }
             None => {
-                let dr = round.draft_round(b as u32, k, false, false, false)?;
+                // FLASHNEXT-DF2-B (ISSUES work[112], 2026-10-23): the greedy draft takes the
+                // trunk's proven entry (batch.rs): the captured round graph when present,
+                // else the eager kernels with the graph's device ints ZEROED. The old call
+                // `draft_round(b, k, ..)` passed the verify width k as the attention WINDOW
+                // (a 7-key band instead of 2048) and ran the eager kernels with `ntot_dev`
+                // still pointing at the boot-capture's device int (max_c + block) whenever a
+                // round graph existed — the band kernel then walked [lo, 262152) against an
+                // eager-sized smem: compute-sanitizer's `gqa_attn_band_ring_b` __shared__
+                // OOB, then CUDA_ERROR_ILLEGAL_ADDRESS (engine DEAD). The sampled branch
+                // above never had either defect (draft_round_dev_sample zeroes the ints and
+                // uses the sliding window).
+                let toks = match sample { Some(o) => o.tokens, None => round.draft_round_graph(b as u32)? };
                 if DF2_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
                     static D2N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                     if D2N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-                        let t: Vec<u32> = dr.tokens.iter().take(6).copied().collect();
+                        let t: Vec<u32> = toks.iter().take(6).copied().collect();
                         eprintln!("[df2trace] drafts={t:?} nprev={}", round.nprev());
                     }
                 }
-                if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] draft done ntok={}", dr.tokens.len()); }
-                let drafts: Vec<i32> = dr.tokens.iter().take(k).map(|&tk| tk as i32).collect();
+                if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] draft done ntok={}", toks.len()); }
+                let drafts: Vec<i32> = toks.iter().take(k).map(|&tk| tk as i32).collect();
                 (drafts, None)
             }
         };
@@ -13737,7 +13891,7 @@ impl FwdModel {
         }
         if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] verify begin (d_dev uploaded)"); }
         let out = self.mtp_verify(sc, slot, k, b, p, drafts, t)?;
-        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] verify done a={}", out.a); }
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] verify done a={} ms={:.1}", out.a, ttr.elapsed().as_secs_f32()*1e3); ttr = std::time::Instant::now(); }
         if DF2_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
             static V2N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             if V2N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
@@ -13746,9 +13900,9 @@ impl FwdModel {
             }
         }
         round.sync_staging_from_sink()?;
-        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] staging synced"); }
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] staging synced ms={:.1}", ttr.elapsed().as_secs_f32()*1e3); ttr = std::time::Instant::now(); }
         round.inject_dev(out.a + 1, None)?;
-        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] injected {}", out.a + 1); }
+        if tr { let _ = self.dev.synchronize(); eprintln!("[df2trace] injected {} ms={:.1}", out.a + 1, ttr.elapsed().as_secs_f32()*1e3); }
         Ok(out)
     }
 
@@ -13799,6 +13953,38 @@ impl FwdModel {
     /// roundings vs the serve path's interleaved roundings (rel ~1e-3) - acceptable for
     /// the DRAFTER's scoring; acceptance is judged by the target's own logits in
     /// mtp_verify.
+    /// The NVFP4-mma pack of the dequantized EXL3 lm_head (one-time; `--no-df2-q2stage` opts out
+    /// at the borrow site in exl3_serve). Same recipe as gpu.rs `build_df2_q_head`: RTW quantize
+    /// the full [n,k] bf16 head, MMA-repack, gs = 1/global per 16-row tile (kernel convention).
+    pub fn df2_q_head_ptrs(&self) -> Option<crate::dflash2::round::Nvfp4Ptrs> {
+        let g = self.df2_q_head.get_or_init(|| {
+            let guard = self.df2_head_bf16.lock().unwrap();
+            let b = guard.as_ref()?;
+            let q = &self.lm_head;
+            let (kk, nn) = (q.k as usize, q.n as usize);
+            if nn % 16 != 0 || kk % 16 != 0 { return None; }
+            eprintln!("[df2] quantizing EXL3 borrowed head bf16->NVFP4-mma in memory ({nn} x {kk}) — one-time");
+            let t0 = std::time::Instant::now();
+            let host: Vec<half::bf16> = self.dev.dtoh_sync_copy(b).ok()?;
+            crate::quant::set_repack_threading(true);
+            let t = crate::quant::quantize_nvfp4(&host, nn, kk);
+            drop(host);
+            let (wt, st) = crate::quant::repack_nvfp4_mma(&t.qweight, &t.scales, nn, kk);
+            let inv_gs = 1.0 / t.global_scale;
+            let gsv = vec![inv_gs; nn / 16];
+            let qweight = self.dev.htod_sync_copy(&wt).ok()?;
+            let scales = self.dev.htod_sync_copy(&st).ok()?;
+            let gs = self.dev.htod_sync_copy(&gsv).ok()?;
+            eprintln!("[df2] EXL3 head quantized in {:.1}s ({} MB packed, was {} MB bf16) — df2 head now reads ~1/3.7x",
+                      t0.elapsed().as_secs_f32(), wt.len() / 1_000_000, nn * kk * 2 / 1_000_000);
+            Some((qweight, scales, gs))
+        });
+        let (q, sc, gs) = g.as_ref()?;
+        Some(crate::dflash2::round::Nvfp4Ptrs {
+            qweight: *q.device_ptr() as u64, scales: *sc.device_ptr() as u64, gs: *gs.device_ptr() as u64,
+        })
+    }
+
     pub fn df2_boot_ptrs(&self) -> Result<(u64, u64)> {
         let t0 = std::time::Instant::now();
         let l = Launcher { dev: &self.dev, stream: &self.stream };
@@ -13835,7 +14021,7 @@ impl FwdModel {
                     .map_err(|e| anyhow::anyhow!("df2 head ws alloc: {e:?}"))?;
                 let ws_ptr = *ws.device_ptr() as u64;
                 exl3_reconstruct(&l, *q.tr.device_ptr() as u64,
-                                 *self.rc_lut.device_ptr() as u64, ws_ptr, q.k, q.n, q.bits)?;
+                                 *self.rc_lut.device_ptr() as u64, ws_ptr, q.k, q.n, q.k2)?;
                 // (b) fold B_N over W_dec's rows (in place; each thread owns its 4 elements).
                 xqlaunch!(l, "exl3_had_svh", ((kk * (nn / 128)) as u32, 1, 1), (32, 1, 1), 0,
                           (ws_ptr, &q.svh, ws_ptr, q.n))?;
@@ -14809,7 +14995,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     // matrix is what its mma consumes); fp32-accumulate reduction
                     // order differs — the drift class pre-authorized by the brief.
                     exl3_reconstruct(l, gu_base + eb * moe.gu_words * 2, rb.rc, rb.ws,
-                                     2560, (mi * 2) as i32, moe.bits as i32)?;
+                                     2560, (mi * 2) as i32, moe.k2 as i32)?;
                     exl3_lt_matmul(l, rb.ws, xh_base + row0 * xh_stride,
                                    yg_base + row0 * yg_stride, 2560, (mi * 2) as usize,
                                    ce as usize, false, rb.ltws, rb.ltws_len)?;
@@ -14864,7 +15050,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     // S-A3-f-g: reconstruct this expert's down projection
                     // ([K=mi, N=2560]) once, then the vendor GEMM per row block.
                     exl3_reconstruct(l, d_base + eb * moe.d_words * 2, rb.rc, rb.ws,
-                                     mi as i32, 2560i32, moe.bits as i32)?;
+                                     mi as i32, 2560i32, moe.k2 as i32)?;
                     exl3_lt_matmul(l, rb.ws, xhd_base + row0 * d_xh_stride,
                                    yd_base + row0 * yd_stride, mi as usize, 2560usize,
                                    ce as usize, false, rb.ltws, rb.ltws_len)?;
@@ -15735,20 +15921,37 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             // residual into the PRIME sink's rows [0, c) (trunk-identical: gpu.rs's S5F
             // prefill capture writes rows [0, n); the serve agent then calls
             // df2_prime_window(round, pos_start, c) per chunk). Flushing a deferred inject
-            // before the tap is bitwise the fused path. TODO-TP: under TP sequence-parallel
-            // prefill psc.resid holds only this rank's OWN rows (hc_post_rows_sp's
-            // lo*h*hcn offset) - gated off until the DF2 TP port lands.
-            if self.df2_prime.is_some() && self.tp.is_none()
-                && self.cfg.hidden_size == crate::dflash2::HIDDEN {
-                if let Some(kk) = crate::dflash2::TAP_LAYERS.iter().position(|&x| x == li) {
-                    if let Some(y) = pend.take() {
-                        self.hc_post_rows_sp(&l, psc, y, c, spl(li))?;
+            // before the tap is bitwise the fused path.
+            // P7-TP2: under TP sequence-parallel prefill psc.resid holds only this rank's
+            // OWN rows (hc_post_rows_sp's lo*h*hcn offset), so the tap all-gathers the
+            // peer's rows first - the same gather the pack head fill does at chunk end.
+            // Both ranks then capture identical full rows [0, c). Gathered peer rows are
+            // inert downstream: every SP op in the loop reads/writes own rows only.
+            if self.df2_prime.is_some()
+                && self.cfg.hidden_size == crate::dflash2::geom().hidden {
+                if let Some(kk) = crate::dflash2::geom().tap_layers.iter().position(|&x| x == li) {
+                    // FLASHNEXT-DF2-B (TP=2 boot, 2026-10-23): under --tp-prefill-overlap the
+                    // pipelined MoE reduce's hook has ALREADY injected `pend` into resid and
+                    // normed the next hc_pre's input (`normed` = true). Flushing it again here
+                    // added the MoE output to the residual a second time and then tripped
+                    // hc_pre_rows_n's "a hooked norm without the fused inj_norm path" (pend
+                    // taken, normed still set) — the head aborted at the first prefill. When the
+                    // hook ran, resid is complete: capture it and leave `pend` to the next
+                    // hc_pre_rows_n (its contract consumes the token). Without the hook, flush.
+                    if !normed {
+                        if let Some(y) = pend.take() {
+                            self.hc_post_rows_sp(&l, psc, y, c, spl(li))?;
+                        }
+                    }
+                    if let (Some(s), Some(tp)) = (sp, self.tp.as_ref()) {
+                        let rw = self.cfg.hc_count.max(1) * self.cfg.hidden_size;
+                        tp.sp_all_gather(&l, *psc.resid.device_ptr() as u64, rw * 4, &s)?;
                     }
                     crate::dflash2::capture::capture_prime_f32(
                         &self.dev, l.stream, self.df2_prime.as_ref().unwrap(),
                         *psc.resid.device_ptr() as u64,
                         self.cfg.hc_count.max(1) * self.cfg.hidden_size,
-                        self.cfg.hidden_size, c, kk)?;
+                        self.cfg.hidden_size, self.cfg.hc_count.max(1), c, kk)?;
                 }
             }
             // TP-SP2 G-T1-b fault injection (--xtp-sp-fault, the xtp probe's sequence-parallel run on ONE
@@ -19066,14 +19269,14 @@ impl FwdModel {
             // trunk's graphed verify tap does). Same guards as the decode hook in
             // forward_step_kernels; flush-before-tap so the residual is materialized.
             if self.df2_sink.is_some() && m <= crate::dflash2::block()
-                && self.cfg.hidden_size == crate::dflash2::HIDDEN {
-                if let Some(kk) = crate::dflash2::TAP_LAYERS.iter().position(|&x| x == lk) {
+                && self.cfg.hidden_size == crate::dflash2::geom().hidden {
+                if let Some(kk) = crate::dflash2::geom().tap_layers.iter().position(|&x| x == lk) {
                     if hc_pend.is_some() { self.hc_flush(l, sc, m, &mut hc_pend)?; }
                     crate::dflash2::capture::capture_cols_f32(
                         &self.dev, l.stream, self.df2_sink.as_ref().unwrap(),
                         *sc.resid.device_ptr() as u64,
                         self.cfg.hc_count.max(1) * self.cfg.hidden_size,
-                        self.cfg.hidden_size, m, kk)?;
+                        self.cfg.hidden_size, self.cfg.hc_count.max(1), m, kk)?;
                 }
             }
             if lk == 0 { if let Some(d) = bmtd.as_ref() { dump_f(&d, &sc.resid, "l0rmlp", 0)?; } }
@@ -19496,10 +19699,9 @@ impl FwdModel {
         let (dg, _) = self.qsa_grid_bucket_key(p + k - 1);
         sc.qsa_grid_nblk = dg;
         // This PROBE stages slot_ids for the chain UNCONDITIONALLY (the head key write targets
-        // slot_ids[b]'s plane even in the dense regime). The SERVED draft (`mtp_draft_adaptive`)
-        // stages them only when the chain's last pass is in the sparse regime, so a dense round
-        // writes the head's raw-key / pooled planes at the previous op's slot (PACK4 review
-        // note 1: acceptance only, never bytes: those planes are read by the head's scorer alone).
+        // slot_ids[b]'s plane even in the dense regime). Since ISSUES 128 the SERVED drafts
+        // (`mtp_draft_adaptive`, the fixed chain) do the same (they used to stage them only for a
+        // sparse last pass, writing a dense round's head QSA rows at the previous op's slot).
         self.dev.htod_copy_into(vec![slot as i32; sc.slot_ids.len()], &mut sc.slot_ids)?;
         self.draft_block(l, sc, head, k, dqsa)?;
         self.dev.synchronize()?;
@@ -22257,7 +22459,9 @@ step (no draft fits before the sparse switch)"));
         let dqsa = self.qsa_live(p + k - 1);
         let (dg, db) = self.qsa_grid_bucket_key(p + k - 1);
         sc.qsa_grid_nblk = dg;
-        if dqsa { self.dev.htod_copy_into(vec![slot as i32; sc.slot_ids.len()], &mut sc.slot_ids)?; }
+        // ISSUES 128: staged in EVERY regime — the head's raw-key / pooled-plane writes address slot_ids[0] in the dense
+        // regime too; staging it only for a sparse last pass let a dense round write into the previous op's slot (another lane).
+        self.dev.htod_copy_into(vec![slot as i32; sc.slot_ids.len()], &mut sc.slot_ids)?;
         let dkey = dkey_of(slot, k, dqsa, db) | self.pen_draft_key(sc) | sk(sc); // WP15 mirror + DHEADP bits + TP-C scratch id
         let want_dgraph = crate::opts::var(crate::opt!("exl3-no-graph")).is_err()
             && tune::get_cur(&T_DRAFT_GRAPH) != 0
@@ -22628,7 +22832,10 @@ step (no draft fits before the sparse switch)"));
             && !dhead::dhead_xcheck(); // DHEAD XCHECK compares on eager passes only
         let mut confs: Vec<f32> = Vec::with_capacity(kmax);
         let mut w = kmax;
-        if self.qsa_live(p + kmax - 1) {
+        // ISSUES 128: staged in EVERY regime (was: only when the chain's last pass is sparse) — the head's raw-key /
+        // pooled-plane writes address slot_ids[0] in the dense regime too, so a dense round of a multi-lane server wrote
+        // the head's QSA rows into the previous op's slot (another lane's): its drafts degraded once it went sparse.
+        {
             if stage {
                 let st = sc.wp05.as_mut().unwrap();
                 let (os, sw) = (st.off_sids(), st.w);
@@ -22973,6 +23180,7 @@ step (no draft fits before the sparse switch)"));
         // t(j) = t_{j-2}; row q history = [t_{q-2}, t_{q-1}, t_q]
         let h3 = [t(q), t(q + 1), toks[q]];
         let uids = ple.ngram_uids(&h3);
+        ple.prefetch_rows(&uids); // PERFFIX1: the row's 16 reads in flight together (no-op for the RAM table)
         ple.embed_row(&uids, st.ple_row(q))
     }
 
@@ -23003,7 +23211,10 @@ step (no draft fits before the sparse switch)"));
             Some((s, h, t)) if s == slot && h == hp && t.len() <= m && t[..] == toks_v[..t.len()] => t.len(),
             _ => 0,
         };
-        if self.ple.is_some() {
+        if let Some(ple) = self.ple.as_ref() {
+            // PERFFIX1: queue every SSD row of this verify at once (no-op for the RAM table)
+            let t = |j: usize| -> i32 { if j >= 2 { toks_v[j - 2] } else if j == 1 { hp.1 } else { hp.0 } };
+            ple.prefetch_h3s(&(have..m).map(|q| [t(q), t(q + 1), toks_v[q]]).collect::<Vec<_>>());
             for q in have..m {
                 self.wp05_ple_row(st, hp, toks_v, q)?;
             }
@@ -23461,5 +23672,48 @@ mod rope_tests {
         assert!((yarn_fr.inv(last) - native_fr.inv(last) / 4.0).abs()
                 <= native_fr.inv(last) / 4.0 * 1e-5,
                 "the lowest-frequency dim interpolates by 1/factor");
+    }
+}
+
+/// ISSUES 122: a spill region is one slot's share of a `[width x per_slot]` plane in BYTES. The capture used the element
+/// count as the byte count: it kept 1/4 of every f32 plane (GDN conv/S state, head-fill carry) and 1/2 of every u16 plane
+/// (QSA keys/pool, PLE ring), at the wrong offset for slot > 0, so a restore left the previous occupant's state in the rest.
+#[cfg(test)]
+mod spill_region_tests {
+    use super::*;
+
+    #[test]
+    fn slot_regions_are_byte_strided_for_every_element_size() {
+        for (size, name) in [(1usize, "u8 KV"), (2, "u16 QSA / PLE"), (4, "f32 GDN state / carry")] {
+            for slot in 0..4 {
+                let (at, len) = spill_slot_region(0x1000, 400, size, 4, slot);
+                assert_eq!((at, len), (0x1000 + (slot * 100 * size) as u64, 100 * size), "{name} slot {slot}");
+            }
+            let (last, len) = spill_slot_region(0x1000, 400, size, 4, 3);
+            assert_eq!(last + len as u64, 0x1000 + (400 * size) as u64, "{name}: the four slots tile the plane exactly");
+        }
+    }
+
+    /// ISSUES 123: a snapshot of `tokens` positions carries rows through the end of the block holding position `tokens`.
+    #[test]
+    fn spill_rows_cover_the_resume_block_and_stop_at_max_pos() {
+        assert_eq!(spill_rows(4327, 4, 262_144), 4328); // resume at 4327: its block is rows 4324..4328
+        assert_eq!(spill_rows(4328, 4, 262_144), 4332);
+        assert_eq!(spill_rows(1, 4, 262_144), 4);
+        assert_eq!(spill_rows(100, 1, 262_144), 101); // no indexer: rows 0..=tokens
+        assert_eq!(spill_rows(262_143, 4, 262_144), 262_144);
+    }
+
+    /// ISSUES 123: one region per segment, each starting at the segment base of THIS slot and `rows` rows long.
+    #[test]
+    fn spill_row_regions_take_the_slot_prefix_of_every_segment() {
+        // [width 4][2 segments][rows_cap 10][row 3 B] = 240 B; slot 2, 7 rows
+        let r = spill_row_regions(0x100, 240, 4, 2, 10, 3, 7).unwrap();
+        assert_eq!(r, vec![(0x100 + 120, 21), (0x100 + 150, 21)]);
+        assert!(spill_row_regions(0x100, 241, 4, 2, 10, 3, 7).is_err(), "a plane of another shape is refused");
+        assert!(spill_row_regions(0x100, 240, 4, 4, 10, 3, 7).is_err(), "slot out of range");
+        assert!(spill_row_regions(0x100, 240, 4, 2, 10, 3, 11).is_err(), "more rows than the plane holds");
+        // the whole-lane case reproduces the version-2 region (one segment, every row)
+        assert_eq!(spill_row_regions(0x0, 400, 4, 1, 100, 1, 100).unwrap(), vec![(100, 100)]);
     }
 }

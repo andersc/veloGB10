@@ -77,6 +77,20 @@ pub enum Kind {
     Forced,
 }
 
+impl Kind {
+    /// LANERES3: the wire discriminant of `Kind` (`WireRequest::reserve::kind`; the enum's
+    /// declaration order Own/Unreserved/Forced is the encoding). Unknown values (a newer
+    /// head) decode as `Unreserved` — the admission counter may miss a rule, but the
+    /// shipped `allowed` set stays authoritative and the pick identical.
+    pub fn from_wire(k: u8) -> Kind {
+        match k {
+            0 => Kind::Own,
+            2 => Kind::Forced,
+            _ => Kind::Unreserved,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan {
     Admit { waiting_index: usize, allowed: Vec<usize>, kind: Kind },
@@ -204,9 +218,46 @@ pub fn normal_finish(reason: &str) -> bool {
     reason != "cancelled" && !reason.starts_with("error")
 }
 
+/// LANERES3 (TP): is any of the policy's allowed lanes FREE right now? The head plans a
+/// scoped admit against its iteration's lane view, but the admit applies later (the
+/// events-apply phase), so the view can be stale by one admit. This is the apply-time
+/// recheck: a scoped admit with no free allowed lane must never refuse the request
+/// (§1b-bis.8) — the head requeues it and the mirror skips the event, both decided on the
+/// same replicated lane state, so they stay in lockstep.
+pub fn allowed_free<L>(lanes: &[Option<L>], allowed: &[usize]) -> bool {
+    allowed.iter().any(|&i| lanes.get(i).map_or(false, |l| l.is_none()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LANERES3: the wire discriminant of `Kind` round-trips, and an unknown value from a
+    /// newer head degrades to `Unreserved` (the shipped `allowed` set stays authoritative).
+    #[test]
+    fn kind_wire_roundtrip() {
+        for k in [Kind::Own, Kind::Unreserved, Kind::Forced] {
+            assert_eq!(Kind::from_wire(k.clone() as u8), k);
+        }
+        assert_eq!(Kind::from_wire(0), Kind::Own);
+        assert_eq!(Kind::from_wire(1), Kind::Unreserved);
+        assert_eq!(Kind::from_wire(2), Kind::Forced);
+        assert_eq!(Kind::from_wire(255), Kind::Unreserved);
+    }
+
+    /// LANERES3 (TP): the apply-time recheck of a scoped admit — True iff some allowed lane
+    /// is free. Out-of-range indices count as occupied (never admit into them).
+    #[test]
+    fn allowed_free_recheck() {
+        let lanes: [Option<()>; 4] = [Some(()), None, None, Some(())];
+        assert!(allowed_free(&lanes, &[1]), "allowed free lane");
+        assert!(allowed_free(&lanes, &[0, 1, 3]), "one of several free");
+        assert!(!allowed_free(&lanes, &[0]), "occupied only");
+        assert!(!allowed_free(&lanes, &[0, 3]), "all occupied");
+        assert!(!allowed_free(&lanes, &[]), "no allowed lanes");
+        assert!(!allowed_free(&lanes, &[9]), "out of range counts occupied");
+        assert!(allowed_free(&lanes, &[3, 2]), "free lane at the end");
+    }
     use std::time::Duration;
 
     const R: u64 = 20;

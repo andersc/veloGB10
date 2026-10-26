@@ -397,7 +397,7 @@ mod h5_direct_print_baseline_tests {
             ("src/boot_report.rs", 2),
             // OUT2 (2026-10-16): boot_report.rs = 2 — the dprintln!/deprintln! macro bodies
             // (direct println!/eprintln! behind the --log-level debug check; zero direct prints at normal).
-            ("src/cluster.rs", 56),
+            ("src/cluster.rs", 57), // NAIVE: +1, the one-time `[head] Naive drafter manifest` boot line (ISSUES 98 drafter shipping)
             ("src/dflash.rs", 2),
             ("src/dflash2/round.rs", 7),
             ("src/dflash2/stepdump.rs", 4),
@@ -411,7 +411,7 @@ mod h5_direct_print_baseline_tests {
             ("src/exl3.rs", 17),
             ("src/exl3_autotune.rs", 15),
             ("src/exl3_bench.rs", 128),
-            ("src/exl3_forward.rs", 325), // EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
+            ("src/exl3_forward.rs", 327), // P7 merge: 325 -> 327 (df2trace ttr timing lines + df2 head-quantization one-time notices auto-merged from the 1.5bpw branch; conscious update). EXL27C: 324 -> 325 (split-MoE EP deal one-time boot line; conscious update). Earlier: 315 -> 323 (--df2-trace gated diagnostics + Fix5 comment; conscious update). OUT2: 317 -> 315 (the two PLE SSD/RAM decision lines -> boot_report::notice(), one normal line each)
             ("src/exl3_forward/dense.rs", 12),
             ("src/exl3_forward/dhead.rs", 11),
             ("src/exl3_forward/w4s.rs", 8),
@@ -433,7 +433,7 @@ mod h5_direct_print_baseline_tests {
         // (eprintln, matching the existing sibling site in finish()/xcheck drain).
         // S-B9-REL-SMALLFIXES item 1: 87 -> 86, the two MTP boot-banner println! became one
         // (the line is built by the testable mtp_banner()).
-        ("src/exl3_serve.rs", 97), // EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
+        ("src/exl3_serve.rs", 103), // EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
             ("src/exl3_tune.rs", 7),
             ("src/exl3_wp27.rs", 8),
             ("src/gptq.rs", 42),
@@ -469,7 +469,7 @@ mod h5_direct_print_baseline_tests {
             // one-time banner class, printed by http_listen before the socket exists) and the
             // FATAL line of fatal_option (direct by the H7 rule above: printed, then flush_and_exit)
             ("src/server.rs", 21),
-            ("src/shard_plan.rs", 7),
+            ("src/shard_plan.rs", 8), // NAIVE: +1, the `owner mismatch` line of the Naive arm of --probe-shard-plan (probe path)
             ("src/tokenizer.rs", 9),
             // S-B9-REL-SURFACE2 item 10: + 2, the ignored `tool_quote_probe` instrument (test code).
             // S-B9-REL-SURFACE2B R1: + 5, the count tables of `exhaustive_small_blocks` and the
@@ -497,12 +497,36 @@ mod h5_direct_print_baseline_tests {
             // (the table kept 1547: a later +1 landed before this baseline was re-pinned).
             // MAXBATCH1 (2026-10-21): 1547 -> 1551 — the four --max-batch EXL3 cap/clamp help
             // lines (truthful help, same println! shape as --max-tokens').
-            ("src/main.rs", 1551),
+            // DFLASH2-GEN 2026-10-23: 1552 -> 1551: the two-line --gen-dflash2-synth help
+            // entry merged into one line (geometry-dynamic wording; not a served path).
+            // DFLASH2-GEN 2026-10-23: 1551 -> 1555 — the three --df2-mask-override help lines
+            // and the disabled-at-CLI boot notice (arg-parse path, not a served path).
+            // NAIVEPORT (the port merge): naive's +33 lands on top of master's own +15 (the MAXBATCH1 / DFLASH2-GEN
+            // help lines above); re-pinned to the count of the MERGED tree (1547 + 33 + 15 = 1595, counted with this
+            // module's counter on the merged main.rs before the build). The row below is OPERATIVE (find() takes the
+            // first); naive-n05's original row is kept verbatim after it for the port's line-identity check.
+            ("src/main.rs", 1595), // OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree
+            ("src/main.rs", 1580), // NAIVE: +33, the --probe-naive-* dispatches' NAIVE_*_FAIL exit-path lines, their usage expect()s' siblings, and the head/node Naive TP boot lines (probe/boot classes)
             // Conscious updates, not conversion misses.
         ("src/tp.rs", 12),
             ("src/tp_bench.rs", 75),
             ("src/w4a4.rs", 1),
             ("src/wp24.rs", 8),
+            // NAIVE (the Naive-N0.5-Flash family tree, src/naive/*, ported from the naive-n05 line 2026-10-21): the family's
+            // own probes and its TP serve loop print directly (probe verdict lines, one-time boot lines, the `[naive-serve]`
+            // request log). Counted consciously at the port; ISSUES (naive-n05 numbering) #105 tracks the conversion to
+            // rprintln!/reprintln! on the served paths. Files of the tree not listed here print nothing.
+            ("src/naive/cpu.rs", 8),
+            ("src/naive/decode.rs", 24),
+            ("src/naive/dequant.rs", 4),
+            ("src/naive/drafter_gpu.rs", 12),
+            ("src/naive/frac.rs", 2),
+            ("src/naive/gpu.rs", 23),
+            ("src/naive/model.rs", 34),
+            ("src/naive/pack.rs", 11),
+            ("src/naive/serve.rs", 68),
+            ("src/naive/shard.rs", 3),
+            ("src/naive/tp.rs", 7),
         ];
         let mut files = Vec::new();
         walk(std::path::Path::new("src"), &mut files);

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>veloGB10 by veloEngine — coming soon</title>
+<meta name="description" content="veloengine.ai will host veloGB10, a from-scratch Rust + CUDA inference engine for NVIDIA GB10 systems. The site is not published yet.">
+<meta name="robots" content="noindex">
+<link rel="canonical" href="https://veloengine.ai/">
+<link rel="icon" type="image/svg+xml" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 4l9 16 9-16" fill="none" stroke="%235b8cff" stroke-width="2.6" stroke-linecap="round"/><path d="M8.5 4l3.5 6.2L15.5 4" fill="none" stroke="%238392ff" stroke-width="2.2" stroke-linecap="round"/></svg>'>
+<style>
+  :root {
+    --bg: #0b0f17; --panel: #10151f; --line: #1b2230; --line-2: #2a3346;
+    --text: #e6ecf7; --muted: #a4b0c4; --faint: #6d7a90;
+    --accent: #5b8cff; --accent-2: #8392ff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: var(--sans); line-height: 1.6;
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 48px 20px;
+  }
+  .card {
+    width: 100%; max-width: 680px; background: #000;
+    border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+  }
+  .hero { padding: 46px 34px 30px; }
+  .hero img {
+    display: block; width: 100%; max-width: 500px; margin: 0 auto; height: auto;
+  }
+  .body { padding: 0 34px 34px; }
+  .eyebrow {
+    display: inline-block; font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 14px;
+  }
+  h1 { font-size: 1.85rem; line-height: 1.25; margin: 0 0 14px; letter-spacing: -0.02em; }
+  p { color: var(--muted); margin: 0 0 16px; }
+  code {
+    font-family: var(--mono); font-size: .88em; color: var(--text);
+    background: #0c1119; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
+  }
+  .links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  a.btn {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+    font-size: .9rem; font-weight: 600; padding: 9px 15px; border-radius: 8px;
+    border: 1px solid var(--line-2); color: var(--text); background: #0c1119;
+    transition: border-color 120ms, color 120ms;
+  }
+  a.btn:hover { border-color: var(--accent); }
+  a.btn.primary { background: var(--accent); border-color: var(--accent); color: #06101f; }
+  a.btn.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+  .foot {
+    margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11px; color: var(--faint);
+    display: flex; flex-wrap: wrap; gap: 8px 18px; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="hero">
+      <img src="assets/velogb10_logo.png" width="960" height="524"
+           alt="VeloGB10 — Fast native compute for GB10 systems">
+    </div>
+    <div class="body">
+      <span class="eyebrow">veloengine.ai · not published yet</span>
+      <h1>This site is being built.</h1>
+      <p>veloengine.ai will be the home of <b>veloGB10</b> — a from-scratch Rust + CUDA
+        inference engine for NVIDIA GB10 systems (DGX Spark and compatible OEM boxes):
+        NVFP4 tensor-core serving, bitwise-lossless MTP speculation, and TP=2/TP=4 as a
+        <em>speed</em> mode. One binary plus its PTX kernels.</p>
+      <p>Until it opens, everything is in the repository: the design notes, measured
+        throughput traces, the per-model setup guides and the changelog. Build it with
+        <code>cargo build --release</code>, or take a prebuilt package from the releases
+        page.</p>
+      <div class="links">
+        <a class="btn primary" href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">veloGB10 on GitHub</a>
+        <a class="btn" href="https://velobenchmark.com" rel="noopener">VeloBenchmark</a>
+        <a class="btn" href="mailto:stav@scalarflow.co.uk">stav@scalarflow.co.uk</a>
+      </div>
+      <div class="foot">
+        <span class="repo"><a href="https://github.com/sf-stav/veloGB10" target="_blank" rel="noopener">github.com/sf-stav/veloGB10</a></span>
+        <span>© 2026 Stav Katsoulis · Apache-2.0</span>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

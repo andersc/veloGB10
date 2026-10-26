@@ -20,10 +20,10 @@ pub const PLAN_VERSION: u32 = 1;
 pub const SHARD_FILE: &str = "gb10_shard.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ShardFormat { Exl3, Nvfp4 }
+pub enum ShardFormat { Exl3, Nvfp4, Naive }
 
 impl ShardFormat {
-    pub fn name(self) -> &'static str { match self { ShardFormat::Exl3 => "exl3", ShardFormat::Nvfp4 => "nvfp4" } }
+    pub fn name(self) -> &'static str { match self { ShardFormat::Exl3 => "exl3", ShardFormat::Nvfp4 => "nvfp4", ShardFormat::Naive => "naive" } }
 }
 
 /// One tensor of a segment: `len` bytes at absolute offset `off` of `src`, stored as `dtype`/`shape`.
@@ -34,7 +34,13 @@ pub struct Piece {
     pub shape: Vec<usize>,
     pub src: PathBuf,
     pub off: u64,
+    /// total bytes of the piece (every row, when strided)
     pub len: u64,
+    /// NAIVE expert TP (2026-10-20): a strided gather — `rows` runs of `len / rows` bytes, the r-th at
+    /// `off + r * stride` (a column slice of a `[k/16][n/16][words]` trellis is one run per tile row).
+    /// `rows <= 1` = one contiguous range (every plan before the expert-TP deal).
+    pub rows: u64,
+    pub stride: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -129,13 +135,33 @@ pub fn write_segment(pieces: &[Piece], w: &mut impl Write) -> Result<()> {
             cur = Some((p.src.clone(), std::fs::File::open(&p.src).with_context(|| format!("open {}", p.src.display()))?));
         }
         let f = &mut cur.as_mut().unwrap().1;
-        f.seek(SeekFrom::Start(p.off))?;
-        let mut left = p.len;
-        while left > 0 {
-            let n = left.min(buf.len() as u64) as usize;
-            f.read_exact(&mut buf[..n]).with_context(|| format!("read {} @{} of {}", p.name, p.off, p.src.display()))?;
-            w.write_all(&buf[..n])?;
-            left -= n as u64;
+        let rows = p.rows.max(1);
+        anyhow::ensure!(p.len % rows == 0, "{}: {} bytes do not split into {rows} rows", p.name, p.len);
+        let row_len = p.len / rows;
+        if rows > 1 && p.stride >= row_len {
+            // a strided gather reads the whole span ONCE, sequentially, and cuts the rows out in memory: seeking to
+            // every 3.5 KB run of a column slice ran at ~64 MB/s from NVMe (queue depth 1); the span of one expert
+            // tensor is a few MB, so this reads ~stride/row_len more bytes at full sequential speed
+            let span = (rows - 1) * p.stride + row_len;
+            let mut big = vec![0u8; span as usize];
+            f.seek(SeekFrom::Start(p.off))?;
+            f.read_exact(&mut big).with_context(|| format!("read {} span @{} of {}", p.name, p.off, p.src.display()))?;
+            for r in 0..rows {
+                let a = (r * p.stride) as usize;
+                w.write_all(&big[a..a + row_len as usize])?;
+            }
+            continue;
+        }
+        for r in 0..rows {
+            let at = p.off + r * if rows > 1 { p.stride } else { 0 };
+            f.seek(SeekFrom::Start(at))?;
+            let mut left = row_len;
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                f.read_exact(&mut buf[..n]).with_context(|| format!("read {} @{at} of {}", p.name, p.src.display()))?;
+                w.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
         }
     }
     Ok(())
@@ -156,13 +182,18 @@ pub fn segment_recipe(pieces: &[Piece]) -> Result<String> {
     }
     let mut s = format!("plan{PLAN_VERSION}\n");
     for p in pieces {
-        s += &format!("{}\t{}\t{:?}\t{}\t{}\t{}\n", p.name, p.dtype, p.shape, srcs[&p.src.to_string_lossy().to_string()], p.off, p.len);
+        s += &format!("{}\t{}\t{:?}\t{}\t{}\t{}", p.name, p.dtype, p.shape, srcs[&p.src.to_string_lossy().to_string()], p.off, p.len);
+        // a strided piece's recipe names its geometry; a contiguous one keeps the pre-expert-TP line (cache keys unchanged)
+        if p.rows > 1 { s += &format!("\t{}x{}", p.rows, p.stride); }
+        s += "\n";
     }
     Ok(s)
 }
 
 /// Which format a model dir is (None = neither shard-plannable format).
 pub fn detect_format(dir: &Path) -> Option<ShardFormat> {
+    // NAIVE S5b: a Naive-N0.5 pack is an EXL3 pack by quant_method; its own plan (naive::shipplan) comes first
+    if crate::naive::config::NaiveConfig::is_naive_dir(&dir.to_string_lossy()) { return Some(ShardFormat::Naive); }
     if crate::exl3::is_exl3_dir(&dir.to_string_lossy()) { return Some(ShardFormat::Exl3); }
     let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -175,6 +206,10 @@ pub fn detect_format(dir: &Path) -> Option<ShardFormat> {
 /// plan does not cover the model (every other Qwen model, the 27B / 35B EXL3 packs, DSV4, ...): its path is unchanged.
 pub fn applies(dir: &Path, world: usize) -> Option<ShardFormat> {
     let fmt = detect_format(dir)?;
+    if fmt == ShardFormat::Naive {
+        let cfg = crate::naive::config::NaiveConfig::from_dir(&dir.to_string_lossy()).ok()?;
+        return (world >= 2 && cfg.num_experts % world == 0).then_some(fmt);
+    }
     // Qwen3.8-Flash-Next (qwen4_exp) only: the brief's scope — every other model keeps its existing path
     let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -230,6 +265,7 @@ pub fn shard_plan(dir: &Path, fmt: ShardFormat, world: usize, rank: usize, deal:
     match fmt {
         ShardFormat::Exl3 => plan_exl3(dir, world, rank, deal),
         ShardFormat::Nvfp4 => plan_nvfp4(dir, world, rank),
+        ShardFormat::Naive => crate::naive::shipplan::plan_deal(dir, world, rank, deal),
     }
 }
 
@@ -260,7 +296,7 @@ fn plan_exl3(dir: &Path, world: usize, rank: usize, deal: &str) -> Result<RankPl
         let mut common = Vec::new();
         for (name, e) in ents {
             if name.contains(".visual.") || name.starts_with("model.visual") { continue; } // the tower runs on the head
-            let piece = Piece { name: name.clone(), dtype: e.dtype.clone(), shape: e.shape.clone(), src: path.clone(),
+            let piece = Piece { rows: 1, stride: 0, name: name.clone(), dtype: e.dtype.clone(), shape: e.shape.clone(), src: path.clone(),
                                 off: e.offset as u64, len: e.n_bytes as u64 };
             match exl3_trunk_expert(name) {
                 Some((l, e_id)) => {
@@ -327,7 +363,7 @@ fn plan_nvfp4(dir: &Path, world: usize, rank: usize) -> Result<RankPlan> {
         for (name, e) in ents {
             if name.contains(".visual.") || name.starts_with("model.visual") { continue; } // the tower runs on the head
             let sibling = name.rsplit_once(".weight_").map_or(false, |(b, _)| banded_bases.contains(b));
-            let mut piece = Piece { name: name.clone(), dtype: e.dtype.clone(), shape: e.shape.clone(), src: path.clone(),
+            let mut piece = Piece { rows: 1, stride: 0, name: name.clone(), dtype: e.dtype.clone(), shape: e.shape.clone(), src: path.clone(),
                                     off: e.offset as u64, len: e.n_bytes as u64 };
             if nvfp4_band(name, &cfg, world) {
                 anyhow::ensure!(e.shape.len() == 2, "shard plan (nvfp4): {name} is not 2-D ({:?})", e.shape);
@@ -434,6 +470,11 @@ pub fn probe(dir: &Path, worlds: &[usize], deals: &[String], tmp: &Path) -> Resu
                         None => (0..world).collect(),
                     },
                     ShardFormat::Nvfp4 => (0..world).collect(), // bands: every rank holds its own slice
+                    ShardFormat::Naive => match crate::naive::shipplan::expert_of(n) {
+                        // expert TP: every rank holds a slice of every expert
+                        Some((_, e)) if deal != crate::naive::shipplan::DEAL_TP => vec![e % world],
+                        _ => (0..world).collect(),
+                    },
                 };
                 if holders != want { bad_owner += 1; if bad_owner <= 3 { println!("  owner mismatch {n}: holders {holders:?} want {want:?}"); } }
             }
@@ -456,6 +497,12 @@ pub fn probe(dir: &Path, worlds: &[usize], deals: &[String], tmp: &Path) -> Resu
                     }
                 }
                 match fmt {
+                    ShardFormat::Naive => {
+                        // the sparse dir opens as a shard (gb10_shard.json) with this rank's inventory
+                        let pack = crate::naive::pack::NaivePack::open(&d.to_string_lossy())?;
+                        println!("  rank {}: naive shard opens: {} quads, {} plain tensors", p.rank, pack.quads.len(), pack.plain.len());
+                        if pack.shard == Some((world, p.rank)) { open_ok += 1; }
+                    }
                     ShardFormat::Exl3 => {
                         let pack = crate::exl3::Exl3Pack::open(&d.to_string_lossy())?;
                         let have: BTreeSet<&str> = pack.modules.iter().map(|m| m.name.as_str()).collect();
@@ -543,6 +590,26 @@ fn wmap_file(dir: &Path, name: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Expert TP (2026-10-20): a strided piece writes `rows` runs of `len / rows` bytes, the r-th from `off + r * stride`,
+    /// identical to cutting them out of the source by hand (the span read and the per-row read are the same bytes).
+    #[test]
+    fn strided_piece_writes_exactly_its_rows() {
+        let dir = std::env::temp_dir().join(format!("gb10_strided_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        let (off, rows, stride, row_len) = (1234u64, 37u64, 1100u64, 300u64);
+        let p = Piece { rows, stride, name: "t".into(), dtype: "U8".into(), shape: vec![(rows * row_len) as usize], src: src.clone(), off, len: rows * row_len };
+        let mut out = Vec::new();
+        write_segment(&[p.clone()], &mut out).unwrap();
+        let hdr = segment_header(&[p]).unwrap().len();
+        let mut want = Vec::new();
+        for r in 0..rows { let a = (off + r * stride) as usize; want.extend_from_slice(&data[a..a + row_len as usize]); }
+        assert_eq!(&out[hdr..], &want[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// Shard shipping is unconditional but scoped: Qwen3.8-Flash-Next ships shards, every other model keeps its path.

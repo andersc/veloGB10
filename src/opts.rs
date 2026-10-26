@@ -461,6 +461,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("bench-lanes", false, Vis::Adv),
     ("bench-mtp", false, Vis::Adv),
     ("bench-mtp-sample", false, Vis::Adv),
+    ("bench-only", false, Vis::Adv),
     ("bench-prefill", false, Vis::Adv),
     ("bench-tau", false, Vis::Adv),
     ("bench-tree", false, Vis::Adv),
@@ -495,6 +496,8 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("df2-bake-nvfp4", false, Vis::Adv),
     ("df2-block", true, Vis::Adv),
     ("df2-carry", true, Vis::Adv),
+    ("df2-k", true, Vis::Adv),
+    ("df2-mask-override", true, Vis::Adv),
     ("df2-prose-lane", true, Vis::Adv),
     ("df2-quant-fidelity", false, Vis::Adv),
     ("df2-round-shard", true, Vis::Adv),
@@ -516,6 +519,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("dump-argmax", false, Vis::Adv),
     ("dump-logits", true, Vis::Adv),
     ("dump-rank-weights", false, Vis::Adv),
+    ("dump-states", false, Vis::Adv),
     ("dump-weights", true, Vis::Adv),
     ("embed", true, Vis::Adv),
     ("embed-from", true, Vis::Adv),
@@ -537,6 +541,8 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("extract-dspark", false, Vis::Adv),
     ("floats", false, Vis::Adv),
     ("from", true, Vis::Adv),
+    ("gemm-m", true, Vis::Adv),
+    ("gen", true, Vis::Adv),
     ("gen-dflash2-synth", true, Vis::Adv),
     ("gen-dspark-synth", true, Vis::Adv),
     ("gid", true, Vis::Adv),
@@ -573,6 +579,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("ladder-dir", true, Vis::Adv),
     ("ladder-layers", true, Vis::Adv),
     ("ladder-step", true, Vis::Adv),
+    ("layer", true, Vis::Adv),
     ("layers", true, Vis::Adv),
     ("legacy-oracle", false, Vis::Adv),
     ("limit", true, Vis::Adv),
@@ -599,6 +606,11 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("net-test", false, Vis::Adv),
     ("ngram", true, Vis::Adv),
     ("ngram-draft", true, Vis::Adv),
+    ("nll", false, Vis::Adv),
+    ("nll-file", true, Vis::Adv),
+    ("nll-out", true, Vis::Adv),
+    ("nll-rows", true, Vis::Adv),
+    ("nll-tokens", true, Vis::Adv),
     ("no-chat", false, Vis::Adv),
     ("no-shard-mixers", false, Vis::Adv),
     ("node", false, Vis::Day),
@@ -691,6 +703,32 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("probe-mxfp4-xchain", false, Vis::Adv),
     ("probe-mxfp4-xchain2", true, Vis::Adv),
     ("probe-mxfp4-xchain2-compare", true, Vis::Adv),
+    ("probe-naive-a1-ab", false, Vis::Adv),
+    ("probe-naive-attn-prefill", false, Vis::Adv),
+    ("probe-naive-chunkxcpu", false, Vis::Adv),
+    ("probe-naive-cpu", false, Vis::Adv),
+    ("probe-naive-dequant", false, Vis::Adv),
+    ("probe-naive-drafter", false, Vis::Adv),
+    ("probe-naive-full", false, Vis::Adv),
+    ("probe-naive-fuse", false, Vis::Adv),
+    ("probe-naive-gemm", false, Vis::Adv),
+    ("probe-naive-gemm-bench", false, Vis::Adv),
+    ("probe-naive-graph", false, Vis::Adv),
+    ("probe-naive-idx-prefill", false, Vis::Adv),
+    ("probe-naive-lanes", false, Vis::Adv),
+    ("probe-naive-loop", false, Vis::Adv),
+    ("probe-naive-oracle", false, Vis::Adv),
+    ("probe-naive-pack", false, Vis::Adv),
+    ("probe-naive-prefill", false, Vis::Adv),
+    ("probe-naive-sampler", false, Vis::Adv),
+    ("probe-naive-shard", false, Vis::Adv),
+    ("probe-naive-shard-dir", false, Vis::Adv),
+    ("probe-naive-slice", false, Vis::Adv),
+    ("probe-naive-slots", false, Vis::Adv),
+    ("probe-naive-spec", false, Vis::Adv),
+    ("probe-naive-topk", false, Vis::Adv),
+    ("probe-naive-tp", false, Vis::Adv),
+    ("probe-naive-tp-engine", false, Vis::Adv),
     ("probe-penalties", false, Vis::Adv),
     ("probe-ppsplit", false, Vis::Adv),
     ("probe-q4", false, Vis::Adv),
@@ -727,6 +765,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("requant-q2fake", false, Vis::Adv),
     ("requant-sim", false, Vis::Adv),
     ("rounds", true, Vis::Adv),
+    ("rows-chunk", true, Vis::Adv),
     ("runs", true, Vis::Adv),
     ("scope", true, Vis::Adv),
     ("seconds", true, Vis::Adv),
@@ -740,6 +779,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("sha256", true, Vis::Adv),
     ("shapes", true, Vis::Adv),
     ("shard", true, Vis::Adv),
+    ("shard-dir", true, Vis::Adv),
     ("shard-end", true, Vis::Adv),
     ("shard-rank", true, Vis::Adv),
     ("shard-start", true, Vis::Adv),
@@ -747,10 +787,12 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("sizes-mb", true, Vis::Adv),
     ("slice-experts", true, Vis::Adv),
     ("spacing-us", false, Vis::Adv),
+    ("spec-block", true, Vis::Adv),
     ("spec-dds", true, Vis::Adv),
     ("spec-depths", true, Vis::Adv),
     ("spec-gen", false, Vis::Adv),
     ("spec-ident", true, Vis::Adv),
+    ("spec-mode", true, Vis::Adv),
     ("spec-prefix", true, Vis::Adv),
     ("spec-prompts", true, Vis::Adv),
     ("spec-reps", false, Vis::Adv),
@@ -1214,7 +1256,7 @@ mod tests {
         // each distinct name exactly once
         assert_eq!(unknown_warnings(&a(&["bin", "--max-bach", "--max-bach"])).len(), 1);
         // argv[0] (the program path) is never judged
-        assert!(unknown_warnings(&a(&["/home/x/--weird-path"])).is_empty());
+        assert!(unknown_warnings(&a(&["/models/x/--weird-path"])).is_empty());
     }
 
     #[test]
@@ -1474,6 +1516,15 @@ mod tests {
     /// CLIPRUNE1: `--help` is the day-to-day launch set ONLY; `--help-advanced` is everything.
     /// Drift in either fails against the committed snapshot fixtures; refresh (after a DELIBERATE
     /// content change only) with `cargo test -- --bless`.
+    /// Owner 2026-10-23: the SSD spill tier is OFF unless asked for, and the flag is in the day-to-day `--help`. The
+    /// server's fallback reads this registry default (exl3_serve), so the two cannot disagree.
+    #[test]
+    fn kv_spill_is_off_by_default_and_in_the_day_help() {
+        let o = crate::opt!("kv-spill").def();
+        assert_eq!((o.def, o.vis), ("off", Vis::Day));
+        assert!(help_day().contains("--kv-spill"), "--kv-spill must be listed by the normal --help");
+    }
+
     #[test]
     fn help_day_snapshot() { check_help_snapshot("help_day.txt", &help_day()); }
 
@@ -1548,7 +1599,7 @@ mod tests {
         // every one of these is a serving option with its default shown. CLIPRUNE1 split --help
         // into tiers: Vis::Day rows are the day-to-day launch set (--help); every accepted row is
         // in --help-advanced; a serving row never lives only in --help-diag.
-        for (flag, def) in [("qsa-row-regime", "[on]"), ("prefill-interleave", "[0]"), ("mtp-lanes", "[off]"),
+        for (flag, def) in [("qsa-row-regime", "[on]"), ("prefill-interleave", "[1]"), ("mtp-lanes", "[off]"),
                             ("prefill-sched", "[cursor]"), ("mtp", "[auto]"), ("lane-order", "[rr]"), ("lane-pack", "[on]")] {
             let o = REG.iter().find(|o| o.flag == flag).unwrap_or_else(|| panic!("--{flag} is not registered"));
             assert_ne!(o.cat, Cat::Diag, "--{flag} is a serving option");
@@ -1576,10 +1627,10 @@ mod tests {
         let lo = REG[idx("lane-order")].help;
         assert!(lo.contains("23% lower with 2") && lo.contains("30% lower with 3"), "{lo}");
         assert!(!lo.contains("about 25%") && !lo.contains("about 33%"), "{lo}");
-        // --prefill-interleave: no claim beyond what was gated (interleave > 0 was not, on the fixed tree)
+        // --prefill-interleave: no claim beyond what was measured (N = 1 byte identity at TP=2/TP=4, PERFFIX1)
         let il = REG[idx("prefill-interleave")].help;
         assert!(!il.contains("is removed by the per-row attention regime"), "{il}");
-        assert!(il.contains("expected, not proven"), "{il}");
+        assert!(il.contains("measured byte-identical to N = 0 (greedy, TP=2 and TP=4"), "{il}");
         // --mtp: says that off is honoured and names the banner
         assert!(REG[idx("mtp")].help.contains("MTP OFF (--mtp off)"));
 
@@ -1596,7 +1647,10 @@ mod tests {
         assert!(body.contains("[EXL3: 0.0; NVFP4: 2.0 on 2B, else 1.5]"));
         // unsent sampler values: the thinking-mode values of the EXL3 chat path are named
         assert!(!body.contains("defaults 0.7 / 0.8 / 20)"));
-        assert!(body.contains("Unsent: 0.7 / 0.8 / 20") && body.contains("1.0 / 0.95 / 20"));
+        // FLASHNEXT-DF2-B (ISSUES work[113]): the unsent values come from the pack's
+        // generation_config.json; the help names the source, the Qwen3.8 triples and the fallback.
+        assert!(body.contains("Unsent: the pack's") && body.contains("generation_config.json triple")
+                && body.contains("1.0 / 0.95 / 20") && body.contains("0.7 / 0.8 / 20"));
         // --mtp: off is honoured by every server; the option is described ONCE, by its registry line
         // (SURFACE2 item 5: the hand-written block repeated it, and the two texts had drifted apart)
         assert!(!body.contains("on/off force it (benchmarking)."));

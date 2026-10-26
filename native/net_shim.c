@@ -2074,7 +2074,10 @@ static void net_proxy_loop_nway(NetCtx* c, int core) {
         //    tag, the slot's generation-tagged tail (R9) — each peer's slot is validated at its own
         //    sender-indexed address — then ONE fence and a RELEASE-store of cpu_done[p] = e for every peer
         //    (I5). Epochs release strictly in order; nothing of the round-keyed rings is read.
-        if (c->oneshot_uniform) {
+        //    NAIVE lever 1b: under the v2 receive mode (net_set_recv_mode gpu=1) this stage is SKIPPED like the
+        //    world-2 and tree receives below: the K2 (tp_wait_add_4way_f32g) validates every peer's tail itself and
+        //    publishes rx_done; the watchdog above already keys on rx_done in that mode.
+        if (c->oneshot_uniform && !c->recv_gpu) {
             uint64_t e = next_release;
             uint64_t advanced = 0;
             while (!c->aborted && !*flagp(c, TP_F_ABORT)) {

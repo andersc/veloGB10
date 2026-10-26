@@ -18,8 +18,18 @@
 //!
 //! The trunk's residual at the end of layer `l` IS `hidden_states[l+1]` (transformers returns
 //! [embed_out, after_layer_0, …, after_layer_63]; after_layer_l = the residual AFTER layer l's
-//! FFN add). The capture is a pure D2D bf16 copy: what the staging holds is BIT-IDENTICAL to the
-//! source residual. The probe proves it against an independent recomputation path (two trunk
+//! FFN add). On an `hc_count == 1` trunk the capture is a pure D2D bf16 copy: what the staging
+//! holds is BIT-IDENTICAL to the source residual.
+//!
+//! # Hyper-connection trunks (FLASHNEXT-DF2-B, 2026-10-23)
+//!
+//! On a qwen4_exp trunk (`hc_count = 4`, residual `rw = 4·h` wide, token-major, stream `s` at
+//! `+s·h`) the tap is the MEAN OVER THE STREAMS — the DFlash2 drafters are trained on
+//! "completed, zero-based layer outputs, averaged over the four hyper-connection streams"
+//! (the Flash-Next artifact's own `patches/qwen38-dflash2-capture.patch`). Every capture entry
+//! takes the trunk's `hcn`; `hcn == 1` keeps the D2D copy, `hcn > 1` launches the hc-mean
+//! kernel (`df2_tap_hcmean_b` / `xq_df2_tap_cvt`). Reading stream 0 alone (the behaviour until
+//! this change) fed the Flash-Next drafter a feature it was never trained on. The probe proves it against an independent recomputation path (two trunk
 //! forwards over the same tokens; captured vs recaptured AND captured vs an independent
 //! surface read of the same residual), and the no-capture path is bit-identical trunk behavior
 //! (the R1 gates: binv + LOSSLESS ×5 + timing noise).
@@ -36,7 +46,7 @@
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice, LaunchAsync};
 use std::sync::Arc;
 
-use crate::dflash2::{block, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
+use crate::dflash2::{block, hidden, tap_concat_dim, tap_layers};
 
 /// The DFlash2 tap sink: drafter-owned staging, written by the trunk at draft time only.
 ///
@@ -57,7 +67,7 @@ impl Df2TapSink {
     /// a tree verifies more columns than the chain's 8; the accepted path is gathered out of
     /// this buffer into the round's 8-column staging by `sync_staging_from_wide`).
     pub fn new_cols(dev: &Arc<CudaDevice>, cols: usize) -> Self {
-        let n = TAP_CONCAT_DIM * cols;
+        let n = tap_concat_dim() * cols;
         let zero = dev.htod_sync_copy(&vec![half::bf16::default(); n]).expect("df2 tap staging alloc");
         Df2TapSink { staging: zero }
     }
@@ -75,7 +85,7 @@ pub struct Df2PrimeSink {
 
 impl Df2PrimeSink {
     pub fn new(dev: &Arc<CudaDevice>, cols: usize) -> Self {
-        let n = TAP_CONCAT_DIM * cols;
+        let n = tap_concat_dim() * cols;
         let zero = dev.htod_sync_copy(&vec![half::bf16::default(); n]).expect("df2 prime sink alloc");
         Df2PrimeSink { taps: zero }
     }
@@ -87,13 +97,31 @@ impl Df2PrimeSink {
 /// `[0, n)`, with `dst_pitch` = the destination's column stride in ELEMENTS. Stream-ordered
 /// 2D D2D on the caller's (compute) stream — AGENTS §2.3; no sync (the copy is async; the
 /// drafter's round-time read is stream-ordered after it).
-pub fn capture_cols_into(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUstream,
+pub fn capture_cols_into(dev: &Arc<CudaDevice>, cstream: &cudarc::driver::CudaStream,
                          dst_ptr: u64, dst_pitch: usize,
-                         src_ptr: u64, h: usize, n: usize, tap_li: usize) {
+                         src_ptr: u64, h: usize, hcn: usize, n: usize, tap_li: usize) {
     use cudarc::driver::sys;
-    debug_assert_eq!(h, HIDDEN, "df2 tap capture: trunk hidden {h} != DFlash2 hidden {HIDDEN}");
+    let stream: sys::CUstream = cstream.stream;
+    debug_assert_eq!(h, hidden(), "df2 tap capture: trunk hidden {h} != DFlash2 hidden {}", hidden());
     debug_assert!(n <= dst_pitch, "df2 tap capture cols {n} > dst pitch {dst_pitch}");
-    debug_assert!(tap_li < TAP_LAYERS.len());
+    debug_assert!(tap_li < tap_layers().len());
+    if hcn > 1 {
+        // Hyper-connection trunk: the tap is the mean over the hcn streams of each token's
+        // rw = hcn*h-wide row (see the module docs) — a kernel, not a memcpy.
+        use cudarc::driver::LaunchConfig;
+        let f = dev.get_func("gpu_kernels", "df2_tap_hcmean_b").unwrap_or_else(|| panic!(
+            "df2 tap capture: kernel df2_tap_hcmean_b not loaded in module gpu_kernels (every \
+             gpu_kernels loader's name table must list it: gpu.rs init_ptx, dflash2/{{gpu,round}}.rs, \
+             dspark/round.rs)"));
+        let elems = (h as i64) * (n as i64);
+        let blocks = (((elems + 255) / 256).min(65535) as u32, 1u32, 1u32);
+        unsafe {
+            f.launch_on_stream(cstream, LaunchConfig { grid_dim: blocks, block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                               (dst_ptr, src_ptr, elems, h as i32, hcn as i32, tap_li as i32, dst_pitch as i64))
+             .expect("df2 tap capture: df2_tap_hcmean_b launch failed");
+        }
+        return;
+    }
     let cp = sys::CUDA_MEMCPY2D {
         srcXInBytes: 0, srcY: 0,
         srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
@@ -135,10 +163,10 @@ pub fn copy_row_into(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUstrea
 }
 
 /// One tap-layer copy into the 8-column staging sink (the S4F layout — see the struct docs).
-pub fn capture_cols(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUstream,
-                    sink: &Df2TapSink, res_ptr: u64, h: usize, n: usize, tap_li: usize) {
-    capture_cols_into(dev, stream, *sink.staging.device_ptr() as u64, TAP_CONCAT_DIM,
-                      res_ptr, h, n, tap_li)
+pub fn capture_cols(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
+                    sink: &Df2TapSink, res_ptr: u64, h: usize, hcn: usize, n: usize, tap_li: usize) {
+    capture_cols_into(dev, stream, *sink.staging.device_ptr() as u64, tap_concat_dim(),
+                      res_ptr, h, hcn, n, tap_li)
 }
 
 // EXL27C-DF2 (fwd): the PITCH-AWARE, DTYPE-CONVERTING tap capture for the EXL3 serve path.
@@ -157,13 +185,18 @@ pub fn capture_cols(dev: &Arc<CudaDevice>, stream: cudarc::driver::sys::CUstream
 //
 // The kernel lives in the exl3_bench module (the EXL3 kernel book); this function fetches
 // it by name, so it requires that module to be loaded (any FwdModel path does).
+//
+// FLASHNEXT-DF2-B: `hcn` = the trunk's hyper-connection stream count; the kernel writes the
+// MEAN over the `hcn` streams of each token row (stream s at `+s*h`), which on hcn == 1 is
+// exactly the old stream-0 conversion (bit-identical) — see the module docs.
 pub fn capture_cols_f32_into(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
                              dst_ptr: u64, dst_pitch: usize, src_ptr: u64, src_pitch: usize,
-                             h: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
+                             h: usize, hcn: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
     use cudarc::driver::LaunchConfig;
     anyhow::ensure!(h > 0 && n > 0, "df2 f32 tap: empty capture (h={h}, n={n})");
-    anyhow::ensure!(src_pitch >= h, "df2 f32 tap: src pitch {src_pitch} < h {h}");
-    anyhow::ensure!(h == HIDDEN, "df2 f32 tap: h {h} != HIDDEN {HIDDEN} (non-27B pack?)");
+    anyhow::ensure!(hcn >= 1 && src_pitch >= hcn * h,
+                    "df2 f32 tap: src pitch {src_pitch} < hcn {hcn} * h {h} (the hc streams must fit the row)");
+    anyhow::ensure!(h == hidden(), "df2 f32 tap: h {h} != hidden() {} (non-27B pack?)", hidden());
     let elems = (h as i64) * (n as i64);
     let f = dev.get_func("exl3_bench", "xq_df2_tap_cvt")
         .ok_or_else(|| anyhow::anyhow!("df2 f32 tap: xq_df2_tap_cvt not loaded (is the exl3_bench module loaded?)"))?;
@@ -173,7 +206,7 @@ pub fn capture_cols_f32_into(dev: &Arc<CudaDevice>, stream: &cudarc::driver::Cud
             stream,
             LaunchConfig { grid_dim: blocks, block_dim: (256, 1, 1), shared_mem_bytes: 0 },
             (dst_ptr as u64, src_ptr as u64, elems, h as i32, src_pitch as i64,
-             tap_li as i32, dst_pitch as i64),
+             tap_li as i32, dst_pitch as i64, hcn as i32),
         )?;
     }
     Ok(())
@@ -184,11 +217,11 @@ pub fn capture_cols_f32_into(dev: &Arc<CudaDevice>, stream: &cudarc::driver::Cud
 /// count (`n <= block()` for the standard sink — the caller gates, same as the trunk).
 pub fn capture_cols_f32(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
                         sink: &Df2TapSink, res_ptr: u64, src_pitch: usize,
-                        h: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
-    anyhow::ensure!(n <= sink.staging.len() / TAP_CONCAT_DIM,
-                    "df2 f32 tap: n {n} > sink columns {}", sink.staging.len() / TAP_CONCAT_DIM);
-    capture_cols_f32_into(dev, stream, *sink.staging.device_ptr() as u64, TAP_CONCAT_DIM,
-                          res_ptr, src_pitch, h, n, tap_li)
+                        h: usize, hcn: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(n <= sink.staging.len() / tap_concat_dim(),
+                    "df2 f32 tap: n {n} > sink columns {}", sink.staging.len() / tap_concat_dim());
+    capture_cols_f32_into(dev, stream, *sink.staging.device_ptr() as u64, tap_concat_dim(),
+                          res_ptr, src_pitch, h, hcn, n, tap_li)
 }
 
 /// The PRIME-sink wrapper (one prefill window): writes rows [0, n) of the prime sink —
@@ -196,10 +229,10 @@ pub fn capture_cols_f32(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStre
 /// consume per chunk. The prefill is eager, so this is outside any captured graph.
 pub fn capture_prime_f32(dev: &Arc<CudaDevice>, stream: &cudarc::driver::CudaStream,
                          prime: &Df2PrimeSink, res_ptr: u64, src_pitch: usize,
-                         h: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
-    anyhow::ensure!(n <= prime.taps.len() / TAP_CONCAT_DIM,
-                    "df2 prime tap: n {n} > prime columns {}", prime.taps.len() / TAP_CONCAT_DIM);
-    capture_cols_f32_into(dev, stream, *prime.taps.device_ptr() as u64, TAP_CONCAT_DIM,
-                          res_ptr, src_pitch, h, n, tap_li)
+                         h: usize, hcn: usize, n: usize, tap_li: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(n <= prime.taps.len() / tap_concat_dim(),
+                    "df2 prime tap: n {n} > prime columns {}", prime.taps.len() / tap_concat_dim());
+    capture_cols_f32_into(dev, stream, *prime.taps.device_ptr() as u64, tap_concat_dim(),
+                          res_ptr, src_pitch, h, hcn, n, tap_li)
 }
 

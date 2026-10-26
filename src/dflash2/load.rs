@@ -9,7 +9,7 @@ use half::bf16;
 use safetensors::SafeTensors;
 
 use crate::dflash2::oracle::{ConvWeights, Dflash2Weights, LayerWeights};
-use crate::dflash2::{inventory, N_PARAMS, N_TENSORS};
+use crate::dflash2::{inventory, n_params, n_tensors};
 
 /// A loaded (and validated) artifact + its host-f32 weights.
 pub struct LoadedArtifact {
@@ -21,9 +21,21 @@ pub struct LoadedArtifact {
     pub header_size: u64,
 }
 
+/// FLASHNEXT-DF2 Phase 4: the sha of the artifact the LAST `load()` hashed — the value the
+/// serve ENGAGED line names (AGENTS §1b-bis.2: the receipt says which artifact served).
+static LAST_LOAD_SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The sha actually verified by the last `load` (None before any load / on load failure).
+pub fn last_load_sha() -> Option<&'static str> {
+    LAST_LOAD_SHA.get().map(|s| s.as_str())
+}
+
 /// Read `dir/model.safetensors`, validate inventory/shapes/dtypes, optional sha256 pin, and
 /// upcast every tensor to f32. Returns an error (not a soft skip) on any mismatch.
 pub fn load(dir: &str, sha256_pin: Option<&str>) -> Result<LoadedArtifact, anyhow::Error> {
+    // DFLASH2-GEN: the artifact's config.json is the geometry source of truth; install it
+    // BEFORE any inventory/buffer work (idempotent; refuses to change after pin_geom()).
+    super::geom::install_geom_from_dir(dir)?;
     let path = Path::new(dir).join("model.safetensors");
     let buf = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
     let file_size = buf.len() as u64;
@@ -33,31 +45,48 @@ pub fn load(dir: &str, sha256_pin: Option<&str>) -> Result<LoadedArtifact, anyho
     let mut h = Sha256::new();
     h.update(&buf);
     let hexd: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let _ = LAST_LOAD_SHA.set(hexd.clone());
     if let Some(pin) = sha256_pin {
+        let known = crate::dflash2::KNOWN_SHA256.iter().any(|k| hexd.eq_ignore_ascii_case(k));
         anyhow::ensure!(
-            hexd.eq_ignore_ascii_case(pin),
-            "sha256 mismatch: file={hexd} pin={pin}"
+            hexd.eq_ignore_ascii_case(pin) || known,
+            "sha256 mismatch: file={hexd} pin={pin} (accepted: REAL/RTNCAL; see dflash2::KNOWN_SHA256)"
         );
     }
 
     let st = SafeTensors::deserialize(&buf).map_err(|e| anyhow::anyhow!("parse safetensors: {e}"))?;
 
-    // Exact name-set equality vs the 81-tensor inventory (sorted → deterministic comparison).
     let inv = inventory();
-    let mut file_names: Vec<String> = st.names().iter().map(|s| s.to_string()).collect();
-    file_names.sort();
-    let mut inv_names: Vec<String> = inv.iter().map(|(n, _)| n.clone()).collect();
-    inv_names.sort();
-    anyhow::ensure!(
-        file_names == inv_names,
-        "inventory name mismatch (have {} tensors; expected {N_TENSORS})",
-        file_names.len()
-    );
-    anyhow::ensure!(file_names.len() == N_TENSORS, "tensor count {} != {N_TENSORS}", file_names.len());
+    // P7/W8 (owner 2026-10-18: "just make it valid"): the RTNcal artifact is the ModelOpt NVFP4
+    // export of the SAME 81-tensor draft — the 35 GEMM projections arrive as
+    // {<name>.weight U8 [r, c/2], <name>.weight_scale F8_E4M3 [r, c/16], <name>.weight_scale_2
+    // F32 scalar, <name>.input_scale (activation side, unused — bf16 activations here)};
+    // every other tensor is BF16 under its inventory name (5*28 + 5*8 + 6 = 186).
+    // Dequant the 35 to BF16 and keep the owner's --draft-dir unchanged.
+    let modelopt = st.names().iter().any(|n: &&str| n.ends_with("weight_scale_2"));
+    let mo_bf16: Option<std::collections::HashMap<String, Vec<u8>>> = if modelopt {
+        Some(build_modelopt_bf16(&st, &inv)?)
+    } else {
+        None
+    };
+    if mo_bf16.is_none() {
+        // Exact name-set equality vs the 81-tensor inventory (sorted → deterministic comparison).
+        let mut file_names: Vec<String> = st.names().iter().map(|s| s.to_string()).collect();
+        file_names.sort();
+        let mut inv_names: Vec<String> = inv.iter().map(|(n, _)| n.clone()).collect();
+        inv_names.sort();
+        anyhow::ensure!(
+            file_names == inv_names,
+            "inventory name mismatch (have {} tensors; expected {})",
+            file_names.len(),
+            inv_names.len()
+        );
+        anyhow::ensure!(file_names.len() == n_tensors(), "tensor count {} != {}", file_names.len(), n_tensors());
+    }
 
     // Per-tensor dtype (BF16-only) + exact shape, in FIXED inventory order.
     let mut weights = Dflash2Weights {
-        layers: Vec::with_capacity(crate::dflash2::N_LAYERS),
+        layers: Vec::with_capacity(crate::dflash2::n_layers()),
         fc: Vec::new(),
         hidden_norm: Vec::new(),
         norm: Vec::new(),
@@ -67,12 +96,16 @@ pub fn load(dir: &str, sha256_pin: Option<&str>) -> Result<LoadedArtifact, anyho
     };
 
     let bf16_to_f32 = |name: &str, shape: &[usize]| -> Result<Vec<f32>, anyhow::Error> {
-        let view = st.tensor(name).map_err(|e| anyhow::anyhow!("tensor {name}: {e}"))?;
-        anyhow::ensure!(view.dtype() == safetensors::Dtype::BF16, "{name}: not BF16 ({:?})", view.dtype());
-        anyhow::ensure!(view.shape() == shape, "{name}: shape {:?} != expected {shape:?}", view.shape());
         anyhow::ensure!(!name.contains("embed_tokens") && !name.contains("lm_head"),
             "{name}: embed/lm_head must NOT be in the checkpoint (borrowed from the target)");
-        let data = view.data();
+        let data: &[u8] = if let Some(m) = &mo_bf16 {
+            &m.get(name).ok_or_else(|| anyhow::anyhow!("ModelOpt view missing {name}"))?[..]
+        } else {
+            let view = st.tensor(name).map_err(|e| anyhow::anyhow!("tensor {name}: {e}"))?;
+            anyhow::ensure!(view.dtype() == safetensors::Dtype::BF16, "{name}: not BF16 ({:?})", view.dtype());
+            anyhow::ensure!(view.shape() == shape, "{name}: shape {:?} != expected {shape:?}", view.shape());
+            view.data()
+        };
         Ok(data
             .chunks_exact(2)
             .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
@@ -85,15 +118,19 @@ pub fn load(dir: &str, sha256_pin: Option<&str>) -> Result<LoadedArtifact, anyho
         let v = bf16_to_f32(name, shape)?;
         assign(&mut weights, name, v)?;
     }
-    anyhow::ensure!(n_params == N_PARAMS, "param count {n_params} != {N_PARAMS}");
+    anyhow::ensure!(
+        n_params == crate::dflash2::n_params(),
+        "param count {n_params} != {}",
+        crate::dflash2::n_params()
+    );
 
     Ok(LoadedArtifact {
         weights,
-        n_tensors: N_TENSORS,
+        n_tensors: n_tensors(),
         n_params,
         sha256: hexd,
         file_size,
-        header_size: file_size - n_params * 2,
+        header_size: 8u64 + u64::from_le_bytes(buf[0..8].try_into().unwrap()),
     })
 }
 
@@ -299,33 +336,83 @@ pub struct QuantArtifact {
 
 /// The linear weights §1a quantizes (everything the per-step block pass streams).
 /// Selector/codebook/norm/base_kernel tensors are NOT here (stay BF16 in
-/// `model.safetensors`).
+/// `model.safetensors`). FLASHNEXT-DF2-NVFP4 (2026-10-23): GEOMETRY-DRIVEN — the table was
+/// hard-wired to the 27B shapes (5120 / 17408 / fc 25600 / conv 1280), so no other artifact
+/// could be baked; the live geometry is the one the bake installs from the source config.
 pub fn quantized_inventory() -> Vec<(String, usize, usize)> {
+    quantized_inventory_geom(&crate::dflash2::geom())
+}
+
+/// [`quantized_inventory`] for an explicit geometry (pure; the bake and the tests use it).
+pub fn quantized_inventory_geom(g: &crate::dflash2::Geom) -> Vec<(String, usize, usize)> {
+    let q = g.num_heads * g.head_dim;
+    let kv = g.num_kv_heads * g.head_dim;
+    let conv = 2 * g.conv_kernel * g.conv_groups();
     let mut v = Vec::new();
-    v.push(("fc.weight".to_string(), 5120, 25600));
-    for i in 0..crate::dflash2::N_LAYERS {
+    v.push(("fc.weight".to_string(), g.hidden, g.tap_concat_dim()));
+    for i in 0..g.n_layers {
         let p = move |s: &str| format!("layers.{i}.{s}");
-        v.push((p("self_attn.q_proj.weight"), 4096, 5120));
-        v.push((p("self_attn.k_proj.weight"), 1024, 5120));
-        v.push((p("self_attn.v_proj.weight"), 1024, 5120));
-        v.push((p("self_attn.o_proj.weight"), 5120, 4096));
-        v.push((p("mlp.gate_proj.weight"), 17408, 5120));
-        v.push((p("mlp.up_proj.weight"), 17408, 5120));
-        v.push((p("mlp.down_proj.weight"), 5120, 17408));
-        v.push((p("attention_conv.kernel_projection.weight"), 1280, 5120));
-        v.push((p("mlp_conv.kernel_projection.weight"), 1280, 5120));
+        v.push((p("self_attn.q_proj.weight"), q, g.hidden));
+        v.push((p("self_attn.k_proj.weight"), kv, g.hidden));
+        v.push((p("self_attn.v_proj.weight"), kv, g.hidden));
+        v.push((p("self_attn.o_proj.weight"), g.hidden, q));
+        v.push((p("mlp.gate_proj.weight"), g.inter, g.hidden));
+        v.push((p("mlp.up_proj.weight"), g.inter, g.hidden));
+        v.push((p("mlp.down_proj.weight"), g.hidden, g.inter));
+        v.push((p("attention_conv.kernel_projection.weight"), conv, g.hidden));
+        v.push((p("mlp_conv.kernel_projection.weight"), conv, g.hidden));
     }
     v
 }
 
 /// The BF16 twins prime_window needs (gemm_mma_fp4_b is N≤16; prime is not).
 pub fn bf16_twin_inventory() -> Vec<(String, usize, usize)> {
-    let mut v = vec![("fc.weight".to_string(), 5120, 25600)];
-    for i in 0..crate::dflash2::N_LAYERS {
-        v.push((format!("layers.{i}.self_attn.k_proj.weight"), 1024, 5120));
-        v.push((format!("layers.{i}.self_attn.v_proj.weight"), 1024, 5120));
+    bf16_twin_inventory_geom(&crate::dflash2::geom())
+}
+
+/// [`bf16_twin_inventory`] for an explicit geometry.
+pub fn bf16_twin_inventory_geom(g: &crate::dflash2::Geom) -> Vec<(String, usize, usize)> {
+    let kv = g.num_kv_heads * g.head_dim;
+    let mut v = vec![("fc.weight".to_string(), g.hidden, g.tap_concat_dim())];
+    for i in 0..g.n_layers {
+        v.push((format!("layers.{i}.self_attn.k_proj.weight"), kv, g.hidden));
+        v.push((format!("layers.{i}.self_attn.v_proj.weight"), kv, g.hidden));
     }
     v
+}
+
+#[cfg(test)]
+mod quant_inventory_tests {
+    use super::*;
+    /// The 27B default geometry reproduces the old hard-wired table exactly; the Flash-Next
+    /// geometry (hidden 2560, inter 7680, 5 taps, conv groups 160) gives its own shapes.
+    #[test]
+    fn quantized_inventory_follows_the_geometry() {
+        let g27 = crate::dflash2::Geom::default();
+        let v = quantized_inventory_geom(&g27);
+        assert_eq!(v[0], ("fc.weight".to_string(), 5120, 25600));
+        assert!(v.contains(&("layers.0.self_attn.q_proj.weight".to_string(), 4096, 5120)));
+        assert!(v.contains(&("layers.4.mlp.down_proj.weight".to_string(), 5120, 17408)));
+        assert!(v.contains(&("layers.2.mlp_conv.kernel_projection.weight".to_string(), 1280, 5120)));
+        assert_eq!(v.len(), 1 + 5 * 9);
+        assert_eq!(bf16_twin_inventory_geom(&g27).len(), 1 + 5 * 2);
+        let fn_cfg = r#"{"hidden_size": 2560, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+            "intermediate_size": 7680, "num_hidden_layers": 5, "vocab_size": 248320, "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 262144, "sliding_window": 2048, "is_causal": false,
+            "rope_parameters": {"rope_theta": 10000, "rope_type": "default"}, "num_target_layers": 48,
+            "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "mask_token_id": 248077,
+                              "selector_rank": 256, "selector_top_k": 16, "target_layer_ids": [5, 15, 25, 35, 45]}}"#;
+        let gfn = crate::dflash2::geom_from_config_json(fn_cfg).expect("flash-next geometry");
+        let v = quantized_inventory_geom(&gfn);
+        assert_eq!(v[0], ("fc.weight".to_string(), 2560, 12800));
+        assert!(v.contains(&("layers.0.self_attn.q_proj.weight".to_string(), 4096, 2560)));
+        assert!(v.contains(&("layers.0.self_attn.k_proj.weight".to_string(), 1024, 2560)));
+        assert!(v.contains(&("layers.3.mlp.gate_proj.weight".to_string(), 7680, 2560)));
+        assert!(v.contains(&("layers.4.attention_conv.kernel_projection.weight".to_string(), 640, 2560)));
+        let twins = bf16_twin_inventory_geom(&gfn);
+        assert_eq!(twins[0], ("fc.weight".to_string(), 2560, 12800));
+        assert!(twins.contains(&("layers.4.self_attn.v_proj.weight".to_string(), 1024, 2560)));
+    }
 }
 
 /// Cheap baked-dir probe: config.json carries `df2_quant == "nvfp4" | "fp8"`.
@@ -350,6 +437,9 @@ pub fn baked_fmt(dir: &str) -> Option<&'static str> {
 /// hi-prec weights via [`load`] (its inventory check is RELAXED to the kept set —
 /// see `load_kept`) plus the packed sidecar.
 pub fn load_quantized(dir: &str) -> Result<(LoadedArtifact, QuantArtifact), anyhow::Error> {
+    // DFLASH2-GEN: geometry from the baked artifact config (same source of truth as the
+    // BF16 loader; idempotent if the funnel already installed it).
+    super::geom::install_geom_from_dir(dir)?;
     // The hi-prec side: same reader, same asserts, kept-subset inventory.
     let weights = load_kept(dir)?;
     let fmt = baked_fmt(dir).ok_or_else(|| anyhow::anyhow!("config.json: df2_quant is neither nvfp4 nor fp8 — not a baked artifact"))?;
@@ -452,7 +542,7 @@ fn load_kept(dir: &str) -> Result<LoadedArtifact, anyhow::Error> {
         file_names.len(), kept_names.len());
 
     let mut weights = Dflash2Weights {
-        layers: Vec::with_capacity(crate::dflash2::N_LAYERS),
+        layers: Vec::with_capacity(crate::dflash2::n_layers()),
         fc: Vec::new(),
         hidden_norm: Vec::new(),
         norm: Vec::new(),
@@ -480,4 +570,57 @@ fn load_kept(dir: &str) -> Result<LoadedArtifact, anyhow::Error> {
         file_size,
         header_size: 0,
     })
+}
+
+/// P7/W8: materialize the 81-tensor BF16 view of the ModelOpt NVFP4 export (186 tensors).
+/// Projection dequant: w[r][c] = e2m1(nibble) * e4m3(weight_scale[r][c/16]) * weight_scale_2.
+/// Nibble order follows our own `pack_e2m1_pair` (low nibble = even index); a flipped
+/// convention shows up immediately as a cratered acceptance, not silent corruption.
+fn build_modelopt_bf16(
+    st: &SafeTensors,
+    inv: &[(String, Vec<usize>)],
+) -> Result<std::collections::HashMap<String, Vec<u8>>, anyhow::Error> {
+    use crate::quant::{e2m1_to_f32, e4m3_to_f32};
+    let mut out = std::collections::HashMap::new();
+    for (name, shape) in inv {
+        // ModelOpt names the packed triple AFTER the inventory name itself:
+        // {name} = U8 packed weight, {name}_scale = F8_E4M3 groups, {name}_scale_2 = F32 scalar.
+        // A direct BF16 hit is the passthrough (norms, convs, codebooks, fc).
+        if let Ok(view) = st.tensor(name) {
+            if view.dtype() == safetensors::Dtype::BF16 {
+                anyhow::ensure!(view.shape() == shape, "{name}: shape {:?} != expected {shape:?}", view.shape());
+                out.insert(name.clone(), view.data().to_vec());
+                continue;
+            }
+        }
+        let wname = name.clone();
+        let sname = format!("{name}_scale");
+        let tname = format!("{name}_scale_2");
+        let wv = st.tensor(&wname).map_err(|e| anyhow::anyhow!("{wname}: {e} (expected a ModelOpt projection)"))?;
+        anyhow::ensure!(wv.dtype() == safetensors::Dtype::U8, "{wname}: not U8");
+        anyhow::ensure!(shape.len() == 2, "{name}: non-matrix projection {shape:?}");
+        let (rows, cols) = (shape[0], shape[1]);
+        anyhow::ensure!(wv.shape() == vec![rows, cols / 2], "{wname}: shape {:?} != [{rows}, {}]", wv.shape(), cols / 2);
+        let sv = st.tensor(&sname).map_err(|e| anyhow::anyhow!("{sname}: {e}"))?;
+        anyhow::ensure!(sv.dtype() == safetensors::Dtype::F8_E4M3, "{sname}: not F8_E4M3");
+        anyhow::ensure!(sv.shape() == vec![rows, cols / 16], "{sname}: shape {:?} != [{rows}, {}]", sv.shape(), cols / 16);
+        let tv = st.tensor(&tname).map_err(|e| anyhow::anyhow!("{tname}: {e}"))?;
+        anyhow::ensure!(tv.dtype() == safetensors::Dtype::F32 && tv.shape().is_empty(), "{tname}: not an F32 scalar");
+        let s2 = f32::from_le_bytes(tv.data()[0..4].try_into().unwrap());
+        let wd = wv.data();
+        let sd = sv.data();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows * cols * 2);
+        for r in 0..rows {
+            let wrow = &wd[r * (cols / 2)..(r + 1) * (cols / 2)];
+            let srow = &sd[r * (cols / 16)..(r + 1) * (cols / 16)];
+            for c in 0..cols {
+                let byte = wrow[c / 2];
+                let nib = if c % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                let v = e2m1_to_f32(nib) * e4m3_to_f32(srow[c / 16]) * s2;
+                buf.extend_from_slice(&bf16::from_f32(v).to_bits().to_le_bytes());
+            }
+        }
+        out.insert(name.clone(), buf);
+    }
+    Ok(out)
 }

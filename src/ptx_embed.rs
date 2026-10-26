@@ -52,6 +52,11 @@ pub const EXL3_BENCH: &str = include_str!("ptx/exl3_bench.ptx");
 /// `exl3_bench::set_k6_module` from the pack header.
 pub const EXL3_BENCH_K6: &str = include_str!("ptx/exl3_bench_k6.ptx");
 
+/// `gpu_naive.cu` (sm_121): the Naive-N0.5-Flash family kernels (half-K trellis GEMM, ...; PLAN/NAIVE_N05_PORT.md).
+pub const GPU_NAIVE: &str = include_str!("ptx/gpu_naive.ptx");
+/// `gpu_naive_draft.cu` (sm_121): the Naive DSpark drafter round (src/naive/drafter_gpu.rs).
+pub const GPU_NAIVE_DRAFT: &str = include_str!("ptx/gpu_naive_draft.ptx");
+
 /// The EXL3 kernel source this process loads: the standard module, or the K=6 one.
 pub fn exl3_bench_src(k6: bool) -> &'static str {
     if k6 { EXL3_BENCH_K6 } else { EXL3_BENCH }

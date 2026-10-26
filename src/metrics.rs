@@ -63,6 +63,14 @@ static SCRUB_PAT_HITS: AtomicU64 = AtomicU64::new(0);
 
 pub fn scrub_hit_provenance() { SCRUB_PROV_HITS.fetch_add(1, Relaxed); }
 pub fn scrub_hit_pattern() { SCRUB_PAT_HITS.fetch_add(1, Relaxed); }
+
+// DFLASH2-GEN: the DF2 chain's engagement counters on the NON-EXL3 (nvfp4) serve path.
+// scripts/owner_check.py prints them; the exl3_df2_* series are the EXL3 server's arm.
+static DF2_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static DF2_MASK_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+pub fn df2_round() { DF2_ROUNDS.fetch_add(1, Relaxed); }
+pub fn df2_mask_override(on: bool) { DF2_MASK_OVERRIDE.store(on as u64, Relaxed); }
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH: AtomicU64 = AtomicU64::new(0);
 /// F2: the `--max-batch` the command line asked for, BEFORE the EXL3 server's 16-lane cap. A number
@@ -85,7 +93,13 @@ static OVER_CAP_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 /// MAXBATCH1: count one over-cap arrival that waits in the queue (owner_check prints it in words).
 pub fn over_cap_queued() {
-    OVER_CAP_QUEUED.fetch_add(1, Relaxed);
+    over_cap_queued_n(1);
+}
+
+/// PREHARD1 [ISSUES 104]: the trunk scheduler's queue IS the channel, so it observes arrivals in
+/// bulk — a burst's delta counted once per loop sample (the same `over_cap_queued` series).
+pub fn over_cap_queued_n(n: u64) {
+    OVER_CAP_QUEUED.fetch_add(n, Relaxed);
 }
 
 /// MAXBATCH1: count one over-cap arrival refused by the waiting limit (503 server_busy).
@@ -184,6 +198,11 @@ static SCHED_STEPS: AtomicU64 = AtomicU64::new(0);
 /// --lane-reserve-patience and took a reserved lane; rate-limited by --lane-reserve-swap).
 /// All zero when the policy is off.
 static LANE_RESERVE_ADMITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// LANERES3: TP scoped admits whose allowed lanes were no longer free at apply time —
+/// requeued by the head (never refused), skipped symmetrically by the mirrors. Non-zero
+/// under bursty arrivals with the policy on; a sustained climb means the planner's view
+/// is chronically stale and should be looked at.
+static LANE_RESERVE_TP_REQUEUED: AtomicU64 = AtomicU64::new(0);
 /// Requests the --lane-reserve policy is holding back right now: waiting while free lanes sit
 /// reserved for their conversations (0 when the policy is off or nothing waits).
 static LANE_RESERVE_WAITING: AtomicU64 = AtomicU64::new(0);
@@ -193,13 +212,55 @@ pub fn lane_reserve_admit(kind: usize) {
 }
 /// The lane-reserve holdback gauge (requests waiting while free lanes are reserved for others).
 pub fn lane_reserve_waiting(n: u64) { LANE_RESERVE_WAITING.store(n, Relaxed); }
+/// LANERES3: a TP scoped admit whose allowed set had no free lane at apply time —
+/// requeued (head) / skipped (mirror), never refused.
+pub fn lane_reserve_tp_requeued() { LANE_RESERVE_TP_REQUEUED.fetch_add(1, Relaxed); }
 /// LANERES2 SSD spill tier counters (--kv-spill): writes, restores, recompute fallbacks, bytes
 /// stored, and prompt tokens whose re-prefill a restore avoided.
 pub static KV_SPILL_WRITES: AtomicU64 = AtomicU64::new(0);
+/// PERFFIX1: --prefill-interleave engagement — decode steps run between the chunks of joining prompts, and the
+/// chunk boundaries that ran at least one (0 with the flag off).
+pub static PREFILL_INTERLEAVE_STEPS: AtomicU64 = AtomicU64::new(0);
+pub static PREFILL_INTERLEAVE_POINTS: AtomicU64 = AtomicU64::new(0);
+pub fn prefill_interleave(points: u64, steps: u64) {
+    PREFILL_INTERLEAVE_POINTS.fetch_add(points, Relaxed);
+    PREFILL_INTERLEAVE_STEPS.fetch_add(steps, Relaxed);
+}
+/// Naive exact speculative sampling (work item A): sampled verify rounds, drafts accepted by the ratio test, and the
+/// rows whose residual draw the kernel could not make (no candidate list / empty residual: the target's own draw was committed)
+pub static NAIVE_SPEC_SAMPLED_ROUNDS: AtomicU64 = AtomicU64::new(0);
+pub static NAIVE_SPEC_SAMPLED_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+pub static NAIVE_SPEC_FALLBACK_NOLIST: AtomicU64 = AtomicU64::new(0);
+pub static NAIVE_SPEC_FALLBACK_EMPTY: AtomicU64 = AtomicU64::new(0);
+/// Naive TP lever 1: the transport ctx addresses (0 = none) whose DEVICE epoch counters are the liveness receipt of
+/// each reduce path: every single-stage reduce advances the single ctx's counter by exactly 1, every tree reduce the
+/// primary's by log2(world) (graph replays included — the counter lives on the device, so no host count can lag it).
+pub static NAIVE_TP_PRIMARY_CTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static NAIVE_TP_SINGLE_CTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Lever 1b: the single-stage ctx runs the GPU-validated receive (`--tp-gpu-recv on`).
+pub static NAIVE_TP_SINGLE_GPU_RECV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Lever 1c: the single-stage ctx's K1 is the multi-block one (`--naive-tp-k1 multi`, default).
+pub static NAIVE_TP_SINGLE_K1_MB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Naive expert tensor parallelism is live on this boot (`--naive-moe-shard tp`), and the G1 lane count (`--naive-lanes`).
+pub static NAIVE_MOE_TP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static NAIVE_LANES: AtomicU64 = AtomicU64::new(0);
+/// G1: every lane keeps its own drafter context (`--naive-lane-ctx on`, with lanes > 1 and a drafter).
+pub static NAIVE_LANE_CTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Naive prefix reuse (`--prefix-cache on`): 1 = on, 2 = asked for but off on this boot (--naive-lanes > 1), 0 = not asked;
+/// prompts that resumed / were prefilled whole, and the prompt tokens not prefilled again.
+pub static NAIVE_PREFIX_ON: AtomicU64 = AtomicU64::new(0);
+pub static NAIVE_PREFIX_HITS: AtomicU64 = AtomicU64::new(0);
+pub static NAIVE_PREFIX_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static NAIVE_PREFIX_REUSED: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_HITS: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static KV_SPILL_SAVED: AtomicU64 = AtomicU64::new(0);
+/// LANERES3: TP spill-agreement outcomes — a capture dropped because SOME rank's write
+/// failed, and a restore skipped because some rank could not read the snapshot (both
+/// re-prefill; the counters prove the cross-rank safety net engaged, not that disks fail).
+pub static KV_SPILL_CAPTURE_PEER_DROPS: AtomicU64 = AtomicU64::new(0);
+pub static KV_SPILL_RESTORE_PEER_MISSES: AtomicU64 = AtomicU64::new(0);
 pub fn kv_spill_write(bytes: u64, tokens: u64) {
     KV_SPILL_WRITES.fetch_add(1, Relaxed);
     KV_SPILL_BYTES.fetch_add(bytes, Relaxed);
@@ -209,6 +270,12 @@ pub fn kv_spill_hit(tokens: u64) {
     KV_SPILL_SAVED.fetch_add(tokens, Relaxed);
 }
 pub fn kv_spill_miss_recompute() { KV_SPILL_MISSES.fetch_add(1, Relaxed); }
+/// LANERES3: a TP capture dropped because at least one rank's local write failed (agreed
+/// across ranks; the key is forgotten everywhere — the policy stays replicated-identical).
+pub fn kv_spill_capture_peer_drop() { KV_SPILL_CAPTURE_PEER_DROPS.fetch_add(1, Relaxed); }
+/// LANERES3: a TP restore skipped because at least one rank could not read the snapshot
+/// (agreed across ranks; both re-prefill — the rounds stay identical).
+pub fn kv_spill_restore_peer_miss() { KV_SPILL_RESTORE_PEER_MISSES.fetch_add(1, Relaxed); }
 /// Milliseconds since `START` when the scheduler last completed a round; 0 = never stepped.
 static SCHED_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static SCHED_BUSY: AtomicU8 = AtomicU8::new(0);
@@ -697,12 +764,16 @@ pub fn render(engine_alive: bool) -> String {
         o.push_str(&format!("# HELP velogb10_uptime_seconds Seconds since the server started.\n# TYPE velogb10_uptime_seconds gauge\nvelogb10_uptime_seconds {:.1}\n",
                             s.elapsed().as_secs_f64()));
     }
+    o.push_str("# HELP velogb10_df2_rounds_total DFlash2 draft rounds served on this boot (the --draft-dir speculator; nvfp4 trunk-path arm; scripts/owner_check.py prints it).\n# TYPE velogb10_df2_rounds_total counter\n");
+    o.push_str(&format!("velogb10_df2_rounds_total {}\n", DF2_ROUNDS.load(Relaxed)));
+    o.push_str("# HELP velogb10_df2_mask_row_override 1 if the draft's mask row measured DAMAGED at load and the artifact's BF16 copy override is engaged (0 otherwise).\n# TYPE velogb10_df2_mask_row_override gauge\n");
+    o.push_str(&format!("velogb10_df2_mask_row_override {}\n", DF2_MASK_OVERRIDE.load(Relaxed)));
     let inflight = IN_FLIGHT.load(Relaxed);
     let cap = MAX_BATCH.load(Relaxed);
     let running = if cap > 0 { inflight.min(cap) } else { inflight };
     o.push_str(&format!("# HELP velogb10_max_batch Lane capacity (--max-batch).\n# TYPE velogb10_max_batch gauge\nvelogb10_max_batch {cap}\n"));
     let req = MAX_BATCH_REQUESTED.load(Relaxed);
-    o.push_str("# HELP velogb10_max_batch_requested The --max-batch the command line asked for, before the EXL3 server's 16-lane cap.\n# TYPE velogb10_max_batch_requested gauge\n");
+    o.push_str("# HELP velogb10_max_batch_requested The --max-batch the command line asked for, before the 16-lane serving cap (EXL3 and NVFP4 trunk servers; PREHARD1).\n# TYPE velogb10_max_batch_requested gauge\n");
     o.push_str(&format!("velogb10_max_batch_requested {req}\n"));
     o.push_str(&format!("# HELP velogb10_requests_running Requests holding a lane.\n# TYPE velogb10_requests_running gauge\nvelogb10_requests_running {running}\n"));
     o.push_str(&format!("# HELP velogb10_requests_waiting Requests queued for a lane.\n# TYPE velogb10_requests_waiting gauge\nvelogb10_requests_waiting {}\n",
@@ -851,16 +922,52 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_requests_rejected_total {}\n", REQ_REJECTED.load(Relaxed)));
     o.push_str("# HELP velogb10_streams_cancelled_backlog_total Streams cancelled for exceeding --stream-backlog-events (the client stopped reading).\n# TYPE velogb10_streams_cancelled_backlog_total counter\n");
     o.push_str(&format!("velogb10_streams_cancelled_backlog_total {}\n", STREAMS_CANCELLED_BACKLOG.load(Relaxed)));
-    o.push_str("# HELP velogb10_lane_reserve_admits_total Admissions decided by the --lane-reserve policy (EXL3 TP=1), by rule: own = the waiting request's prompt-end snapshot sat in a free lane (admitted first, into that lane); unreserved = a free lane no reservation protects; forced = the queue head out-waited --lane-reserve-patience and took a reserved lane (rate-limited by --lane-reserve-swap). All zero when --lane-reserve is off (default).\n# TYPE velogb10_lane_reserve_admits_total counter\n");
+    o.push_str("# HELP velogb10_lane_reserve_admits_total Admissions decided by the --lane-reserve policy (EXL3; head-authoritative at TP>=2 since LANERES3: the head ships each admit's scoping, every rank picks the same lane), by rule: own = the waiting request's prompt-end snapshot sat in a free lane (admitted first, into that lane); unreserved = a free lane no reservation protects; forced = the queue head out-waited --lane-reserve-patience and took a reserved lane (rate-limited by --lane-reserve-swap). All zero when --lane-reserve is off (default).\n# TYPE velogb10_lane_reserve_admits_total counter\n");
     o.push_str(&format!("velogb10_lane_reserve_admits_total{{rule=\"own\"}} {}\n", LANE_RESERVE_ADMITS[0].load(Relaxed)));
     o.push_str(&format!("velogb10_lane_reserve_admits_total{{rule=\"unreserved\"}} {}\n", LANE_RESERVE_ADMITS[1].load(Relaxed)));
     o.push_str(&format!("velogb10_lane_reserve_admits_total{{rule=\"forced\"}} {}\n", LANE_RESERVE_ADMITS[2].load(Relaxed)));
+    o.push_str(&format!("velogb10_lane_reserve_tp_requeued_total {}\n", LANE_RESERVE_TP_REQUEUED.load(Relaxed)));
     o.push_str("# HELP velogb10_lane_reserve_waiting Requests waiting while the --lane-reserve policy holds every free lane reserved for their conversations (0 when the policy is off or nothing waits).\n# TYPE velogb10_lane_reserve_waiting gauge\n");
     o.push_str(&format!("velogb10_lane_reserve_waiting {}\n", LANE_RESERVE_WAITING.load(Relaxed)));
+    {
+        let (pc, sc) = (NAIVE_TP_PRIMARY_CTX.load(Relaxed), NAIVE_TP_SINGLE_CTX.load(Relaxed));
+        if pc != 0 {
+            o.push_str("# HELP velogb10_naive_tp_reduce Naive TP all-reduce paths (device epoch counters): single_stage = 1 when --tp-reduce resolved to the one-shot ctx (world 4); single_epochs_total = reduces that took it (one epoch each); tree_epochs_total = exchanges on the primary link (log2(world) per tree reduce: prefill chunks, and every reduce when the single stage is off)\n");
+            o.push_str(&format!("velogb10_naive_tp_reduce_single_stage {}\n", (sc != 0) as u8));
+            o.push_str(&format!("velogb10_naive_tp_reduce_single_gpu_recv {}\n", (sc != 0 && NAIVE_TP_SINGLE_GPU_RECV.load(Relaxed)) as u8));
+            o.push_str(&format!("velogb10_naive_tp_reduce_single_k1_multiblock {}\n", (sc != 0 && NAIVE_TP_SINGLE_K1_MB.load(Relaxed)) as u8));
+            o.push_str(&format!("velogb10_naive_tp_reduce_single_epochs_total {}\n", if sc != 0 { crate::net::ctx_device_epoch(sc) } else { 0 }));
+            o.push_str(&format!("velogb10_naive_tp_reduce_tree_epochs_total {}\n", crate::net::ctx_device_epoch(pc)));
+        }
+        // every velogb10_naive_* series renders ONLY on a Naive server (lanes > 0): owner_check keys its NAIVE-N0.5
+        // section on their presence, and any other model's server must export none of them
+        let nl = NAIVE_LANES.load(Relaxed);
+        if nl > 0 {
+            o.push_str("# HELP velogb10_naive_config Naive serve configuration of this boot: moe_shard_tp = 1 when every rank holds a slice of every expert (--naive-moe-shard tp), lanes = concurrent requests (--naive-lanes)\n");
+            o.push_str(&format!("velogb10_naive_moe_shard_tp {}\n", NAIVE_MOE_TP.load(Relaxed) as u8));
+            o.push_str(&format!("velogb10_naive_lanes {nl}\n"));
+            o.push_str(&format!("velogb10_naive_lane_ctx {}\n", NAIVE_LANE_CTX.load(Relaxed) as u8));
+        o.push_str("# HELP velogb10_naive_spec_sampled Naive exact speculative sampling (sampled requests): rounds, accepted drafts, residual fallbacks by cause\n");
+        o.push_str(&format!("velogb10_naive_spec_sampled_rounds_total {}\n", NAIVE_SPEC_SAMPLED_ROUNDS.load(Relaxed)));
+        o.push_str(&format!("velogb10_naive_spec_sampled_accepted_total {}\n", NAIVE_SPEC_SAMPLED_ACCEPTED.load(Relaxed)));
+        o.push_str(&format!("velogb10_naive_spec_fallback_nolist_total {}\n", NAIVE_SPEC_FALLBACK_NOLIST.load(Relaxed)));
+        o.push_str(&format!("velogb10_naive_spec_fallback_empty_residual_total {}\n", NAIVE_SPEC_FALLBACK_EMPTY.load(Relaxed)));
+            o.push_str("# HELP velogb10_naive_prefix Naive prefix reuse (--prefix-cache on): state 1 = on (one conversation per KV slot), 0 = not asked (2 = asked but off: builds before 2026-10-21 with --naive-lanes > 1); hits = prompts that resumed after the previous prompt's prefix, misses = prompts prefilled whole, reused_tokens = prompt tokens not prefilled again\n");
+            o.push_str(&format!("velogb10_naive_prefix_state {}\n", NAIVE_PREFIX_ON.load(Relaxed)));
+            o.push_str(&format!("velogb10_naive_prefix_hits_total {}\n", NAIVE_PREFIX_HITS.load(Relaxed)));
+            o.push_str(&format!("velogb10_naive_prefix_misses_total {}\n", NAIVE_PREFIX_MISSES.load(Relaxed)));
+            o.push_str(&format!("velogb10_naive_prefix_reused_tokens_total {}\n", NAIVE_PREFIX_REUSED.load(Relaxed)));
+        }
+    }
     o.push_str("# HELP velogb10_kv_spill SSD spill tier for evicted lane snapshots (--kv-spill)\n");
     o.push_str(&format!("velogb10_kv_spill_writes_total {}\n", KV_SPILL_WRITES.load(Relaxed)));
+    o.push_str("# HELP velogb10_prefill_interleave_steps_total Decode steps run between prefill chunks of joining prompts (--prefill-interleave)\n");
+    o.push_str(&format!("velogb10_prefill_interleave_steps_total {}\n", PREFILL_INTERLEAVE_STEPS.load(Relaxed)));
+    o.push_str(&format!("velogb10_prefill_interleave_points_total {}\n", PREFILL_INTERLEAVE_POINTS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_hits_total {}\n", KV_SPILL_HITS.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_misses_recompute_total {}\n", KV_SPILL_MISSES.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_capture_peer_drop_total {}\n", KV_SPILL_CAPTURE_PEER_DROPS.load(Relaxed)));
+    o.push_str(&format!("velogb10_kv_spill_restore_peer_miss_total {}\n", KV_SPILL_RESTORE_PEER_MISSES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_bytes {}\n", KV_SPILL_BYTES.load(Relaxed)));
     o.push_str(&format!("velogb10_kv_spill_tokens_recompute_saved_total {}\n", KV_SPILL_SAVED.load(Relaxed)));
     let (steps, drafts, accepted, emitted) = crate::tel::spec_totals();

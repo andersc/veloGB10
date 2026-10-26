@@ -277,7 +277,8 @@ pub fn ship_plans(model_dir: &Path, world: u32) -> Result<Vec<RankShip>> {
     let world = world as usize;
     let fmt = detect_format(model_dir).with_context(|| format!(
         "shard shipping: {} is neither an EXL3 pack nor a qwen4_exp NVFP4 model — no shard plan", model_dir.display()))?;
-    let deal = match fmt { ShardFormat::Exl3 => crate::exl3_forward::xtp::ep_deal_kind(), ShardFormat::Nvfp4 => "contig".to_string() };
+    let deal = match fmt { ShardFormat::Exl3 => crate::exl3_forward::xtp::ep_deal_kind(), ShardFormat::Nvfp4 => "contig".to_string(),
+                           ShardFormat::Naive => crate::naive::shipplan::deal(world) };
     let base = model_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "model".into());
     let mut plans = Vec::new();
     for r in 1..world { plans.push(shard_plan(model_dir, fmt, world, r, &deal)?); }
@@ -1426,6 +1427,26 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
     assign_ranks(&mut nodes, &ifaces);
     let topology = build_topology(&nodes, &ifaces, world)?;
     crate::tp::set_topology(topology.clone());
+    // FLASHNEXT-DF2-C (ISSUES 116): the EXL3 serve ships the drafter too (this entry passed `None`).
+    let draft = draft_for_cfg(cfg);
+    let df2_draft = draft; // master's DF2-class decision (ISSUES 116), kept for every non-Naive session
+    // ISSUES 98 (2026-10-20): a Naive SERVE session ships its drafter through the same draft round the DFlash2 /
+    // DSpark sessions use (`run_head_session`): the sharded drafter loads its shard on EVERY rank, and a node must
+    // never depend on a hand-copied local dir. The head set `df2_draft_dir` only when the drafter is on its disk and
+    // speculation is on (`naive::serve::head_draft_dir`). Every other session that comes here ships no drafter.
+    let draft: Option<(String, Vec<Artifact>)> = if cfg.exl3_mode.starts_with("naive-serve:") && !cfg.df2_draft_dir.is_empty() {
+        match draft_manifest(Path::new(&cfg.df2_draft_dir)) {
+            Ok((id, arts)) => {
+                let dtotal: u64 = arts.iter().map(|a| a.size).sum();
+                println!("[head] Naive drafter manifest '{id}': {} artifacts, {:.2} GB — ships to every node", arts.len(), dtotal as f64 / 1e9);
+                Some((id, arts))
+            }
+            Err(e) => bail!("the Naive drafter at {} could not be listed for the nodes ({e:#}); start with --spec-source none to serve without it", cfg.df2_draft_dir),
+        }
+    } else { None };
+    // the port resolution: a naive-serve session ships the Naive drafter decision above; every other session
+    // keeps master's DF2-class decision (FLASHNEXT-DF2-C) instead of the None the block above yields for it.
+    let draft = if cfg.exl3_mode.starts_with("naive-serve:") { draft } else { df2_draft };
     let mut streams = Vec::with_capacity(nodes.len());
     for (i, node) in nodes.iter().enumerate() {
         let rank = (i + 1) as i32;
@@ -1435,7 +1456,7 @@ pub fn run_head_retain(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, disc
             Some(sh) => (sh[rank as usize].model_id.as_str(), Some(&sh[rank as usize].srcs)),
             None => (model_id.as_str(), None),
         };
-        streams.push(head_sync_one(node, rank, model_dir, mid, &per_rank[rank as usize], &topology, cfg, None, srcs)?);
+        streams.push(head_sync_one(node, rank, model_dir, mid, &per_rank[rank as usize], &topology, cfg, draft.as_ref(), srcs)?);
     }
     crate::deprintln!("[head] all {} node(s) synced.", nodes.len());
     sync_only_exit(cfg, nodes.len());
@@ -1461,6 +1482,41 @@ fn total_artifacts(per_rank: &[Vec<Artifact>]) -> usize {
 /// Returns the retained streams RANK-INDEXED (`streams[i]` is the stream to rank `i + 1`), so the
 /// head can fan out `CalibTable` / `Step` / `Shutdown` to every node (world > 2) and wait for
 /// `Ready` from every node. The node side is `run_node`'s retained stream.
+/// The drafter the head ships to every node this session, decided from the shipped config alone:
+/// a serve session whose spec source is a DFlash2 / DSpark / DFlash source and whose
+/// `df2_draft_dir` is resolved. ONE decision for BOTH head entries — FLASHNEXT-DF2-C
+/// (ISSUES 116, 2026-10-23): `run_head_retain` (the EXL3 serve) passed `None` here while
+/// `run_head_session` (nvfp4) computed this block inline, so an EXL3 node never received the
+/// drafter, re-parsed the head's argv, opened the head's filesystem path on its own disk and —
+/// without a local copy — fell to the 27B default geometry while the head ENGAGED.
+/// A manifest failure is loud but not fatal: the head's own round load fails the same way and
+/// the boot agree keeps the ranks consistent.
+/// P14: `dflash` (the v1 BLOCK drafter) ships through the same content-addressed slot.
+pub(crate) fn draft_for_cfg(cfg: &crate::tp::TpConfig) -> Option<(String, Vec<Artifact>)> {
+    let src_parsed = crate::batch::SpecSource::from_cli(&cfg.spec_source)
+        .unwrap_or(crate::batch::SpecSource::Mtp);
+    if !(cfg.mode_serve
+        && (crate::batch::is_df2_src(src_parsed)
+            || matches!(src_parsed, crate::batch::SpecSource::Dspark)
+            || matches!(src_parsed, crate::batch::SpecSource::DFlash))
+        && !cfg.df2_draft_dir.is_empty()) {
+        return None;
+    }
+    match draft_manifest(Path::new(&cfg.df2_draft_dir)) {
+        Ok((id, arts)) => {
+            let dtotal: u64 = arts.iter().map(|a| a.size).sum();
+            crate::deprintln!("[head] draft manifest '{id}': {} artifacts, {:.2} GB — ships to every node",
+                      arts.len(), dtotal as f64 / 1e9);
+            Some((id, arts))
+        }
+        Err(e) => {
+            eprintln!("[head] WARN: draft manifest build FAILED ({e:#}) — nodes get NO drafter; \
+                       the head's round load fails the same way and the boot agree refuses a split outcome");
+            None
+        }
+    }
+}
+
 pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wait: Duration,
                         cfg: &crate::tp::TpConfig)
     -> Result<(Vec<NodeInfo>, Vec<TcpStream>)>
@@ -1503,31 +1559,7 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
     // A manifest failure is loud but not fatal here — the head's own round load fails the same
     // way and CalibTable's df2_round=false keeps all ranks consistently on MTP.
     // WI1: the DSpark source ships its artifact through the same content-addressed sync.
-    let src_parsed = crate::batch::SpecSource::from_cli(&cfg.spec_source)
-        .unwrap_or(crate::batch::SpecSource::Mtp);
-    // P14: `dflash` (the v1 BLOCK drafter) ships through the same content-addressed slot: its lane
-    // is part of the mirrored `decode_step`, so every rank needs the artifact, and the node must
-    // never read the head's filesystem path.
-    let draft: Option<(String, Vec<Artifact>)> = if cfg.mode_serve
-        && (crate::batch::is_df2_src(src_parsed)
-            || matches!(src_parsed, crate::batch::SpecSource::Dspark)
-            || matches!(src_parsed, crate::batch::SpecSource::DFlash))
-        && !cfg.df2_draft_dir.is_empty()
-    {
-        match draft_manifest(Path::new(&cfg.df2_draft_dir)) {
-            Ok((id, arts)) => {
-                let dtotal: u64 = arts.iter().map(|a| a.size).sum();
-                crate::deprintln!("[head] draft manifest '{id}': {} artifacts, {:.2} GB — ships to every node",
-                          arts.len(), dtotal as f64 / 1e9);
-                Some((id, arts))
-            }
-            Err(e) => {
-                eprintln!("[head] WARN: draft manifest build FAILED ({e:#}) — nodes get NO drafter; \
-                           the head's round load fails the same way and all ranks fall back to MTP");
-                None
-            }
-        }
-    } else { None };
+    let draft = draft_for_cfg(cfg);
 
     // Sync every node and RETAIN every node's sync stream, RANK-INDEXED (streams[i] == rank i+1).
     // The serving control plane (CalibTable, per-step Step, Shutdown) must fan out to ALL world-1
@@ -2261,6 +2293,36 @@ mod build_id_tests {
         }
     }
 
+    /// FLASHNEXT-DF2-C (ISSUES 116): the drafter decision is ONE helper for both head entries, and an
+    /// EXL3 serve config with a DF2 source + a resolved draft dir ships the artifact (config.json
+    /// included — the node's geometry install reads it); a non-DF2 source or an empty dir ships nothing.
+    #[test]
+    fn exl3_serve_config_ships_the_dflash2_drafter_like_the_nvfp4_one() {
+        let d = std::env::temp_dir().join(format!("df2c_manifest_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.json"), "{\"hidden_size\": 2560}").unwrap();
+        std::fs::write(d.join("model.safetensors"), vec![7u8; 4096]).unwrap();
+        let mut cfg = crate::tp::TpConfig::from_opts();
+        cfg.mode_serve = true; cfg.exl3 = true; cfg.world = 2;
+        cfg.spec_source = "dflash2".into();
+        cfg.df2_draft_dir = d.to_string_lossy().to_string();
+        let (id, arts) = draft_for_cfg(&cfg).expect("an EXL3 serve with a DF2 source ships its drafter");
+        assert_eq!(id, d.file_name().unwrap().to_string_lossy());
+        let mut names: Vec<&str> = arts.iter().map(|a| a.logical.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["config.json", "model.safetensors"]);
+        cfg.spec_source = "mtp".into();
+        assert!(draft_for_cfg(&cfg).is_none(), "a non-DF2 source ships no drafter");
+        cfg.spec_source = "dflash2-auto".into(); cfg.df2_draft_dir.clear();
+        assert!(draft_for_cfg(&cfg).is_none(), "no resolved draft dir: nothing to ship");
+        // both head entries hand the SAME decision to head_sync_one (the retain entry passed None)
+        let src = include_str!("cluster.rs");
+        let retain = &src[src.find("pub fn run_head_retain(").unwrap()..src.find("fn sync_only_exit(").unwrap()];
+        assert!(retain.contains("let draft = draft_for_cfg(cfg);") && retain.contains("cfg, draft.as_ref(), srcs)"),
+                "run_head_retain must ship draft_for_cfg's decision");
+        assert!(!retain.contains("cfg, None, srcs)"), "the EXL3 head may no longer pass None as the drafter");
+        std::fs::remove_dir_all(&d).ok();
+    }
     /// The node's half, the real `node_handle` over loopback: a head with another version token is told
     /// `binary mismatch` and nothing follows (no manifest is read).
     #[test]

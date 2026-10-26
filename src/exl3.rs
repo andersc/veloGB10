@@ -79,8 +79,10 @@ impl TensorMeta {
 pub struct ModuleMeta {
     /// Module key without the suffix, e.g. "model.language_model.layers.1.mlp.experts.0.down_proj".
     pub name: String,
-    /// bits per weight (= trellis shape[-1] / 16). The reference calls this K.
-    pub bits: usize,
+    /// Half-bit units per weight (= trellis shape[-1] / 8 = 2*K, or 2*K+1 for the
+    /// fractional widths K = 1.5/2.5/3.5). The reference's own switch index (k2_from_K,
+    /// exllamav3 v1.6.3 bits_k.cuh). Integer K = k2/2; k2 & 1 is the half flag.
+    pub k2: usize,
     /// Matrix rows (input dim) = trellis shape[0] * 16.
     pub k: usize,
     /// Matrix cols (output dim) = trellis shape[1] * 16.
@@ -299,9 +301,9 @@ impl Exl3Pack {
             codebook: q["codebook"].as_str().unwrap_or("").to_string(),
         };
         // CF-P1g: a pack with a K = 6 module needs the K = 6 kernel module (decided here, before any module loads).
-        let max_k = q["tensor_storage"].as_object()
-            .map(|o| o.values().filter_map(|v| v["bits_per_weight"].as_u64()).max().unwrap_or(0)).unwrap_or(0);
-        crate::exl3_bench::set_k6_module(max_k >= 6);
+        let max_k2 = q["tensor_storage"].as_object()
+            .map(|o| o.values().filter_map(|v| v["bits_per_weight"].as_f64().map(|k| k2_from_bpw(k) as usize)).max().unwrap_or(0)).unwrap_or(0);
+        crate::exl3_bench::set_k6_module(max_k2 >= 12);
         if quant.quant_method != "exl3" {
             bail!(
                 "EXL3 pack {dir}: quant_method={:?} (wanted \"exl3\") — refusing to guess",
@@ -388,24 +390,24 @@ impl Exl3Pack {
                     continue;
                 }
             };
-            let bits = shape[2] / 16;
-            // This check is the only one the loader makes: it ACCEPTS 1..=8 bits. Whether a kernel decodes a
-            // width is the dispatch's business, and the wide trellis family decodes 3..=5 only
-            // (`exl3_forward::wide_trellis_supports_bits`; the K=6 module adds 6 to the m16 / grouped switches,
-            // not to the wide ones). The comment "loader refuses other rates" in the wide kernel's switch
-            // (kernels/exl3_bench.cu) is therefore wrong; it is left as is so the kernel build id, and with
-            // it every PTX byte, stays what the previous gates ran (S-B9-REL-INTEG D1).
-            if shape[2] % 16 != 0 || bits == 0 || bits > 8 {
+            let k2 = k2_from_words(shape[2]).map_err(|e| anyhow::anyhow!("EXL3 pack {dir}: {name}: {e}"))?;
+            // Capability audit (S-B9-REL-INTEG D1 class: a width whose kernel body does not exist must
+            // REFUSE here, never reach a `default: break` switch that writes nothing = garbage). Fractional
+            // (odd k2) bodies land with the W3/W4 kernels of this branch; until then odd k2 refuses here.
+            // 7/8-bit (k2 14/16) have no bodies in either PTX module and always refuse.
+            if !crate::exl3_forward::quad_k2_supported(k2) {
                 bail!(
-                    "EXL3 pack {dir}: {name}: trellis last dim {} is not 16*bits (bits 1..8)",
-                    shape[2]
+                    "EXL3 pack {dir}: {name}: K={} (k2 {}) has no decode kernel in this build{}",
+                    k2 as f32 / 2.0,
+                    k2,
+                    if k2 % 2 == 1 { " (fractional-K kernels land with W3/W4 of this branch)" } else { "" }
                 );
             }
             let class = classify(&module);
             *class_counts.entry(class).or_insert(0) += 1;
             modules.push(ModuleMeta {
                 name: module,
-                bits,
+                k2,
                 k: shape[0] * 16,
                 n: shape[1] * 16,
                 trellis: TensorMeta {
@@ -594,7 +596,32 @@ pub fn tmap_table() -> [[usize; 16]; 16] {
 
 /// Decode one 16x16 block. `ring` = the block's 16*bits int16 words viewed as
 /// 8*bits little-endian uint32s (out[t] = fp16 bit pattern of value at t).
-pub fn decode_block(ring: &[u32], bits: usize, cb: &[u16], out: &mut [u16; 256]) {
+/// Half-bit units from a trellis last dim: 16*K uint16 words = 8*k2. Mirrors the reference
+/// `bits_from_K` (exllamav3 v1.6.3 bits_k.cuh): integer K 1..=8, or the fractional widths
+/// 1.5 / 2.5 / 3.5 (mul1 codebook only). K=0.5 and fractional K above 3.5 do not exist.
+pub fn k2_from_words(words: usize) -> Result<usize, String> {
+    if words % 8 != 0 {
+        return Err(format!("trellis last dim {} is not 8*k2 (16*K words, K integer or .5)", words));
+    }
+    let k2 = words / 8;
+    let half = k2 % 2 == 1;
+    if k2 < 2 || k2 > 16 || (half && k2 > 7) {
+        return Err(format!("k2 {} is outside the format (K 1..=8 integer, or 1.5/2.5/3.5)", k2));
+    }
+    Ok(k2)
+}
+
+/// k2 from the pack per-module bits_per_weight float.
+pub fn k2_from_bpw(k: f64) -> f64 {
+    2.0 * k
+}
+
+pub fn decode_block(ring: &[u32], k2: usize, cb: &[u16], out: &mut [u16; 256]) {
+    if k2 % 2 == 1 {
+        decode_block_half(ring, k2 / 2, cb, out);
+        return;
+    }
+    let bits = k2 / 2;
     let w_words = bits * 8;
     debug_assert_eq!(ring.len(), w_words);
     for t in 0..256 {
@@ -615,18 +642,57 @@ pub fn decode_block(ring: &[u32], bits: usize, cb: &[u16], out: &mut [u16; 256])
     }
 }
 
-/// Decode a whole trellis tensor [kb, nb, 16*bits] int16 into W [kb*16, nb*16]
+/// Fractional K = KA + 0.5 host mirror of the reference `dq8_half` (exllamav3 v1.6.3
+/// exl3_dq.cuh), transcribed literally: weight PAIRS consume bits2 = 2*KA+1 bits;
+/// the eight 16-bit windows of a group are fetched from two 64-bit merges (e7/e3),
+/// windows alternating (KA+1, KA) spacing; each window decodes through the same mul1
+/// 3-instruction codebook as integer K (the full 16-bit pattern is the codeword).
+/// Weight t0+k of the group maps to window w_k. Validated against the reference
+/// reconstruct oracle (W6); the integer path above is the G-A3-1-validated original.
+fn decode_block_half(ring: &[u32], ka: usize, cb: &[u16], out: &mut [u16; 256]) {
+    let bits2 = 2 * ka + 1;
+    let words = 4 * bits2;
+    let gspan = 18 + 3 * ka; // bits spanned by four windows (incl. the 16-bit fetch of the top one)
+    debug_assert_eq!(ring.len(), words);
+    let mut w = [0u32; 8];
+    for t0 in (0..256).step_by(8) {
+        let e7 = ((t0 / 2) + 4) * bits2 + 128 * bits2;
+        let e3 = e7 - 2 * bits2;
+        for &(e, top) in &[(e7, 7usize), (e3, 3usize)] {
+            let lo = (e - gspan) / 32;
+            let hi = (e - 1) / 32;
+            let s = (hi + 1) * 32 - e;
+            debug_assert!(s <= 31);
+            let a = ring[lo % words] as u64;
+            let b = ring[hi % words] as u64;
+            let merged: u64 = if s == 0 {
+                b
+            } else {
+                (b >> s) | ((a << (32 - s)) & 0xFFFF_FFFF)
+            };
+            w[top] = merged as u32;
+            w[top - 1] = w[top] >> (ka + 1);
+            w[top - 2] = w[top - 1] >> ka;
+            w[top - 3] = w[top - 2] >> (ka + 1);
+        }
+        for k in 0..8 {
+            out[t0 + k] = cb[(w[k] & 0xFFFF) as usize];
+        }
+    }
+}
+
+/// Decode a whole trellis tensor [kb, nb, 8*k2] int16 into W [kb*16, nb*16]
 /// fp16 bit patterns (row-major). This is `ext.reconstruct` pre-suh/svh.
-pub fn decode_trellis_host(trellis: &[i16], kb: usize, nb: usize, bits: usize) -> Vec<u16> {
+pub fn decode_trellis_host(trellis: &[i16], kb: usize, nb: usize, k2: usize) -> Vec<u16> {
     let cb = mul1_codebook();
-    let ring = trellis_to_ring(trellis, bits);
+    let ring = trellis_to_ring(trellis, k2);
     let mut out = vec![0u16; kb * 16 * nb * 16];
     let mut block = [0u16; 256];
     let tmap = tmap_table();
     for k in 0..kb {
         for n in 0..nb {
             let b = k * nb + n;
-            decode_block(&ring[b * bits * 8..(b + 1) * bits * 8], bits, &cb, &mut block);
+            decode_block(&ring[b * 4 * k2..(b + 1) * 4 * k2], k2, &cb, &mut block);
             for r in 0..16 {
                 let orow = (k * 16 + r) * (nb * 16);
                 for c in 0..16 {
@@ -639,12 +705,12 @@ pub fn decode_trellis_host(trellis: &[i16], kb: usize, nb: usize, bits: usize) -
 }
 
 /// reinterpret [.., 16*bits] int16 as [.., 8*bits] LE uint32 per block.
-fn trellis_to_ring(trellis: &[i16], bits: usize) -> Vec<u32> {
-    let words = bits * 8;
-    let nblocks = trellis.len() / (16 * bits);
+fn trellis_to_ring(trellis: &[i16], k2: usize) -> Vec<u32> {
+    let words = 4 * k2; // uint32 per 16x16 tile: 8*k2 uint16
+    let nblocks = trellis.len() / (8 * k2);
     let mut ring = Vec::with_capacity(nblocks * words);
     for b in 0..nblocks {
-        let base = b * 16 * bits;
+        let base = b * 8 * k2;
         for j in 0..words {
             let lo = trellis[base + 2 * j] as u16 as u32;
             let hi = trellis[base + 2 * j + 1] as u16 as u32;
@@ -693,8 +759,8 @@ pub fn probe_oracle(dir: &str, ref_dir: &str) -> anyhow::Result<()> {
     for (i, e) in entries.iter().enumerate() {
         let meta = by_module.get(e.module.as_str())
             .with_context(|| format!("oracle: module {} not in pack", e.module))?;
-        if meta.bits != e.bits {
-            bail!("oracle: bits mismatch on {}: pack={}, ref={}", e.module, meta.bits, e.bits);
+        if meta.k2 != 2 * e.bits {
+            bail!("oracle: bits mismatch on {}: pack={}, ref={}", e.module, meta.k2, 2 * e.bits);
         }
         if meta.k != e.k || meta.n != e.n {
             bail!("oracle: shape mismatch on {}: pack={}x{} ref={}x{}", e.module, meta.k, meta.n, e.k, e.n);
@@ -705,7 +771,7 @@ pub fn probe_oracle(dir: &str, ref_dir: &str) -> anyhow::Result<()> {
             trellis[j] = i16::from_le_bytes([c[0], c[1]]);
         }
         let t0 = std::time::Instant::now();
-        let ours = decode_trellis_host(&trellis, meta.k / 16, meta.n / 16, meta.bits);
+        let ours = decode_trellis_host(&trellis, meta.k / 16, meta.n / 16, meta.k2);
         let dt = t0.elapsed().as_secs_f64();
         let ref_bytes = std::fs::read(format!("{}/{}", ref_dir.trim_end_matches('/'), e.file))
             .with_context(|| format!("oracle: ref dump {}", e.file))?;
@@ -733,7 +799,7 @@ pub fn probe_oracle(dir: &str, ref_dir: &str) -> anyhow::Result<()> {
             }
         }
         let gbps = tr_bytes.len() as f64 / dt / 1e9;
-        let s = per_bits.entry(e.bits).or_insert([0.0; 6]);
+        let s = per_bits.entry(e.bits).or_insert([0.0; 6]); // report keyed on integer bits (ref manifest)
         s[0] += e.blocks as f64;
         s[1] += bad_values as f64;
         s[2] += bad_blocks as f64;
@@ -832,6 +898,66 @@ mod tests {
     }
 
     #[test]
+    fn k2_from_words_matches_reference_rates() {
+        // integer K: 16*K words -> k2 = 2*K
+        for (words, want) in [(16usize, 2usize), (32, 4), (48, 6), (64, 8), (80, 10), (96, 12), (112, 14), (128, 16)] {
+            assert_eq!(k2_from_words(words).unwrap(), want, "words={words}");
+        }
+        // fractional K: 24 -> 1.5, 40 -> 2.5, 56 -> 3.5
+        for (words, want) in [(24usize, 3usize), (40, 5), (56, 7)] {
+            assert_eq!(k2_from_words(words).unwrap(), want, "frac words={words}");
+        }
+        // refusals: not 8-aligned, K=0.5, fractional above 3.5, above K=8
+        assert!(k2_from_words(12).is_err());
+        assert!(k2_from_words(20).is_err());
+        assert!(k2_from_words(8).is_err()); // k2=1 -> K=0.5
+        assert!(k2_from_words(88).is_err()); // k2=11 -> K=5.5
+        assert!(k2_from_words(136).is_err()); // k2=17 -> K=8.5
+        assert!(k2_from_words(144).is_err()); // k2=18 -> K=9
+    }
+
+    #[test]
+    fn decode_block_half_zero_ring_decodes_to_cb0_and_wraps() {
+        // K=1.5 (ka=1): 12 uint32 per tile. All-zero ring: every window fetch is 0 -> cb[0]
+        // everywhere, and the e7/e3 window math + ring modulo must not panic for any group.
+        let cb = mul1_codebook();
+        for k2 in [3usize, 5, 7] {
+            let ring = vec![0u32; 4 * k2];
+            let mut out = [0u16; 256];
+            decode_block(&ring, k2, &cb, &mut out);
+            assert!(out.iter().all(|&v| v == cb[0]), "k2={k2}");
+        }
+    }
+
+    #[test]
+    fn decode_block_k2_even_routes_to_integer_path() {
+        // Regression: the k2-routed integer path is the G-A3-1-validated original.
+        let cb = mul1_codebook();
+        let ring = vec![0x12345678u32; 8 * 5]; // K=5 tile
+        let mut a = [0u16; 256];
+        decode_block(&ring, 10, &cb, &mut a);
+        // old integer body, inlined for comparison
+        let bits = 5usize;
+        let w_words = bits * 8;
+        let mut b = [0u16; 256];
+        for t in 0..256 {
+            let b1 = (t + 257) * bits;
+            let b0 = b1 - 16;
+            let i0 = b0 / 32;
+            let i1 = (b1 - 1) / 32;
+            let sh = ((i1 + 1) * 32) - b1;
+            let x = ring[i0 % w_words] as u64;
+            let y = ring[i1 % w_words] as u64;
+            let idx = if sh == 0 {
+                y & 0xFFFF
+            } else {
+                ((y >> sh) | ((x << (32 - sh)) & 0xFFFF_FFFF)) & 0xFFFF
+            };
+            b[t] = cb[idx as usize];
+        }
+        assert_eq!(a, b);
+    }
+
     fn decode_block_all_zero_ring_decodes_to_cb0() {
         let cb = mul1_codebook();
         let ring = vec![0u32; 24]; // bits=3

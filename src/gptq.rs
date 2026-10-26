@@ -1319,7 +1319,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
 /// layer is then calibrated on the already-quantized prefix of the drafter stack.
 pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
                opts: GptqOpts, context_vectors: usize) -> Result<()> {
-    use crate::dflash2::{BLOCK as DB, HEAD_DIM, HIDDEN, INTER, N_LAYERS, NUM_HEADS, NUM_KV_HEADS};
+    use crate::dflash2::{BLOCK as DB, head_dim, hidden, inter, n_layers, num_heads, num_kv_heads};
     validate_opts(&opts)?;
     anyhow::ensure!(
         !opts.maca,
@@ -1372,7 +1372,7 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
     for (si, toks) in samples.iter().enumerate() {
         let sample_path = cache.join(format!("{si:06}.bin"));
         if std::fs::metadata(&sample_path).map(|m| m.len() as usize).ok()
-            == Some(4 + HIDDEN * opts.seqlen * 2) { continue; }
+            == Some(4 + hidden() * opts.seqlen * 2) { continue; }
         gpu.zero_slot_state(&mut state, 0, opts.seqlen);
         let (anchor, residual) = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0,
             opts.seqlen, 0, 0, cfg.num_layers, None);
@@ -1384,7 +1384,7 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
         let tmp = sample_path.with_extension("tmp");
         std::fs::write(&tmp, raw)?;
         std::fs::rename(tmp, sample_path)?;
-        pool.release_bf16(residual, HIDDEN * opts.seqlen);
+        pool.release_bf16(residual, hidden() * opts.seqlen);
         if (si + 1) % 8 == 0 || si + 1 == samples.len() {
             println!("[gptq-df2] tap cache {}/{} ({:.1} min)", si + 1, samples.len(), t_all.elapsed().as_secs_f32()/60.0);
         }
@@ -1395,15 +1395,15 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
     let mut cs = Cusolver::new(&gpu)?;
     let mut records: HashMap<String, Rec> = HashMap::new();
     let specs = [
-        ("self_attn.q_proj", NUM_HEADS * HEAD_DIM, HIDDEN, 0usize),
-        ("self_attn.k_proj", NUM_KV_HEADS * HEAD_DIM, HIDDEN, 1usize),
-        ("self_attn.v_proj", NUM_KV_HEADS * HEAD_DIM, HIDDEN, 1usize),
-        ("self_attn.o_proj", HIDDEN, NUM_HEADS * HEAD_DIM, 2usize),
-        ("mlp.gate_proj", INTER, HIDDEN, 3usize),
-        ("mlp.up_proj", INTER, HIDDEN, 3usize),
-        ("mlp.down_proj", HIDDEN, INTER, 4usize),
+        ("self_attn.q_proj", num_heads() * head_dim(), hidden(), 0usize),
+        ("self_attn.k_proj", num_kv_heads() * head_dim(), hidden(), 1usize),
+        ("self_attn.v_proj", num_kv_heads() * head_dim(), hidden(), 1usize),
+        ("self_attn.o_proj", hidden(), num_heads() * head_dim(), 2usize),
+        ("mlp.gate_proj", inter(), hidden(), 3usize),
+        ("mlp.up_proj", inter(), hidden(), 3usize),
+        ("mlp.down_proj", hidden(), inter(), 4usize),
     ];
-    for li in 0..N_LAYERS {
+    for li in 0..n_layers() {
         let checkpoint = cache.join(format!("layer-{li}.records"));
         if checkpoint.exists() {
             let saved = read_df2_checkpoint(&checkpoint)?;
@@ -1419,14 +1419,14 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
             continue;
         }
         let tl = std::time::Instant::now();
-        let mut hq = gpu.gptq_hess_new(HIDDEN);
-        let mut hkv = gpu.gptq_hess_new(HIDDEN);
-        let mut ho = gpu.gptq_hess_new(NUM_HEADS * HEAD_DIM);
-        let mut hgu = gpu.gptq_hess_new(HIDDEN);
-        let mut hdn = gpu.gptq_hess_new(INTER);
+        let mut hq = gpu.gptq_hess_new(hidden());
+        let mut hkv = gpu.gptq_hess_new(hidden());
+        let mut ho = gpu.gptq_hess_new(num_heads() * head_dim());
+        let mut hgu = gpu.gptq_hess_new(hidden());
+        let mut hdn = gpu.gptq_hess_new(inter());
         for si in 0..samples.len() {
             let raw = std::fs::read(cache.join(format!("{si:06}.bin")))?;
-            anyhow::ensure!(raw.len() == 4 + HIDDEN * opts.seqlen * 2, "corrupt DFlash2 cache sample {si}");
+            anyhow::ensure!(raw.len() == 4 + hidden() * opts.seqlen * 2, "corrupt DFlash2 cache sample {si}");
             let anchor = u32::from_le_bytes(raw[..4].try_into().unwrap());
             let th: &[bf16] = bytemuck::cast_slice(&raw[4..]);
             round.reset();
@@ -1443,10 +1443,10 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
             gpu.gptq_hess_accum_external(&mut hdn, &dnd, DB, true);
             // Evenly sample prompt context for k/v. Full 2048-token Hessians are redundant and
             // would dominate runtime; 16/sample gives 8192 context vectors at nsamples=512.
-            let mut sub = Vec::with_capacity(HIDDEN * context_vectors);
+            let mut sub = Vec::with_capacity(hidden() * context_vectors);
             for j in 0..context_vectors {
                 let c = ((j + 1) * opts.seqlen / (context_vectors + 1)).min(opts.seqlen - 1);
-                sub.extend_from_slice(&th[c * HIDDEN..(c + 1) * HIDDEN]);
+                sub.extend_from_slice(&th[c * hidden()..(c + 1) * hidden()]);
             }
             let td = gpu.gptq_upload_bf16(&sub);
             gpu.gptq_hess_accum_external(&mut hkv, &td, context_vectors, true);
@@ -1473,7 +1473,7 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
         }).collect();
         write_df2_checkpoint(&checkpoint, &saved)?;
         println!("[gptq-df2] layer {li}/{} quantized sequentially in {:.1} min",
-                 N_LAYERS - 1, tl.elapsed().as_secs_f32()/60.0);
+                 n_layers() - 1, tl.elapsed().as_secs_f32()/60.0);
     }
 
     drop(round); drop(cs); drop(gpu);

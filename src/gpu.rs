@@ -2532,10 +2532,11 @@ impl GpuModel {
     /// load the round (lossless by construction — the verify checks every draft); only its τ
     /// quality is the user's choice.
     pub fn df2_round_compatible(&self) -> bool {
-        use crate::dflash2::{HIDDEN, TAP_LAYERS, VOCAB};
-        self.cfg.hidden_size == HIDDEN
-            && self.cfg.vocab_size >= VOCAB
-            && self.cfg.num_layers > *TAP_LAYERS.last().unwrap()
+        crate::dflash2::geom().trunk_compatible(
+            self.cfg.hidden_size,
+            self.cfg.vocab_size,
+            self.cfg.num_layers,
+        )
     }
 
     /// S10' §4 — the trunk's (hidden, vocab, layers) for the compat-guard WARN line.
@@ -4840,7 +4841,10 @@ impl GpuModel {
         let ptx = Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         let fnames = ["rmsnorm_qwen","rmsnorm_gated","rmsnorm_perhead","silu_mul","add_residual",
             "sigmoid_gate","rope_rot_half","gqa_attention","write_kv","split_qgate","conv1d_step","delta_step",
-            "f32tobf16","bf16tof32","fused_residual_rmsnorm","argmax_pass1","argmax_pass2"];
+            "f32tobf16","bf16tof32","fused_residual_rmsnorm","argmax_pass1","argmax_pass2",
+            // FLASHNEXT-DF2-B: the hc-mean DFlash2 tap for hyper-connection trunks (every
+            // gpu_kernels loader lists it — the last load wins cudarc's module slot).
+            "df2_tap_hcmean_b"];
         dev.load_ptx(ptx, "gpu_kernels", &fnames)?;
         Ok(())
     }
@@ -10832,9 +10836,9 @@ impl GpuModel {
             // OFF (df2_capture == None): this branch reads one Option and exits — free.
             if batch <= crate::dflash2::block() {
                 if let Some(sink) = &self.df2_capture {
-                    if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
-                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
-                            *residual.device_ptr() as u64, h, batch, k);
+                    if let Some(k) = crate::dflash2::tap_layers().iter().position(|&l| l == li) {
+                        crate::dflash2::capture::capture_cols(&self.dev, &self.stream, sink,
+                            *residual.device_ptr() as u64, h, hcn, batch, k);
                     }
                 }
             }
@@ -10844,8 +10848,8 @@ impl GpuModel {
             if batch <= crate::dspark::BLOCK {
                 if let Some(sink) = &self.dspark_capture {
                     if let Some(k) = crate::dspark::TAP_LAYERS.iter().position(|&l| (l as i32 + Self::dspark_tap_shift()) == li as i32) {
-                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
-                            *residual.device_ptr() as u64, h, batch, k);
+                        crate::dflash2::capture::capture_cols(&self.dev, &self.stream, sink,
+                            *residual.device_ptr() as u64, h, hcn, batch, k);
                     }
                 }
             }
@@ -12925,18 +12929,18 @@ impl GpuModel {
             // width n (up to PREFILL_CHUNK ≫ 8), so the tap lands in the WIDE prime sink, not the
             // 8-column staging. DEFAULT OFF (df2_prime == None): one Option read per layer — free.
             if let Some(ps) = &self.df2_prime {
-                if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
-                    crate::dflash2::capture::capture_cols_into(&self.dev, self.stream.stream,
-                        *ps.taps.device_ptr() as u64, crate::dflash2::TAP_CONCAT_DIM,
-                        *residual.device_ptr() as u64, h, n, k);
+                if let Some(k) = crate::dflash2::tap_layers().iter().position(|&l| l == li) {
+                    crate::dflash2::capture::capture_cols_into(&self.dev, &self.stream,
+                        *ps.taps.device_ptr() as u64, crate::dflash2::tap_concat_dim(),
+                        *residual.device_ptr() as u64, h, hcn, n, k);
                 }
             }
             // WI1 DSpark prompt-prime twin (same wide buffer shape, dspark taps).
             if let Some(ps) = &self.dspark_prime {
                 if let Some(k) = crate::dspark::TAP_LAYERS.iter().position(|&l| (l as i32 + Self::dspark_tap_shift()) == li as i32) {
-                    crate::dflash2::capture::capture_cols_into(&self.dev, self.stream.stream,
+                    crate::dflash2::capture::capture_cols_into(&self.dev, &self.stream,
                         *ps.taps.device_ptr() as u64, crate::dspark::TAP_CONCAT_DIM,
-                        *residual.device_ptr() as u64, h, n, k);
+                        *residual.device_ptr() as u64, h, hcn, n, k);
                 }
             }
             pool.release_bf16(mixer, h*n); pool.release_bf16(mlp_out, h*n);
@@ -13982,17 +13986,17 @@ impl GpuModel {
             // per-column taps land in the WIDE sink; the accepted path is gathered out of it.
             if n > crate::dflash2::block() && n <= MAX_VERIFY {
                 if let Some(sink) = &self.df2_capture_tree {
-                    if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
-                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
-                            res_ptr, h, n, k);
+                    if let Some(k) = crate::dflash2::tap_layers().iter().position(|&l| l == li) {
+                        crate::dflash2::capture::capture_cols(&self.dev, &self.stream, sink,
+                            res_ptr, h, hcn, n, k);
                     }
                 }
             }
             if n <= crate::dflash2::block() {
                 if let Some(sink) = &self.df2_capture {
-                    if let Some(k) = crate::dflash2::TAP_LAYERS.iter().position(|&l| l == li) {
-                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
-                            res_ptr, h, n, k);
+                    if let Some(k) = crate::dflash2::tap_layers().iter().position(|&l| l == li) {
+                        crate::dflash2::capture::capture_cols(&self.dev, &self.stream, sink,
+                            res_ptr, h, hcn, n, k);
                     }
                 }
             }
@@ -14003,8 +14007,8 @@ impl GpuModel {
             if n <= crate::dspark::BLOCK + 1 {
                 if let Some(sink) = &self.dspark_capture {
                     if let Some(k) = crate::dspark::TAP_LAYERS.iter().position(|&l| (l as i32 + Self::dspark_tap_shift()) == li as i32) {
-                        crate::dflash2::capture::capture_cols(&self.dev, self.stream.stream, sink,
-                            res_ptr, h, n, k);
+                        crate::dflash2::capture::capture_cols(&self.dev, &self.stream, sink,
+                            res_ptr, h, hcn, n, k);
                     }
                 }
             }
@@ -17925,7 +17929,7 @@ impl GpuModel {
                     let p_abs = mtp_tokens.len() + li;
                     match (vhs.get(li), dh) {
                         (Some(v), Some(d)) if v != &d => {
-                            eprintln!("  [f9x] HIDDEN DIVERGE at abs pos {p_abs} (step {n_steps} col {li}): verify 0x{v:016x} decode 0x{d:016x}");
+                            eprintln!("  [f9x] hidden() DIVERGE at abs pos {p_abs} (step {n_steps} col {li}): verify 0x{v:016x} decode 0x{d:016x}");
                             *f9_div_count.get_or_insert_with(|| 0usize) += 1;
                             if f9_div_count.unwrap() == 1
                                && crate::opts::var(crate::opt!("f9-xhash")).as_deref() == Ok("2") {

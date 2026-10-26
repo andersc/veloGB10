@@ -45,16 +45,16 @@ use crate::dflash2::gpu::{fork_blocking_stream, upload_bf16, upload_fp8, upload_
 #[derive(Clone, Copy)]
 enum Kv { K, V }
 use crate::dflash2::band_smem;
-use crate::dflash2::{block, levels, CONV_GROUP, CONV_GROUPS, CONV_KERNEL, HEAD_DIM, HIDDEN, INTER, N_LAYERS,
-                     NUM_HEADS, NUM_KV_HEADS, RMS_EPS, SELECTOR_RANK, TAP_CONCAT_DIM, TAP_LAYERS, VOCAB};
+use crate::dflash2::{block, levels, conv_group, conv_groups, conv_kernel, head_dim, hidden, inter, n_layers,
+                     num_heads, num_kv_heads, rms_eps, selector_rank, tap_concat_dim, tap_layers, vocab};
 
 /// The ring depth (the sliding window; all 5 layers `sliding_attention`).
-pub const RING: usize = crate::dflash2::SLIDING_WINDOW;      // 2048
+pub fn ring() -> usize { crate::dflash2::sliding_window() } // 2048 for both shipped artifacts
 /// Ring KV stride: ring rows + the 8 block rows above them.
-/// Ring KV stride = RING + the live draft block (2056 at block 8, 2064 at block 16).
+/// Ring KV stride = ring() + the live draft block (2056 at block 8, 2064 at block 16).
 /// Runtime, not const: the ring row count is indexed by block position.
 #[inline]
-pub fn ring_stride() -> usize { RING + block() }
+pub fn ring_stride() -> usize { ring() + block() }
 
 fn d<T>(s: &CudaSlice<T>) -> u64 {
     *s.device_ptr()
@@ -228,6 +228,11 @@ pub struct Df2Round {
     /// serving trunk) or BF16 (the plain-BF16 class).
     pub head: Option<BorrowedW>,
     pub embed: Option<BorrowedW>,
+    /// DFLASH2-GEN mask override: the artifact's exact BF16 mask row + a zeros token table,
+    /// staged when the trunk's quantized mask row measures DAMAGED (rel-L2 > 0.25 at load).
+    /// `embed_gather` then overwrites the block's MASK rows (1..block) with this copy.
+    mask_ovr_row: Option<CudaSlice<bf16>>,
+    mask_ovr_toks: Option<CudaSlice<i32>>,
     cos_table: CudaSlice<f32>,
     sin_table: CudaSlice<f32>,
     /// Ring KV: per layer `[nkv, RING_STRIDE, hd]` bf16.
@@ -238,7 +243,7 @@ pub struct Df2Round {
     /// DF2_CARRY: which physical prefix-cache slot's committed prefix the ring rows currently
     /// reflect (None = unproven), and the frontier they are valid up to.
     ///
-    /// The ring is a MODULO ring (`pos % RING`, RING = 2048), unlike `DsparkRound`'s ring which
+    /// The ring is a MODULO ring (`pos % ring()`, ring() = 2048), unlike `DsparkRound`'s ring which
     /// is LINEAR (`c_ring = max_c`, no wrap) — so "the ring covered this prefix" is not by
     /// itself enough: rows are recycled, and the caller must also know that the rows it still
     /// needs have not been overwritten. `ring_len` is the frontier the caller passes to
@@ -266,11 +271,15 @@ pub struct Df2Round {
     // block scratch (S3F shapes)
     blk: BlkScratch,
     pos_blk: CudaSlice<i32>,     // [8] block rope positions (absolute)
-    wrow_blk: CudaSlice<i32>,    // [8] block ring write rows [RING..RING+8)
+    /// PERFFIX1: the ring frontier `pos_blk` / `cos8` / `sin8` / `wrow_ctl` were last refreshed for (None = unknown:
+    /// boot, or the round-graph capture parked them at max_c). `refresh_block_pos_if_stale` skips a refresh that
+    /// would rewrite the same values (the head drafts, then verifies, at one frontier).
+    pos_at: Option<usize>,
+    wrow_blk: CudaSlice<i32>,    // [8] block ring write rows [ring()..ring()+8)
     wrow_ctl: CudaSlice<i32>,    // [8] block rows at [nprev..nprev+8) — the linear-control write
     toks_blk: CudaSlice<i32>,    // [8] anchor + 7×MASK
     // head + selector scratch
-    logits: CudaSlice<bf16>,     // [VOCAB, 7] col-major
+    logits: CudaSlice<bf16>,     // [vocab(), 7] col-major
     coarse_idx: CudaSlice<u32>,  // [7, 256] the TwoStage shortlist (ids per token column)
     h2d_stage: CudaSlice<i32>,   // [2*block()+2] merged per-replay inputs (toks|pos|ntot|anchor)
     out_vals: CudaSlice<f32>,    // [7*16]
@@ -316,9 +325,9 @@ pub struct Df2Round {
     /// pre-P2 replicated round, byte-identical to the S9F/S10R behavior.
     ar: Option<Df2ArCtx>,
     /// P2: the rank-local GEMM widths (the full constants when unsharded).
-    nq_l: usize,      // local q heads  (NUM_HEADS / world)
-    nkv_l: usize,     // local kv heads (NUM_KV_HEADS / world)
-    ni_l: usize,      // local MLP intermediate (INTER / world)
+    nq_l: usize,      // local q heads  (num_heads() / world)
+    nkv_l: usize,     // local kv heads (num_kv_heads() / world)
+    ni_l: usize,      // local MLP intermediate (inter() / world)
 }
 
 struct BlkScratch {
@@ -397,6 +406,10 @@ impl Df2Round {
     /// `load_tp` with an explicit artifact sha256 pin override (see `load_pinned`).
     pub fn load_tp_pinned(dir: &str, head: Option<BorrowedW>, embed: Option<BorrowedW>, max_c: usize,
                           ar: Option<Df2ArCtx>, sha_pin: Option<&str>) -> Result<Self> {
+        // DFLASH2-GEN: install the artifact geometry (from its config.json) BEFORE anything is
+        // sized, then pin it — after this point the process cannot silently re-shape the round.
+        crate::dflash2::geom::install_geom_from_dir(dir)?;
+        crate::dflash2::geom::pin_geom();
         let pin: Option<&str> = match sha_pin {
             Some("off") => None,
             Some(hex) => Some(hex),
@@ -416,8 +429,14 @@ impl Df2Round {
             // carries the same value under df2_quant_source_sha256; honor a requested pin vs it.
             if let Some(p) = pin {
                 if p != "off" {
-                    anyhow::ensure!(q.source_sha256.eq_ignore_ascii_case(p),
-                        "baked artifact source sha {} != pin {p}", q.source_sha256);
+                    // Multi-pin rule (12528992): a published, owner-validated artifact must never
+                    // be orphaned by re-pinning. A pin that names a KNOWN published hash accepts
+                    // any KNOWN source stamp; an exotic explicit pin stays strict.
+                    let pin_known = crate::dflash2::KNOWN_SHA256.iter().any(|k| p.eq_ignore_ascii_case(k));
+                    let src_known = crate::dflash2::KNOWN_SHA256.iter().any(|k| q.source_sha256.eq_ignore_ascii_case(k));
+                    let ok = q.source_sha256.eq_ignore_ascii_case(p) || (pin_known && src_known);
+                    anyhow::ensure!(ok,
+                        "baked artifact source sha {} != pin {p} (accepted: KNOWN_SHA256 when the pin is a published hash)", q.source_sha256);
                 }
             }
             (a.weights, Some(q.tensors))
@@ -436,9 +455,9 @@ impl Df2Round {
             Some(a) => {
                 let world = a.world as usize;
                 anyhow::ensure!(world > 1, "df2 round shard: world {} <= 1", world);
-                anyhow::ensure!(NUM_HEADS % world == 0 && NUM_KV_HEADS % world == 0
-                                && INTER % world == 0,
-                    "df2 round shard: world {world} does not divide heads {NUM_HEADS}/{NUM_KV_HEADS} or inter {INTER}");
+                anyhow::ensure!(num_heads() % world == 0 && num_kv_heads() % world == 0
+                                && inter() % world == 0,
+                    "df2 round shard: world {world} does not divide heads {}/{} or inter {}", num_heads(), num_kv_heads(), inter());
                 anyhow::ensure!((0..world).contains(&(a.rank as usize)),
                     "df2 round shard: rank {} out of range for world {world}", a.rank);
                 (true, a.rank as usize, world)
@@ -446,9 +465,9 @@ impl Df2Round {
             None => (false, 0, 1),
         };
         let (nq_l, nkv_l, ni_l) = if sharded {
-            (NUM_HEADS / world, NUM_KV_HEADS / world, INTER / world)
+            (num_heads() / world, num_kv_heads() / world, inter() / world)
         } else {
-            (NUM_HEADS, NUM_KV_HEADS, INTER)
+            (num_heads(), num_kv_heads(), inter())
         };
 
         let dev = CudaDevice::new(0).context("CudaDevice")?;
@@ -476,7 +495,9 @@ impl Df2Round {
             "top16_b", "df2_sel_walk_b", "df2_sel_walk_sample_b", "bf16tof32", "conv2_dynamic_b",
             "f32tobf16", "kernel_build_id",
             // F8-CATCHUP two-stage draft head (coarse NVFP4 + exact bf16 re-rank)
-            "df2_top256_b", "df2_head_rerank_b"];
+            "df2_top256_b", "df2_head_rerank_b",
+            // FLASHNEXT-DF2-B: the trunk's hc-mean tap capture (hyper-connection trunks)
+            "df2_tap_hcmean_b"];
         dev.load_ptx(kptx, "gpu_kernels", &kfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_kernels")?;
         let mut bk = HashMap::new();
@@ -489,7 +510,7 @@ impl Df2Round {
             let b: Vec<bf16> = data.iter().map(|&x| bf16::from_f32(x)).collect();
             dev.htod_sync_copy(&b).expect("upload bf16")
         };
-        let mut layers = Vec::with_capacity(N_LAYERS);
+        let mut layers = Vec::with_capacity(n_layers());
         for (li, l) in w.layers.iter().enumerate() {
             // P2 shard-at-load (host-side slices BEFORE the bf16 upload — the trunk's proven
             // pattern). Row-major [out, in]: head/row bands are contiguous row slices; the
@@ -511,19 +532,19 @@ impl Df2Round {
                     for r in 0..rows_n { o.extend_from_slice(&v[r * cols_n + c0..r * cols_n + c1]); }
                     o
                 };
-                let nq_rows = nq_l * HEAD_DIM;    // 1024 @ world=4
-                let nkv_rows = nkv_l * HEAD_DIM;  // 256
+                let nq_rows = nq_l * head_dim();    // 1024 @ world=4
+                let nkv_rows = nkv_l * head_dim();  // 256
                 layers.push(GpuLayer {
-                    q_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.q_proj, HIDDEN, shard_rank * nq_rows, (shard_rank + 1) * nq_rows))),
-                    k_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.k_proj, HIDDEN, shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows))),
+                    q_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.q_proj, hidden(), shard_rank * nq_rows, (shard_rank + 1) * nq_rows))),
+                    k_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.k_proj, hidden(), shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows))),
                     k_proj_bf16: None,
-                    v_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.v_proj, HIDDEN, shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows))),
+                    v_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.v_proj, hidden(), shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows))),
                     v_proj_bf16: None,
-                    o_proj: Df2W::Bf16(upload_bf16(&dev, &cols(&l.o_proj, HIDDEN, NUM_HEADS * HEAD_DIM,
+                    o_proj: Df2W::Bf16(upload_bf16(&dev, &cols(&l.o_proj, hidden(), num_heads() * head_dim(),
                                                     shard_rank * nq_rows, (shard_rank + 1) * nq_rows))),
-                    gate_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.gate_proj, HIDDEN, shard_rank * ni_l, (shard_rank + 1) * ni_l))),
-                    up_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.up_proj, HIDDEN, shard_rank * ni_l, (shard_rank + 1) * ni_l))),
-                    down_proj: Df2W::Bf16(upload_bf16(&dev, &cols(&l.down_proj, HIDDEN, INTER,
+                    gate_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.gate_proj, hidden(), shard_rank * ni_l, (shard_rank + 1) * ni_l))),
+                    up_proj: Df2W::Bf16(upload_bf16(&dev, &rows(&l.up_proj, hidden(), shard_rank * ni_l, (shard_rank + 1) * ni_l))),
+                    down_proj: Df2W::Bf16(upload_bf16(&dev, &cols(&l.down_proj, hidden(), inter(),
                                                        shard_rank * ni_l, (shard_rank + 1) * ni_l))),
                     q_norm: upload_norm(&dev, &l.q_norm),
                     k_norm: upload_norm(&dev, &l.k_norm),
@@ -569,17 +590,17 @@ impl Df2Round {
                         assert!(r1 <= v.len() / cols, "bf16 twin slice {r0}..{r1} out of range");
                         v[r0 * cols..r1 * cols].to_vec()
                     };
-                    let nq_rows = nq_l * HEAD_DIM;
-                    let nkv_rows = nkv_l * HEAD_DIM;
+                    let nq_rows = nq_l * head_dim();
+                    let nkv_rows = nkv_l * head_dim();
                     let (rq0, rq1) = (shard_rank * nq_rows, (shard_rank + 1) * nq_rows);
                     let (rk0, rk1) = (shard_rank * nkv_rows, (shard_rank + 1) * nkv_rows);
                     let (ri0, ri1) = (shard_rank * ni_l, (shard_rank + 1) * ni_l);
                     layers.push(GpuLayer {
                         q_proj: up4(sl_rows(pick(&ln("self_attn.q_proj.weight")), rq0, rq1)),
                         k_proj: up4(sl_rows(pick(&ln("self_attn.k_proj.weight")), rk0, rk1)),
-                        k_proj_bf16: Some(upload_bf16(&dev, &rows16(&l.k_proj, HIDDEN, rk0, rk1))),
+                        k_proj_bf16: Some(upload_bf16(&dev, &rows16(&l.k_proj, hidden(), rk0, rk1))),
                         v_proj: up4(sl_rows(pick(&ln("self_attn.v_proj.weight")), rk0, rk1)),
-                        v_proj_bf16: Some(upload_bf16(&dev, &rows16(&l.v_proj, HIDDEN, rk0, rk1))),
+                        v_proj_bf16: Some(upload_bf16(&dev, &rows16(&l.v_proj, hidden(), rk0, rk1))),
                         o_proj: up4(sl_k(pick(&ln("self_attn.o_proj.weight")), rq0, rq1)),
                         gate_proj: up4(sl_rows(pick(&ln("mlp.gate_proj.weight")), ri0, ri1)),
                         up_proj: up4(sl_rows(pick(&ln("mlp.up_proj.weight")), ri0, ri1)),
@@ -676,49 +697,57 @@ impl Df2Round {
         let alloc_zi = move |n: usize| dev4.alloc_zeros::<i32>(n).expect("alloc i32");
         let dev5 = dev.clone();
         let dev6 = dev.clone();
-        let mut k_ring = Vec::with_capacity(N_LAYERS);
-        let mut v_ring = Vec::with_capacity(N_LAYERS);
-        for _ in 0..N_LAYERS {
+        let mut k_ring = Vec::with_capacity(n_layers());
+        let mut v_ring = Vec::with_capacity(n_layers());
+        // P7-TP2: the ring KV is read partially before its rows are written (block-16 decode
+        // spans ahead of the ring head). alloc_zeros does NOT zero (AGENTS §2.2) — at TP=1 the
+        // stale bytes were locally deterministic so every gate stayed green, but the two TP
+        // ranks hold DIFFERENT stale bytes and the first mtp-round digest diverges (agree()
+        // FAIL at lockstep step 8, run-varying digests = uninitialized reads). Zero the whole
+        // ring at install: both ranks read identical zeros wherever a row is unwritten.
+        // (~21 MB one-time boot cost.)
+        let ring_zero = vec![bf16::default(); nkv_l * ring_stride() * head_dim()];
+        for _ in 0..n_layers() {
             // P2: the ring holds ONLY this rank's kv-heads post-shard (heads are independent —
             // no cross-rank attention traffic; the ring rows stay compile-time 2056×128,
             // ctx-free by construction post-S10R).
-            k_ring.push(alloc_z(nkv_l * ring_stride() * HEAD_DIM));
-            v_ring.push(alloc_z(nkv_l * ring_stride() * HEAD_DIM));
+            k_ring.push(dev.htod_sync_copy(&ring_zero)?);
+            v_ring.push(dev.htod_sync_copy(&ring_zero)?);
         }
         // Explicit zeroing of the persistent buffers a first round might read partially
         // (AGENTS §2.2: alloc_zeros does NOT zero).
-        let zero8: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * block()];
+        let zero8: Vec<bf16> = vec![bf16::default(); tap_concat_dim() * block()];
         let staging = dev.htod_sync_copy(&zero8)?;
         let blk = BlkScratch {
-            h: alloc_z(HIDDEN * block()),
-            normed: alloc_z(HIDDEN * block()),
-            x_conv: alloc_z(HIDDEN * block()),
-            dyn_attn: alloc_z(2 * CONV_KERNEL * CONV_GROUPS * block()),
-            q: alloc_z(NUM_HEADS * HEAD_DIM * block()),
-            k: alloc_z(NUM_KV_HEADS * HEAD_DIM * block()),
-            v: alloc_z(NUM_KV_HEADS * HEAD_DIM * block()),
-            attn: alloc_z(NUM_HEADS * HEAD_DIM * block()),
-            attn_out: alloc_z(HIDDEN * block()),
-            fin: alloc_z(HIDDEN * block()),
-            normed2: alloc_z(HIDDEN * block()),
-            x_conv2: alloc_z(HIDDEN * block()),
-            dyn_mlp: alloc_z(2 * CONV_KERNEL * CONV_GROUPS * block()),
-            gate: alloc_z(INTER * block()),
-            up: alloc_z(INTER * block()),
-            mlp_out: alloc_z(HIDDEN * block()),
-            fin2: alloc_z(HIDDEN * block()),
+            h: alloc_z(hidden() * block()),
+            normed: alloc_z(hidden() * block()),
+            x_conv: alloc_z(hidden() * block()),
+            dyn_attn: alloc_z(2 * conv_kernel() * conv_groups() * block()),
+            q: alloc_z(num_heads() * head_dim() * block()),
+            k: alloc_z(num_kv_heads() * head_dim() * block()),
+            v: alloc_z(num_kv_heads() * head_dim() * block()),
+            attn: alloc_z(num_heads() * head_dim() * block()),
+            attn_out: alloc_z(hidden() * block()),
+            fin: alloc_z(hidden() * block()),
+            normed2: alloc_z(hidden() * block()),
+            x_conv2: alloc_z(hidden() * block()),
+            dyn_mlp: alloc_z(2 * conv_kernel() * conv_groups() * block()),
+            gate: alloc_z(inter() * block()),
+            up: alloc_z(inter() * block()),
+            mlp_out: alloc_z(hidden() * block()),
+            fin2: alloc_z(hidden() * block()),
             // gemm_dsp (m8) reads X rows 1..=8 at +HIDDEN for the selector projection: the
             // 9th row is a permanently-zero guard row (row 8 never written, only read by the
             // hp GEMM's 8th column, which no consumer reads).
-            h_final: dev6.htod_sync_copy(&vec![bf16::default(); HIDDEN * (block() + 1)])
+            h_final: dev6.htod_sync_copy(&vec![bf16::default(); hidden() * (block() + 1)])
                 .expect("h_final zeroed 9 rows"),
-            cos8: alloc_zf(block() * HEAD_DIM),
-            sin8: alloc_zf(block() * HEAD_DIM),
+            cos8: alloc_zf(block() * head_dim()),
+            sin8: alloc_zf(block() * head_dim()),
             slot_ids: dev.htod_sync_copy(&vec![0i32; block()])?,
         };
         let pos_blk: Vec<i32> = (0..block()).map(|b| b as i32).collect();
         let pos_blk = dev.htod_sync_copy(&pos_blk)?;
-        let wrow_blk: Vec<i32> = (0..block()).map(|b| (RING + b) as i32).collect();
+        let wrow_blk: Vec<i32> = (0..block()).map(|b| (ring() + b) as i32).collect();
         let wrow_blk = dev.htod_sync_copy(&wrow_blk)?;
         let wrow_ctl: Vec<i32> = (0..block()).map(|b| b as i32).collect();
         let wrow_ctl = dev.htod_sync_copy(&wrow_ctl)?;
@@ -729,34 +758,36 @@ impl Df2Round {
             eprintln!("[df2] round SHARDED across {world} ranks (rank {shard_rank}): \
                        qkv/gate/up col-split ({}q/{}kv heads, {} inter rows/rank), o/down K-split, \
                        ring KV [{} x {} x {}]/layer, 2 all-reduce sites/layer on the round stream",
-                      nq_l, nkv_l, ni_l, nkv_l, ring_stride(), HEAD_DIM);
+                      nq_l, nkv_l, ni_l, nkv_l, ring_stride(), head_dim());
         }
-        Ok(Self {
+        let mut me = Self {
             dev, stream, bk, layers, glob, hp_w, pred_cb, succ_cb, head, embed,
             cos_table, sin_table, k_ring, v_ring, nprev: 0, ring_slot: None, ring_len: 0,
             staging,
             sink: None,
-            th_raw: alloc_z(HIDDEN * block()),
-            th: alloc_z(HIDDEN * block()),
-            kc: alloc_z(NUM_KV_HEADS * HEAD_DIM * block()),
-            vc: alloc_z(NUM_KV_HEADS * HEAD_DIM * block()),
-            cos_c: alloc_zf(block() * HEAD_DIM),
-            sin_c: alloc_zf(block() * HEAD_DIM),
+            mask_ovr_row: None,
+            mask_ovr_toks: None,
+            th_raw: alloc_z(hidden() * block()),
+            th: alloc_z(hidden() * block()),
+            kc: alloc_z(num_kv_heads() * head_dim() * block()),
+            vc: alloc_z(num_kv_heads() * head_dim() * block()),
+            cos_c: alloc_zf(block() * head_dim()),
+            sin_c: alloc_zf(block() * head_dim()),
             pos_c: alloc_zi(block()),
             wrow_c: alloc_zi(block()),
             slot_c: dev5.htod_sync_copy(&vec![0i32; block()])?,
             blk, pos_blk, wrow_blk, wrow_ctl, toks_blk,
-            logits: alloc_z(VOCAB * levels()),
+            logits: alloc_z(vocab() * levels()),
             coarse_idx: dev5.alloc_zeros::<u32>(levels() * 256).expect("alloc coarse_idx"),
             h2d_stage: dev5.alloc_zeros::<i32>(2 * block() + 2).expect("alloc h2d_stage"),
             out_vals: alloc_zf(levels() * 16),
             out_ids: dev5.alloc_zeros::<u32>(levels() * 16).expect("alloc u32"),
-            hp_bf16: alloc_z(SELECTOR_RANK * block()),  // the hp GEMM is launched per m8 tile; block() cols
-            hp_f32: alloc_zf(SELECTOR_RANK * block()),
+            hp_bf16: alloc_z(selector_rank() * block()),  // the hp GEMM is launched per m8 tile; block() cols
+            hp_f32: alloc_zf(selector_rank() * block()),
             unary_ctl: alloc_zf(levels() * 16),
             walk_tokens: dev5.alloc_zeros::<u32>(levels()).expect("alloc u32"),
-            ctl_attn_ref: alloc_z(NUM_HEADS * HEAD_DIM * block()),
-            ctl_attn: alloc_z(NUM_HEADS * HEAD_DIM * block()),
+            ctl_attn_ref: alloc_z(num_heads() * head_dim() * block()),
+            ctl_attn: alloc_z(num_heads() * head_dim() * block()),
             walk_scores: alloc_zf(levels() * 16),
             walk_out_tok: dev5.alloc_zeros::<u32>(levels() + levels() * 16).expect("alloc u32"),
             walk_out_q: alloc_zf(levels() + levels() * 16),
@@ -765,6 +796,7 @@ impl Df2Round {
             ntot_dev: 0,
             anchor_dev: 0,
             round_graph: None,
+            pos_at: None,
             inject_graphs: std::collections::HashMap::new(),
             ntot_buf: None,
             anchor_buf: None,
@@ -772,7 +804,11 @@ impl Df2Round {
             nq_l,
             nkv_l,
             ni_l,
-        })
+        };
+        // DFLASH2-GEN (mask sub-item): measure the trunk's quantized mask row against the
+        // artifact's shipped BF16 copy ONCE at boot; logs, never fails the load.
+        me.mask_row_check(dir);
+        Ok(me)
     }
 
     /// Attach the TRUNK's tap sink as this round's fc input (the capture staging is then read
@@ -796,12 +832,12 @@ impl Df2Round {
                 srcXInBytes: 0, srcY: 0,
                 srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
                 srcHost: std::ptr::null(), srcDevice: *sink.staging.device_ptr() as u64,
-                srcArray: std::ptr::null_mut(), srcPitch: TAP_CONCAT_DIM * 2,
+                srcArray: std::ptr::null_mut(), srcPitch: tap_concat_dim() * 2,
                 dstXInBytes: 0, dstY: 0,
                 dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
                 dstHost: std::ptr::null_mut(), dstDevice: *self.staging.device_ptr() as u64,
-                dstArray: std::ptr::null_mut(), dstPitch: TAP_CONCAT_DIM * 2,
-                WidthInBytes: TAP_CONCAT_DIM * 2, Height: block(),
+                dstArray: std::ptr::null_mut(), dstPitch: tap_concat_dim() * 2,
+                WidthInBytes: tap_concat_dim() * 2, Height: block(),
             };
             unsafe {
                 let r = sys::cuMemcpy2DAsync_v2(&cp, self.stream.stream);
@@ -866,8 +902,8 @@ impl Df2Round {
     /// asserts these never intersect the trunk's KV-cache ranges (the drafter's ring is
     /// drafter-private; an overlap would corrupt trunk KV on write).
     pub fn ring_kv_ptr_ranges(&self) -> Vec<(u64, u64)> {
-        let bytes = self.nkv_l * ring_stride() * HEAD_DIM * 2;
-        (0..N_LAYERS).flat_map(|li| {
+        let bytes = self.nkv_l * ring_stride() * head_dim() * 2;
+        (0..n_layers()).flat_map(|li| {
             [(d(&self.k_ring[li]), bytes as u64), (d(&self.v_ring[li]), bytes as u64)]
         }).collect()
     }
@@ -876,12 +912,108 @@ impl Df2Round {
     /// embed gate, isolated from the layer stack.
     pub fn embed_probe(&mut self, anchor: u32) -> Result<Vec<f32>> {
         let toks: Vec<i32> = [anchor as i32].iter().copied()
-            .chain(std::iter::repeat(crate::dflash2::MASK_TOKEN_ID as i32).take(block() - 1)).collect();
+            .chain(std::iter::repeat(crate::dflash2::mask_token_id() as i32).take(block() - 1)).collect();
         self.dev.htod_sync_copy_into(&toks, &mut self.toks_blk)?;
         self.embed_gather();
         self.dev.synchronize()?;
         let h: Vec<bf16> = self.dev.dtoh_sync_copy(&self.blk.h)?;
         Ok(h.iter().map(|x| x.to_f32()).collect())
+    }
+
+    /// DFLASH2-GEN (mask sub-item): one-boot measurement of the trunk's QUANTIZED mask row
+    /// vs the artifact's shipped BF16 copy (`mask_embedding.safetensors` — an exact copy of
+    /// the target's pre-quant row). The incoai card documents the failure class: the row's
+    /// values are ~1e-6-scale and a format that zeroes tiny block scales destroys it, halving
+    /// acceptance. Our own NVFP4 pack has two-level scales and *should* survive, but that is
+    /// a measurement, not an assumption: this runs the SERVED gather path (the borrowed
+    /// embed's dequant) once for the mask token and reports rel-L2 / max-abs. Verdict bands:
+    /// rel-L2 <= 0.05 healthy (normal NVFP4 quant noise); 0.05..0.25 elevated (logged, no
+    /// action); > 0.25 DAMAGED — surfaced loudly as an owner decision with this receipt
+    /// (the fix is reading this override file into the round, per the findings doc).
+    fn mask_row_check(&mut self, dir: &str) {
+        use safetensors::SafeTensors;
+        if self.embed.is_none() {
+            return; // no borrowed embed (e.g. the GPTQ calibration load) — nothing to measure.
+        }
+        let p = std::path::Path::new(dir).join("mask_embedding.safetensors");
+        let buf = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(_) => return, // artifact ships no override copy — nothing to compare against.
+        };
+        let st = match SafeTensors::deserialize(&buf) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::reprintln!("[df2] mask row: unreadable {} — {e}", p.display());
+                return;
+            }
+        };
+        let Some(name) = st.names().first().map(|s| s.to_string()) else { return };
+        let Ok(view) = st.tensor(&name) else { return };
+        let h = hidden();
+        if view.dtype() != safetensors::Dtype::BF16 || view.shape() != [h] {
+            crate::reprintln!(
+                "[df2] mask row: override {name} dtype {:?} shape {:?} != BF16 [{h},] — ignored",
+                view.dtype(), view.shape());
+            return;
+        }
+        let ref_row: Vec<f32> = view.data()
+            .chunks_exact(2)
+            .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect();
+        let gathered = match self.embed_probe(crate::dflash2::mask_token_id()) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::reprintln!("[df2] mask row: gather probe failed — {e:#}");
+                return;
+            }
+        };
+        // Row 0 of the probe block IS the mask row exactly as serving gathers it.
+        let g = &gathered[..h];
+        let mut num = 0f64;
+        let mut den = 0f64;
+        let mut mx = 0f64;
+        for i in 0..h {
+            let d = (g[i] - ref_row[i]) as f64;
+            num += d * d;
+            den += (ref_row[i] as f64) * (ref_row[i] as f64);
+            mx = mx.max(d.abs());
+        }
+        let rel = if den > 0.0 { (num / den).sqrt() } else { f64::INFINITY };
+        let verdict = if rel > 0.25 {
+            "DAMAGED — see the override line below for whether the artifact's BF16 copy serves"
+        } else if rel > 0.05 {
+            "elevated (logged; within quant-noise-plus; no action)"
+        } else {
+            "healthy (normal quant noise)"
+        };
+        crate::reprintln!(
+            "[df2] mask row {}: rel-L2 {rel:.4} max-abs {mx:.5} vs {name} in mask_embedding.safetensors — {verdict}",
+            crate::dflash2::mask_token_id());
+        if rel > 0.25 && !crate::dflash2::mask_override() {
+            crate::reprintln!(
+                "[df2] mask row OVERRIDE suppressed by --df2-mask-override off — the DAMAGED \
+                 quantized row serves MASK positions (the measured A/B arm)");
+            return;
+        }
+        if rel > 0.25 {
+            // DFLASH2-GEN: the row is destroyed by quantization — read the artifact's exact
+            // BF16 copy into the round (the sanctioned fix): every block's MASK rows embed
+            // the copy instead of the trunk's quantized row. One-time staging; the broadcast
+            // rides embed_gather (graph-stable: staged at load, before any capture).
+            let ovr_bf: Vec<bf16> = ref_row.iter().map(|&x| bf16::from_f32(x)).collect();
+            let toks: Vec<i32> = vec![0i32; block() - 1];
+            if let (Ok(t), Ok(r)) = (self.dev.htod_sync_copy(&toks),
+                                     self.dev.htod_sync_copy(&ovr_bf)) {
+                self.mask_ovr_toks = Some(t);
+                self.mask_ovr_row = Some(r);
+                crate::metrics::df2_mask_override(true);
+                crate::reprintln!(
+                    "[df2] mask row OVERRIDE engaged: the block's MASK rows now embed the artifact's exact BF16 copy");
+            } else {
+                crate::reprintln!(
+                    "[df2] mask row OVERRIDE staging FAILED — serving continues with the damaged quantized row");
+            }
+        }
     }
 
     /// Embed the block input `toks_blk` from the TRUNK's embed, dispatching on the borrowed
@@ -893,13 +1025,24 @@ impl Df2Round {
                 panic!("TwoStage borrow on the embed (contract violation)");
             }
             BorrowedW::Nvfp4(p) => {
-                klaunch!(self, "embed_gather_fp4_tiled_b", grid(HIDDEN * block()), (256, 1, 1), 0,
-                    (d(&self.blk.h), p.qweight, p.scales, p.gs, d(&self.toks_blk), HIDDEN as i32, block() as i32));
+                klaunch!(self, "embed_gather_fp4_tiled_b", grid(hidden() * block()), (256, 1, 1), 0,
+                    (d(&self.blk.h), p.qweight, p.scales, p.gs, d(&self.toks_blk), hidden() as i32, block() as i32));
             }
             BorrowedW::Bf16 { ptr } => {
-                klaunch!(self, "embed_gather_b", grid(HIDDEN * block()), (256, 1, 1), 0,
-                    (d(&self.blk.h), ptr, d(&self.toks_blk), HIDDEN as i32, block() as i32));
+                klaunch!(self, "embed_gather_b", grid(hidden() * block()), (256, 1, 1), 0,
+                    (d(&self.blk.h), ptr, d(&self.toks_blk), hidden() as i32, block() as i32));
             }
+        }
+        // DFLASH2-GEN mask override: with a DAMAGED quantized row staged, the MASK rows
+        // (1..block — [anchor, MASK..] by construction at every gather site) are overwritten
+        // with the artifact's exact BF16 copy: one broadcast gather over a 1-row table.
+        if let (Some(row), Some(toks)) = (&self.mask_ovr_row, &self.mask_ovr_toks) {
+            let rows = block() - 1;
+            // Row 1 of blk.h starts at hidden()*2 BYTES (bf16 elements) past the base —
+            // the out pointer is a byte address; a bare `+ hidden()` lands half a row in.
+            let row1 = std::mem::size_of::<bf16>() as u64 * hidden() as u64;
+            klaunch!(self, "embed_gather_b", grid(hidden() * rows), (256, 1, 1), 0,
+                (d(&self.blk.h) + row1, d(row), d(toks), hidden() as i32, rows as i32));
         }
     }
 
@@ -911,35 +1054,35 @@ impl Df2Round {
         match self.head.expect("head ptrs") {
             BorrowedW::TwoStage { q, bf16_ptr } => {
                 // Stage 1: coarse NVFP4 pass over the full vocab (reads 0.68 GB).
-                let persistent = (crate::gpu::GB10_SMS * 6).min(VOCAB / 16) as u32;
+                let persistent = (crate::gpu::GB10_SMS * 6).min(vocab() / 16) as u32;
                 klaunch!(self, "gemm_mma_fp4_b", (persistent, 1, 1), (256, 1, 1), 0,
                     (d(&self.logits), q.qweight, q.scales, q.gs,
-                     d(&self.blk.h_final) + (HIDDEN * 2) as u64,
-                     VOCAB as i32, HIDDEN as i32, levels() as i32, 0u64, 0i32));
+                     d(&self.blk.h_final) + (hidden() * 2) as u64,
+                     vocab() as i32, hidden() as i32, levels() as i32, 0u64, 0i32));
                 // Stage 1b: per-column top-256 shortlist (deterministic; recall@256 is the only
                 // quality requirement — stage 2 supplies the exact ranking).
                 klaunch!(self, "df2_top256_b", (levels() as u32, 1, 1), (256, 1, 1), 0,
-                    (d(&self.coarse_idx), d(&self.logits), VOCAB as i32, levels() as i32));
+                    (d(&self.coarse_idx), d(&self.logits), vocab() as i32, levels() as i32));
                 // Stage 2: exact bf16 re-rank of the shortlist against the ORIGINAL hiddens
                 // (2.6 MB read; fp32 accumulation, deterministic order).
                 klaunch!(self, "df2_head_rerank_b", (levels() as u32 * 256, 1, 1), (256, 1, 1), 0,
                     (d(&self.logits), d(&self.coarse_idx), bf16_ptr,
-                     d(&self.blk.h_final) + (HIDDEN * 2) as u64,
-                     VOCAB as i32, HIDDEN as i32, levels() as i32));
+                     d(&self.blk.h_final) + (hidden() * 2) as u64,
+                     vocab() as i32, hidden() as i32, levels() as i32));
             }
             BorrowedW::Nvfp4(p) => {
-                let persistent = (crate::gpu::GB10_SMS * 6).min(VOCAB / 16) as u32;
+                let persistent = (crate::gpu::GB10_SMS * 6).min(vocab() / 16) as u32;
                 klaunch!(self, "gemm_mma_fp4_b", (persistent, 1, 1), (256, 1, 1), 0,
                     (d(&self.logits), p.qweight, p.scales, p.gs,
-                     d(&self.blk.h_final) + (HIDDEN * 2) as u64,
-                     VOCAB as i32, HIDDEN as i32, levels() as i32, 0u64, 0i32));
+                     d(&self.blk.h_final) + (hidden() * 2) as u64,
+                     vocab() as i32, hidden() as i32, levels() as i32, 0u64, 0i32));
             }
             BorrowedW::Bf16 { ptr } => {
                 let smem = (levels() * 256 * 4) as u32;
-                klaunch!(self, "gemm_binv_b", (VOCAB as u32, 1, 1), (256, 1, 1), smem,
+                klaunch!(self, "gemm_binv_b", (vocab() as u32, 1, 1), (256, 1, 1), smem,
                     (d(&self.logits), ptr,
-                     d(&self.blk.h_final) + (HIDDEN * 2) as u64,
-                     VOCAB as i32, HIDDEN as i32, levels() as i32));
+                     d(&self.blk.h_final) + (hidden() * 2) as u64,
+                     vocab() as i32, hidden() as i32, levels() as i32));
             }
         }
     }
@@ -1031,7 +1174,7 @@ impl Df2Round {
         // htod_sync_copy_into requires EQUAL lens, so the copy is always the full BLOCK width
         // (row-major [8, 25600]); rows >= m are garbage-but-unread (column-independent math).
         assert!(m <= block() && m >= 1);
-        let need = TAP_CONCAT_DIM * block();
+        let need = tap_concat_dim() * block();
         // DF2 block-16: a caller may hold only the m columns it actually has (the real-tap
         // fixtures are narrower than a 16-wide block). Only columns < m are read downstream —
         // the math is column-independent — so a short slab is padded rather than refused. A
@@ -1040,8 +1183,8 @@ impl Df2Round {
             self.dev.htod_sync_copy_into(&cols[..need], &mut self.staging)
                 .context("upload tap chunk")?;
         } else {
-            assert!(cols.len() >= TAP_CONCAT_DIM * m,
-                "upload_chunk needs >= m={m} columns, got {}", cols.len() / TAP_CONCAT_DIM);
+            assert!(cols.len() >= tap_concat_dim() * m,
+                "upload_chunk needs >= m={m} columns, got {}", cols.len() / tap_concat_dim());
             let mut buf = vec![bf16::default(); need];
             buf[..cols.len()].copy_from_slice(cols);
             self.dev.htod_sync_copy_into(&buf, &mut self.staging)
@@ -1127,44 +1270,44 @@ impl Df2Round {
 
     fn rmsnorm(&self, out: &CudaSlice<bf16>, x: &CudaSlice<bf16>, w: &CudaSlice<f32>, n: usize, b: usize) {
         klaunch!(self, "rmsnorm_b", (b as u32, 1, 1), (1024, 1, 1), 4096,
-            (d(out), d(x), d(w), n as i32, b as i32, fbits(RMS_EPS)));
+            (d(out), d(x), d(w), n as i32, b as i32, fbits(rms_eps())));
     }
 
     fn rmsnorm_perhead(&self, x: &CudaSlice<bf16>, w: &CudaSlice<f32>, heads: usize, b: usize) {
-        klaunch!(self, "rmsnorm_perhead_b", ((b * heads) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), (HEAD_DIM * 4) as u32,
-            (d(x), d(x), d(w), heads as i32, HEAD_DIM as i32, b as i32, fbits(RMS_EPS)));
+        klaunch!(self, "rmsnorm_perhead_b", ((b * heads) as u32, 1, 1), (head_dim() as u32, 1, 1), (head_dim() * 4) as u32,
+            (d(x), d(x), d(w), heads as i32, head_dim() as i32, b as i32, fbits(rms_eps())));
     }
 
     fn rope(&self, x: &CudaSlice<bf16>, cos: &CudaSlice<f32>, sin: &CudaSlice<f32>, heads: usize, b: usize) {
-        klaunch!(self, "rope_b", grid(b * heads * (HEAD_DIM / 2)), (256, 1, 1), 0,
-            (d(x), d(cos), d(sin), heads as i32, HEAD_DIM as i32, HEAD_DIM as i32, b as i32));
+        klaunch!(self, "rope_b", grid(b * heads * (head_dim() / 2)), (256, 1, 1), 0,
+            (d(x), d(cos), d(sin), heads as i32, head_dim() as i32, head_dim() as i32, b as i32));
     }
 
     fn gather_rope(&self, out_cos: &CudaSlice<f32>, out_sin: &CudaSlice<f32>, pos: u64, b: usize) {
-        klaunch!(self, "gather_rope_b", grid(b * HEAD_DIM), (256, 1, 1), 0,
-            (d(out_cos), d(out_sin), d(&self.cos_table), d(&self.sin_table), pos, HEAD_DIM as i32, b as i32));
+        klaunch!(self, "gather_rope_b", grid(b * head_dim()), (256, 1, 1), 0,
+            (d(out_cos), d(out_sin), d(&self.cos_table), d(&self.sin_table), pos, head_dim() as i32, b as i32));
     }
 
     fn conv2(&self, out: &CudaSlice<bf16>, x: &CudaSlice<bf16>, dyn_all: &CudaSlice<bf16>,
              base_ptr: u64, n: usize, side: usize) {
-        let dyn_side = (side * CONV_KERNEL * CONV_GROUPS) as i32;
-        let dyn_stride = (2 * CONV_KERNEL * CONV_GROUPS) as i32;
-        klaunch!(self, "conv2_dynamic_b", grid(n * HIDDEN), (256, 1, 1), 0,
-            (d(out), d(x), d(dyn_all), base_ptr, HIDDEN as i32, n as i32,
-             CONV_GROUPS as i32, CONV_GROUP as i32, dyn_side, dyn_stride));
+        let dyn_side = (side * conv_kernel() * conv_groups()) as i32;
+        let dyn_stride = (2 * conv_kernel() * conv_groups()) as i32;
+        klaunch!(self, "conv2_dynamic_b", grid(n * hidden()), (256, 1, 1), 0,
+            (d(out), d(x), d(dyn_all), base_ptr, hidden() as i32, n as i32,
+             conv_groups() as i32, conv_group() as i32, dyn_side, dyn_stride));
     }
 
     // ---- §3.2 incremental ctx injection (M ≤ 8, gemm_dsp path) ---------------
 
     /// Inject `m ≤ 8` committed tap columns (read from `self.staging` cols `[0, m)` — the
     /// trunk capture's staging or an upload). Positions are ABSOLUTE `[nprev, nprev+m)`:
-    /// RoPE at true positions; ring write rows `pos % RING`. `timer` (optional) brackets the
+    /// RoPE at true positions; ring write rows `pos % ring()`. `timer` (optional) brackets the
     /// whole injection (fc + norm + 5×(k/v proj + norm + rope + write)).
     pub fn inject_dev(&mut self, m: usize, mut timer: Option<&mut EvTimer>) -> Result<()> {
         assert!(m <= block(), "inject chunk {m} > block {}", block());
         assert!(self.nprev + m <= self.max_c, "nprev {} + {m} > max_c {}", self.nprev, self.max_c);
         let n0 = self.nprev;
-        let ring = RING;
+        let ring = ring();
 
         // rope positions (absolute) + ring write rows for this chunk (padded to BLOCK width:
         // htod_sync_copy_into needs equal lens; rows >= m are garbage-but-unread)
@@ -1201,23 +1344,23 @@ impl Df2Round {
     /// all-reduce (kv projections are rank-local) — capture-safe by construction.
     fn inject_kernels(&self, m: usize) {
         // fc + hidden_norm at M=m (gemm_dsp; cols ≥ m are garbage-but-unread)
-        self.gemm_lin(&self.th_raw, &self.glob.fc, d(&self.staging), HIDDEN, TAP_CONCAT_DIM);
-        self.rmsnorm(&self.th, &self.th_raw, &self.glob.hidden_norm, HIDDEN, m);
+        self.gemm_lin(&self.th_raw, &self.glob.fc, d(&self.staging), hidden(), tap_concat_dim());
+        self.rmsnorm(&self.th, &self.th_raw, &self.glob.hidden_norm, hidden(), m);
 
         // per-layer k/v: k = rope(k_norm(k_proj(th))) @ ring rows; v raw
         // P2: the projections run at the rank-local kv-head width (heads are independent —
         // no all-reduce; each rank writes only ITS kv-heads' ring rows).
         let nkv = self.nkv_l;
         self.gather_rope(&self.cos_c, &self.sin_c, d(&self.pos_c), m);
-        for li in 0..N_LAYERS {
+        for li in 0..n_layers() {
             let l = &self.layers[li];
-            self.gemm_lin(&self.kc, &l.k_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
+            self.gemm_lin(&self.kc, &l.k_proj, d(&self.th), nkv * head_dim(), hidden());
             self.rmsnorm_perhead(&self.kc, &l.k_norm, nkv, m);
             self.rope(&self.kc, &self.cos_c, &self.sin_c, nkv, m);
-            self.gemm_lin(&self.vc, &l.v_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
-            klaunch!(self, "write_kv_b", grid(m * nkv * HEAD_DIM), (256, 1, 1), 0,
+            self.gemm_lin(&self.vc, &l.v_proj, d(&self.th), nkv * head_dim(), hidden());
+            klaunch!(self, "write_kv_b", grid(m * nkv * head_dim()), (256, 1, 1), 0,
                 (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&self.kc), d(&self.vc),
-                 d(&self.wrow_c), ring_stride() as i32, nkv as i32, HEAD_DIM as i32,
+                 d(&self.wrow_c), ring_stride() as i32, nkv as i32, head_dim() as i32,
                  m as i32, d(&self.slot_c)));
         }
     }
@@ -1256,7 +1399,7 @@ impl Df2Round {
     /// window) via the S3F tiled GEMM, instead of n/8 skinny-M chunks. `taps` is the prefill
     /// capture buffer `[TAP_CONCAT_DIM, n]` col-major bf16 (the same per-layer-row layout as the
     /// sink's staging), cols [0, n) = the window's taps. Positions are ABSOLUTE
-    /// `[pos_start, pos_start+n)`; ring write rows `pos % RING`. Sets `nprev = pos_start + n`.
+    /// `[pos_start, pos_start+n)`; ring write rows `pos % ring()`. Sets `nprev = pos_start + n`.
     /// Bit-identical k/v to the probe's chunked path (same kernels, same reduction orders — the
     /// per-chunk probe asserts th/k bitwise; M only changes the GEMM tile count, not the math per
     /// element). Runs on the round's stream; the caller must have synced the capture D2Ds.
@@ -1264,7 +1407,7 @@ impl Df2Round {
         assert!(n >= 1 && n <= 8192, "prime window {n} out of range (1..8192)");
         assert!(pos_start + n <= self.max_c, "prime {}..{} > max_c {}",
                 pos_start, pos_start + n - 1, self.max_c);
-        let ring = RING;
+        let ring = ring();
 
         let pos: Vec<i32> = (0..n).map(|j| (pos_start + j) as i32).collect();
         let wrow: Vec<i32> = (0..n).map(|j| ((pos_start + j) % ring) as i32).collect();
@@ -1275,30 +1418,30 @@ impl Df2Round {
         let pos_dev = self.dev.htod_sync_copy(&pos).context("prime pos")?;
         let wrow_dev = self.dev.htod_sync_copy(&wrow).context("prime wrow")?;
         let slot_dev = self.dev.htod_sync_copy(&slots).context("prime slots")?;
-        let cos_c = self.dev.alloc_zeros::<f32>(n * HEAD_DIM).context("prime cos")?;
-        let sin_c = self.dev.alloc_zeros::<f32>(n * HEAD_DIM).context("prime sin")?;
+        let cos_c = self.dev.alloc_zeros::<f32>(n * head_dim()).context("prime cos")?;
+        let sin_c = self.dev.alloc_zeros::<f32>(n * head_dim()).context("prime sin")?;
         self.gather_rope(&cos_c, &sin_c, d(&pos_dev), n);
 
         // fc + hidden_norm at M=n (one weight read for the whole window).
-        let th_raw = self.dev.alloc_zeros::<bf16>(HIDDEN * n).context("prime th_raw")?;
-        let th = self.dev.alloc_zeros::<bf16>(HIDDEN * n).context("prime th")?;
-        self.gemm_tiled(&th_raw, self.fc_prime(), d(taps), HIDDEN, TAP_CONCAT_DIM, n);
-        self.rmsnorm(&th, &th_raw, &self.glob.hidden_norm, HIDDEN, n);
+        let th_raw = self.dev.alloc_zeros::<bf16>(hidden() * n).context("prime th_raw")?;
+        let th = self.dev.alloc_zeros::<bf16>(hidden() * n).context("prime th")?;
+        self.gemm_tiled(&th_raw, self.fc_prime(), d(taps), hidden(), tap_concat_dim(), n);
+        self.rmsnorm(&th, &th_raw, &self.glob.hidden_norm, hidden(), n);
 
-        // per-layer k/v at M=n, written at ring rows (pos_start+j) % RING.
+        // per-layer k/v at M=n, written at ring rows (pos_start+j) % ring().
         // P2: rank-local kv-head width (same as inject_dev).
         let nkv = self.nkv_l;
-        let kc = self.dev.alloc_zeros::<bf16>(nkv * HEAD_DIM * n).context("prime k")?;
-        let vc = self.dev.alloc_zeros::<bf16>(nkv * HEAD_DIM * n).context("prime v")?;
-        for li in 0..N_LAYERS {
+        let kc = self.dev.alloc_zeros::<bf16>(nkv * head_dim() * n).context("prime k")?;
+        let vc = self.dev.alloc_zeros::<bf16>(nkv * head_dim() * n).context("prime v")?;
+        for li in 0..n_layers() {
             let l = &self.layers[li];
-            self.gemm_tiled(&kc, self.kv_prime(li, Kv::K), d(&th), nkv * HEAD_DIM, HIDDEN, n);
+            self.gemm_tiled(&kc, self.kv_prime(li, Kv::K), d(&th), nkv * head_dim(), hidden(), n);
             self.rmsnorm_perhead(&kc, &l.k_norm, nkv, n);
             self.rope(&kc, &cos_c, &sin_c, nkv, n);
-            self.gemm_tiled(&vc, self.kv_prime(li, Kv::V), d(&th), nkv * HEAD_DIM, HIDDEN, n);
-            klaunch!(self, "write_kv_b", grid(n * nkv * HEAD_DIM), (256, 1, 1), 0,
+            self.gemm_tiled(&vc, self.kv_prime(li, Kv::V), d(&th), nkv * head_dim(), hidden(), n);
+            klaunch!(self, "write_kv_b", grid(n * nkv * head_dim()), (256, 1, 1), 0,
                 (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&kc), d(&vc),
-                 d(&wrow_dev), ring_stride() as i32, nkv as i32, HEAD_DIM as i32,
+                 d(&wrow_dev), ring_stride() as i32, nkv as i32, head_dim() as i32,
                  n as i32, d(&slot_dev)));
         }
         self.dev.synchronize()?;
@@ -1316,7 +1459,7 @@ impl Df2Round {
     #[allow(clippy::too_many_arguments)]
     pub fn draft_round(&mut self, anchor: u32, window: usize, flip_unary: bool,
                        ctl_dual_write: bool, dump: bool) -> Result<Df2RoundOut> {
-        self.draft_round_depth(anchor, window, flip_unary, ctl_dual_write, dump, N_LAYERS)
+        self.draft_round_depth(anchor, window, flip_unary, ctl_dual_write, dump, n_layers())
     }
 
     /// Probe-only layer bisect: run the round with the first `nlayers` block layers (the
@@ -1337,20 +1480,20 @@ impl Df2Round {
 
         // ---- block input: [anchor, MASK×7] from the TRUNK's real embed table ----
         let toks: Vec<i32> = [anchor as i32].iter().copied()
-            .chain(std::iter::repeat(crate::dflash2::MASK_TOKEN_ID as i32).take(block() - 1)).collect();
+            .chain(std::iter::repeat(crate::dflash2::mask_token_id() as i32).take(block() - 1)).collect();
         self.dev.htod_sync_copy_into(&toks, &mut self.toks_blk)?;
         self.embed_gather();
 
         // ---- 5-layer backbone (S3F sequence; ring attention) ----
-        for li in 0..nlayers.min(N_LAYERS) {
+        for li in 0..nlayers.min(n_layers()) {
             self.layer_forward(li, ntot, window, ctl_dual_write);
         }
         // final norm
-        self.rmsnorm(&self.blk.h_final, &self.blk.h, &self.glob.norm, HIDDEN, block());
+        self.rmsnorm(&self.blk.h_final, &self.blk.h, &self.glob.norm, hidden(), block());
         timer.mark(self.stream.stream);
         if !post {
             let mut hf: Vec<bf16> = self.dev.dtoh_sync_copy(&self.blk.h_final)?;
-            hf.truncate(HIDDEN * block());   // the 9th row is the guard row — not part of the output
+            hf.truncate(hidden() * block());   // the 9th row is the guard row — not part of the output
             return Ok(Df2RoundOut {
                 tokens: vec![0; levels()], candidates: vec![0; levels() * 16], unary: vec![0.0; levels() * 16],
                 scores: vec![0.0; levels() * 16], h_final: hf.iter().map(|x| x.to_f32()).collect(),
@@ -1366,13 +1509,13 @@ impl Df2Round {
         timer.mark(self.stream.stream);
         // ---- top-16 on the 7 MASK rows ----
         klaunch!(self, "top16_b", (levels() as u32, 1, 1), (256, 1, 1), 0,
-            (d(&self.out_vals), d(&self.out_ids), d(&self.logits), VOCAB as i32, levels() as i32));
+            (d(&self.out_vals), d(&self.out_ids), d(&self.logits), vocab() as i32, levels() as i32));
         timer.mark(self.stream.stream);
 
         // ---- hidden_projection [256,5120] × h_sel [5120,7] (rows 1..7) → hp ----
-        self.gemm_dsp(&self.hp_bf16, &self.hp_w, d(&self.blk.h_final) + (HIDDEN * 2) as u64, SELECTOR_RANK, HIDDEN);
-        klaunch!(self, "bf16tof32", grid(SELECTOR_RANK * block()), (256, 1, 1), 0,
-            (d(&self.hp_f32), d(&self.hp_bf16), (SELECTOR_RANK * block()) as i32));
+        self.gemm_dsp(&self.hp_bf16, &self.hp_w, d(&self.blk.h_final) + (hidden() * 2) as u64, selector_rank(), hidden());
+        klaunch!(self, "bf16tof32", grid(selector_rank() * block()), (256, 1, 1), 0,
+            (d(&self.hp_f32), d(&self.hp_bf16), (selector_rank() * block()) as i32));
 
         // ---- the greedy chain (sign-flip control negates the unary term) ----
         let unary_src: &CudaSlice<f32> = if flip_unary {
@@ -1386,7 +1529,7 @@ impl Df2Round {
         klaunch!(self, "df2_sel_walk_b", (1u32, 1, 1), (256, 1, 1), 0,
             (d(&self.walk_tokens), d(&self.walk_scores), d(&self.hp_f32), d(&self.out_ids),
              d(unary_src), d(&self.pred_cb), d(&self.succ_cb), anchor, self.anchor_dev,
-             SELECTOR_RANK as i32, levels() as i32));
+             selector_rank() as i32, levels() as i32));
         timer.mark(self.stream.stream);
 
         // ---- read back ----
@@ -1395,12 +1538,12 @@ impl Df2Round {
         let candidates: Vec<u32> = self.dev.dtoh_sync_copy(&self.out_ids)?.to_vec();
         let unary: Vec<f32> = self.dev.dtoh_sync_copy(&self.out_vals)?.to_vec();
         let mut hf: Vec<bf16> = self.dev.dtoh_sync_copy(&self.blk.h_final)?;
-        hf.truncate(HIDDEN * block());   // guard row never leaves the device
+        hf.truncate(hidden() * block());   // guard row never leaves the device
         let h_final: Vec<f32> = hf.iter().map(|x| x.to_f32()).collect();
         let (logits, hp) = if dump {
             let lg: Vec<bf16> = self.dev.dtoh_sync_copy(&self.logits)?;
             let mut hp16: Vec<bf16> = self.dev.dtoh_sync_copy(&self.hp_bf16)?;
-            hp16.truncate(SELECTOR_RANK * levels());   // 8th gemm column never leaves the device
+            hp16.truncate(selector_rank() * levels());   // 8th gemm column never leaves the device
             (Some(lg.iter().map(|x| x.to_f32()).collect()),
              Some(hp16.iter().map(|x| x.to_f32()).collect()))
         } else {
@@ -1416,12 +1559,12 @@ impl Df2Round {
     /// probe-only surfaces removed (no EvTimer, no dumps, no ctl/dual-write, no flip) and ONLY the
     /// 7 walk tokens read back. This is the serving-callable round the decode loop drives.
     /// Requires `nprev >= 1` (the committed prefix incl. the prompt prime). The block pass reads
-    /// the RING (ctx) — the sink staging is NOT read here (its fresh contents are consumed by
+    /// the ring() (ctx) — the sink staging is NOT read here (its fresh contents are consumed by
     /// [`inject_dev`] after the trunk verify). Stream-ordered on the round's stream.
     pub fn draft_round_dev(&mut self, anchor: u32) -> Result<Vec<u32>> {
         // ---- block input: [anchor, MASK×7] from the TRUNK's real embed table ----
         let toks: Vec<i32> = [anchor as i32].iter().copied()
-            .chain(std::iter::repeat(crate::dflash2::MASK_TOKEN_ID as i32).take(block() - 1)).collect();
+            .chain(std::iter::repeat(crate::dflash2::mask_token_id() as i32).take(block() - 1)).collect();
         self.dev.htod_sync_copy_into(&toks, &mut self.toks_blk)?;
         // The EAGER path must use the packed-arg kernels (ntot/anchor from the launch args, NOT
         // the graph's device ints): after a capture, self.ntot_dev/anchor_dev point at the graph
@@ -1453,8 +1596,8 @@ impl Df2Round {
         let (ntot_save, anchor_save) = (self.ntot_dev, self.anchor_dev);
         self.ntot_dev = 0;
         self.anchor_dev = 0;
-        let r = self.draft_round_stages(anchor, crate::dflash2::SLIDING_WINDOW, false, false,
-                                        true, crate::dflash2::N_LAYERS, true);
+        let r = self.draft_round_stages(anchor, crate::dflash2::sliding_window(), false, false,
+                                        true, crate::dflash2::n_layers(), true);
         self.ntot_dev = ntot_save;
         self.anchor_dev = anchor_save;
         r
@@ -1462,7 +1605,7 @@ impl Df2Round {
 
     /// The kernel-only draft-round sequence (embed gather -> 5 layers -> final norm -> head ->
     /// top16 -> hp -> walk). All inputs must be device-resident: `toks_blk` (anchor+MASK),
-    /// `pos_blk` + `cos8`/`sin8` (refreshed by `refresh_block_pos`), the RING (ctx), and the
+    /// `pos_blk` + `cos8`/`sin8` (refreshed by `refresh_block_pos`), the ring() (ctx), and the
     /// per-replay device ints (`ntot_dev`, `anchor_dev` — 0 on the eager path). Shared by the
     /// eager path and the CUDA-graph capture (the capture records exactly this sequence).
     /// `graph_mode` = true for the capture/replay (the walk reads the anchor from `anchor_dev`);
@@ -1476,20 +1619,20 @@ impl Df2Round {
         let ntot = self.nprev + block();
         self.embed_gather();
         // ---- 5-layer backbone (ring attention) ----
-        for li in 0..N_LAYERS {
-            self.layer_forward(li, ntot, crate::dflash2::SLIDING_WINDOW, false);
+        for li in 0..n_layers() {
+            self.layer_forward(li, ntot, crate::dflash2::sliding_window(), false);
         }
         // final norm
-        self.rmsnorm(&self.blk.h_final, &self.blk.h, &self.glob.norm, HIDDEN, block());
+        self.rmsnorm(&self.blk.h_final, &self.blk.h, &self.glob.norm, hidden(), block());
         // ---- borrowed head at N=7 on h_final cols 1..7 ----
         self.head_logits();
         // ---- top-16 on the 7 MASK rows ----
         klaunch!(self, "top16_b", (levels() as u32, 1, 1), (256, 1, 1), 0,
-            (d(&self.out_vals), d(&self.out_ids), d(&self.logits), VOCAB as i32, levels() as i32));
+            (d(&self.out_vals), d(&self.out_ids), d(&self.logits), vocab() as i32, levels() as i32));
         // ---- hidden_projection [256,5120] × h_sel [5120,7] → hp ----
-        self.gemm_dsp(&self.hp_bf16, &self.hp_w, d(&self.blk.h_final) + (HIDDEN * 2) as u64, SELECTOR_RANK, HIDDEN);
-        klaunch!(self, "bf16tof32", grid(SELECTOR_RANK * block()), (256, 1, 1), 0,
-            (d(&self.hp_f32), d(&self.hp_bf16), (SELECTOR_RANK * block()) as i32));
+        self.gemm_dsp(&self.hp_bf16, &self.hp_w, d(&self.blk.h_final) + (hidden() * 2) as u64, selector_rank(), hidden());
+        klaunch!(self, "bf16tof32", grid(selector_rank() * block()), (256, 1, 1), 0,
+            (d(&self.hp_f32), d(&self.hp_bf16), (selector_rank() * block()) as i32));
         // ---- the chain: greedy (device unary, no flip) or S5F2 sampled ----
         match sample {
             Some((seeds, temperature)) => {
@@ -1503,14 +1646,14 @@ impl Df2Round {
                      d(&self.pred_cb), d(&self.succ_cb),
                      anchor, if graph_mode { self.anchor_dev } else { 0 },
                      d(&self.walk_seeds), temperature,
-                     ((SELECTOR_RANK as i32) << 8) | levels() as i32));
+                     ((selector_rank() as i32) << 8) | levels() as i32));
             }
             None => {
                 klaunch!(self, "df2_sel_walk_b", (1u32, 1, 1), (256, 1, 1), 0,
                     (d(&self.walk_tokens), d(&self.walk_scores), d(&self.hp_f32), d(&self.out_ids),
                      d(&self.out_vals), d(&self.pred_cb), d(&self.succ_cb),
                      anchor, if graph_mode { self.anchor_dev } else { 0 },
-                     SELECTOR_RANK as i32, levels() as i32));
+                     selector_rank() as i32, levels() as i32));
             }
         }
         Ok(())
@@ -1529,7 +1672,7 @@ impl Df2Round {
         assert_eq!(seeds.len(), l_,
             "draft_round_dev_sample needs block()-1 = {l_} selector seeds");
         let toks: Vec<i32> = [anchor as i32].iter().copied()
-            .chain(std::iter::repeat(crate::dflash2::MASK_TOKEN_ID as i32).take(block() - 1)).collect();
+            .chain(std::iter::repeat(crate::dflash2::mask_token_id() as i32).take(block() - 1)).collect();
         self.dev.htod_sync_copy_into(&toks, &mut self.toks_blk)?;
         let (ntot_save, anchor_save) = (self.ntot_dev, self.anchor_dev);
         self.ntot_dev = 0;
@@ -1574,9 +1717,9 @@ impl Df2Round {
         // gather is a whole-row copy per accepted token — one driver call each.
         for j in 0..k {
             copy_row_into(&self.dev, self.stream.stream,
-                          dst + (j * TAP_CONCAT_DIM * 2) as u64,
-                          src + (path[j] * TAP_CONCAT_DIM * 2) as u64,
-                          TAP_CONCAT_DIM);
+                          dst + (j * tap_concat_dim() * 2) as u64,
+                          src + (path[j] * tap_concat_dim() * 2) as u64,
+                          tap_concat_dim());
         }
         Ok(())
     }
@@ -1601,6 +1744,7 @@ impl Df2Round {
         self.anchor_dev = *anchor_buf.device_ptr() as u64;
         // position the block at max_c so the recorded launches (smem, grid) cover every replay.
         let pos_max: Vec<i32> = (0..block()).map(|b| (self.max_c + b) as i32).collect();
+        self.pos_at = None; // the capture parks the block at max_c
         if dev.htod_sync_copy_into(&pos_max, &mut self.pos_blk).is_err() { return false; }
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_blk), block());
         if dev.synchronize().is_err() { return false; }
@@ -1671,7 +1815,7 @@ impl Df2Round {
         // anchor rides the same bytes it always did, only the transport changes.)
         let mut stage: Vec<i32> = Vec::with_capacity(2 * block() + 2);
         stage.push(anchor as i32);
-        stage.extend(std::iter::repeat(crate::dflash2::MASK_TOKEN_ID as i32).take(block() - 1));
+        stage.extend(std::iter::repeat(crate::dflash2::mask_token_id() as i32).take(block() - 1));
         stage.extend((0..block()).map(|b| (self.nprev + b) as i32));
         stage.push(ntot as i32);
         stage.push(anchor as i32);
@@ -1712,84 +1856,85 @@ impl Df2Round {
     fn layer_forward(&self, li: usize, ntot: usize, window: usize, ctl_dual_write: bool) {
         let l = &self.layers[li];
         let blk = &self.blk;
-        let base1_off = (CONV_KERNEL * HIDDEN * 2) as u64;
+        let base1_off = (conv_kernel() * hidden() * 2) as u64;
         // P2: local widths (the full constants when unsharded — the dims below are then
         // byte-identical to the pre-P2 launches).
         let (nq, nkv, ni) = (self.nq_l, self.nkv_l, self.ni_l);
         let sharded = self.ar.is_some();
         // attention sublayer
-        self.rmsnorm(&blk.normed, &blk.h, &l.input_ln, HIDDEN, block());
-        self.gemm_lin(&blk.dyn_attn, &l.attn_kp, d(&blk.normed), 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.rmsnorm(&blk.normed, &blk.h, &l.input_ln, hidden(), block());
+        self.gemm_lin(&blk.dyn_attn, &l.attn_kp, d(&blk.normed), 2 * conv_kernel() * conv_groups(), hidden());
         self.conv2(&blk.x_conv, &blk.normed, &blk.dyn_attn, d(&l.attn_base), block(), 0);
-        self.gemm_lin(&blk.q, &l.q_proj, d(&blk.x_conv), nq * HEAD_DIM, HIDDEN);
+        self.gemm_lin(&blk.q, &l.q_proj, d(&blk.x_conv), nq * head_dim(), hidden());
         self.rmsnorm_perhead(&blk.q, &l.q_norm, nq, block());
         self.rope(&blk.q, &blk.cos8, &blk.sin8, nq, block());
-        self.gemm_lin(&blk.k, &l.k_proj, d(&blk.x_conv), nkv * HEAD_DIM, HIDDEN);
+        self.gemm_lin(&blk.k, &l.k_proj, d(&blk.x_conv), nkv * head_dim(), hidden());
         self.rmsnorm_perhead(&blk.k, &l.k_norm, nkv, block());
         self.rope(&blk.k, &blk.cos8, &blk.sin8, nkv, block());
-        self.gemm_lin(&blk.v, &l.v_proj, d(&blk.x_conv), nkv * HEAD_DIM, HIDDEN);
-        // block rows → ring rows [RING, RING+8) (+ the linear control copy at [nprev, nprev+8))
-        klaunch!(self, "write_kv_b", grid(block() * nkv * HEAD_DIM), (256, 1, 1), 0,
+        self.gemm_lin(&blk.v, &l.v_proj, d(&blk.x_conv), nkv * head_dim(), hidden());
+        // block rows → ring rows [ring(), ring()+8) (+ the linear control copy at [nprev, nprev+8))
+        klaunch!(self, "write_kv_b", grid(block() * nkv * head_dim()), (256, 1, 1), 0,
             (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&blk.k), d(&blk.v),
-             d(&self.wrow_blk), ring_stride() as i32, nkv as i32, HEAD_DIM as i32,
+             d(&self.wrow_blk), ring_stride() as i32, nkv as i32, head_dim() as i32,
              block() as i32, d(&blk.slot_ids)));
-        if ctl_dual_write && ntot <= RING {
-            klaunch!(self, "write_kv_b", grid(block() * nkv * HEAD_DIM), (256, 1, 1), 0,
+        if ctl_dual_write && ntot <= ring() {
+            klaunch!(self, "write_kv_b", grid(block() * nkv * head_dim()), (256, 1, 1), 0,
                 (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&blk.k), d(&blk.v),
-                 d(&self.wrow_ctl), ring_stride() as i32, nkv as i32, HEAD_DIM as i32,
+                 d(&self.wrow_ctl), ring_stride() as i32, nkv as i32, head_dim() as i32,
                  block() as i32, d(&blk.slot_ids)));
         }
-        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let scale = 1.0f32 / (head_dim() as f32).sqrt();
         let smem = crate::dflash2::band_smem(window, ntot);
-        let nh_packed = ((nq << 20) | (HEAD_DIM << 10) | nkv) as i32;
-        let packed = (((ntot as u64) << 32) | ((RING as u64) << 16) | ring_stride() as u64);
+        let nh_packed = ((nq << 20) | (head_dim() << 10) | nkv) as i32;
+        let packed = (((ntot as u64) << 32) | ((ring() as u64) << 16) | ring_stride() as u64);
         let window_b = ((window << crate::dflash2::DF2_WB_SHIFT) | block()) as i32;
-        klaunch!(self, "gqa_attn_band_ring_b", ((block() * nq) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
+        klaunch!(self, "gqa_attn_band_ring_b", ((block() * nq) as u32, 1, 1), (head_dim() as u32, 1, 1), smem as u32,
             (d(&blk.attn), d(&blk.q), d(&self.k_ring[li]), d(&self.v_ring[li]),
              d(&self.pos_blk), packed, self.ntot_dev, nh_packed, window_b, fbits(scale)));
         if ctl_dual_write && li == 0 {
             // the ring-vs-linear control: (a) the ring kernel again into a reference buffer
             // (deterministic -> bitwise copy of what just ran), (b) the S3F linear kernel over
             // the same cache's dual-written linear rows.
-            klaunch!(self, "gqa_attn_band_ring_b", ((block() * nq) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
+            klaunch!(self, "gqa_attn_band_ring_b", ((block() * nq) as u32, 1, 1), (head_dim() as u32, 1, 1), smem as u32,
                 (d(&self.ctl_attn_ref), d(&blk.q), d(&self.k_ring[li]), d(&self.v_ring[li]),
                  d(&self.pos_blk), packed, self.ntot_dev, nh_packed, window_b, fbits(scale)));
             let lin_stride = (((ntot as u64) << 16) | ring_stride() as u64) as i64;
-            klaunch!(self, "gqa_attn_band_b", ((block() * nq) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
+            klaunch!(self, "gqa_attn_band_b", ((block() * nq) as u32, 1, 1), (head_dim() as u32, 1, 1), smem as u32,
                 (d(&self.ctl_attn), d(&blk.q), d(&self.k_ring[li]), d(&self.v_ring[li]),
                  d(&self.pos_blk), lin_stride, nh_packed, window_b, fbits(scale)));
         }
-        self.gemm_lin(&blk.attn_out, &l.o_proj, d(&blk.attn), HIDDEN, nq * HEAD_DIM);
+        self.gemm_lin(&blk.attn_out, &l.o_proj, d(&blk.attn), hidden(), nq * head_dim());
         if sharded {
             // AR site 1: land the rank's o_proj partial (K-split over q heads) — conv2's
             // channel-local finish and the residual then run on the full sum.
-            self.tp_ar_bf16(d(&blk.attn_out), HIDDEN * block());
+            self.tp_ar_bf16(d(&blk.attn_out), hidden() * block());
         }
         self.conv2(&blk.fin, &blk.attn_out, &blk.dyn_attn, d(&l.attn_base) + base1_off, block(), 1);
-        klaunch!(self, "add_residual_b", grid(HIDDEN * block()), (256, 1, 1), 0,
-            (d(&blk.h), d(&blk.h), d(&blk.fin), (HIDDEN * block()) as i32));
+        klaunch!(self, "add_residual_b", grid(hidden() * block()), (256, 1, 1), 0,
+            (d(&blk.h), d(&blk.h), d(&blk.fin), (hidden() * block()) as i32));
         // mlp sublayer
-        self.rmsnorm(&blk.normed2, &blk.h, &l.post_ln, HIDDEN, block());
-        self.gemm_lin(&blk.dyn_mlp, &l.mlp_kp, d(&blk.normed2), 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.rmsnorm(&blk.normed2, &blk.h, &l.post_ln, hidden(), block());
+        self.gemm_lin(&blk.dyn_mlp, &l.mlp_kp, d(&blk.normed2), 2 * conv_kernel() * conv_groups(), hidden());
         self.conv2(&blk.x_conv2, &blk.normed2, &blk.dyn_mlp, d(&l.mlp_base), block(), 0);
-        self.gemm_lin(&blk.gate, &l.gate_proj, d(&blk.x_conv2), ni, HIDDEN);
-        self.gemm_lin(&blk.up, &l.up_proj, d(&blk.x_conv2), ni, HIDDEN);
+        self.gemm_lin(&blk.gate, &l.gate_proj, d(&blk.x_conv2), ni, hidden());
+        self.gemm_lin(&blk.up, &l.up_proj, d(&blk.x_conv2), ni, hidden());
         klaunch!(self, "silu_mul_b", grid(ni * block()), (256, 1, 1), 0,
             (d(&blk.gate), d(&blk.gate), d(&blk.up), (ni * block()) as i32));
-        self.gemm_lin(&blk.mlp_out, &l.down_proj, d(&blk.gate), HIDDEN, ni);
+        self.gemm_lin(&blk.mlp_out, &l.down_proj, d(&blk.gate), hidden(), ni);
         if sharded {
             // AR site 2: land the rank's down_proj partial (K-split over inter rows).
-            self.tp_ar_bf16(d(&blk.mlp_out), HIDDEN * block());
+            self.tp_ar_bf16(d(&blk.mlp_out), hidden() * block());
         }
         self.conv2(&blk.fin2, &blk.mlp_out, &blk.dyn_mlp, d(&l.mlp_base) + base1_off, block(), 1);
-        klaunch!(self, "add_residual_b", grid(HIDDEN * block()), (256, 1, 1), 0,
-            (d(&blk.h), d(&blk.h), d(&blk.fin2), (HIDDEN * block()) as i32));
+        klaunch!(self, "add_residual_b", grid(hidden() * block()), (256, 1, 1), 0,
+            (d(&blk.h), d(&blk.h), d(&blk.fin2), (hidden() * block()) as i32));
     }
 
     /// Refresh the per-round block position arrays (call when nprev changes, before the
     /// round): block RoPE positions = ABSOLUTE `[nprev, nprev+8)`; the linear-control rows
     /// = `[nprev, nprev+8)`.
     pub fn refresh_block_pos(&mut self) -> Result<()> {
+        self.pos_at = None;
         let n = self.nprev;
         let pos: Vec<i32> = (0..block()).map(|b| (n + b) as i32).collect();
         self.dev.htod_sync_copy_into(&pos, &mut self.pos_blk)?;
@@ -1797,7 +1942,16 @@ impl Df2Round {
         self.dev.htod_sync_copy_into(&ctl, &mut self.wrow_ctl)?;
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_blk), block());
         self.dev.synchronize()?;
+        self.pos_at = Some(n);
         Ok(())
+    }
+
+    /// PERFFIX1: `refresh_block_pos` unless the arrays already hold this frontier's values (the round's draft
+    /// refreshed them and nothing moved the ring since): saves two blocking uploads, a rope gather and a device sync
+    /// per DF2 round on the drafting rank. A rank that did not draft (a TP node adopting the head's draft) refreshes.
+    pub fn refresh_block_pos_if_stale(&mut self) -> Result<()> {
+        if self.pos_at == Some(self.nprev) { return Ok(()); }
+        self.refresh_block_pos()
     }
 
     /// The ring-vs-linear attention control (probe-only): re-run LAYER 0's attention with the
@@ -1805,14 +1959,14 @@ impl Df2Round {
     /// dual-written) and return the output for a bit-for-bit diff vs the ring kernel's.
     pub fn ctl_linear_attn(&mut self, window: usize) -> Result<Vec<f32>> {
         let ntot = self.nprev + block();
-        assert!(ntot <= RING, "the linear control needs ntot {} <= RING {RING}", ntot);
-        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        assert!(ntot <= ring(), "the linear control needs ntot {} <= ring {}", ntot, ring());
+        let scale = 1.0f32 / (head_dim() as f32).sqrt();
         let smem = crate::dflash2::band_smem(window, ntot);
         let (nq, nkv) = (self.nq_l, self.nkv_l);
-        let nh_packed = ((nq << 20) | (HEAD_DIM << 10) | nkv) as i32;
+        let nh_packed = ((nq << 20) | (head_dim() << 10) | nkv) as i32;
         let ntot_stride = ((ntot as u64) << 16) | ring_stride() as u64;
         let window_b = ((window << crate::dflash2::DF2_WB_SHIFT) | block()) as i32;
-        klaunch!(self, "gqa_attn_band_b", ((block() * nq) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
+        klaunch!(self, "gqa_attn_band_b", ((block() * nq) as u32, 1, 1), (head_dim() as u32, 1, 1), smem as u32,
             (d(&self.blk.attn), d(&self.blk.q), d(&self.k_ring[0]), d(&self.v_ring[0]),
              d(&self.pos_blk), ntot_stride, nh_packed, window_b, fbits(scale)));
         let a: Vec<bf16> = self.dev.dtoh_sync_copy(&self.blk.attn)?;
@@ -1825,7 +1979,7 @@ impl Df2Round {
     /// committed-row sample (rows 0..4 and C-4..C) — the write_kv targets and their neighbors.
     pub fn dump_ring_regions(&self, li: usize, c: usize) -> Result<(Vec<f32>, Vec<f32>)> {
         let stride_r: usize = ring_stride(); // 2056, runtime (block-dependent)
-        const RING_R: usize = RING;          // 2048
+        let ring_r: usize = ring();            // 2048 for both shipped artifacts
         let nkv = self.nkv_l;
         let mut grab = |buf: &CudaSlice<bf16>| -> Vec<f32> {
             let full: Vec<bf16> = self.dev.dtoh_sync_copy(buf).unwrap();
@@ -1834,7 +1988,7 @@ impl Df2Round {
                 let base = h * stride_r * 128;
                 for r in 0..4usize { out.extend(full[base + r * 128..base + r * 128 + 128].iter().map(|x| x.to_f32())); }
                 for r in (c - 4)..c { out.extend(full[base + r * 128..base + r * 128 + 128].iter().map(|x| x.to_f32())); }
-                for r in RING_R..(RING_R + 8) { out.extend(full[base + r * 128..base + r * 128 + 128].iter().map(|x| x.to_f32())); }
+                for r in ring_r..(ring_r + 8) { out.extend(full[base + r * 128..base + r * 128 + 128].iter().map(|x| x.to_f32())); }
             }
             out
         };
@@ -1846,13 +2000,13 @@ impl Df2Round {
     /// if it reproduces round-0's value, blk.attn was overwritten after attention.
     pub fn ctl_ring_attn(&mut self, window: usize) -> Result<Vec<f32>> {
         let ntot = self.nprev + block();
-        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let scale = 1.0f32 / (head_dim() as f32).sqrt();
         let smem = crate::dflash2::band_smem(window, ntot);
         let (nq, nkv) = (self.nq_l, self.nkv_l);
-        let nh_packed = ((nq << 20) | (HEAD_DIM << 10) | nkv) as i32;
-        let packed = (((ntot as u64) << 32) | ((RING as u64) << 16) | ring_stride() as u64);
+        let nh_packed = ((nq << 20) | (head_dim() << 10) | nkv) as i32;
+        let packed = (((ntot as u64) << 32) | ((ring() as u64) << 16) | ring_stride() as u64);
         let window_b = ((window << crate::dflash2::DF2_WB_SHIFT) | block()) as i32;
-        klaunch!(self, "gqa_attn_band_ring_b", ((block() * nq) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
+        klaunch!(self, "gqa_attn_band_ring_b", ((block() * nq) as u32, 1, 1), (head_dim() as u32, 1, 1), smem as u32,
             (d(&self.ctl_attn_ref), d(&self.blk.q), d(&self.k_ring[0]), d(&self.v_ring[0]),
              d(&self.pos_blk), packed, self.ntot_dev, nh_packed, window_b, fbits(scale)));
         let v: Vec<bf16> = self.dev.dtoh_sync_copy(&self.ctl_attn_ref)?;
@@ -1866,12 +2020,12 @@ impl Df2Round {
         Ok(v.iter().map(|x| x.to_f32()).collect())
     }
 
-    /// S5F3 dump: read back selected RING rows (k+v, bf16-as-f32) for one layer — the ctx
-    /// rows `[c_lo, c_hi)` + the block rows `[RING, RING+8)`. The S1 ring-bisect surface.
+    /// S5F3 dump: read back selected ring() rows (k+v, bf16-as-f32) for one layer — the ctx
+    /// rows `[c_lo, c_hi)` + the block rows `[ring(), ring()+8)`. The S1 ring-bisect surface.
     pub fn dump_ring_rows(&self, li: usize, c_lo: usize, c_hi: usize) -> Result<(Vec<f32>, Vec<f32>)> {
         let nkv = self.nkv_l;
-        let hd = crate::dflash2::HEAD_DIM;
-        let rows: Vec<usize> = (c_lo..c_hi.min(RING)).chain(RING..RING + 8).collect();
+        let hd = crate::dflash2::head_dim();
+        let rows: Vec<usize> = (c_lo..c_hi.min(ring())).chain(ring()..ring() + 8).collect();
         // The ring's writers run on the ROUND's stream — the dtoh (NULL stream) must not race
         // them: a device-wide sync first (dump-only path).
         self.dev.synchronize()?;
@@ -1906,7 +2060,7 @@ impl Df2Round {
     /// S5F probe debug: the post-final-norm block hidden read back (row-major [8][HIDDEN]).
     pub fn dump_h_final(&self) -> Result<Vec<f32>> {
         let v: Vec<bf16> = self.dev.dtoh_sync_copy(&self.blk.h_final)?;
-        Ok(v[..HIDDEN * block()].iter().map(|x| x.to_f32()).collect())
+        Ok(v[..hidden() * block()].iter().map(|x| x.to_f32()).collect())
     }
 
     /// The block hidden (pre-final-norm) read back (probe).

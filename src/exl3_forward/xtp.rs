@@ -1706,12 +1706,12 @@ impl FwdModel {
                     anyhow::ensure!(kb % q.ks == 0, "chain ks {} does not divide kb {}", q.ks, kb);
                     anyhow::ensure!(q.ks as usize * mn <= ws.len(), "chain_ws too small: need {} have {}", q.ks as usize * mn, ws.len());
                     xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                             (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.bits))?;
+                             (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.k2))?;
                     xqlaunch!(l, "xq_ks_combine_f32_k1l", g(mn), (256, 1, 1), 0,
                              (tp.dec_ctx(), ws, part, m as i32, q.n, q.ks as i32, arrive))?;
                 } else {
                     xqlaunch!(l, "exl3_hmma_gemm", ((q.n as u32) / 128, 1, 1), (256, 1, 1), 0,
-                             (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.bits))?;
+                             (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.k2))?;
                     xqlaunch!(l, "xq_cvt_f16_f32_k1l", g(mn), (256, 1, 1), 0, (tp.dec_ctx(), part, yp, mn as i32, arrive))?;
                 }
                 tp.dec_sum_finish(l, d, yp, part, mn)?;
@@ -1723,11 +1723,11 @@ impl FwdModel {
                 anyhow::ensure!(kb % q.ks == 0, "chain ks {} does not divide kb {}", q.ks, kb);
                 anyhow::ensure!(q.ks as usize * mn <= ws.len(), "chain_ws too small: need {} have {}", q.ks as usize * mn, ws.len());
                 xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                         (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.bits))?;
+                         (&q.tr, &mut *xh, ws, m as i32, q.k, q.n, q.k2))?;
                 xqlaunch!(l, "xq_ks_combine_f32", g(mn), (256, 1, 1), 0, (ws, part, m as i32, q.n, q.ks as i32))?;
             } else {
                 xqlaunch!(l, "exl3_hmma_gemm", ((q.n as u32) / 128, 1, 1), (256, 1, 1), 0,
-                         (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.bits))?;
+                         (&q.tr, &mut *xh, &mut *yraw, m as i32, q.k, q.n, q.k2))?;
                 xqlaunch!(l, "xq_cvt_f16_f32", g(mn), (256, 1, 1), 0, (part, &*yraw, mn as i64))?;
             }
         } else {
@@ -1911,8 +1911,8 @@ fn le_u16v(b: &[u8]) -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes(
 
 /// Gather the 16x16-block sub-array (row block ranges x col block ranges, in 16-units) of a
 /// trellis [kb][nb][16*bits] — the load-time slice/re-tile (a copy, never a requant).
-pub(super) fn slice_trellis<T: Copy>(tr: &[T], nb: usize, bits: usize, rows: &[(usize, usize)], cols: &[(usize, usize)]) -> Vec<T> {
-    let bw = 16 * bits;
+pub(super) fn slice_trellis<T: Copy>(tr: &[T], nb: usize, k2: usize, rows: &[(usize, usize)], cols: &[(usize, usize)]) -> Vec<T> {
+    let bw = 8 * k2; // uint16 words per tile (16*K, or 8*k2 with K possibly X.5)
     let mut out = Vec::new();
     for &(r0, r1) in rows {
         for r in r0..r1 {
@@ -2092,11 +2092,11 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
         let tr = le_i16v(&m.trellis.read_bytes(dir)?);
         let suh = le_u16v(&m.suh.read_bytes(dir)?);
         let svh = le_u16v(&m.svh.read_bytes(dir)?);
-        let (k, n, bits) = (m.k, m.n, m.bits);
+        let (k, n, k2) = (m.k, m.n, m.k2);
         let (kb, nb) = (k / 16, n / 16);
-        anyhow::ensure!(tr.len() == kb * nb * 16 * bits && suh.len() == k && svh.len() == n,
-            "{}: trellis/suh/svh shapes do not match k={k} n={n} bits={bits}", m.name);
-        let full = crate::exl3::decode_trellis_host(&tr, kb, nb, bits);
+        anyhow::ensure!(tr.len() == kb * nb * 8 * k2 && suh.len() == k && svh.len() == n,
+            "{}: trellis/suh/svh shapes do not match k={k} n={n} k2={k2}", m.name);
+        let full = crate::exl3::decode_trellis_host(&tr, kb, nb, k2);
         let class = class_of(&m.name);
         let x: Vec<f64> = (0..k).map(|_| next()).collect();
         // the full operator once per module (skipped for the 635M-weight lm_head beyond one check)
@@ -2118,9 +2118,9 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
             match &plan {
                 SplitPlan::Col(parts) => {
                     for cols in parts {
-                        let s = slice_trellis(&tr, nb, bits, &[(0, kb)], cols);
+                        let s = slice_trellis(&tr, nb, k2, &[(0, kb)], cols);
                         let ns = span_len(cols);
-                        let dec = crate::exl3::decode_trellis_host(&s, kb, ns, bits);
+                        let dec = crate::exl3::decode_trellis_host(&s, kb, ns, k2);
                         let cidx: Vec<usize> = cols.iter().flat_map(|&(a, b)| (a * 16)..(b * 16)).collect();
                         let mut bad = 0usize;
                         for r in 0..k {
@@ -2138,9 +2138,9 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
                 SplitPlan::Row(parts) => {
                     let mut zsum = vec![0f64; n];
                     for rows in parts {
-                        let s = slice_trellis(&tr, nb, bits, rows, &[(0, nb)]);
+                        let s = slice_trellis(&tr, nb, k2, rows, &[(0, nb)]);
                         let ks = span_len(rows);
-                        let dec = crate::exl3::decode_trellis_host(&s, ks, nb, bits);
+                        let dec = crate::exl3::decode_trellis_host(&s, ks, nb, k2);
                         let ridx: Vec<usize> = rows.iter().flat_map(|&(a, b)| (a * 16)..(b * 16)).collect();
                         let mut bad = 0usize;
                         for (p, &r) in ridx.iter().enumerate() {
@@ -2166,8 +2166,8 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
         // weights are block-exact at any 16 multiple, but the OPERATOR's output H128 is cut.
         if n >= 256 {
             let cols = [(4usize, 12usize)];
-            let s = slice_trellis(&tr, nb, bits, &[(0, kb)], &cols);
-            let dec = crate::exl3::decode_trellis_host(&s, kb, 8, bits);
+            let s = slice_trellis(&tr, nb, k2, &[(0, kb)], &cols);
+            let dec = crate::exl3::decode_trellis_host(&s, kb, 8, k2);
             let svh_s: Vec<u16> = (64..192).map(|c| svh[c]).collect();
             let y_s = op_f64(&dec, k, 128, &suh, &svh_s, &x);
             let err = (0..128).map(|p| (y_s[p] - y_full[64 + p]).abs()).fold(0f64, f64::max);
@@ -2208,13 +2208,14 @@ pub fn probe_slice(dir: &str, experts_per_layer: usize, gpu: bool) -> Result<()>
     Ok(())
 }
 
-fn quad_from_host(dev: &Arc<CudaDevice>, tr: &[i16], suh: &[u16], svh: &[u16], k: usize, n: usize, bits: usize) -> Result<Quad> {
+fn quad_from_host(dev: &Arc<CudaDevice>, tr: &[i16], suh: &[u16], svh: &[u16], k: usize, n: usize, k2: usize) -> Result<Quad> {
     let tru: Vec<u16> = tr.iter().map(|&v| v as u16).collect();
     Ok(Quad {
         tr: dev.htod_sync_copy(&tru)?,
         suh: dev.htod_sync_copy(suh)?,
         svh: dev.htod_sync_copy(svh)?,
-        bits: bits as i32,
+        bits: (k2 / 2) as i32,
+        k2: k2 as i32,
         k: k as i32,
         n: n as i32,
         ks: chain_ks(k as i32, n as i32),
@@ -2246,14 +2247,14 @@ fn probe_slice_gpu(dir: &str, pack: &Exl3Pack) -> Result<()> {
         let tr = le_i16v(&m.trellis.read_bytes(dir)?);
         let suh = le_u16v(&m.suh.read_bytes(dir)?);
         let svh = le_u16v(&m.svh.read_bytes(dir)?);
-        let (k, n, bits) = (m.k, m.n, m.bits);
+        let (k, n, k2) = (m.k, m.n, m.k2);
         let (kb, nb) = (k / 16, n / 16);
-        let full_cpu = crate::exl3::decode_trellis_host(&tr, kb, nb, bits);
+        let full_cpu = crate::exl3::decode_trellis_host(&tr, kb, nb, k2);
         let Some((desc, plan)) = planned_split(name, k, n, 2, cfg) else { continue };
         let parts = match &plan { SplitPlan::Col(p) => p.clone(), SplitPlan::Row(p) => p.clone() };
         let is_col = matches!(plan, SplitPlan::Col(_));
         // full chain at m=1 (only for K == hidden inputs; sc-free buffers sized here)
-        let qf = quad_from_host(&dev, &tr, &suh, &svh, k, n, bits)?;
+        let qf = quad_from_host(&dev, &tr, &suh, &svh, k, n, k2)?;
         let xh_host: Vec<u16> = (0..k).map(|i| f16::from_f32(((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 0.2).to_bits()).collect();
         let x = dev.htod_sync_copy(&xh_host)?;
         let mut xh = dev.alloc_zeros::<u16>(k.max(16) * 16)?;
@@ -2268,16 +2269,16 @@ fn probe_slice_gpu(dir: &str, pack: &Exl3Pack) -> Result<()> {
         let mut row_sum = vec![0f32; n];
         for (r, rng) in parts.iter().enumerate() {
             let (rows, cols) = if is_col { (vec![(0, kb)], rng.clone()) } else { (rng.clone(), vec![(0, nb)]) };
-            let st = slice_trellis(&tr, nb, bits, &rows, &cols);
+            let st = slice_trellis(&tr, nb, k2, &rows, &cols);
             let (ks_, ns_) = (span_len(&rows), span_len(&cols));
             let ridx: Vec<usize> = rows.iter().flat_map(|&(a, b)| (a * 16)..(b * 16)).collect();
             let cidx: Vec<usize> = cols.iter().flat_map(|&(a, b)| (a * 16)..(b * 16)).collect();
             let suh_s: Vec<u16> = ridx.iter().map(|&i| suh[i]).collect();
             let svh_s: Vec<u16> = cidx.iter().map(|&i| svh[i]).collect();
-            let q = quad_from_host(&dev, &st, &suh_s, &svh_s, ks_ * 16, ns_ * 16, bits)?;
+            let q = quad_from_host(&dev, &st, &suh_s, &svh_s, ks_ * 16, ns_ * 16, k2)?;
             let wdec = dev.alloc_zeros::<u16>(ks_ * 16 * ns_ * 16)?;
             exl3_reconstruct(&l, *q.tr.device_ptr() as u64, *rc.device_ptr() as u64, *wdec.device_ptr() as u64,
-                             (ks_ * 16) as i32, (ns_ * 16) as i32, bits as i32)?;
+                             (ks_ * 16) as i32, (ns_ * 16) as i32, k2 as i32)?;
             dev.synchronize()?;
             let wd = dev.dtoh_sync_copy(&wdec)?;
             for (pr, &rr) in ridx.iter().enumerate() {

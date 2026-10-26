@@ -362,9 +362,14 @@ impl QwenTokenizer {
         if let Some(env) = &self.chat_env {
             let msgs: Vec<serde_json::Value> =
                 messages.iter().map(|m| m.to_template_json(self.raw_tool_args_history)).collect();
+            // NAIVE S5: a toolless request renders `tools` as an EMPTY LIST, not null. minijinja answers
+            // `none is iterable` with true (Jinja2: false), so a template guarded by
+            // `tools is iterable and tools | length > 0` (Naive-N0.5) raised "cannot calculate length of
+            // value of type none"; `[]` reads the same as null under every guard in use (`if tools`,
+            // `tools and tools is iterable and tools is not mapping`: Qwen3.8).
             let mut ctx = serde_json::json!({
                 "messages": msgs,
-                "tools": tools,
+                "tools": tools.map(|t| serde_json::Value::Array(t.to_vec())).unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
                 "add_generation_prompt": add_generation_prompt,
             });
             // W1: `chat_template_kwargs` (the vLLM/SGLang field OpenAI clients send) is an

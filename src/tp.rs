@@ -30,6 +30,8 @@ const DEFAULT_RDMA_DEV: &str = "rocep1s0f1";
 
 /// Wire default for `df2_block` when an older peer omits the field: the shipped block (8).
 fn df2_block_default() -> usize { crate::dflash2::BLOCK }
+/// Wire default for `df2_mask_override` when an older peer omits the field: ON (the default).
+fn df2_mask_override_default() -> bool { true }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TpConfig {
@@ -236,6 +238,11 @@ pub struct TpConfig {
     /// (an old head) means the default 8 via `df2_block_default()`.
     #[serde(default = "df2_block_default")]
     pub df2_block: usize,
+    /// DFLASH2-GEN: the head's resolved `--df2-mask-override <on|off>` (default ON). SPMD —
+    /// every rank must embed MASK rows the same way or the verify columns diverge. An older
+    /// peer omitting the field gets ON (the default behavior).
+    #[serde(default = "df2_mask_override_default")]
+    pub df2_mask_override: bool,
     /// DF2_CARRY: keep DFlash2 in the draft seat across a prefix-cache hit (default OFF until
     /// `PLAN/DF2_CARRY_SPEC.md` §7 is green). SPMD — every rank must make the SAME admit
     /// decision, or the carried lane would desync the verify all-reduce. Absent (an old head)
@@ -425,6 +432,7 @@ impl TpConfig {
             df2_sha_pin: None,
             df2_round_shard: false,
             df2_block: crate::dflash2::BLOCK,
+            df2_mask_override: true,
             df2_carry: false,
             df2_step_dump: false,
             df2_prose_lane_greedy: false,
@@ -461,14 +469,17 @@ pub fn set_tp_config(c: TpConfig) {
                mtp_depth={:?} batch_probe={:?} step_probe={:?} mode_serve={} accept={:?} capture={:?} \
                dspark={} dspark_depth={:?} exact_gemm={} server_dspark={} fp8_head={} splitk_gemm={} \
                mxfp4={} mxfp4_mtp_native={} dflash={} moe_fold={} e8_shard={} e9_fold={} \
-               gpu_recv={:?} reduce_fuse={:?} df2_round_shard={} df2_block={} df2_carry={} df2_prose_lane_greedy={}",
+               gpu_recv={:?} reduce_fuse={:?} df2_round_shard={} df2_block={} df2_carry={} df2_prose_lane_greedy={} df2_mask_override={}",
               c.world, c.shard_mixers, c.shard_mtp, c.graph, c.fp32_partials, c.trace, c.mtp,
               c.mtp_depth, c.batch_probe, c.step_probe, c.mode_serve, c.accept, c.capture,
               c.dspark, c.dspark_depth, c.exact_gemm, c.server_dspark, c.dspark_fp8_head,
               c.splitk_gemm, c.mxfp4, c.mxfp4_mtp_native, c.dflash, c.moe_fold, c.e8_shard, c.e9_fold,
-              c.gpu_recv, c.reduce_fuse, c.df2_round_shard, c.df2_block, c.df2_carry, c.df2_prose_lane_greedy);
+              c.gpu_recv, c.reduce_fuse, c.df2_round_shard, c.df2_block, c.df2_carry, c.df2_prose_lane_greedy, c.df2_mask_override);
     // Phase-9 A.2: publish the boot context the status route reports (tp width, df2 block).
     crate::tel::set_boot(c.world as usize, c.df2_block as usize);
+    // DFLASH2-GEN: SPMD-apply the mask-row override switch (node: from the head's shipped
+    // config; head: re-stores its own already-installed CLI value — a no-op).
+    crate::dflash2::set_mask_override(c.df2_mask_override);
     if TP_CONFIG.set(c).is_err() {
         eprintln!("[tp] WARNING: TP config already installed — keeping the first");
     }
@@ -818,6 +829,8 @@ pub enum TpBranch {
     Generate,
     /// TP-A: the EXL3 cross-TP probe program (rung 3).
     Exl3Xtp,
+    /// NAIVE S5: the Naive-N0.5 TP program (fork naive-n05).
+    Naive,
 }
 
 impl TpBranch {
@@ -835,6 +848,7 @@ impl TpBranch {
             TpBranch::BinvTp => 0x70,
             TpBranch::StateTp => 0x71,
             TpBranch::Exl3Xtp => 0x80,
+            TpBranch::Naive => 0x90,
         }
     }
 }

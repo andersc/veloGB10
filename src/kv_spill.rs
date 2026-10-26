@@ -101,6 +101,11 @@ impl Policy {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+    /// LANERES3: the configured byte cap — the TP capture gate reads it as the
+    /// deterministic budget check (identical on every rank, unlike the live writer queue).
+    pub fn cap_bytes(&self) -> u64 {
+        self.cap_bytes
+    }
     pub fn contains(&self, conv: u64) -> bool {
         self.lru.iter().any(|&(c, _, _)| c == conv)
     }
@@ -200,6 +205,7 @@ impl Policy {
 /// enqueues (async, never in the round) and, on restore, does one synchronous read — the same
 /// blocking an admission prefill already costs. Payloads are opaque to this module: the engine
 /// serializes lane snapshots through its per-slot checkpoint path, so bit-exactness is theirs.
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
     tx: Option<Sender<Job>>,
@@ -307,6 +313,26 @@ impl Store {
             self.pending.fetch_add(total, Ordering::Relaxed);
         }
         Ok(total)
+    }
+
+    /// LANERES3 (TP): write one snapshot SYNCHRONOUSLY from the calling (scheduler) thread —
+    /// the TP capture hook needs the outcome at the lockstep point where it is agreed
+    /// across ranks (`TpSync::spill_agree`), not an async completion that lands at an
+    /// arbitrary later step. Same file format and accounting as the writer thread's
+    /// Job::Write (tmp + rename); no queue, so no `max_pending` pressure — the TP path has
+    /// at most one capture in flight at a time by construction (admission is serial).
+    pub fn put_sync(&self, conv: u64, rank: usize, data: &[u8]) -> io::Result<u64> {
+        let path = path_for(&self.dir, conv, rank);
+        let tmp = path.with_extension("ksp.part");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        self.written.fetch_add(1, Ordering::Relaxed);
+        self.durable.fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(data.len() as u64)
     }
 
     /// Synchronous read for a restore: tokens + payload; Err on any miss/corruption (the caller

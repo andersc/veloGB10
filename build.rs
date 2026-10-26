@@ -71,6 +71,12 @@ fn main() {
         ("exl3_bench.cu", "exl3_bench.ptx", "sm_121"),
         // CF-P1g (4.05 bpw): the same source with a `case 6` in every bit-width switch (see the file).
         ("exl3_bench_k6.cu", "exl3_bench_k6.ptx", "sm_121"),
+        // NAIVE (PLAN/NAIVE_N05_PORT.md S3): the Naive-N0.5-Flash family module — copies of the EXL3
+        // kernels with half-integer trellis rates; loaded by src/naive/gpu.rs only.
+        ("gpu_naive.cu", "gpu_naive.ptx", "sm_121"),
+        // NAIVE S8: the DSpark drafter round (plain f16 weights, small-M mma GEMM, Markov + confidence);
+        // loaded by src/naive/drafter_gpu.rs only.
+        ("gpu_naive_draft.cu", "gpu_naive_draft.ptx", "sm_121"),
     ];
 
     for (src_name, _, _) in &kernels {

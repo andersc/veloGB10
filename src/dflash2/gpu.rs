@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 use crate::dflash2::mirror;
 use crate::dflash2::oracle::Dflash2Config;
-use crate::dflash2::{block, CONV_GROUP, CONV_GROUPS, CONV_KERNEL, HEAD_DIM, HIDDEN, INTER, N_LAYERS,
-                       NUM_HEADS, NUM_KV_HEADS, RMS_EPS, TAP_CONCAT_DIM};
+use crate::dflash2::{block, conv_group, conv_groups, conv_kernel, head_dim, hidden, inter, n_layers,
+                       num_heads, num_kv_heads, rms_eps, tap_concat_dim};
 
 fn d<T>(s: &CudaSlice<T>) -> u64 {
     *s.device_ptr()
@@ -249,7 +249,7 @@ impl Df2Gpu {
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
         let kptx = Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         let kfnames = ["gemm_dsp_b_m8_r2", "gemm_dsp_b_m8_r4", "gemm_tiled_b",
-            "conv2_dynamic_b", "gqa_attn_band_b", "kernel_build_id"];
+            "conv2_dynamic_b", "gqa_attn_band_b", "kernel_build_id", "df2_tap_hcmean_b"];
         dev.load_ptx(kptx, "gpu_kernels", &kfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_kernels")?;
         let mut bk = HashMap::new();
@@ -258,7 +258,7 @@ impl Df2Gpu {
             bk.insert(n.to_string(), dev.get_func(module, n).with_context(|| format!("kernel {n} not in ptx"))?);
         }
 
-        let mut layers = Vec::with_capacity(N_LAYERS);
+        let mut layers = Vec::with_capacity(n_layers());
         for l in &w.layers {
             layers.push(GpuLayer {
                 q_proj: Df2W::Bf16(upload_bf16(&dev, &l.q_proj)),
@@ -297,34 +297,34 @@ impl Df2Gpu {
 
         let alloc_z = |n: usize| dev.alloc_zeros::<bf16>(n).expect("alloc bf16");
         let caches_n = max_c + block();
-        let mut k_cache = Vec::with_capacity(N_LAYERS);
-        let mut v_cache = Vec::with_capacity(N_LAYERS);
-        for _ in 0..N_LAYERS {
-            k_cache.push(alloc_z(NUM_KV_HEADS * caches_n * HEAD_DIM));
-            v_cache.push(alloc_z(NUM_KV_HEADS * caches_n * HEAD_DIM));
+        let mut k_cache = Vec::with_capacity(n_layers());
+        let mut v_cache = Vec::with_capacity(n_layers());
+        for _ in 0..n_layers() {
+            k_cache.push(alloc_z(num_kv_heads() * caches_n * head_dim()));
+            v_cache.push(alloc_z(num_kv_heads() * caches_n * head_dim()));
         }
 
         let blk = BlockScratch {
-            normed: alloc_z(HIDDEN * block()),
-            x_conv: alloc_z(HIDDEN * block()),
-            dyn_attn: alloc_z(2 * CONV_KERNEL * CONV_GROUPS * block()),
-            q: alloc_z(NUM_HEADS * HEAD_DIM * block()),
-            k: alloc_z(NUM_KV_HEADS * HEAD_DIM * block()),
-            v: alloc_z(NUM_KV_HEADS * HEAD_DIM * block()),
-            attn: alloc_z(NUM_HEADS * HEAD_DIM * block()),
-            attn_out: alloc_z(HIDDEN * block()),
-            fin: alloc_z(HIDDEN * block()),
-            normed2: alloc_z(HIDDEN * block()),
-            x_conv2: alloc_z(HIDDEN * block()),
-            dyn_mlp: alloc_z(2 * CONV_KERNEL * CONV_GROUPS * block()),
-            gate: alloc_z(INTER * block()),
-            up: alloc_z(INTER * block()),
-            mlp_out: alloc_z(HIDDEN * block()),
-            fin2: alloc_z(HIDDEN * block()),
-            h: alloc_z(HIDDEN * block()),
-            h_final: alloc_z(HIDDEN * block()),
-            cos8: dev.alloc_zeros::<f32>(block() * HEAD_DIM).expect("alloc f32"),
-            sin8: dev.alloc_zeros::<f32>(block() * HEAD_DIM).expect("alloc f32"),
+            normed: alloc_z(hidden() * block()),
+            x_conv: alloc_z(hidden() * block()),
+            dyn_attn: alloc_z(2 * conv_kernel() * conv_groups() * block()),
+            q: alloc_z(num_heads() * head_dim() * block()),
+            k: alloc_z(num_kv_heads() * head_dim() * block()),
+            v: alloc_z(num_kv_heads() * head_dim() * block()),
+            attn: alloc_z(num_heads() * head_dim() * block()),
+            attn_out: alloc_z(hidden() * block()),
+            fin: alloc_z(hidden() * block()),
+            normed2: alloc_z(hidden() * block()),
+            x_conv2: alloc_z(hidden() * block()),
+            dyn_mlp: alloc_z(2 * conv_kernel() * conv_groups() * block()),
+            gate: alloc_z(inter() * block()),
+            up: alloc_z(inter() * block()),
+            mlp_out: alloc_z(hidden() * block()),
+            fin2: alloc_z(hidden() * block()),
+            h: alloc_z(hidden() * block()),
+            h_final: alloc_z(hidden() * block()),
+            cos8: dev.alloc_zeros::<f32>(block() * head_dim()).expect("alloc f32"),
+            sin8: dev.alloc_zeros::<f32>(block() * head_dim()).expect("alloc f32"),
             slot_ids: dev.alloc_zeros::<i32>(block()).expect("alloc i32"),
         };
 
@@ -359,31 +359,31 @@ impl Df2Gpu {
 
     fn conv2(&self, out: &CudaSlice<bf16>, x: &CudaSlice<bf16>, dyn_all: &CudaSlice<bf16>,
              base_ptr: u64, n: usize, side: usize) {
-        let dyn_side = (side * CONV_KERNEL * CONV_GROUPS) as i32;
-        let dyn_stride = (2 * CONV_KERNEL * CONV_GROUPS) as i32;
-        klaunch!(self, "conv2_dynamic_b", grid(n * HIDDEN), (256, 1, 1), 0,
-            (d(out), d(x), d(dyn_all), base_ptr, HIDDEN as i32, n as i32,
-             CONV_GROUPS as i32, CONV_GROUP as i32, dyn_side, dyn_stride));
+        let dyn_side = (side * conv_kernel() * conv_groups()) as i32;
+        let dyn_stride = (2 * conv_kernel() * conv_groups()) as i32;
+        klaunch!(self, "conv2_dynamic_b", grid(n * hidden()), (256, 1, 1), 0,
+            (d(out), d(x), d(dyn_all), base_ptr, hidden() as i32, n as i32,
+             conv_groups() as i32, conv_group() as i32, dyn_side, dyn_stride));
     }
 
     fn rmsnorm(&self, out: &CudaSlice<bf16>, x: &CudaSlice<bf16>, w: &CudaSlice<f32>, n: usize, b: usize) {
         klaunch!(self, "rmsnorm_b", (b as u32, 1, 1), (1024, 1, 1), 4096,
-            (d(out), d(x), d(w), n as i32, b as i32, fbits(RMS_EPS)));
+            (d(out), d(x), d(w), n as i32, b as i32, fbits(rms_eps())));
     }
 
     fn rmsnorm_perhead(&self, x: &CudaSlice<bf16>, w: &CudaSlice<f32>, heads: usize, b: usize) {
-        klaunch!(self, "rmsnorm_perhead_b", ((b * heads) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), (HEAD_DIM * 4) as u32,
-            (d(x), d(x), d(w), heads as i32, HEAD_DIM as i32, b as i32, fbits(RMS_EPS)));
+        klaunch!(self, "rmsnorm_perhead_b", ((b * heads) as u32, 1, 1), (head_dim() as u32, 1, 1), (head_dim() * 4) as u32,
+            (d(x), d(x), d(w), heads as i32, head_dim() as i32, b as i32, fbits(rms_eps())));
     }
 
     fn rope(&self, x: &CudaSlice<bf16>, cos: &CudaSlice<f32>, sin: &CudaSlice<f32>, heads: usize, b: usize) {
-        let rdim = HEAD_DIM;
+        let rdim = head_dim();
         klaunch!(self, "rope_b", grid(b * heads * (rdim / 2)), (256, 1, 1), 0,
-            (d(x), d(cos), d(sin), heads as i32, HEAD_DIM as i32, rdim as i32, b as i32));
+            (d(x), d(cos), d(sin), heads as i32, head_dim() as i32, rdim as i32, b as i32));
     }
 
     fn gather_rope(&self, out_cos: &CudaSlice<f32>, out_sin: &CudaSlice<f32>, pos: u64, b: usize) {
-        let rdim = HEAD_DIM;
+        let rdim = head_dim();
         klaunch!(self, "gather_rope_b", grid(b * rdim), (256, 1, 1), 0,
             (d(out_cos), d(out_sin), d(&self.cos_table), d(&self.sin_table), pos, rdim as i32, b as i32));
     }
@@ -395,13 +395,13 @@ impl Df2Gpu {
                       cos_c: &CudaSlice<f32>, sin_c: &CudaSlice<f32>,
                       pos_ctx: &CudaSlice<i32>, slot_ids: &CudaSlice<i32>) {
         let l = &self.layers[li];
-        self.gemm_tiled(k_out, l.k_proj.bf16(), th, NUM_KV_HEADS * HEAD_DIM, HIDDEN, c);
-        self.rmsnorm_perhead(k_out, &l.k_norm, NUM_KV_HEADS, c);
-        self.rope(k_out, cos_c, sin_c, NUM_KV_HEADS, c);
-        self.gemm_tiled(v_out, l.v_proj.bf16(), th, NUM_KV_HEADS * HEAD_DIM, HIDDEN, c);
-        klaunch!(self, "write_kv_b", grid(c * NUM_KV_HEADS * HEAD_DIM), (256, 1, 1), 0,
+        self.gemm_tiled(k_out, l.k_proj.bf16(), th, num_kv_heads() * head_dim(), hidden(), c);
+        self.rmsnorm_perhead(k_out, &l.k_norm, num_kv_heads(), c);
+        self.rope(k_out, cos_c, sin_c, num_kv_heads(), c);
+        self.gemm_tiled(v_out, l.v_proj.bf16(), th, num_kv_heads() * head_dim(), hidden(), c);
+        klaunch!(self, "write_kv_b", grid(c * num_kv_heads() * head_dim()), (256, 1, 1), 0,
             (d(&self.k_cache[li]), d(&self.v_cache[li]), d(k_out), d(v_out),
-             d(pos_ctx), self.caches_n as i32, NUM_KV_HEADS as i32, HEAD_DIM as i32, c as i32,
+             d(pos_ctx), self.caches_n as i32, num_kv_heads() as i32, head_dim() as i32, c as i32,
              d(slot_ids)));
     }
 
@@ -413,7 +413,7 @@ impl Df2Gpu {
     pub fn forward(&mut self, taps: &[f32], anchor: u32, c: usize, band_window: usize, dump_pieces: bool)
         -> Result<Df2PassOut> {
         assert!(c <= self.max_c, "c {c} > max_c {}", self.max_c);
-        let tap_dim = TAP_CONCAT_DIM;
+        let tap_dim = tap_concat_dim();
 
         // ---- taps [c, 25600] row-major f32 == col-major [25600, c] bf16 (same flat layout) ----
         let taps_b: Vec<bf16> = taps.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -426,25 +426,25 @@ impl Df2Gpu {
         self.dev.htod_sync_copy_into(&pos_block, &mut self.pos_block).context("pos_block")?;
         let slot_ids: Vec<i32> = vec![0i32; c];
         let slot_ids_dev = self.dev.htod_sync_copy(&slot_ids).context("slot_ids")?;
-        let th_raw = self.dev.alloc_zeros::<bf16>(HIDDEN * c).expect("th_raw");
-        let th = self.dev.alloc_zeros::<bf16>(HIDDEN * c).expect("th");
-        let k_ctx = self.dev.alloc_zeros::<bf16>(NUM_KV_HEADS * HEAD_DIM * c).expect("k_ctx");
-        let v_ctx = self.dev.alloc_zeros::<bf16>(NUM_KV_HEADS * HEAD_DIM * c).expect("v_ctx");
-        let cos_c = self.dev.alloc_zeros::<f32>(c * HEAD_DIM).expect("cos_c");
-        let sin_c = self.dev.alloc_zeros::<f32>(c * HEAD_DIM).expect("sin_c");
+        let th_raw = self.dev.alloc_zeros::<bf16>(hidden() * c).expect("th_raw");
+        let th = self.dev.alloc_zeros::<bf16>(hidden() * c).expect("th");
+        let k_ctx = self.dev.alloc_zeros::<bf16>(num_kv_heads() * head_dim() * c).expect("k_ctx");
+        let v_ctx = self.dev.alloc_zeros::<bf16>(num_kv_heads() * head_dim() * c).expect("v_ctx");
+        let cos_c = self.dev.alloc_zeros::<f32>(c * head_dim()).expect("cos_c");
+        let sin_c = self.dev.alloc_zeros::<f32>(c * head_dim()).expect("sin_c");
 
         // ---- per-seq RoPE tables ----
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_block), block());
         self.gather_rope(&cos_c, &sin_c, d(&pos_ctx_dev), c);
 
         // ---- tap projection: th = hidden_norm(fc(taps)) over c rows ----
-        self.gemm_tiled(&th_raw, self.glob.fc.bf16(), &taps_dev, HIDDEN, tap_dim, c);
-        self.rmsnorm(&th, &th_raw, &self.glob.hidden_norm, HIDDEN, c);
+        self.gemm_tiled(&th_raw, self.glob.fc.bf16(), &taps_dev, hidden(), tap_dim, c);
+        self.rmsnorm(&th, &th_raw, &self.glob.hidden_norm, hidden(), c);
 
         // ---- draft KV write for all 5 layers (ctx rows 0..C-1) ----
         let mut layer0_k: Option<Vec<f32>> = None;
         let mut layer0_v: Option<Vec<f32>> = None;
-        for li in 0..N_LAYERS {
+        for li in 0..n_layers() {
             self.draft_kv_write(li, c, &th, &k_ctx, &v_ctx, &cos_c, &sin_c, &pos_ctx_dev, &slot_ids_dev);
             if li == 0 && dump_pieces {
                 let k = self.dev.dtoh_sync_copy(&k_ctx)?;
@@ -463,9 +463,9 @@ impl Df2Gpu {
         }
 
         // ---- 5-layer backbone ----
-        let mut layer_hiddens = Vec::with_capacity(N_LAYERS);
+        let mut layer_hiddens = Vec::with_capacity(n_layers());
         let mut layer0_pieces: Option<Df2Pieces> = None;
-        for li in 0..N_LAYERS {
+        for li in 0..n_layers() {
             self.layer_forward(li, c, band_window);
             if li == 0 && dump_pieces {
                 layer0_pieces = Some(self.dump_pieces(layer0_k.clone(), layer0_v.clone()));
@@ -475,7 +475,7 @@ impl Df2Gpu {
         }
 
         // ---- final norm ----
-        self.rmsnorm(&self.blk.h_final, &self.blk.h, &self.glob.norm, HIDDEN, block());
+        self.rmsnorm(&self.blk.h_final, &self.blk.h, &self.glob.norm, hidden(), block());
 
         self.dev.synchronize()?;
         let th = self.dev.dtoh_sync_copy(&th)?;
@@ -490,46 +490,46 @@ impl Df2Gpu {
         let l = &self.layers[li];
         let blk = &self.blk;
         let ntot = c + block();
-        let base1_off = (CONV_KERNEL * HIDDEN * 2) as u64; // byte offset of side 1 in base_kernel
+        let base1_off = (conv_kernel() * hidden() * 2) as u64; // byte offset of side 1 in base_kernel
         // attention sublayer
-        self.rmsnorm(&blk.normed, &blk.h, &l.input_ln, HIDDEN, block());
-        self.gemm_dsp(&blk.dyn_attn, l.attn_kp.bf16(), &blk.normed, 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.rmsnorm(&blk.normed, &blk.h, &l.input_ln, hidden(), block());
+        self.gemm_dsp(&blk.dyn_attn, l.attn_kp.bf16(), &blk.normed, 2 * conv_kernel() * conv_groups(), hidden());
         self.conv2(&blk.x_conv, &blk.normed, &blk.dyn_attn, d(&l.attn_base), block(), 0);
-        self.gemm_dsp(&blk.q, l.q_proj.bf16(), &blk.x_conv, NUM_HEADS * HEAD_DIM, HIDDEN);
-        self.rmsnorm_perhead(&blk.q, &l.q_norm, NUM_HEADS, block());
-        self.rope(&blk.q, &blk.cos8, &blk.sin8, NUM_HEADS, block());
-        self.gemm_dsp(&blk.k, l.k_proj.bf16(), &blk.x_conv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
-        self.rmsnorm_perhead(&blk.k, &l.k_norm, NUM_KV_HEADS, block());
-        self.rope(&blk.k, &blk.cos8, &blk.sin8, NUM_KV_HEADS, block());
-        self.gemm_dsp(&blk.v, l.v_proj.bf16(), &blk.x_conv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
-        klaunch!(self, "write_kv_b", grid(block() * NUM_KV_HEADS * HEAD_DIM), (256, 1, 1), 0,
+        self.gemm_dsp(&blk.q, l.q_proj.bf16(), &blk.x_conv, num_heads() * head_dim(), hidden());
+        self.rmsnorm_perhead(&blk.q, &l.q_norm, num_heads(), block());
+        self.rope(&blk.q, &blk.cos8, &blk.sin8, num_heads(), block());
+        self.gemm_dsp(&blk.k, l.k_proj.bf16(), &blk.x_conv, num_kv_heads() * head_dim(), hidden());
+        self.rmsnorm_perhead(&blk.k, &l.k_norm, num_kv_heads(), block());
+        self.rope(&blk.k, &blk.cos8, &blk.sin8, num_kv_heads(), block());
+        self.gemm_dsp(&blk.v, l.v_proj.bf16(), &blk.x_conv, num_kv_heads() * head_dim(), hidden());
+        klaunch!(self, "write_kv_b", grid(block() * num_kv_heads() * head_dim()), (256, 1, 1), 0,
             (d(&self.k_cache[li]), d(&self.v_cache[li]), d(&blk.k), d(&blk.v),
-             d(&self.pos_block), self.caches_n as i32, NUM_KV_HEADS as i32, HEAD_DIM as i32, block() as i32,
+             d(&self.pos_block), self.caches_n as i32, num_kv_heads() as i32, head_dim() as i32, block() as i32,
              d(&self.slot_ids())));
-        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let scale = 1.0f32 / (head_dim() as f32).sqrt();
         let smem = crate::dflash2::band_smem(band_window, ntot);
-        let nh_packed = ((NUM_HEADS << 20) | (HEAD_DIM << 10) | NUM_KV_HEADS) as i32;
+        let nh_packed = ((num_heads() << 20) | (head_dim() << 10) | num_kv_heads()) as i32;
         let ntot_stride = ((ntot as u64) << 16) | (self.caches_n as u64);
         let window_b = ((band_window << crate::dflash2::DF2_WB_SHIFT) | block()) as i32;
-        klaunch!(self, "gqa_attn_band_b", ((block() * NUM_HEADS) as u32, 1, 1), (HEAD_DIM as u32, 1, 1), smem as u32,
+        klaunch!(self, "gqa_attn_band_b", ((block() * num_heads()) as u32, 1, 1), (head_dim() as u32, 1, 1), smem as u32,
             (d(&blk.attn), d(&blk.q), d(&self.k_cache[li]), d(&self.v_cache[li]),
              d(&self.pos_block), ntot_stride, nh_packed, window_b, fbits(scale)));
-        self.gemm_dsp(&blk.attn_out, l.o_proj.bf16(), &blk.attn, HIDDEN, NUM_HEADS * HEAD_DIM);
+        self.gemm_dsp(&blk.attn_out, l.o_proj.bf16(), &blk.attn, hidden(), num_heads() * head_dim());
         self.conv2(&blk.fin, &blk.attn_out, &blk.dyn_attn, d(&l.attn_base) + base1_off, block(), 1);
-        klaunch!(self, "add_residual_b", grid(HIDDEN * block()), (256, 1, 1), 0,
-            (d(&blk.h), d(&blk.h), d(&blk.fin), (HIDDEN * block()) as i32));
+        klaunch!(self, "add_residual_b", grid(hidden() * block()), (256, 1, 1), 0,
+            (d(&blk.h), d(&blk.h), d(&blk.fin), (hidden() * block()) as i32));
         // mlp sublayer
-        self.rmsnorm(&blk.normed2, &blk.h, &l.post_ln, HIDDEN, block());
-        self.gemm_dsp(&blk.dyn_mlp, l.mlp_kp.bf16(), &blk.normed2, 2 * CONV_KERNEL * CONV_GROUPS, HIDDEN);
+        self.rmsnorm(&blk.normed2, &blk.h, &l.post_ln, hidden(), block());
+        self.gemm_dsp(&blk.dyn_mlp, l.mlp_kp.bf16(), &blk.normed2, 2 * conv_kernel() * conv_groups(), hidden());
         self.conv2(&blk.x_conv2, &blk.normed2, &blk.dyn_mlp, d(&l.mlp_base), block(), 0);
-        self.gemm_dsp(&blk.gate, l.gate_proj.bf16(), &blk.x_conv2, INTER, HIDDEN);
-        self.gemm_dsp(&blk.up, l.up_proj.bf16(), &blk.x_conv2, INTER, HIDDEN);
-        klaunch!(self, "silu_mul_b", grid(INTER * block()), (256, 1, 1), 0,
-            (d(&blk.gate), d(&blk.gate), d(&blk.up), (INTER * block()) as i32));
-        self.gemm_dsp(&blk.mlp_out, l.down_proj.bf16(), &blk.gate, HIDDEN, INTER);
+        self.gemm_dsp(&blk.gate, l.gate_proj.bf16(), &blk.x_conv2, inter(), hidden());
+        self.gemm_dsp(&blk.up, l.up_proj.bf16(), &blk.x_conv2, inter(), hidden());
+        klaunch!(self, "silu_mul_b", grid(inter() * block()), (256, 1, 1), 0,
+            (d(&blk.gate), d(&blk.gate), d(&blk.up), (inter() * block()) as i32));
+        self.gemm_dsp(&blk.mlp_out, l.down_proj.bf16(), &blk.gate, hidden(), inter());
         self.conv2(&blk.fin2, &blk.mlp_out, &blk.dyn_mlp, d(&l.mlp_base) + base1_off, block(), 1);
-        klaunch!(self, "add_residual_b", grid(HIDDEN * block()), (256, 1, 1), 0,
-            (d(&blk.h), d(&blk.h), d(&blk.fin2), (HIDDEN * block()) as i32));
+        klaunch!(self, "add_residual_b", grid(hidden() * block()), (256, 1, 1), 0,
+            (d(&blk.h), d(&blk.h), d(&blk.fin2), (hidden() * block()) as i32));
     }
 
     /// The single-slot (all-zero) id array for the block write (persistent, size 8).
@@ -545,20 +545,20 @@ impl Df2Gpu {
         };
         let blk = &self.blk;
         Df2Pieces {
-            input_ln_out: g(&blk.normed, HIDDEN * block()),
-            dyn_attn: g(&blk.dyn_attn, 2 * CONV_KERNEL * CONV_GROUPS * block()),
-            q: g(&blk.q, NUM_HEADS * HEAD_DIM * block()),
-            k: g(&blk.k, NUM_KV_HEADS * HEAD_DIM * block()),
-            v: g(&blk.v, NUM_KV_HEADS * HEAD_DIM * block()),
-            attn: g(&blk.attn, NUM_HEADS * HEAD_DIM * block()),
-            o: g(&blk.attn_out, HIDDEN * block()),
-            x_conv: g(&blk.x_conv, HIDDEN * block()),
-            fin: g(&blk.fin, HIDDEN * block()),
-            post_ln_out: g(&blk.normed2, HIDDEN * block()),
-            x_conv2: g(&blk.x_conv2, HIDDEN * block()),
-            dyn_mlp: g(&blk.dyn_mlp, 2 * CONV_KERNEL * CONV_GROUPS * block()),
-            mlp_out: g(&blk.mlp_out, HIDDEN * block()),
-            fin2: g(&blk.fin2, HIDDEN * block()),
+            input_ln_out: g(&blk.normed, hidden() * block()),
+            dyn_attn: g(&blk.dyn_attn, 2 * conv_kernel() * conv_groups() * block()),
+            q: g(&blk.q, num_heads() * head_dim() * block()),
+            k: g(&blk.k, num_kv_heads() * head_dim() * block()),
+            v: g(&blk.v, num_kv_heads() * head_dim() * block()),
+            attn: g(&blk.attn, num_heads() * head_dim() * block()),
+            o: g(&blk.attn_out, hidden() * block()),
+            x_conv: g(&blk.x_conv, hidden() * block()),
+            fin: g(&blk.fin, hidden() * block()),
+            post_ln_out: g(&blk.normed2, hidden() * block()),
+            x_conv2: g(&blk.x_conv2, hidden() * block()),
+            dyn_mlp: g(&blk.dyn_mlp, 2 * conv_kernel() * conv_groups() * block()),
+            mlp_out: g(&blk.mlp_out, hidden() * block()),
+            fin2: g(&blk.fin2, hidden() * block()),
             k_ctx: k_ctx.unwrap_or_default(),
             v_ctx: v_ctx.unwrap_or_default(),
         }
@@ -567,9 +567,9 @@ impl Df2Gpu {
 
 /// The whole-pass outputs (col-major [dim, B] flattened).
 pub struct Df2PassOut {
-    pub th: Vec<f32>,                 // [c, HIDDEN]
-    pub layer_hiddens: Vec<Vec<f32>>, // [5][block()*HIDDEN]
-    pub h: Vec<f32>,                  // [block()*HIDDEN]
+    pub th: Vec<f32>,                 // [c, hidden()]
+    pub layer_hiddens: Vec<Vec<f32>>, // [5][block()*hidden()]
+    pub h: Vec<f32>,                  // [block()*hidden()]
     pub pieces: Option<Df2Pieces>,
 }
 

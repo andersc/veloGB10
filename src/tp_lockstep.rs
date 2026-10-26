@@ -33,6 +33,8 @@ pub(crate) const RND_WIRE: usize = RND_PAYLOAD + 2;
 pub(crate) const ID_HDR: usize = 2;
 pub(crate) const ALLOC_PAYLOAD: usize = 3;
 pub(crate) const ALLOC_WIRE: usize = 10; // payload 3 + 2 tail words = 5; padded to a size no other class uses (even: 8-byte aligned tail tag)
+pub(crate) const SPILL_PAYLOAD: usize = 2;
+pub(crate) const SPILL_WIRE: usize = 16; // payload 2 + tail 2 = 4, padded to a size no other class uses (even: 8-byte aligned tail tag)
 
 /// Wire words of an IDENT frame carrying `n` digests.
 pub(crate) fn id_wire(n: usize) -> usize { ID_HDR + 2 * n + 2 }
@@ -42,6 +44,7 @@ const PV_TAG: u32 = 0x9E00_0000;
 const RND_TAG: u32 = 0xC0DE_0000;
 const ID_TAG: u32 = 0xD100_0000;
 const ALLOC_TAG: u32 = 0xA110_0000;
+const SPILL_TAG: u32 = 0x5B11_0000;
 
 /// Compare the listed words of every frame against rank 0's; Err names up to six offenders.
 fn same_words(what: &str, names: &[&str], frames: &[Vec<u32>], cmp: &[usize]) -> Result<(), String> {
@@ -191,6 +194,26 @@ pub(crate) fn alloc_verdict(frames: &[Vec<u32>], world: usize) -> Result<Vec<usi
     Ok(frames.iter().enumerate().filter(|(_, f)| f[2] == 0).map(|(r, _)| r).collect())
 }
 
+/// LANERES3: the spill tier's lockstep bit (hub path, world > 2): every rank contributes
+/// whether its LOCAL disk op succeeded (capture write / restore read); the verdict is the
+/// AND (see `TpSync::spill_agree`). [tag, ok].
+pub(crate) fn spill_frame(ok: bool) -> [u32; SPILL_PAYLOAD] {
+    [SPILL_TAG, ok as u32]
+}
+
+/// Ok(the AND of every rank's ok bit). Err = desync (shape/tag mismatch, or a rank's frame
+/// is not where the others are — never a recoverable state).
+pub(crate) fn spill_verdict(frames: &[Vec<u32>], world: usize) -> Result<bool, String> {
+    check_shape("spill agree", frames, world, SPILL_PAYLOAD)?;
+    // ISSUES 121: a spill frame is exactly [SPILL_TAG, ok]; SPILL_TAG has bits inside the low 20, so the 0xFFF0_0000 mask
+    // the other classes use rejected EVERY healthy spill frame (the first TP=4 capture killed the engine).
+    if frames[0][0] != SPILL_TAG {
+        return Err(format!("spill agree: the head's frame carries tag {:#010x}, not a spill-agree frame", frames[0][0]));
+    }
+    same_words("spill agree", &["tag", "ok"], frames, &[0])?;
+    Ok(frames.iter().all(|f| f[1] != 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +335,37 @@ mod tests {
         assert!(alloc_verdict(&other, world).unwrap_err().contains("not a checkpoint-allocation frame"));
     }
 
+    /// ISSUES 121: the spill verdict accepts its own healthy frames (it rejected every one: a tag mask that cut bits
+    /// out of SPILL_TAG), ANDs the ok bits, and still names a rank whose frame is of another class.
+    #[test]
+    fn spill_verdict_accepts_its_own_frames_and_ands_the_ok_bits() {
+        for world in [3usize, 4] {
+            assert_eq!(spill_verdict(&all_same(spill_frame(true), world), world), Ok(true), "world {world}: every rank wrote");
+            for bad in 0..world {
+                let frames: Vec<Vec<u32>> = (0..world).map(|r| spill_frame(r != bad).to_vec()).collect();
+                assert_eq!(spill_verdict(&frames, world), Ok(false), "world {world}: rank {bad}'s write failed: dropped everywhere");
+            }
+        }
+        let mut desync = all_same(spill_frame(true), 4);
+        desync[2] = vec![ALLOC_TAG | 3, 3];
+        let e = spill_verdict(&desync, 4).unwrap_err();
+        assert!(e.contains("rank 2 tag") && !e.contains("rank 1") && !e.contains("rank 3"), "{e}");
+        let mut not_spill = all_same(spill_frame(true), 4);
+        not_spill[0][0] = SPILL_TAG | 1;
+        assert!(spill_verdict(&not_spill, 4).unwrap_err().contains("not a spill-agree frame"));
+    }
+
+    /// Every lockstep class's verdict accepts the frame its own builder makes (the class of bug behind ISSUES 121:
+    /// a verdict that can never pass is invisible to a test that only feeds it bad frames).
+    #[test]
+    fn every_verdict_accepts_its_own_healthy_frames() {
+        let w = 4;
+        assert!(go_verdict(&(0..w).map(|r| go_frame(r == 0, 0xC0_0007, 0x42, 3).to_vec()).collect::<Vec<_>>(), w).is_ok());
+        assert!(pv_verdict(&all_same(pv_frame(0x77, 5, 0xDEAD_BEEF, 2), w), w).is_ok());
+        assert_eq!(alloc_verdict(&all_same(alloc_frame(7, true), w), w), Ok(vec![]));
+        assert_eq!(spill_verdict(&all_same(spill_frame(true), w), w), Ok(true));
+    }
+
     #[test]
     fn wire_sizes_fit_the_control_slot() {
         // every class keeps the tail tag 8-byte aligned (even wire words) in both the node frame and the head's
@@ -323,6 +377,7 @@ mod tests {
         assert_ne!(GO_WIRE, PV_WIRE);
         assert_ne!(PV_WIRE, RND_WIRE);
         for other in [GO_WIRE, PV_WIRE, RND_WIRE] { assert_ne!(ALLOC_WIRE, other, "frame classes of one hub lane must differ in wire size"); }
+        for other in [GO_WIRE, PV_WIRE, RND_WIRE, ALLOC_WIRE] { assert_ne!(SPILL_WIRE, other, "frame classes of one hub lane must differ in wire size"); }
         // an IDENT frame of the widest realistic digest window (rows 0..16 x (logits + resid + taps)) fits at world 8
         assert!(8 * id_wire(16 * 3 + 64) * 4 <= crate::tp::TP_SLOT_BYTES);
         assert!(GO_PAYLOAD * 4 + 8 <= GO_WIRE * 4 && PV_PAYLOAD * 4 + 8 <= PV_WIRE * 4 && RND_PAYLOAD * 4 + 8 <= RND_WIRE * 4

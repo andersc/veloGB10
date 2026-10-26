@@ -47,6 +47,7 @@ pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 pub mod quant;
 pub mod mxfp4;
 pub mod exl3;
+pub mod naive; // NAIVE: Naive-N0.5-Flash family (PLAN/NAIVE_N05_PORT.md) — own tree, copies + one-line dispatches
 pub mod shard_plan;
 pub mod exl3_bench;
 pub mod exl3_forward;

@@ -286,6 +286,32 @@ extern "C" __global__ void bf16tof32(float* dst, const __nv_bfloat16* src, int n
     if (i < n) dst[i] = __bfloat162float(src[i]);
 }
 
+// FLASHNEXT-DF2-B (2026-10-23): the DFlash2 tap capture for a HYPER-CONNECTION trunk
+// (qwen4_exp, hc_count = 4): the drafter is trained on the completed layer's residual
+// AVERAGED over the hc streams (the artifact's SGLang patch:
+// hidden_states.unflatten(-1, (hc_count, hidden)).mean(dim=-2)). The trunk's residual is
+// token-major and rw = h*hc wide (token m at m*rw, stream s at +s*h — hc_norm_b's layout),
+// which a cuMemcpy2D can neither average nor (at n > 1) even stride correctly, so the
+// hc > 1 capture is this kernel; hc == 1 trunks keep the bit-identical D2D copy
+// (dflash2::capture::capture_cols_into). dst: the tap staging, column m at m*dst_pitch,
+// this tap's rows [tap_li*h, +h). Ascending stream order, f32 accumulate, one bf16 rounding.
+extern "C" __global__ void df2_tap_hcmean_b(__nv_bfloat16* __restrict__ dst,
+                                            const __nv_bfloat16* __restrict__ src,
+                                            long long n_elems, int h, int hc, int tap_li,
+                                            long long dst_pitch) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long gs = (long long)gridDim.x * blockDim.x;
+    const long long rw = (long long)h * hc;
+    for (; i < n_elems; i += gs) {
+        const long long m = i / h;
+        const int c = (int)(i % h);
+        const __nv_bfloat16* row = src + m * rw + c;
+        float acc = __bfloat162float(row[0]);
+        for (int s = 1; s < hc; ++s) acc += __bfloat162float(row[(long long)s * h]);
+        dst[m * dst_pitch + (long long)tap_li * h + c] = __float2bfloat16(acc / (float)hc);
+    }
+}
+
 // ---- fused: residual += mixer, then out = rmsnorm(residual, w) * (1+w) ----
 // one block over vector length n.
 extern "C" __global__ void fused_residual_rmsnorm(float* out, float* residual, const float* mixer,

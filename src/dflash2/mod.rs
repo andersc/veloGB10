@@ -29,8 +29,22 @@ pub mod capture;
 pub mod round;
 pub mod stepdump;
 
+// DFLASH2-GEN: the artifact geometry module (installed from the draft config.json at load;
+// the consts below remain the 27B default and the source of Geom::default()).
+pub mod geom;
+pub use geom::{
+    geom, install_geom, install_geom_from_dir, pin_geom, geom_from_config_json, Geom,
+    hidden, num_heads, num_kv_heads, head_dim, inter, vocab, n_layers, mask_token_id,
+    rope_theta, rms_eps, max_positions, sliding_window, is_causal, conv_kernel, conv_group,
+    conv_groups, selector_rank, selector_top_k, n_taps, tap_layers, tap_concat_dim,
+    n_tensors, n_params, num_target_layers, max_ctx_safe, inventory_geom, reconcile_params_geom,
+};
+
 // ---------------------------------------------------------------------------
 // Anatomy constants (config.json + parsed safetensors header + model.py — verified 2026-08-19).
+//
+// DFLASH2-GEN: these are the 27B artifact DEFAULTS (Geom::default); the LIVE values are
+// the geom() accessors above, installed from the draft dir's config.json by the loader.
 // ---------------------------------------------------------------------------
 
 /// Hidden size of the draft backbone and the tap projection output.
@@ -82,6 +96,26 @@ pub fn levels() -> usize {
     block() - 1
 }
 
+/// The process-wide mask-row override switch (`--df2-mask-override on|off`, default ON).
+/// ON: when the trunk's quantized mask-embedding row measures DAMAGED at round load
+/// (rel-L2 > 0.25 vs the artifact's BF16 copy), the artifact row is staged and embedded
+/// for every MASK position (`round::Df2Round::mask_row_check` / `embed_gather`).
+/// OFF: the quantized row serves even when damaged — the measured A/B arm; one clear
+/// log line, no refusal.
+static MASK_OVERRIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The live mask-row override switch (true = engage the override when a row is DAMAGED).
+#[inline]
+pub fn mask_override() -> bool {
+    MASK_OVERRIDE.load(Ordering::Relaxed)
+}
+
+/// Install the mask-row override switch. Written once, before any DFlash2 round is
+/// constructed, from the resolved CLI flag (single-box/head) or the shipped TpConfig (node).
+pub fn set_mask_override(on: bool) {
+    MASK_OVERRIDE.store(on, Ordering::Relaxed);
+}
+
 /// Install the draft block. Idempotent for the same value; refuses anything outside 8 or 16.
 /// Must be called before any DFlash2 round/buffer is constructed.
 pub fn set_block(b: usize) -> anyhow::Result<()> {
@@ -121,9 +155,17 @@ pub const SLIDING_WINDOW: usize = 2048;
 /// PLAN/B8_S10R_DISSECTION.md §4). Constant at any ctx for window=SLIDING_WINDOW:
 /// (128 + 2056 + 32) x 4 = 8,864 B — never approaches the 48 KiB dynamic default cap
 /// (the old `(HEAD_DIM + ntot + 32) * 4` capped ctx at 12120).
-pub fn band_smem(window: usize, ntot: usize) -> usize {
-    let scores_len = if window + block() < ntot { window + block() } else { ntot };
-    (HEAD_DIM + scores_len + 32) * 4
+pub fn band_smem(window: usize, _ntot: usize) -> usize {
+    // FLASHNEXT-DF2-B (ISSUES work[112], 2026-10-23): ALWAYS the window bound, never
+    // min(window+B, ntot). The kernel sizes its scores region from the ntot it READS
+    // (`ntot_dev` on a replay), so a launch recorded at a small ntot inside a CUDA graph
+    // (the EXL3 step graph records the greedy DF2 draft at the current context) under-sized
+    // the dynamic smem for every later replay with a longer context: compute-sanitizer
+    // "Invalid __shared__ write ... gqa_attn_band_ring_b" (PLAN/FLASHNEXT_DF2_MEMCHECK.txt).
+    // (HEAD_DIM + window + B + 32) * 4 = 8,864 B at window 2048 / block 8 is the fixed,
+    // ctx-independent bound the S10R comment always claimed; eager launches now carry the
+    // same 8,864 B (bytes written by the kernel are unchanged — only the allocation grew).
+    (HEAD_DIM + window + block() + 32) * 4
 }
 /// S10R (2026-08-21) — the SAFE absolute-context bound for the round is now the MODEL's
 /// `max_position_embeddings` (262,144): the S10R window-bounding fix (`scores[j - lo]`,
@@ -165,7 +207,28 @@ pub const N_TENSORS: usize = 81;
 pub const N_PARAMS: u64 = 1_924_404_480;
 
 /// The published sha256 of the REAL `model.safetensors` (HF LFS oid; staged copy verified).
+/// Owner-validated 2026-10-18: the RTN-calibrated draft
+/// (`maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal`) is the production artifact; repinned to it.
+/// Previous (pre-RTNcal staged copy): 67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c
+/// (boot with `--sha256 <hex>` to use that or any other owner-verified variant).
 pub const REAL_SHA256: &str = "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c";
+/// Owner-validated 2026-10-18: the RTN-calibrated export (maurienne-ai/…-RTNcal) is a
+/// second accepted artifact (the ModelOpt loader branch reads it); listed, not primary.
+pub const RTNCAL_SHA256: &str = "2228b9b22e93a88d84556419c879448ab6c490ae65c4c0b166f4962190ddbf26";
+/// Every owner-validated draft artifact hash; the loader accepts any of these (or an
+/// explicit --sha256 override) — repinning must never orphan a validated artifact.
+/// ORNITH15 (2026-10-23): the incoai/Ornith-1.5-122B-DFlash2 draft (hidden 3072, 6 layers,
+/// 8 taps, block 16; owner-booted 2026-10-21/22 per PLAN/ORNITH15_DFLASH2_FINDINGS_2026-10-22.md).
+/// `incoai/Qwen3.8-Flash-Next-DFlash2` — the Flash-Next drafter (603,065,600 params BF16,
+/// 81 tensors, taps [5,15,25,35,45], hidden 2560, rope 1e4, mask 248077). Header-verified
+/// 2026-10-23 at FLASHNEXT-DF2 Phase 0.
+pub const FLASHNEXT_SHA256: &str =
+    "d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f";
+
+pub const ORNITH_SHA256: &str =
+    "448fed97ee07d1bd2ab2550231ceeb6272f7c846903bac46060757757227b05f";
+pub const KNOWN_SHA256: [&str; 4] =
+    [REAL_SHA256, RTNCAL_SHA256, ORNITH_SHA256, FLASHNEXT_SHA256];
 
 /// The REAL artifact directory is USER-SUPPLIED (`--draft-dir`, mandatory on every DFlash2
 /// path; owner rule 2026-08-23: no default, no fallback constant, a bad path stops the app).
@@ -197,56 +260,13 @@ pub const SYNTH_TAP_SEED: u64 = 0xDF2C_2026_7A95_0003;
 /// `{attention,mlp}_conv.kernel_projection.weight` is `[2*sides… = 2*kernel*groups, hidden]` =
 /// `[1280, 5120]`; the selector codebooks are `nn.Embedding` tables `[vocab, rank]` stored WITHOUT
 /// the `.weight` suffix (the reference's `from_pretrained` key_mapping adds it — model.py:633).
+/// The inventory for the 27B default when nothing is installed; the GEOMETRY-DRIVEN
+/// inventory (same builder, live dims) is `geom::inventory_geom(&geom())`.
 pub fn inventory() -> Vec<(String, Vec<usize>)> {
-    let mut v = Vec::with_capacity(N_TENSORS);
-    v.push(("fc.weight".to_string(), vec![HIDDEN, TAP_CONCAT_DIM]));
-    v.push(("hidden_norm.weight".to_string(), vec![HIDDEN]));
-    v.push(("norm.weight".to_string(), vec![HIDDEN]));
-    v.push((
-        "candidate_selector.hidden_projection.weight".to_string(),
-        vec![SELECTOR_RANK, HIDDEN],
-    ));
-    v.push((
-        "candidate_selector.predecessor_codebook".to_string(),
-        vec![VOCAB, SELECTOR_RANK],
-    ));
-    v.push((
-        "candidate_selector.successor_codebook".to_string(),
-        vec![VOCAB, SELECTOR_RANK],
-    ));
-    for i in 0..N_LAYERS {
-        let lp = format!("layers.{i}");
-        v.push((format!("{lp}.self_attn.q_proj.weight"), vec![NUM_HEADS * HEAD_DIM, HIDDEN]));
-        v.push((format!("{lp}.self_attn.k_proj.weight"), vec![NUM_KV_HEADS * HEAD_DIM, HIDDEN]));
-        v.push((format!("{lp}.self_attn.v_proj.weight"), vec![NUM_KV_HEADS * HEAD_DIM, HIDDEN]));
-        v.push((format!("{lp}.self_attn.o_proj.weight"), vec![HIDDEN, NUM_HEADS * HEAD_DIM]));
-        v.push((format!("{lp}.self_attn.q_norm.weight"), vec![HEAD_DIM]));
-        v.push((format!("{lp}.self_attn.k_norm.weight"), vec![HEAD_DIM]));
-        v.push((format!("{lp}.input_layernorm.weight"), vec![HIDDEN]));
-        v.push((format!("{lp}.post_attention_layernorm.weight"), vec![HIDDEN]));
-        v.push((format!("{lp}.mlp.gate_proj.weight"), vec![INTER, HIDDEN]));
-        v.push((format!("{lp}.mlp.up_proj.weight"), vec![INTER, HIDDEN]));
-        v.push((format!("{lp}.mlp.down_proj.weight"), vec![HIDDEN, INTER]));
-        v.push((
-            format!("{lp}.attention_conv.base_kernel"),
-            vec![2, CONV_KERNEL, HIDDEN],
-        ));
-        v.push((
-            format!("{lp}.attention_conv.kernel_projection.weight"),
-            vec![2 * CONV_KERNEL * CONV_GROUPS, HIDDEN],
-        ));
-        v.push((format!("{lp}.mlp_conv.base_kernel"), vec![2, CONV_KERNEL, HIDDEN]));
-        v.push((
-            format!("{lp}.mlp_conv.kernel_projection.weight"),
-            vec![2 * CONV_KERNEL * CONV_GROUPS, HIDDEN],
-        ));
-    }
-    debug_assert_eq!(v.len(), N_TENSORS);
-    v
+    geom::inventory_geom(&geom())
 }
 
-/// Reconcile the inventory to the exact published parameter count. Returns the summed param count.
-/// This is the load-bearing arithmetic the generator AND loader both assert at runtime.
+/// Reconcile the inventory to the exact parameter count for the LIVE geometry.
 pub fn reconcile_params() -> u64 {
-    inventory().iter().map(|(_, s)| s.iter().map(|&d| d as u64).product::<u64>()).sum()
+    geom::reconcile_params_geom(&geom())
 }

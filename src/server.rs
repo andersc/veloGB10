@@ -31,6 +31,32 @@ impl SamplingDefaults {
     /// Qwen3.8-Flash-Next model card: thinking temperature=1.0 top_p=0.95 top_k=20; instruct
     /// (non-thinking) temperature=0.7 top_p=0.80 top_k=20 (min_p 0 in both).
     pub const QWEN38_CARD: Self = Self { think: (1.0, 0.95, 20), no_think: (0.7, 0.8, 20) };
+
+    /// FLASHNEXT-DF2-B (ISSUES work[113]; owner decision 2026-10-08 "read the sampler triple from
+    /// generation_config.json"): the unsent-field defaults come from the PACK's
+    /// `generation_config.json` (temperature / top_p / top_k) when it has a temperature;
+    /// `fallback` otherwise. The file carries ONE triple, so it becomes the thinking-mode
+    /// values; the non-thinking values stay the family card's when the fallback is the Qwen3.8
+    /// card (its instruct recommendation 0.7 / 0.8 / 20 is not in the file), else the same
+    /// triple. Returns the defaults and a one-word provenance for the boot line.
+    pub fn from_pack(model_dir: &str, fallback: Self) -> (Self, &'static str) {
+        let path = format!("{}/generation_config.json", model_dir.trim_end_matches('/'));
+        let Ok(txt) = std::fs::read_to_string(&path) else { return (fallback, "built-in (no generation_config.json)"); };
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) else { return (fallback, "built-in (generation_config.json unreadable)"); };
+        let Some(t) = j.get("temperature").and_then(|v| v.as_f64()) else { return (fallback, "built-in (generation_config.json has no temperature)"); };
+        let top_p = j.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let top_k = j.get("top_k").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let think = (t as f32, top_p, top_k);
+        let qwen38 = fallback.think == Self::QWEN38_CARD.think && fallback.no_think == Self::QWEN38_CARD.no_think;
+        let no_think = if qwen38 { Self::QWEN38_CARD.no_think } else { think };
+        (Self { think, no_think }, "generation_config.json")
+    }
+
+    /// The boot line's text for these defaults.
+    pub fn describe(&self, source: &str) -> String {
+        format!("sampler defaults for unsent fields: thinking T={} top_p={} top_k={}; non-thinking T={} top_p={} top_k={} (source: {source}; a request's own values always win)",
+                self.think.0, self.think.1, self.think.2, self.no_think.0, self.no_think.1, self.no_think.2)
+    }
 }
 
 #[derive(Clone)]
@@ -184,20 +210,28 @@ pub fn resolve_model_name(model_name: Option<&str>, served_model_name: Option<&s
 }
 
 /// The model's PUBLIC id for /v1/models and response `model` fields: the model card's
-/// frontmatter `base_model:` line (every model dir ships one, e.g. `base_model: Qwen/Qwen3.8-27B`),
-/// falling back to the directory name when the card or the line is absent. Before this, the
-/// server reported the lab directory fragment (`"model": "3.8-27b-nvfp4-full-all"`) — an
-/// internal path name that no client or catalog can resolve. `--model-name` still overrides.
+/// frontmatter `model_name:` line (the pack's own hub id, e.g.
+/// `model_name: doth4580/Naive-N0.5-Flash-EXL3-3.5bpw`), else its `base_model:` line, else the
+/// directory name. `model_name:` was added 2026-10-20 (owner: the two Naive EXL3 packs both
+/// announced themselves as NaiveAI's own releases, since a quantized pack's `base_model:` is the
+/// ORIGINAL model, not the pack). Before `base_model:` the server reported the lab directory
+/// fragment (`"model": "3.8-27b-nvfp4-full-all"`). `--model-name` still overrides.
 pub fn model_id_from_dir(model_path: &str) -> String {
     let dir = std::path::Path::new(model_path.trim_end_matches('/'));
     if let Ok(card) = std::fs::read_to_string(dir.join("README.md")) {
+        let mut base: Option<String> = None;
         for line in card.lines() {
             let l = line.trim();
-            if let Some(v) = l.strip_prefix("base_model:") {
-                let v = v.trim().trim_matches('"').trim_matches('\'').trim();
-                if !v.is_empty() { return v.to_string(); }
+            for (key, own) in [("model_name:", true), ("base_model:", false)] {
+                if let Some(v) = l.strip_prefix(key) {
+                    let v = v.trim().trim_matches('"').trim_matches('\'').trim();
+                    if v.is_empty() { continue; }
+                    if own { return v.to_string(); }
+                    if base.is_none() { base = Some(v.to_string()); }
+                }
             }
         }
+        if let Some(b) = base { return b; }
     }
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1956,7 +1990,7 @@ async fn chat_completions(
     }
 
     let t_encode = std::time::Instant::now();
-    let mut prompt_tokens = match state.tokenizer.encode(&prompt, true) {
+    let mut prompt_tokens = match encode_off_thread(&state.tokenizer, &prompt, true).await {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -2453,6 +2487,19 @@ fn dump_tokens(id: &str, tokens: &[u32]) {
     crate::reprintln!("[gen-ids] id={id} n={} ids=[{}]", tokens.len(), ids.join(","));
 }
 
+/// PERFFIX1: tokenize a large text on Tokio's blocking pool instead of the server's single request thread (render +
+/// encode measured ~1 ms per 1,000 prompt tokens: a 100K-token prompt held every other stream's SSE writes, /metrics
+/// and /health for ~100 ms). Same tokenizer, same call, same tokens; texts under 64 KiB stay inline (a thread hop
+/// would cost more than it saves).
+async fn encode_off_thread(tok: &Arc<QwenTokenizer>, text: &str, add_special: bool) -> anyhow::Result<Vec<u32>> {
+    if text.len() < 64 * 1024 {
+        return tok.encode(text, add_special);
+    }
+    let (tok, text) = (tok.clone(), text.to_owned());
+    tokio::task::spawn_blocking(move || tok.encode(&text, add_special)).await
+        .map_err(|e| anyhow::anyhow!("tokenizer task failed: {e}"))?
+}
+
 /// Phase-2 A3 observability: ONE line per generation carrying exactly the fields the Phase-1
 /// ledger had to reconstruct — or could not recover at all — from the harness transcripts:
 /// the final finish_reason, the terminal token id and whether it is a model stop token, and the
@@ -2465,6 +2512,9 @@ fn log_generation(tok: &QwenTokenizer, stop_ids: &[u32], id: &str, finish: &str,
                   reasoning: Option<&str>, content: &str, tool_calls: usize,
                   tools_offered: usize, effort: Option<&str>, presence_penalty: f32,
                   pp_source: &str, stop_kind: &str, stop_info: Option<(f32, u32, bool)>) {
+    // PERFFIX1: the line below prints in debug mode only — skip the two re-tokenizations (up to the whole generation)
+    // otherwise; they ran on the request thread after every request for a line nobody saw.
+    if !crate::boot_report::debug() { return; }
     let count = |s: Option<&str>| s.map(|x| tok.encode(x, false).map(|v| v.len()).unwrap_or(0))
         .unwrap_or(0);
     let r_tok = count(reasoning);
@@ -2596,7 +2646,7 @@ async fn tokenize(State(state): State<AppState>, Json(body): Json<serde_json::Va
         };
         // The model's ACTUAL resident tokenizer — token-identity with the reference is the
         // whole point of this endpoint. Never a naive split.
-        match state.tokenizer.encode(&rendered, add_special) {
+        match encode_off_thread(&state.tokenizer, &rendered, add_special).await {
             Ok(t) => t,
             Err(e) => return bad(format!("tokenization failed: {e}")),
         }
@@ -2608,7 +2658,7 @@ async fn tokenize(State(state): State<AppState>, Json(body): Json<serde_json::Va
                 if text.is_empty() {
                     Vec::new()
                 } else {
-                    match state.tokenizer.encode(text, add_special) {
+                    match encode_off_thread(&state.tokenizer, text, add_special).await {
                         Ok(t) => t,
                         Err(e) => return bad(format!("tokenization failed: {e}")),
                     }
@@ -2617,18 +2667,10 @@ async fn tokenize(State(state): State<AppState>, Json(body): Json<serde_json::Va
             // Token-id round-trip (our extension per the plan; stock vLLM only accepts a string):
             // echo the ids verbatim. add_special_tokens has nothing to encode here — the ids ARE
             // tokens — so it does not apply (same as vLLM's id-prompt paths elsewhere).
-            Some(serde_json::Value::Array(items)) => {
-                let vocab = state.tokenizer.vocab_size();
-                let mut ids: Vec<u32> = Vec::with_capacity(items.len());
-                for it in items {
-                    match it.as_u64() {
-                        Some(id) if (id as usize) < vocab => ids.push(id as u32),
-                        _ => return bad(format!(
-                            "'prompt' ids must be integers in [0, {}) (got {it})", vocab)),
-                    }
-                }
-                ids
-            }
+            Some(serde_json::Value::Array(items)) => match prompt_token_ids(items, state.tokenizer.vocab_size()) {
+                Ok(ids) => ids,
+                Err(e) => return bad(e),
+            },
             _ => return bad("'prompt' must be a string or a list of token ids, or use 'messages'"
                 .into()),
         }
@@ -2778,12 +2820,16 @@ async fn completions(
         return bad_param(msg);
     }
     let prompt_tokens: Vec<u32> = match req.prompt.as_ref() {
-        Some(serde_json::Value::String(t)) => match state.tokenizer.encode(t, true) {
+        Some(serde_json::Value::String(t)) => match encode_off_thread(&state.tokenizer, t, true).await {
             Ok(v) => v,
             Err(e) => return (StatusCode::BAD_REQUEST, format!("tokenize failed: {e}")).into_response(),
         },
-        Some(serde_json::Value::Array(a)) if !a.is_empty() && a[0].is_number() =>
-            a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect(),
+        // ISSUES 129: every element must be an integer in [0, vocab) — no element dropped, none truncated to u32
+        // (an out-of-range id used to reach the GPU embedding gather unchecked)
+        Some(serde_json::Value::Array(a)) if !a.is_empty() => match prompt_token_ids(a, state.tokenizer.vocab_size()) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        },
         _ => return (StatusCode::BAD_REQUEST,
                      "prompt must be a string or a non-empty token-id array".to_string()).into_response(),
     };
@@ -2962,6 +3008,32 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// ISSUES 129: a token-id prompt is accepted only when EVERY element is an integer in `[0, vocab)`: nothing is
+/// dropped, nothing is truncated to u32, so no out-of-range id can reach the embedding gather. Shared by
+/// `/v1/tokenize` and `/v1/completions`.
+pub(crate) fn prompt_token_ids(items: &[serde_json::Value], vocab: usize) -> Result<Vec<u32>, String> {
+    items.iter().map(|it| match it.as_u64() {
+        Some(id) if id < vocab as u64 => Ok(id as u32),
+        _ => Err(format!("'prompt' ids must be integers in [0, {vocab}) (got {it})")),
+    }).collect()
+}
+
+#[cfg(test)]
+mod prompt_token_id_tests {
+    use super::prompt_token_ids;
+    use serde_json::json;
+
+    #[test]
+    fn every_id_must_be_an_integer_in_the_vocab() {
+        assert_eq!(prompt_token_ids(&[json!(0), json!(5), json!(99)], 100), Ok(vec![0, 5, 99]));
+        for bad in [json!(-1), json!(1.5), json!(2.0), json!("7"), json!(null), json!(100), json!(4294967296u64),
+                    json!(4294967297u64)] {
+            let e = prompt_token_ids(&[json!(1), bad.clone(), json!(2)], 100).unwrap_err();
+            assert!(e.contains("[0, 100)") && e.contains(&bad.to_string()), "{bad}: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod context_budget_tests {
     // PR #4's context-budget contract. The PR's two further tests
@@ -3097,7 +3169,23 @@ mod model_id_tests {
         d.to_string_lossy().to_string()
     }
 
-    /// v0.7.3 (#8.3): the public model id resolves as flag > alias > base_model > dir name.
+    /// 2026-10-20: a quantized pack names ITSELF with `model_name:`; `base_model:` is the original
+    /// model and only serves as the id when the card has no `model_name:` line.
+    #[test]
+    fn model_id_prefers_the_packs_own_name() {
+        let card = "---\nlicense: mit\nmodel_name: doth4580/Naive-N0.5-Flash-EXL3-3.5bpw\nbase_model: NaiveAI/Naive-N0.5-Flash\nbase_model_relation: quantized\n---\ncard\n";
+        let dir = temp_model_dir("own", Some(card));
+        assert_eq!(model_id_from_dir(&dir), "doth4580/Naive-N0.5-Flash-EXL3-3.5bpw");
+        let card = "---\nbase_model: NaiveAI/Naive-N0.5-Flash\nmodel_name: \"doth4580/Naive-N0.5-Flash-EXL3-4bpw\"\n---\n";
+        let dir2 = temp_model_dir("own2", Some(card));
+        assert_eq!(model_id_from_dir(&dir2), "doth4580/Naive-N0.5-Flash-EXL3-4bpw", "order in the card and quotes do not matter");
+        let card = "---\nmodel_name:   \nbase_model: NaiveAI/Naive-N0.5-Flash\n---\n";
+        let dir3 = temp_model_dir("own3", Some(card));
+        assert_eq!(model_id_from_dir(&dir3), "NaiveAI/Naive-N0.5-Flash", "a blank model_name: falls through to base_model:");
+        for d in [dir, dir2, dir3] { let _ = std::fs::remove_dir_all(&d); }
+    }
+
+    /// v0.7.3 (#8.3): the public model id resolves as flag > alias > model_name > base_model > dir name.
     #[test]
     fn model_id_resolution_order() {
         let card = "---\nbase_model: Qwen/Qwen3.8-27B\n---\nsome card\n";

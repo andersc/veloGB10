@@ -38,7 +38,7 @@ fn print_help() {
     println!("  MODEL");
     println!("    --model-dir <DIR>          Model directory (config.json + *.safetensors + tokenizer).");
     println!("                               THIS is the normal way to load.                   [required]");
-    println!("    --model-name <NAME>        Name reported by /v1/models    [model card base_model: else dir name]");
+    println!("    --model-name <NAME>        Name reported by /v1/models    [model card model_name: else base_model: else dir name]");
     println!("    --served-model-name <NAME> Alias of --model-name (the vLLM spelling)");
     println!("    --model <FILE>             Legacy: single .safetensors file (use --model-dir instead)");
     println!("    --tokenizer <FILE>         Legacy: tokenizer.json path (implied by --model-dir)");
@@ -46,10 +46,10 @@ fn print_help() {
     println!("  SERVING");
     println!("    --port <N>                 Listen port                                          [8000]");
     println!("    --max-batch <N>            Max concurrent sequences (lanes)                        [8]");
-    println!("                              EXL3 server: at most 16 lanes serve at once; a larger N boots");
-    println!("                              with 16 (or fewer if memory at the asked --max-seq-len holds");
-    println!("                              fewer — the boot line and /metrics velogb10_max_batch say how");
-    println!("                              many) and further requests wait in the queue");
+    println!("                              server (EXL3 and the NVFP4 trunk): at most 16 lanes serve at");
+    println!("                              once; a larger N boots with 16 (EXL3 may boot fewer still when");
+    println!("                              memory at the asked --max-seq-len holds fewer — the boot line");
+    println!("                              and /metrics velogb10_max_batch say); requests beyond wait in queue");
     println!("    --max-tokens <N>           Output length for a CHAT request that omits max_tokens. A default,\n\
 \x20                              not a cap: a request may ask for more, up to the room left in\n\
 \x20                              the context. Unset: EXL3 server = no limit (a stop token or the\n\
@@ -108,9 +108,11 @@ fn print_help() {
     println!("                               distribution-exact; ratio changes seeded output bytes. Greedy");
     println!("                               requests are unaffected                                  [match]");
     println!("    --draft-temperature <T>    EXL3 ratio mode: the draft sampling temperature  [= request's T]");
-    println!("    (temperature / top_p / top_k / seed are per-REQUEST only. Unsent: 0.7 / 0.8 / 20; an EXL3\n\
-\x20    chat request whose prompt opens a thinking block: 1.0 / 0.95 / 20. The penalty defaults\n\
-\x20    above apply to /v1/chat/completions; /v1/completions uses 1.0 / 0.0 / 0.0)");
+    println!("    (temperature / top_p / top_k / seed are per-REQUEST only. Unsent: the pack's\n\
+\x20    generation_config.json triple (Qwen3.8 packs: 1.0 / 0.95 / 20; its non-thinking requests\n\
+\x20    keep the card's 0.7 / 0.8 / 20); a pack without one: 0.7 / 0.8 / 20. The boot prints the\n\
+\x20    resolved values. The penalty defaults above apply to /v1/chat/completions;\n\
+\x20    /v1/completions uses 1.0 / 0.0 / 0.0)");
     println!();
     println!("  VISION  (optional capability — never a boot blocker)");
     println!("    The image tower is loaded ONLY when the pack declares a COMPATIBLE `model.visual`");
@@ -249,8 +251,7 @@ fn print_help() {
     println!("                             piecewise). [--sha256 <hex>] pins the artifact hash.");
     println!();
     println!("  DFlash2 (incoai/Qwen3.8-27B-DFlash2) reference-oracle substrate (S2F, CPU-only — no CUDA):");
-    println!("    --gen-dflash2-synth <dir>  Deterministic synthetic-weight artifact: 81 tensors,");
-    println!("                             BF16, 1,924,404,480 params + config.json + marker README.");
+    println!("    --gen-dflash2-synth <dir>  Deterministic synthetic-weight artifact (live geometry:");
     println!("                             Default dir tool_probe/dflash2-synth (gitignored).");
     println!("                             [--seed <u64>] overrides the fixed generator seed.");
     println!("    --probe-dflash2 <dir>      Load the REAL (or synthetic) artifact + run the oracle");
@@ -290,12 +291,21 @@ fn print_help() {
     println!("                             and a failed load refuses to start — never a silent");
     println!("                             downgrade. (`--dflash-dir` is a DEPRECATED P14-era alias");
     println!("                             for the dflash source only; it warns and will be removed.)");
+    println!("  Naive (DSpark drafter) speculation: --spec-block/-conf/-guard-off/-guard-on/-probe-every/-draft-temp/-drafter/-sampler, see --help-advanced (SPEC)");
     println!("    --df2-round-shard <on|off> P2: shard the DFlash2 drafter round across the TP ranks");
+    println!("    --df2-mask-override <on|off> DFlash2: when the trunk's quantized mask-embedding row");
+    println!("                                 measures DAMAGED (rel-L2>0.25 vs the artifact's BF16 copy),");
+    println!("                                 embed the artifact's exact row for MASK positions (default on).");
     println!("    --df2-carry <on|off>       Keep DFlash2 in the draft seat across a prefix-cache");
     println!("                               hit (default off). Off = a cache hit falls back to MTP,");
     println!("                               which on prefix-heavy traffic is most requests.");
     println!("    --df2-block <8|16>         DFlash2 draft block (default 8). 16 = anchor + 15x MASK,");
     println!("                               verify width 16 = MAX_VERIFY. Block 16 is refused with");
+    println!("    --df2-k <n>                EXL3 DFlash2 verify width: verify only the first n of the round's");
+    println!("                               block-1 drafts (1..block-1; default = block-1 = 7 at block 8). A");
+    println!("                               smaller n trades acceptance for a narrower trunk verify (on a MoE");
+    println!("                               pack the verify's expert bytes scale with the width). Out-of-range");
+    println!("                               values are clamped and printed, never refused.");
     println!("                               --spec-source dflash2-tree (the tree needs up to 31 cols).");
     println!("                               The draft artifacts are block-agnostic: no re-bake.");
     println!("                               (TP>2 only; head+selector stay replicated; the sharded");
@@ -638,6 +648,16 @@ fn main() {
             panic!("--df2-block must be 8 or 16 (got '{v}')")
         });
         gb10_inference::dflash2::set_block(b).unwrap_or_else(|e| panic!("--df2-block: {e}"));
+    }
+    // DFLASH2-GEN: the mask-row override lever (default ON; the OFF arm is the A/B cell).
+    // Rides TpConfig to the nodes (SPMD); single-box reads the global directly.
+    if let Some(v) = parse_arg(&args, "--df2-mask-override") {
+        let on = matches!(v, "on" | "true" | "1" | "yes");
+        gb10_inference::dflash2::set_mask_override(on);
+        if !on {
+            println!("[df2] mask-row override DISABLED by --df2-mask-override off — a DAMAGED \
+                      quantized mask row will serve as-is (logged at round load)");
+        }
     }
     cli_opts_bridge(&args);
 
@@ -1262,6 +1282,238 @@ fn main() {
         let opts = exl3_xtp_opts(&args);
         gb10_inference::exl3_forward::xtp::probe_xtp_ref(dir, &ids, gen, max_pos, out, &opts).unwrap_or_else(|e| {
             eprintln!("PROBE_XTP_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S0 gate: our decode vs pinned ext.reconstruct dumps, bitwise (CPU; dumps from a GPU burst).
+    //   ./gb10_inference --probe-naive-oracle --model-dir <pack> --oracle-dir <ref>
+    if args.iter().any(|a| a == "--probe-naive-oracle") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-oracle requires --model-dir <DIR>");
+        let ref_dir = parse_arg(&args, "--oracle-dir").expect("--probe-naive-oracle requires --oracle-dir <REF_DIR>");
+        gb10_inference::naive::frac::probe_oracle(&dir, &ref_dir).unwrap_or_else(|e| {
+            eprintln!("NAIVE_ORACLE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S4: the GPU slice model vs its CPU twin (first N layers, T tokens). GPU: ask first.
+    //   ./gb10_inference --probe-naive-slice --model-dir <pack> [--layers N] [--tokens T]
+    if args.iter().any(|a| a == "--probe-naive-fuse") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-fuse requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+        gb10_inference::naive::model::probe_fuse(&dir, layers).unwrap_or_else(|e| { eprintln!("NAIVE_FUSE_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    if args.iter().any(|a| a == "--probe-naive-slice") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-slice requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").map(|v| v.parse().expect("--layers takes an integer")).unwrap_or(2);
+        let tokens: usize = parse_arg(&args, "--tokens").map(|v| v.parse().expect("--tokens takes an integer")).unwrap_or(8);
+        gb10_inference::naive::model::probe_slice(&dir, layers, tokens).unwrap_or_else(|e| {
+            eprintln!("NAIVE_SLICE_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S4b: the whole model, one layer resident at a time, greedy decode (GPU coherence).
+    //   ./gb10_inference --probe-naive-full --model-dir <pack> [--prompt S|--prompt-file F] [--gen N] [--nll] [--dump-states OUT.safetensors]
+    if args.iter().any(|a| a == "--probe-naive-full") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-full requires --model-dir <DIR>");
+        let from_file = parse_arg(&args, "--prompt-file").map(|f| std::fs::read_to_string(f).expect("--prompt-file"));
+        let prompt = from_file.as_deref().unwrap_or(parse_arg(&args, "--prompt").unwrap_or("The capital of France is"));
+        let gen: usize = parse_arg(&args, "--gen").and_then(|s| s.parse().ok()).unwrap_or(4);
+        let rows_chunk: usize = parse_arg(&args, "--rows-chunk").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let dump = parse_arg(&args, "--dump-states");
+        gb10_inference::naive::model::probe_full_dump(&dir, prompt, gen, rows_chunk, args.iter().any(|a| a == "--nll"), dump).unwrap_or_else(|e| {
+            eprintln!("NAIVE_FULL_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S6: GEMM variant bench on the real shapes.
+    if args.iter().any(|a| a == "--probe-naive-gemm-bench") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-gemm-bench requires --model-dir <DIR>");
+        let m: usize = parse_arg(&args, "--gemm-m").and_then(|s| s.parse().ok()).unwrap_or(1);
+        gb10_inference::naive::gpu::probe_gemm_bench(&dir, m).unwrap_or_else(|e| { eprintln!("NAIVE_GEMM_BENCH_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S8: the DSpark drafter round on the GPU vs the CPU reference (fixture), then 20 timed rounds
+    // of the real drafter with the pack's embedding + lm_head.
+    //   ./gb10_inference --probe-naive-drafter --model-dir <pack> [--draft-dir <dir>]
+    if args.iter().any(|a| a == "--probe-naive-drafter") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-drafter requires --model-dir <DIR>");
+        let draft = parse_arg(&args, "--draft-dir").unwrap_or("/mnt/models/NaiveAI/Naive-N0.5-Flash-FP8-Draft");
+        gb10_inference::naive::drafter_gpu::probe_drafter(&dir, draft).unwrap_or_else(|e| { eprintln!("NAIVE_DRAFTER_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S6: the GPU sampler vs a CPU reference distribution.
+    if args.iter().any(|a| a == "--probe-naive-sampler") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-sampler requires --model-dir <DIR>");
+        gb10_inference::naive::decode::probe_sampler(&dir).unwrap_or_else(|e| { eprintln!("NAIVE_SAMPLER_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // option A: the per-request KV slot dimension — 2 sequences in 2 slots == 2 sequential forwards.
+    if args.iter().any(|a| a == "--probe-naive-slots") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-slots requires --model-dir <DIR>");
+        gb10_inference::naive::decode::probe_slots(&dir).unwrap_or_else(|e| { eprintln!("NAIVE_SLOTS_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // G1: lane isolation — m requests in one DecodeStep share no sampler state.
+    if args.iter().any(|a| a == "--probe-naive-lanes") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-lanes requires --model-dir <DIR>");
+        gb10_inference::naive::decode::probe_lanes(&dir).unwrap_or_else(|e| { eprintln!("NAIVE_LANES_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S6: the graphed decode step vs the eager step on one GPU.
+    if args.iter().any(|a| a == "--probe-naive-graph") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-graph requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+        let bench_only = args.iter().any(|a| a == "--bench-only");
+        gb10_inference::naive::gpu::set_pdl(gb10_inference::naive::serve::pdl_flag(&args));
+        gb10_inference::naive::decode::probe_graph(&dir, layers, bench_only).unwrap_or_else(|e| { eprintln!("NAIVE_GRAPH_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S5: the loopback TP gate on one GPU (two shards, two threads, a host channel).
+    if args.iter().any(|a| a == "--probe-naive-loop") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-loop requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+        let tokens: usize = parse_arg(&args, "--tokens").and_then(|s| s.parse().ok()).unwrap_or(8);
+        let world: usize = parse_tp_world(&args).unwrap_or(2) as usize;
+        gb10_inference::naive::serve::run_loop_probe(&dir, layers, tokens, world).unwrap_or_else(|e| { eprintln!("NAIVE_LOOP_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S6b: the prefill attention kernels (group-shared K/V) against the per-head kernels, bitwise.
+    if args.iter().any(|a| a == "--probe-naive-attn-prefill") {
+        gb10_inference::naive::gpu::probe_attn_prefill().unwrap_or_else(|e| { eprintln!("NAIVE_ATTN_PREFILL_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S6b: the wide prefill path vs the 16-row chunked path (bitwise), one GPU.
+    if args.iter().any(|a| a == "--probe-naive-prefill") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-prefill requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+        let tokens: usize = parse_arg(&args, "--tokens").and_then(|s| s.parse().ok()).unwrap_or(300);
+        gb10_inference::naive::serve::run_prefill_probe(&dir, layers, tokens).unwrap_or_else(|e| { eprintln!("NAIVE_PREFILL_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S5b: a shipped shard dir vs the full pack sliced at load (bitwise), one GPU.
+    if args.iter().any(|a| a == "--probe-naive-shard-dir") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-shard-dir requires --model-dir <FULL PACK>");
+        let sd = parse_arg(&args, "--shard-dir").expect("--probe-naive-shard-dir requires --shard-dir <SHIPPED SHARD DIR>");
+        let layers: usize = parse_arg(&args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+        let tokens: usize = parse_arg(&args, "--tokens").and_then(|s| s.parse().ok()).unwrap_or(8);
+        gb10_inference::naive::serve::run_shard_dir_probe(&dir, &sd, layers, tokens).unwrap_or_else(|e| { eprintln!("NAIVE_SHARD_DIR_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S8: the speculative engine path vs plain greedy on one GPU.
+    if args.iter().any(|a| a == "--probe-naive-spec") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-spec requires --model-dir <DIR>");
+        let dd = parse_arg(&args, "--draft-dir").unwrap_or("/mnt/models/NaiveAI/Naive-N0.5-Flash-FP8-Draft");
+        let layers: usize = parse_arg(&args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+        let block: usize = parse_arg(&args, "--spec-block").and_then(|s| s.parse().ok()).unwrap_or(4);
+        let tokens: usize = parse_arg(&args, "--tokens").and_then(|s| s.parse().ok()).unwrap_or(24);
+        let mode = parse_arg(&args, "--spec-mode").unwrap_or("drafter");
+        let world: usize = parse_arg(&args, "--tp").and_then(|s| s.parse().ok()).unwrap_or(1);
+        let sampler = parse_arg(&args, "--spec-sampler").unwrap_or("auto");
+        gb10_inference::naive::serve::run_spec_probe(&dir, dd, layers, block, tokens, mode, world, sampler).unwrap_or_else(|e| { eprintln!("NAIVE_SPEC_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S5: the quad-slicing gate on one GPU (no transport).
+    if args.iter().any(|a| a == "--probe-naive-shard") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-shard requires --model-dir <DIR>");
+        gb10_inference::naive::shard::probe_shard(&dir).unwrap_or_else(|e| { eprintln!("NAIVE_SHARD_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
+    // NAIVE S5: the two-rank identity probe (this box = head; the other runs `--node`).
+    //   ./gb10_inference --probe-naive-tp --model-dir <pack> --tp 2 [--layers N] [--tokens T] [--nodes ip]
+    if args.iter().any(|a| a == "--probe-naive-tp") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-tp requires --model-dir <DIR>");
+        run_naive_tp_head(&args, &dir, "probe");
+        return;
+    }
+    // NAIVE prefill: tensor-core indexer scorer vs the scalar kernel (synthetic planes).
+    //   ./gb10_inference --probe-naive-idx-prefill --model-dir <pack>
+    if args.iter().any(|a| a == "--probe-naive-idx-prefill") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-idx-prefill requires --model-dir <DIR>");
+        gb10_inference::naive::gpu::probe_idx_prefill(&dir).unwrap_or_else(|e| {
+            eprintln!("NAIVE_IDX_PREFILL_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S3: indexer scorer + exact top-k at long positions (synthetic, GPU vs CPU).
+    //   ./gb10_inference --probe-naive-topk --model-dir <pack>
+    if args.iter().any(|a| a == "--probe-naive-topk") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-topk requires --model-dir <DIR>");
+        gb10_inference::naive::gpu::probe_topk(&dir).unwrap_or_else(|e| {
+            eprintln!("NAIVE_TOPK_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE T0-c: the staged body's BITWISE A/B against the per-step body, on real quads.
+    // Engagement was proven by the nsys census in PLAN/NAIVE_RUN1_TP4_RESULTS.md; this proves
+    // EQUALITY, which that census cannot. Same inputs, same surrounding passes, only the GEMM body.
+    //   ./gb10_inference --probe-naive-a1-ab --model-dir <pack>
+    if args.iter().any(|a| a == "--probe-naive-a1-ab") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-a1-ab requires --model-dir <DIR>");
+        gb10_inference::naive::gpu::probe_a1_ab(&dir).unwrap_or_else(|e| {
+            eprintln!("NAIVE_A1_AB_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S3: GPU kernel gates on real quads (decode bitwise, chain vs CPU dequant, batch invariance,
+    // grouped == dense). GPU: ask the owner for the box first.
+    //   ./gb10_inference --probe-naive-gemm --model-dir <pack>
+    if args.iter().any(|a| a == "--probe-naive-gemm") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-gemm requires --model-dir <DIR>");
+        gb10_inference::naive::gpu::probe_gemm(&dir).unwrap_or_else(|e| {
+            eprintln!("NAIVE_GEMM_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S2c: the real pack through the first N layers on the CPU (coherence check, no GPU).
+    //   ./gb10_inference --probe-naive-cpu --model-dir <pack> [--layers N] [--prompt TEXT]
+    if args.iter().any(|a| a == "--probe-naive-cpu") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-cpu requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").map(|v| v.parse().expect("--layers takes an integer")).unwrap_or(2);
+        let prompt = parse_arg(&args, "--prompt").unwrap_or("The capital of France is");
+        gb10_inference::naive::cpu::probe_cpu(&dir, layers, &prompt).unwrap_or_else(|e| {
+            eprintln!("NAIVE_CPU_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE 1c: chunked GPU prefill vs the CPU reference (CROSS-CLASS, the real equality check).
+    //   ./gb10_inference --probe-naive-chunkxcpu --model-dir <pack> [--layers N] [--tokens T]
+    if args.iter().any(|a| a == "--probe-naive-chunkxcpu") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-chunkxcpu requires --model-dir <DIR>");
+        let layers: usize = parse_arg(&args, "--layers").map(|v| v.parse().expect("--layers takes an integer")).unwrap_or(2);
+        let tokens: usize = parse_arg(&args, "--tokens").map(|v| v.parse().expect("--tokens takes an integer")).unwrap_or(16);
+        gb10_inference::naive::model::probe_chunk_xcpu(&dir, layers, tokens).unwrap_or_else(|e| {
+            eprintln!("NAIVE_CHUNK_XCPU_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S2b: host dequant of one layer's non-expert quads + the padded-region falsifier.
+    //   ./gb10_inference --probe-naive-dequant --model-dir <pack> [--layer N]
+    if args.iter().any(|a| a == "--probe-naive-dequant") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-dequant requires --model-dir <DIR>");
+        let layer: usize = parse_arg(&args, "--layer").map(|v| v.parse().expect("--layer takes an integer")).unwrap_or(0);
+        gb10_inference::naive::dequant::probe(&dir, layer).unwrap_or_else(|e| {
+            eprintln!("NAIVE_DEQUANT_FAIL: {e:#}");
+            std::process::exit(1);
+        });
+        return;
+    }
+    // NAIVE S1 (PLAN/NAIVE_N05_PORT.md): pack census + inventory check, headers only.
+    //   ./gb10_inference --probe-naive-pack --model-dir <Naive-N0.5-Flash EXL3 pack>
+    if args.iter().any(|a| a == "--probe-naive-pack") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-naive-pack requires --model-dir <DIR>");
+        gb10_inference::naive::pack::probe(&dir).unwrap_or_else(|e| {
+            eprintln!("NAIVE_PACK_FAIL: {e:#}");
             std::process::exit(1);
         });
         return;
@@ -2540,8 +2792,8 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         for &r in &reqdirs {
             let rdir = format!("{dir}/r{r}");
             let raw = match std::fs::read(format!("{rdir}/taps_wide.bin")) { Ok(x) => x, Err(_) => continue };
-            let plen = raw.len() / (2 * TAP_CONCAT_DIM);
-            let mut taps: Vec<bf16> = Vec::with_capacity(plen * TAP_CONCAT_DIM);
+            let plen = raw.len() / (2 * gb10_inference::dflash2::tap_concat_dim());
+            let mut taps: Vec<bf16> = Vec::with_capacity(plen * gb10_inference::dflash2::tap_concat_dim());
             for c in raw.chunks_exact(2) { taps.push(bf16::from_le_bytes([c[0], c[1]])); }
             let steps_meta: Vec<(u32, Vec<u32>, Vec<u32>, usize)> = (0..24).filter_map(|k| {
                 let meta = std::fs::read_to_string(format!("{rdir}/step{k}/meta.txt")).ok()?;
@@ -2599,8 +2851,8 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
                 }
                 let sraw = std::fs::read(format!("{rdir}/step{k}/staging.bin")).expect("staging");
                 let st: Vec<bf16> = sraw.chunks_exact(2).map(|c| bf16::from_le_bytes([c[0], c[1]])).collect();
-                assert_eq!(st.len(), 8 * TAP_CONCAT_DIM, "staging dump must be 8 columns");
-                let mut chunk_f = vec![0.0f32; 8 * TAP_CONCAT_DIM];
+                assert_eq!(st.len(), 8 * gb10_inference::dflash2::tap_concat_dim(), "staging dump must be 8 columns");
+                let mut chunk_f = vec![0.0f32; 8 * gb10_inference::dflash2::tap_concat_dim()];
                 for (i, b) in st.iter().enumerate() { chunk_f[i] = b.to_f32(); }
                 round.upload_chunk(&chunk_f).expect("upload chunk");
                 round.inject_dev(m).expect("inject");
@@ -2631,11 +2883,11 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
                 let (_t, _h) = gpu.prefill_batch(&mut pool, ptoks, &mut state, 0, kv_stride, 0);
                 gpu.sync_stream();
                 let cols: Vec<half::bf16> = gpu.dev().dtoh_sync_copy(&prime2.taps).unwrap();
-                let n = ptoks.len().min(cols.len() / TAP_CONCAT_DIM);
-                cols[..n * TAP_CONCAT_DIM].iter().map(|b| b.to_f32()).collect()
+                let n = ptoks.len().min(cols.len() / gb10_inference::dflash2::tap_concat_dim());
+                cols[..n * gb10_inference::dflash2::tap_concat_dim()].iter().map(|b| b.to_f32()).collect()
             };
             let col = |taps: &[f32], c: usize| -> Vec<f32> {
-                taps[c * TAP_CONCAT_DIM..(c + 1) * TAP_CONCAT_DIM].to_vec()
+                taps[c * gb10_inference::dflash2::tap_concat_dim()..(c + 1) * gb10_inference::dflash2::tap_concat_dim()].to_vec()
             };
             // ---- The tap-noise discriminator: re-prime the ring from PREFILL ground-truth taps
             // of the true committed stream (zero decode-capture/FP8-verify noise) and measure
@@ -2666,8 +2918,8 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
                     let mut gt = prime_cols(&stream[..np]); // GT taps for [0..np)
                     // A/B: reverse the 5 tap chunks per column (fc pairing convention)
                     if gb10_inference::opts::var(gb10_inference::opt!("dspark-tap-rev")).map(|v| v == "1").unwrap_or(false) {
-                        let c5 = TAP_CONCAT_DIM / 5;
-                        for col in gt.chunks_mut(TAP_CONCAT_DIM) {
+                        let c5 = gb10_inference::dflash2::tap_concat_dim() / 5;
+                        for col in gt.chunks_mut(gb10_inference::dflash2::tap_concat_dim()) {
                             for i in 0..2 {
                                 for j in 0..c5 {
                                     let (a, b) = (i * c5 + j, (4 - i) * c5 + j);
@@ -2727,14 +2979,14 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
 
     // synthetic taps: 16 rows (8 prime + 8 inject), one deterministic generator
     let tap_scale = 0.5f32;
-    let mut taps_rm = vec![0.0f32; 16 * TAP_CONCAT_DIM];   // row-major [16, 25600]
+    let mut taps_rm = vec![0.0f32; 16 * gb10_inference::dflash2::tap_concat_dim()];   // row-major [16, 25600]
     for i in 0..16 {
-        let r = synth.row(SyntheticTables::TABLE_TAPS, i as u32, TAP_CONCAT_DIM, tap_scale);
-        taps_rm[i * TAP_CONCAT_DIM..(i + 1) * TAP_CONCAT_DIM].copy_from_slice(&r);
+        let r = synth.row(SyntheticTables::TABLE_TAPS, i as u32, gb10_inference::dflash2::tap_concat_dim(), tap_scale);
+        taps_rm[i * gb10_inference::dflash2::tap_concat_dim()..(i + 1) * gb10_inference::dflash2::tap_concat_dim()].copy_from_slice(&r);
     }
     // the gemm x convention is TOKEN-major (column c at c*inn) — the prime buffer is just the
     // first 8 tap ROWS, contiguous (row-major [8, 25600])
-    let taps_b: Vec<bf16> = taps_rm[..8 * TAP_CONCAT_DIM].iter().map(|&x| bf16::from_f32(x)).collect();
+    let taps_b: Vec<bf16> = taps_rm[..8 * gb10_inference::dflash2::tap_concat_dim()].iter().map(|&x| bf16::from_f32(x)).collect();
     let taps_dev = dev.htod_sync_copy(&taps_b).expect("taps upload");
 
     // host replicate of the ctx-KV write (k/v_proj + perhead k_norm + rope at offset
@@ -2827,7 +3079,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         let lat_dev = round.read_latents().expect("read_latents");
         // oracle on the SAME taps
         let ctx = RoundCtx {
-            tap_hiddens: taps_rm[..ctx_rows * TAP_CONCAT_DIM].to_vec(),
+            tap_hiddens: taps_rm[..ctx_rows * gb10_inference::dflash2::tap_concat_dim()].to_vec(),
             anchor: anchor_tok,
             confidence_threshold: 0.15,
         };
@@ -2912,7 +3164,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         // th gate: prime's fc+hidden_norm vs the oracle's tap projection (rows 0..8)
         let th_dev = round.dump_th(8).expect("dump_th");
         let ctx = RoundCtx {
-            tap_hiddens: taps_rm[..8 * TAP_CONCAT_DIM].to_vec(),
+            tap_hiddens: taps_rm[..8 * gb10_inference::dflash2::tap_concat_dim()].to_vec(),
             anchor: 1234,
             confidence_threshold: 0.15,
         };
@@ -2924,14 +3176,14 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
     // ctx-KV gates: prime rows [0..8) at positions [0..8) — the oracle's own th feeds the host
     // replicate, so this isolates k/v_proj + k_norm + rope + the ring write from the block pass.
     for li in [0usize, 4] {
-        let th_prime = oracle.tap_project(&taps_rm[..8 * TAP_CONCAT_DIM], 8);
+        let th_prime = oracle.tap_project(&taps_rm[..8 * gb10_inference::dflash2::tap_concat_dim()], 8);
         kv_gate("prime-ctx8", li, 0, 8, &th_prime, &round);
     }
 
     // ---- K-pipeline stage bisect: gemm → norm → rope → ring write, one layer, vs host. ----
     {
         let li = 0usize;
-        let th8 = oracle.tap_project(&taps_rm[..8 * TAP_CONCAT_DIM], 8);
+        let th8 = oracle.tap_project(&taps_rm[..8 * gb10_inference::dflash2::tap_concat_dim()], 8);
         let (g, nr, rp, ring) = round.probe_k_pipeline(li, &th8, 8, 0).expect("probe_k_pipeline");
         // host stages
         let l = &art.weights.layers[li];
@@ -2987,12 +3239,12 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
     // ---- Round 2: inject 8 more committed taps (the serving step shape), ctx 16
     {
         // the inject's staging is the NEXT 8 committed tap rows, row-major (upload_chunk doc)
-        round.upload_chunk(&taps_rm[8 * TAP_CONCAT_DIM..]).expect("upload_chunk");
+        round.upload_chunk(&taps_rm[8 * gb10_inference::dflash2::tap_concat_dim()..]).expect("upload_chunk");
         round.inject_dev(8).expect("inject_dev 8");
     }
     // ctx-KV gates: inject rows [8..16) at positions [8..16)
     for li in [0usize, 4] {
-        let th_inj = oracle.tap_project(&taps_rm[8 * TAP_CONCAT_DIM..16 * TAP_CONCAT_DIM], 8);
+        let th_inj = oracle.tap_project(&taps_rm[8 * gb10_inference::dflash2::tap_concat_dim()..16 * gb10_inference::dflash2::tap_concat_dim()], 8);
         kv_gate("inject-ctx16", li, 8, 8, &th_inj, &round);
     }
     run_round_checks("round2 ctx16", 4321, 16, &mut round, &oracle);
@@ -3001,8 +3253,8 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
     // the ctx16 failure lives in the INJECT path's state or in the ctx16 shape itself.
     {
         round.reset();
-        let mut taps64 = vec![0.0f32; 16 * TAP_CONCAT_DIM];
-        taps64[..16 * TAP_CONCAT_DIM].copy_from_slice(&taps_rm[..16 * TAP_CONCAT_DIM]);
+        let mut taps64 = vec![0.0f32; 16 * gb10_inference::dflash2::tap_concat_dim()];
+        taps64[..16 * gb10_inference::dflash2::tap_concat_dim()].copy_from_slice(&taps_rm[..16 * gb10_inference::dflash2::tap_concat_dim()]);
         let w16: Vec<bf16> = taps64.iter().map(|&x| bf16::from_f32(x)).collect();
         let w16_dev = dev.htod_sync_copy(&w16).expect("w16 upload");
         round.prime_window(&w16_dev, 16, 0).expect("prime 16");
@@ -3013,15 +3265,15 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         // rebuild the failing state: prime 8 + inject 8 (round2's path), then layer-by-layer
         round.reset();
         {
-            let mut taps8 = vec![0.0f32; 8 * TAP_CONCAT_DIM];
-            taps8.copy_from_slice(&taps_rm[..8 * TAP_CONCAT_DIM]);
+            let mut taps8 = vec![0.0f32; 8 * gb10_inference::dflash2::tap_concat_dim()];
+            taps8.copy_from_slice(&taps_rm[..8 * gb10_inference::dflash2::tap_concat_dim()]);
             let w8: Vec<bf16> = taps8.iter().map(|&x| bf16::from_f32(x)).collect();
             let w8_dev = dev.htod_sync_copy(&w8).expect("w8 upload");
             round.prime_window(&w8_dev, 8, 0).expect("prime 8");
         }
         {
-            let mut chunk = vec![0.0f32; 8 * TAP_CONCAT_DIM];
-            chunk.copy_from_slice(&taps_rm[8 * TAP_CONCAT_DIM..16 * TAP_CONCAT_DIM]);
+            let mut chunk = vec![0.0f32; 8 * gb10_inference::dflash2::tap_concat_dim()];
+            chunk.copy_from_slice(&taps_rm[8 * gb10_inference::dflash2::tap_concat_dim()..16 * gb10_inference::dflash2::tap_concat_dim()]);
             round.upload_chunk(&chunk).expect("upload 8");
             round.inject_dev(8).expect("inject 8");
         }
@@ -3047,7 +3299,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
             o
         };
         // th for the ctx rows → the oracle's ctx KV (public API) at positions [0..16)
-        let th16 = oracle.tap_project(&taps_rm[..16 * TAP_CONCAT_DIM], 16);
+        let th16 = oracle.tap_project(&taps_rm[..16 * gb10_inference::dflash2::tap_concat_dim()], 16);
         let ctxkv = oracle.draft_kv_write(&th16, 16);
         let toks = [777u32, 248077, 248077, 248077, 248077, 248077, 248077];
         let freqs = gb10_inference::dspark::oracle::yaarn_freqs(128, 1e7, 32.0, 8192, 32, 1);
@@ -3150,16 +3402,16 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
     {
         round.reset();
         {
-            let mut taps8 = vec![0.0f32; 8 * TAP_CONCAT_DIM];
-            taps8.copy_from_slice(&taps_rm[..8 * TAP_CONCAT_DIM]);
+            let mut taps8 = vec![0.0f32; 8 * gb10_inference::dflash2::tap_concat_dim()];
+            taps8.copy_from_slice(&taps_rm[..8 * gb10_inference::dflash2::tap_concat_dim()]);
             let w8: Vec<bf16> = taps8.iter().map(|&x| bf16::from_f32(x)).collect();
             let w8_dev = dev.htod_sync_copy(&w8).expect("w8 upload");
             round.prime_window(&w8_dev, 8, 0).expect("prime 8");
         }
         let _ = round.draft_round_dev(777).expect("ctx8 draft");
         {
-            let mut chunk = vec![0.0f32; 8 * TAP_CONCAT_DIM];
-            chunk.copy_from_slice(&taps_rm[8 * TAP_CONCAT_DIM..16 * TAP_CONCAT_DIM]);
+            let mut chunk = vec![0.0f32; 8 * gb10_inference::dflash2::tap_concat_dim()];
+            chunk.copy_from_slice(&taps_rm[8 * gb10_inference::dflash2::tap_concat_dim()..16 * gb10_inference::dflash2::tap_concat_dim()]);
             round.upload_chunk(&chunk).expect("upload 8");
             round.inject_dev(8).expect("inject 8");
         }
@@ -3170,7 +3422,7 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         let toks_dev = round.draft_round_dev(777).expect("full ctx16 draft after sequence");
         let h_dev = round.read_h_final().expect("read_h_final");
         let ctx = RoundCtx {
-            tap_hiddens: taps_rm[..16 * TAP_CONCAT_DIM].to_vec(),
+            tap_hiddens: taps_rm[..16 * gb10_inference::dflash2::tap_concat_dim()].to_vec(),
             anchor: 777,
             confidence_threshold: 0.15,
         };
@@ -3189,19 +3441,19 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
     // at window widths) would show here and NOWHERE else.
     {
         round.reset();
-        let mut taps64 = vec![0.0f32; 64 * TAP_CONCAT_DIM];
+        let mut taps64 = vec![0.0f32; 64 * gb10_inference::dflash2::tap_concat_dim()];
         for i in 0..64 {
-            let r = synth.row(SyntheticTables::TABLE_TAPS, (100 + i) as u32, TAP_CONCAT_DIM, tap_scale);
-            taps64[i * TAP_CONCAT_DIM..(i + 1) * TAP_CONCAT_DIM].copy_from_slice(&r);
+            let r = synth.row(SyntheticTables::TABLE_TAPS, (100 + i) as u32, gb10_inference::dflash2::tap_concat_dim(), tap_scale);
+            taps64[i * gb10_inference::dflash2::tap_concat_dim()..(i + 1) * gb10_inference::dflash2::tap_concat_dim()].copy_from_slice(&r);
         }
-        let w61: Vec<bf16> = taps64[..61 * TAP_CONCAT_DIM].iter().map(|&x| bf16::from_f32(x)).collect();
+        let w61: Vec<bf16> = taps64[..61 * gb10_inference::dflash2::tap_concat_dim()].iter().map(|&x| bf16::from_f32(x)).collect();
         let w61_dev = dev.htod_sync_copy(&w61).expect("wide taps upload");
         round.prime_window(&w61_dev, 61, 0).expect("wide prime 61");
         let toks_dev = round.draft_round_dev(777).expect("draft ctx61");
         let h_dev = round.read_h_final().expect("read_h_final");
         let lg_dev = round.dump_logits().expect("dump_logits");
         let ctx = RoundCtx {
-            tap_hiddens: taps64[..61 * TAP_CONCAT_DIM].to_vec(),
+            tap_hiddens: taps64[..61 * gb10_inference::dflash2::tap_concat_dim()].to_vec(),
             anchor: 777,
             confidence_threshold: 0.15,
         };
@@ -3213,15 +3465,15 @@ fn run_probe_dspark_round(args: &[String], draft_dir: &str) {
         check(&format!("round3 ctx61 chain tokens EXACT"), toks_dev[..7] == mo.tokens);
         // then the serving step shape: 3 committed taps injected (nacc=2 style)
         {
-            let mut chunk = vec![0.0f32; 8 * TAP_CONCAT_DIM];
-            chunk[..3 * TAP_CONCAT_DIM].copy_from_slice(&taps64[61 * TAP_CONCAT_DIM..64 * TAP_CONCAT_DIM]);
+            let mut chunk = vec![0.0f32; 8 * gb10_inference::dflash2::tap_concat_dim()];
+            chunk[..3 * gb10_inference::dflash2::tap_concat_dim()].copy_from_slice(&taps64[61 * gb10_inference::dflash2::tap_concat_dim()..64 * gb10_inference::dflash2::tap_concat_dim()]);
             round.upload_chunk(&chunk).expect("upload_chunk 3");
             round.inject_dev(3).expect("inject_dev 3");
         }
         let toks_dev = round.draft_round_dev(555).expect("draft ctx64");
         let lg_dev = round.dump_logits().expect("dump_logits");
         let ctx = RoundCtx {
-            tap_hiddens: taps64[..64 * TAP_CONCAT_DIM].to_vec(),
+            tap_hiddens: taps64[..64 * gb10_inference::dflash2::tap_concat_dim()].to_vec(),
             anchor: 555,
             confidence_threshold: 0.15,
         };
@@ -3454,8 +3706,34 @@ fn parse_tp_world(args: &[String]) -> Option<u32> {
 }
 
 fn run_cli(args: &[String]) {
-    let model_path = parse_arg(args, "--model").unwrap_or("qwen3.5-0.8b-packed");
-    let tokenizer_path = parse_arg(args, "--tokenizer").unwrap_or("model/tokenizer.json");
+    // PREHARD1 [ISSUES 84]: the bare CLI path (no subcommand) used to IGNORE --model-dir —
+    // `gb10_inference --model-dir X` fell back to the CWD-relative default 'qwen3.5-0.8b-packed'
+    // and died with a bare "No such file or directory (os error 2)" that named neither the path
+    // it tried nor the flag it ignored (found while diagnosing the owner's boot failure; the
+    // --server path was already correct). Now: --model-dir stands in for --model when --model is
+    // absent (a directory of config.json + *.safetensors is exactly what Model::load takes), the
+    // tokenizer defaults INSIDE that dir, and a model path that does not exist is ONE clear line.
+    let model_path = parse_arg(args, "--model")
+        .or_else(|| parse_arg(args, "--model-dir"))
+        .unwrap_or("qwen3.5-0.8b-packed");
+    let from_model_dir = parse_arg(args, "--model-dir").is_some() && parse_arg(args, "--model").is_none();
+    let tokenizer_path: String = match parse_arg(args, "--tokenizer") {
+        Some(t) => t.to_string(),
+        None => if from_model_dir {
+            format!("{}/tokenizer.json", parse_arg(args, "--model-dir").unwrap())
+        } else {
+            "model/tokenizer.json".to_string()
+        },
+    };
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!(
+            "model path not found: '{}'{} — pass --model-dir <dir> (a directory with config.json \
+             and *.safetensors) or --model <packed-model path>",
+            model_path,
+            if from_model_dir { " (from --model-dir)" } else { "" }
+        );
+        std::process::exit(2);
+    }
     let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
     let max_seq_len = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
     let max_new_tokens = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
@@ -4451,12 +4729,13 @@ fn run_gen_dflash2_synth(args: &[String], dir: &str) {
     println!("  dir       = {}", s.dir);
     println!("  sha256    = {}", s.sha256);
     println!("  tensors   = {} (assert 81)", s.n_tensors);
-    println!("  params    = {} (assert 1,924,404,480)", s.n_params);
+    println!("  params    = {} (asserted vs the live geometry's reconcile)", s.n_params);
     println!("  file_size = {} bytes", s.file_size);
     println!("  data_size = {} bytes (BF16 x params)", s.n_params * 2);
     println!("  header    = {} bytes (8-byte len + JSON)", s.header_size);
     println!("  config.json + SYNTHETIC_README.md written");
-    println!("RESULT: GENERATED (81 / 1,924,404,480 asserted at generation time)");
+    println!("RESULT: GENERATED ({} tensors / {} params asserted at generation time)",
+             gb10_inference::dflash2::n_tensors(), gb10_inference::dflash2::n_params());
 }
 
 /// rel-L2 = ‖a−b‖₂ / ‖b‖₂ (f64 accumulation for the metric only).
@@ -4555,10 +4834,10 @@ fn run_replay_df2_bisect(args: &[String]) {
     let head_path = parse_arg(args, "--head").expect("--head").to_string();
     let embed_path = parse_arg(args, "--embed").expect("--embed").to_string();
     let trunk = parse_arg(args, "--model-dir").expect("--model-dir <trunk>").to_string();
-    let (hidden, vocab, mask) = (gb10_inference::dflash2::HIDDEN, gb10_inference::dflash2::VOCAB,
-                                 gb10_inference::dflash2::MASK_TOKEN_ID as usize);
+    let (hidden, vocab, mask) = (gb10_inference::dflash2::hidden(), gb10_inference::dflash2::vocab(),
+                                 gb10_inference::dflash2::mask_token_id() as usize);
     let block = 8usize;
-    let tap_dim = gb10_inference::dflash2::TAP_CONCAT_DIM;
+    let tap_dim = gb10_inference::dflash2::tap_concat_dim();
 
     // oracle + real head/embed
     let art = gb10_inference::dflash2::load::load(&draft_dir, Some(gb10_inference::dflash2::REAL_SHA256))
@@ -4620,7 +4899,7 @@ fn run_replay_df2_bisect(args: &[String]) {
     // engine h_final at nlayers 1..5 (post final-norm of the k-layer hidden)
     for k in 1..=5usize {
         round.refresh_block_pos().expect("refresh");
-        let out = round.draft_round_depth(st.committed, gb10_inference::dflash2::SLIDING_WINDOW, false, false, true, k)
+        let out = round.draft_round_depth(st.committed, gb10_inference::dflash2::sliding_window(), false, false, true, k)
             .expect("round depth");
         // the oracle's per-layer hiddens on the same taps
         let mut tap_h = Vec::with_capacity(pos * tap_dim);
@@ -4678,7 +4957,7 @@ fn run_replay_df2_bisect(args: &[String]) {
         if off + block * hidden <= hfinal.len() {
             let orig = &hfinal[off..off + block * hidden];
             round.refresh_block_pos().expect("refresh");
-            let out5 = round.draft_round_depth(st.committed, gb10_inference::dflash2::SLIDING_WINDOW, false, false, true, 5)
+            let out5 = round.draft_round_depth(st.committed, gb10_inference::dflash2::sliding_window(), false, false, true, 5)
                 .expect("round 5");
             let rel = |a: &[f32], b: &[f32]| -> f64 {
                 let mut num = 0.0f64; let mut den = 0.0f64;
@@ -4770,8 +5049,8 @@ fn run_replay_df2_bisect(args: &[String]) {
         let th_oracle_all = oracle.tap_project(&tap_h_all, pos);
         let kv_oracle = oracle.draft_kv_write(&th_oracle_all, pos, 0);
         let k_oracle = &kv_oracle.layers[0].k;
-        let nkv = gb10_inference::dflash2::NUM_KV_HEADS;
-        let hd = gb10_inference::dflash2::HEAD_DIM;
+        let nkv = gb10_inference::dflash2::num_kv_heads();
+        let hd = gb10_inference::dflash2::head_dim();
         let mut kor = Vec::with_capacity((pos - 181) * nkv * hd);
         for r in 181..pos { kor.extend_from_slice(&k_oracle[r * nkv * hd..(r + 1) * nkv * hd]); }
         println!("[bisect] ISOLATION: inject ring k rows [181..{pos}) vs ORACLE k: relL2 {:.4e}",
@@ -4810,8 +5089,8 @@ fn run_replay_df2_bisect(args: &[String]) {
         let (injk0, _) = round2.dump_ring_rows(0, lo, pos).unwrap_or_default();
         let th_all = oracle.tap_project(&tap_h_all, pos);
         let kv_all2 = oracle.draft_kv_write(&th_all, pos, 0);
-        let nkv2 = gb10_inference::dflash2::NUM_KV_HEADS;
-        let hd2 = gb10_inference::dflash2::HEAD_DIM;
+        let nkv2 = gb10_inference::dflash2::num_kv_heads();
+        let hd2 = gb10_inference::dflash2::head_dim();
         let mut okor = Vec::with_capacity((pos - lo) * nkv2 * hd2);
         for h in 0..nkv2 {
             for r in lo..pos {
@@ -4871,10 +5150,10 @@ fn run_replay_df2_round(args: &[String]) {
     let embed_path = parse_arg(args, "--embed").expect("--replay-df2-round needs --embed <embed.bf16>").to_string();
     let out_dir = parse_arg(args, "--out").map(str::to_string).unwrap_or_else(|| "/tmp/s5f3/replay".to_string());
     let max_steps: usize = parse_arg(args, "--steps").and_then(|s| s.parse().ok()).unwrap_or(16);
-    let (hidden, vocab, mask) = (gb10_inference::dflash2::HIDDEN, gb10_inference::dflash2::VOCAB,
-                                 gb10_inference::dflash2::MASK_TOKEN_ID as usize);
+    let (hidden, vocab, mask) = (gb10_inference::dflash2::hidden(), gb10_inference::dflash2::vocab(),
+                                 gb10_inference::dflash2::mask_token_id() as usize);
     let block = 8usize;
-    let tap_dim = gb10_inference::dflash2::TAP_CONCAT_DIM;
+    let tap_dim = gb10_inference::dflash2::tap_concat_dim();
 
     // ---- load the oracle ----
     let art = gb10_inference::dflash2::load::load(&draft_dir, Some(gb10_inference::dflash2::REAL_SHA256))
@@ -5097,17 +5376,20 @@ fn run_probe_dflash2(args: &[String], dir: &str) {
     let art = gb10_inference::dflash2::load::load(dir, sha_pin).expect("load artifact");
     println!("inventory: {} tensors, {} params, {} bytes, sha256 {}",
              art.n_tensors, art.n_params, art.file_size, art.sha256);
-    check("inventory == 81 tensors / 1,924,404,480 params / BF16-only (loader)",
-          art.n_tensors == 81 && art.n_params == 1_924_404_480);
-    check("sha256 == published pin 67fc76d6…bab65c (or --sha256 override)",
-          sha_pin.is_none() || art.sha256 == gb10_inference::dflash2::REAL_SHA256
+    check(&format!("inventory == {} tensors / {} params / BF16-only (loader, live geometry)",
+                   gb10_inference::dflash2::n_tensors(), gb10_inference::dflash2::n_params()),
+          art.n_tensors == gb10_inference::dflash2::n_tensors()
+              && art.n_params == gb10_inference::dflash2::n_params());
+    check(&format!("sha256 == a published pin (matched {}..{} — or --sha256 override)",
+                   &art.sha256[..8], &art.sha256[56..]),
+          sha_pin.is_none() || gb10_inference::dflash2::KNOWN_SHA256.iter().any(|k| *k == art.sha256.as_str())
               || sha_pin.map(|p| art.sha256.eq_ignore_ascii_case(p)).unwrap_or(false));
 
     let cfg = Dflash2Config::default();
     let oracle = Dflash2Oracle::from_weights(cfg.clone(), art.weights.clone()).expect("oracle");
 
     // Deterministic synthetic context (DECISION O): C committed positions of tap hiddens.
-    let tap_dim = 5 * cfg.hidden;
+    let tap_dim = cfg.n_taps * cfg.hidden;
     let taps_gen = SyntheticTables::new(gb10_inference::dflash2::SYNTH_TAP_SEED);
     let tap_scale = 1.0f32 / (tap_dim as f32).sqrt();
     let gen_taps = |c: usize| -> Vec<f32> {
@@ -5190,7 +5472,7 @@ fn run_probe_dflash2(args: &[String], dir: &str) {
     // candidates are exactly the top-16 of each logits row under the (value desc, id asc) total
     // order — verified via an INDEPENDENT full sort (the oracle used the incremental selector).
     let mut cand_ok = true;
-    for p in 0..7 {
+    for p in 0..cfg.block - 1 {
         let row = &a1.logits[p * cfg.vocab..(p + 1) * cfg.vocab];
         let mut order: Vec<(f32, u32)> = row.iter().enumerate().map(|(i, &v)| (v, i as u32)).collect();
         order.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
@@ -5223,9 +5505,12 @@ fn run_probe_dflash2(args: &[String], dir: &str) {
     let conv_ok = hn.1.x_conv != hn.0 && hn.1.x_conv.iter().all(|x| x.is_finite())
         && hn.2 != hn.1.x_conv && hn.2.iter().all(|x| x.is_finite());
     check("structure: conv prepare/finish transform their inputs (wired, finite)", conv_ok);
-    // verify width is a constant 8 (DECISION G — no confidence head; the S5F fold note).
-    check("structure: verify width ≡ 8 (no confidence head in the 81-tensor inventory)",
-          cfg.block == 8 && art.n_tensors == 81);
+    // verify width follows the LIVE block (DECISION G — the S5F fold note: whatever the
+    // artifact, its inventory ships no confidence head; 27B 81 tensors, Ornith 96).
+    let no_conf = gb10_inference::dflash2::inventory()
+        .iter().all(|(n, _)| !n.contains("confidence"));
+    check("structure: verify width ≡ live block (no confidence head in the inventory)",
+          no_conf);
 
     // (g) piecewise — each API callable standalone, and the composition == run_round bit-exactly.
     let piecewise = (|| -> Result<(), String> {
@@ -5247,7 +5532,7 @@ fn run_probe_dflash2(args: &[String], dir: &str) {
             return Err("backbone_forward != run_round".into());
         }
         let h_sel = &h[hidden..cfg.block * hidden];
-        let logits = oracle.logits(h_sel, 7);
+        let logits = oracle.logits(h_sel, cfg.block - 1);
         if logits != a1.logits { return Err("logits != run_round".into()); }
         let sel = oracle.select_path(h_sel, &logits, anchor);
         if sel.tokens != a1.select.tokens || sel.candidates != a1.select.candidates
@@ -5422,13 +5707,16 @@ fn run_probe_df2_draft(args: &[String], dir: &str) {
         .expect("load artifact");
     println!("inventory: {} tensors, {} params, sha256 {}",
              art.n_tensors, art.n_params, &art.sha256[..16]);
-    check("inventory == 81 tensors / 1,924,404,480 params", art.n_tensors == 81 && art.n_params == 1_924_404_480);
+    check(&format!("inventory == {} tensors / {} params (live geometry)",
+                   gb10_inference::dflash2::n_tensors(), gb10_inference::dflash2::n_params()),
+          art.n_tensors == gb10_inference::dflash2::n_tensors()
+              && art.n_params == gb10_inference::dflash2::n_params());
 
     let cfg = Dflash2Config::default();
     let _oracle = Dflash2Oracle::from_weights(cfg.clone(), art.weights.clone()).expect("oracle");
     let synth = SyntheticTables::new(gb10_inference::dflash2::SYNTH_EMBED_HEAD_SEED);
 
-    let tap_dim = 5 * cfg.hidden;
+    let tap_dim = cfg.n_taps * cfg.hidden;
     let taps_gen = SyntheticTables::new(gb10_inference::dflash2::SYNTH_TAP_SEED);
     let tap_scale = 1.0f32 / (tap_dim as f32).sqrt();
     let gen_taps = |c: usize| -> Vec<f32> {
@@ -5605,6 +5893,12 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
                std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>)> {
     use gb10_inference::dflash2::capture::{Df2PrimeSink, Df2TapSink};
     use gb10_inference::dflash2::round::Df2Round;
+    // DFLASH2-GEN: install the draft's geometry from its config.json BEFORE the guards — the
+    // ctx bound, the trunk-compat check and the load below all read the LIVE geometry, and a
+    // non-27B draft would otherwise be refused against the 27B defaults (the 2026-10-23 boot
+    // receipt: the Ornith trunk was WARNed against hidden=5120 exact=64). Idempotent: the
+    // round load installs the same values again.
+    let _ = gb10_inference::dflash2::geom::install_geom_from_dir(draft_dir);
     // S10R — the ctx guard: the S10R window-bounding fix made the round's attention smem
     // ctx-INDEPENDENT (band_smem(), 8,864 B constant — PLAN/B8_S10R_DISSECTION.md §4), so the
     // round now serves up to the model's max_position_embeddings. MAX_CTX_SAFE = 262,144 is the
@@ -5612,11 +5906,11 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
     // range — AUTO-FALL BACK to MTP (the standing directive's fallback, never a hard cap).
     // Same inputs on every rank (max_seq_len rides TpConfig), so the head and the zero-config
     // nodes fall back in lockstep.
-    if max_c > gb10_inference::dflash2::MAX_CTX_SAFE {
+    if max_c > gb10_inference::dflash2::max_ctx_safe() {
         eprintln!("[df2] WARN: --max-seq-len {max_c} exceeds the DFlash2 round's ctx bound \
                    ({} = the model's max_position_embeddings; the round's RoPE tables end there) — \
                    serving via MTP (auto-fallback)",
-                  gb10_inference::dflash2::MAX_CTX_SAFE);
+                  gb10_inference::dflash2::max_ctx_safe());
         return None;
     }
     // S10' §4 — the trunk-compatibility guard: the round is dimension-fixed to the 3.8-27B shapes
@@ -5626,8 +5920,11 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
     if !gpu.df2_round_compatible() {
         let (h, v, l) = gpu.df2_trunk_dims();
         eprintln!("[df2] WARN: trunk hidden={h} vocab={v} layers={l} is not DFlash2-compatible \
-                   (the round needs hidden=5120 vocab>=248320 layers>61) — serving via MTP \
-                   (auto-fallback; the round is dimension-fixed to the 3.8-27B trunk)");
+                   (the round needs hidden={} vocab>={} layers>{} exact={}) — serving via MTP \
+                   (auto-fallback; the round's geometry comes from the draft config.json)",
+                   gb10_inference::dflash2::hidden(), gb10_inference::dflash2::vocab(),
+                   gb10_inference::dflash2::geom().tap_layers.last().copied().unwrap_or(0),
+                   gb10_inference::dflash2::num_target_layers());
         return None;
     }
     // S9F (the TP-DF2 leg): the round now loads on EVERY rank under TP — the trunk's full
@@ -6428,7 +6725,7 @@ fn run_bench_df2_matrix(args: &[String]) {
 /// NVFP4-trunk captures are the L1c fit input (paired with the BF16 references).
 fn run_probe_df2_tapcap(args: &[String]) {
     use gb10_inference::dflash2::capture::Df2TapSink;
-    use gb10_inference::dflash2::{HIDDEN, TAP_CONCAT_DIM};
+    use gb10_inference::dflash2::{hidden, tap_concat_dim};
     use half::bf16;
     let trunk_dir = parse_arg(args, "--model-dir")
         .expect("--probe-df2-tapcap needs --model-dir <trunk>").to_string();
@@ -6447,17 +6744,17 @@ fn run_probe_df2_tapcap(args: &[String]) {
     assert!(gpu.df2_capture_armed(), "tap capture not armed");
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     let mut state = gpu.new_batch_state(1, 2, 4096);
-    let mut taps: Vec<f32> = Vec::with_capacity(ids.len() * TAP_CONCAT_DIM);
+    let mut taps: Vec<f32> = Vec::with_capacity(ids.len() * gb10_inference::dflash2::tap_concat_dim());
     for (t, &tok) in ids.iter().enumerate() {
         let hidden = gpu.embed_batch(&[tok]);
         let out = gpu.forward_batch(&mut pool, hidden, &[t], &mut state, 4096, 1);
         gpu.sync_stream();
         let col: Vec<bf16> = gpu.dev().dtoh_sync_copy(&sink.staging).expect("staging dtoh");
-        for k in 0..TAP_CONCAT_DIM { taps.push(col[k].to_f32()); }
-        pool.release_bf16(out, HIDDEN);
+        for k in 0..gb10_inference::dflash2::tap_concat_dim() { taps.push(col[k].to_f32()); }
+        pool.release_bf16(out, gb10_inference::dflash2::hidden());
     }
     std::fs::write(&out_path, bytemuck::cast_slice(&taps)).expect("write taps");
-    println!("[tapcap] wrote {out_path}: [{}, {TAP_CONCAT_DIM}] f32 ({} bytes)", ids.len(), taps.len() * 4);
+    println!("[tapcap] wrote {out_path}: [{}, {}] f32 ({} bytes)", ids.len(), gb10_inference::dflash2::tap_concat_dim(), taps.len() * 4);
     println!("RESULT: TAPCAP_DONE");
 }
 
@@ -6470,8 +6767,8 @@ fn run_probe_df2_tapcap(args: &[String]) {
 /// deltas are documented findings, not gates — drafts are verify-rejected either way).
 fn run_probe_df2_prime(args: &[String]) {
     use gb10_inference::dflash2::capture::{Df2PrimeSink, Df2TapSink};
-    use gb10_inference::dflash2::round::{Df2Round, RING, ring_stride};
-    use gb10_inference::dflash2::{BLOCK, HIDDEN, TAP_CONCAT_DIM};
+    use gb10_inference::dflash2::round::{Df2Round, ring, ring_stride};
+    use gb10_inference::dflash2::{BLOCK, hidden, tap_concat_dim};
     use gb10_inference::dflash2::synth::SyntheticTables;
     use half::bf16;
     let trunk_dir = parse_arg(args, "--model-dir")
@@ -6493,26 +6790,26 @@ fn run_probe_df2_prime(args: &[String]) {
     // ---- Part A: synthetic taps through BOTH prime paths. ----
     println!("== A: synthetic taps — chunked inject vs prime_window ==");
     let taps_gen = SyntheticTables::new(gb10_inference::dflash2::SYNTH_TAP_SEED);
-    let tap_scale = 1.0f32 / (TAP_CONCAT_DIM as f32).sqrt();
+    let tap_scale = 1.0f32 / (gb10_inference::dflash2::tap_concat_dim() as f32).sqrt();
     let c = 130usize;   // a realistic short-prompt length (> 8, exercising the wide path)
     let taps_cm: Vec<bf16> = {
         // col-major [25600, c]: column j = the tap row j (the prime_window layout).
-        let mut t = vec![bf16::default(); TAP_CONCAT_DIM * c];
+        let mut t = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * c];
         for j in 0..c {
-            let row = taps_gen.row(SyntheticTables::TABLE_TAPS, j as u32, TAP_CONCAT_DIM, tap_scale);
-            for k in 0..TAP_CONCAT_DIM { t[j * TAP_CONCAT_DIM + k] = bf16::from_f32(row[k]); }
+            let row = taps_gen.row(SyntheticTables::TABLE_TAPS, j as u32, gb10_inference::dflash2::tap_concat_dim(), tap_scale);
+            for k in 0..gb10_inference::dflash2::tap_concat_dim() { t[j * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(row[k]); }
         }
         t
     };
     // (a1) the PROVEN chunked path: upload_chunk + inject_dev in BLOCK chunks.
-    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+    let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
     round.reset();
     let mut pos = 0usize;
     while pos < c {
         let n = gb10_inference::dflash2::block().min(c - pos);
         for mi in 0..n {
-            for k in 0..TAP_CONCAT_DIM {
-                staged[mi * TAP_CONCAT_DIM + k] = taps_cm[(pos + mi) * TAP_CONCAT_DIM + k];
+            for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = taps_cm[(pos + mi) * gb10_inference::dflash2::tap_concat_dim() + k];
             }
         }
         round.upload_chunk(&staged, n).unwrap();
@@ -6547,9 +6844,9 @@ fn run_probe_df2_prime(args: &[String]) {
             }
             m
         };
-        // rows actually compared: the ring rows the prime wrote (0..c % RING) for both k and v.
+        // rows actually compared: the ring rows the prime wrote (0..c % ring()) for both k and v.
         for (ki, buf) in [&ring_a[li].0, &ring_a[li].1].iter().enumerate() {
-            for row in 0..c.min(RING) {
+            for row in 0..c.min(ring()) {
                 let scale = rowmax(row, buf).max(1e-9);
                 let other = if ki == 0 { &ring_b[li].0 } else { &ring_b[li].1 };
                 for h in 0..8usize {
@@ -6588,7 +6885,7 @@ fn run_probe_df2_prime(args: &[String]) {
     gpu.set_df2_prime_sink(prime.clone());
     gpu.zero_slot_state(&mut state, 0, max_c);
     let (a0, hout) = gpu.prefill_batch(&mut pool, &prompt, &mut state, 0, max_c, 0);
-    pool.release_bf16(hout, HIDDEN * plen);
+    pool.release_bf16(hout, hidden() * plen);
     gpu.set_df2_prime_off();
     round2.reset();
     round2.prime_window(&prime.taps, plen, 0).unwrap();
@@ -6598,7 +6895,7 @@ fn run_probe_df2_prime(args: &[String]) {
     // the DECODE-captured reference: forward_batch per token with the 8-col sink armed.
     gpu.set_df2_capture(sink.clone());
     round.reset();
-    let mut dcap: Vec<bf16> = Vec::with_capacity(plen * TAP_CONCAT_DIM);
+    let mut dcap: Vec<bf16> = Vec::with_capacity(plen * gb10_inference::dflash2::tap_concat_dim());
     let mut state2 = gpu.new_batch_state(1, 2, max_c);
     gpu.zero_slot_state(&mut state2, 0, max_c);
     for (t, &tok) in prompt.iter().enumerate() {
@@ -6606,17 +6903,17 @@ fn run_probe_df2_prime(args: &[String]) {
         let out = gpu.forward_batch(&mut pool, hidden, &[t], &mut state2, max_c, 1);
         gpu.sync_stream();
         let col: Vec<bf16> = gpu.dev().dtoh_sync_copy(&sink.staging).expect("staging dtoh");
-        dcap.extend_from_slice(&col[..TAP_CONCAT_DIM]);
-        pool.release_bf16(out, HIDDEN);
+        dcap.extend_from_slice(&col[..gb10_inference::dflash2::tap_concat_dim()]);
+        pool.release_bf16(out, gb10_inference::dflash2::hidden());
     }
     gpu.set_df2_capture_off();
-    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+    let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
     let mut pos = 0usize;
     while pos < plen {
         let n = gb10_inference::dflash2::block().min(plen - pos);
         for mi in 0..n {
-            for k in 0..TAP_CONCAT_DIM {
-                staged[mi * TAP_CONCAT_DIM + k] = dcap[(pos + mi) * TAP_CONCAT_DIM + k];
+            for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = dcap[(pos + mi) * gb10_inference::dflash2::tap_concat_dim() + k];
             }
         }
         round.upload_chunk(&staged, n).unwrap();
@@ -6626,7 +6923,7 @@ fn run_probe_df2_prime(args: &[String]) {
     round.refresh_block_pos().unwrap();
     let draft_decode = round.draft_round_dev(a0).unwrap();
     let pf_taps: Vec<bf16> = gpu.dev().dtoh_sync_copy(&prime.taps).expect("pf taps dtoh")
-        .into_iter().take(plen * TAP_CONCAT_DIM).collect();
+        .into_iter().take(plen * gb10_inference::dflash2::tap_concat_dim()).collect();
     let mut tap_mm = 0usize; let mut tap_tot = 0usize; let mut tap_ulp = 0u32;
     for (x, y) in pf_taps.iter().zip(dcap.iter()) {
         tap_tot += 1;
@@ -6645,12 +6942,12 @@ fn run_probe_df2_prime(args: &[String]) {
     for k in 0..5usize {
         let mut num = 0.0f64; let mut den = 0.0f64;
         for j in 0..plen {
-            for i in 0..HIDDEN {
-                let d = (pf_f[j * TAP_CONCAT_DIM + k * HIDDEN + i]
-                         - dc_f[j * TAP_CONCAT_DIM + k * HIDDEN + i]) as f64;
+            for i in 0..hidden() {
+                let d = (pf_f[j * gb10_inference::dflash2::tap_concat_dim() + k * hidden() + i]
+                         - dc_f[j * gb10_inference::dflash2::tap_concat_dim() + k * hidden() + i]) as f64;
                 num += d * d;
-                den += (dc_f[j * TAP_CONCAT_DIM + k * HIDDEN + i] as f64)
-                         * (dc_f[j * TAP_CONCAT_DIM + k * HIDDEN + i] as f64);
+                den += (dc_f[j * gb10_inference::dflash2::tap_concat_dim() + k * hidden() + i] as f64)
+                         * (dc_f[j * gb10_inference::dflash2::tap_concat_dim() + k * hidden() + i] as f64);
             }
         }
         worst_pd = worst_pd.max((num / den.max(1e-30)).sqrt());
@@ -6669,7 +6966,7 @@ fn run_probe_df2_prime(args: &[String]) {
         let mut f = std::fs::File::create("/tmp/s5f/chat1_engine_taps.f32").expect("tap dump");
         use std::io::Write;
         let pf_f: Vec<f32> = pf_taps.iter().map(|b| b.to_f32()).collect();
-        f.write_all(bytemuck::cast_slice(&pf_f[..plen * TAP_CONCAT_DIM])).expect("write taps");
+        f.write_all(bytemuck::cast_slice(&pf_f[..plen * gb10_inference::dflash2::tap_concat_dim()])).expect("write taps");
         println!("  engine chat1 prefill taps ({plen} cols) -> /tmp/s5f/chat1_engine_taps.f32");
     }
     println!("RESULT: {}", if all_pass.get() { "ALL PASS" } else { "FAIL" });
@@ -6684,7 +6981,7 @@ fn run_probe_df2_prime(args: &[String]) {
 fn run_probe_df2_graph(args: &[String]) {
     use gb10_inference::dflash2::capture::{Df2PrimeSink, Df2TapSink};
     use gb10_inference::dflash2::round::Df2Round;
-    use gb10_inference::dflash2::{BLOCK, HIDDEN, TAP_CONCAT_DIM};
+    use gb10_inference::dflash2::{BLOCK, hidden, tap_concat_dim};
     use gb10_inference::dflash2::synth::SyntheticTables;
     use half::bf16;
     let trunk_dir = parse_arg(args, "--model-dir")
@@ -6705,15 +7002,15 @@ fn run_probe_df2_graph(args: &[String]) {
 
     // Prime with deterministic synthetic taps (the chunked path).
     let taps_gen = SyntheticTables::new(gb10_inference::dflash2::SYNTH_TAP_SEED);
-    let tap_scale = 1.0f32 / (TAP_CONCAT_DIM as f32).sqrt();
+    let tap_scale = 1.0f32 / (gb10_inference::dflash2::tap_concat_dim() as f32).sqrt();
     let c = 512usize;
-    let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+    let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
     let mut pos = 0usize;
     while pos < c {
         let n = gb10_inference::dflash2::block().min(c - pos);
         for mi in 0..n {
-            let row = taps_gen.row(SyntheticTables::TABLE_TAPS, (pos + mi) as u32, TAP_CONCAT_DIM, tap_scale);
-            for k in 0..TAP_CONCAT_DIM { staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(row[k]); }
+            let row = taps_gen.row(SyntheticTables::TABLE_TAPS, (pos + mi) as u32, gb10_inference::dflash2::tap_concat_dim(), tap_scale);
+            for k in 0..gb10_inference::dflash2::tap_concat_dim() { staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(row[k]); }
         }
         round.upload_chunk(&staged, n).unwrap();
         round.inject_dev(n, None).unwrap();
@@ -6752,7 +7049,7 @@ fn run_probe_df2_graph(args: &[String]) {
                 println!("    nprev={np}: eager {eg:?} vs graph {gp:?}");
                 // first-diverging surface: the post-final-norm block hidden (the head's input).
                 let hf = round.dump_h_final().unwrap();
-                let h = gb10_inference::dflash2::HIDDEN;
+                let h = gb10_inference::dflash2::hidden();
                 let mut nd = 0usize; let mut f = 0usize;
                 for i in 0..hf.len() {
                     if hf[i].to_bits() != hf[i].to_bits() { nd += 1; if f == 0 { f = i; } }
@@ -6820,8 +7117,8 @@ fn bf16_ulp_dist(a: half::bf16, b: half::bf16) -> u32 {
 fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     let baked = gb10_inference::dflash2::load::is_baked(draft_dir);
     use gb10_inference::dflash2::capture::Df2TapSink;
-    use gb10_inference::dflash2::round::{Df2Round, EvTimer, Nvfp4Ptrs, RING};
-    use gb10_inference::dflash2::{mirror as m, BLOCK, HIDDEN, TAP_CONCAT_DIM, VOCAB};
+    use gb10_inference::dflash2::round::{Df2Round, EvTimer, Nvfp4Ptrs, ring};
+    use gb10_inference::dflash2::{mirror as m, BLOCK, hidden, tap_concat_dim, vocab};
     use gb10_inference::dflash2::oracle::Dflash2Config;
     use gb10_inference::dflash2::synth::SyntheticTables;
     use half::bf16;
@@ -6876,9 +7173,9 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
         (pv.data().to_vec(), sv.data().to_vec(), gs, mm, kk)
     };
     let (hp_pack, hp_sc, hp_gs, hm, hk) = host_nvfp4("lm_head");
-    assert_eq!((hm, hk), (VOCAB, HIDDEN), "trunk lm_head shape {hm}x{hk}");
+    assert_eq!((hm, hk), (vocab(), hidden()), "trunk lm_head shape {hm}x{hk}");
     let (ep_pack, ep_sc, ep_gs, em, ek) = host_nvfp4("model.language_model.embed_tokens");
-    assert_eq!((em, ek), (VOCAB, HIDDEN), "trunk embed shape {em}x{ek}");
+    assert_eq!((em, ek), (vocab(), hidden()), "trunk embed shape {em}x{ek}");
     println!("  trunk head/embed host copies: gs {hp_gs:.4}/{ep_gs:.4}, {hm}x{hk}");
 
     // decode the head ONCE (row-parallel) into a flat bf16 matrix (mma semantics, no gs)
@@ -6932,7 +7229,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     let round_pin = if gb10_inference::dflash2::load::is_baked(draft_dir) { None } else { Some(gb10_inference::dflash2::REAL_SHA256) };
     let mut round = Df2Round::load_pinned(draft_dir, Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(head_p)), Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(embed_p)), max_c, round_pin)
         .expect("round load");
-    println!("  Df2Round loaded in {:.1}s (ring {RING} rows/layer)", t3.elapsed().as_secs_f32());
+    println!("  Df2Round loaded in {:.1}s (ring {} rows/layer)", t3.elapsed().as_secs_f32(), gb10_inference::dflash2::round::ring());
 
 
 
@@ -6944,7 +7241,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     let det_only = gb10_inference::opts::var(gb10_inference::opt!("df2-det-only")).is_ok();
     if det_only {
         let gen_taps = |c: usize| -> Vec<f32> {
-            let mut t = vec![0f32; c * TAP_CONCAT_DIM];
+            let mut t = vec![0f32; c * gb10_inference::dflash2::tap_concat_dim()];
             let mut rng: u64 = 0x9E3779B97F4A7C15;
             for v in t.iter_mut() {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -6953,11 +7250,11 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             t
         };
         let staged_row = |staged: &mut Vec<bf16>, taps: &[f32], base: usize| {
-            for mi in 0..8usize { for k in 0..TAP_CONCAT_DIM {
-                staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(base + mi) * TAP_CONCAT_DIM + k]);
+            for mi in 0..8usize { for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(taps[(base + mi) * gb10_inference::dflash2::tap_concat_dim() + k]);
             } }
         };
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+        let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
         let c = 512usize;
         let taps = gen_taps(c);
         {
@@ -7024,7 +7321,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 let mut nd = 0usize; let mut f = 0usize;
                 for k in 0..a.len() { if a[k] != b[k] { nd += 1; if f == 0 { f = k; } } }
                 println!("    stage {name}: DIVERGES rep {i}: {nd}/{} elems, first at {f} (row {}, col {}): {:+e} vs {:+e}",
-                         a.len(), f / HIDDEN.max(1), f % HIDDEN.max(1), a[f.min(a.len()-1)], b[f.min(a.len()-1)]);
+                         a.len(), f / hidden().max(1), f % hidden().max(1), a[f.min(a.len()-1)], b[f.min(a.len()-1)]);
                 if first_div.is_none() { first_div = Some((i, name)); }
             } else {
                 println!("    stage {name}: stable (30 reps)");
@@ -7058,28 +7355,28 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     let mut run_capture = |trunk: &gb10_inference::gpu::GpuModel, sink: &std::sync::Arc<Df2TapSink>,
                            logits_out: &mut Vec<f32>| -> Vec<f32> {
         let mut state = trunk.new_batch_state(1, 2, 4096);
-        let mut taps: Vec<f32> = Vec::with_capacity(cap_prompt.len() * TAP_CONCAT_DIM);
+        let mut taps: Vec<f32> = Vec::with_capacity(cap_prompt.len() * gb10_inference::dflash2::tap_concat_dim());
         for (t, &tok) in cap_prompt.iter().enumerate() {
             let hidden = trunk.embed_batch(&[tok]);
             let out = trunk.forward_batch(&mut pool, hidden, &[t], &mut state, 4096, 1);
             trunk.sync_stream();
             // staging col 0 = THIS forward's taps (5 layers x 5120, layer-major)
             let col: Vec<bf16> = trunk.dev().dtoh_sync_copy(&sink.staging).expect("staging dtoh");
-            let col0: Vec<bf16> = (0..TAP_CONCAT_DIM).map(|k| col[k]).collect();
+            let col0: Vec<bf16> = (0..gb10_inference::dflash2::tap_concat_dim()).map(|k| col[k]).collect();
             taps.extend(col0.iter().map(|x| x.to_f32()));
             if t == cap_prompt.len() - 1 {
                 let lg = trunk.logits_batch(&mut pool, &out, 1);
                 let lgv: Vec<bf16> = trunk.dev().dtoh_sync_copy(&lg).expect("logits dtoh");
                 *logits_out = lgv.iter().map(|x| x.to_f32()).collect();
-                pool.release_bf16(lg, VOCAB);
+                pool.release_bf16(lg, vocab());
             }
-            pool.release_bf16(out, HIDDEN);
+            pool.release_bf16(out, gb10_inference::dflash2::hidden());
         }
         taps
     };
     let mut lg1 = Vec::new();
     let taps_a = run_capture(&trunk, &sink, &mut lg1);
-    check("captured 64 positions x 25600", taps_a.len() == 64 * TAP_CONCAT_DIM);
+    check("captured 64 positions x 25600", taps_a.len() == 64 * gb10_inference::dflash2::tap_concat_dim());
 
     // double-run determinism: a fresh trunk state, same prompt -> identical capture
     let mut lg2 = Vec::new();
@@ -7099,9 +7396,9 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 let lg = trunk.logits_batch(&mut pool, &out, 1);
                 let lgv: Vec<bf16> = trunk.dev().dtoh_sync_copy(&lg).expect("logits dtoh");
                 lg3 = lgv.iter().map(|x| x.to_f32()).collect();
-                pool.release_bf16(lg, VOCAB);
+                pool.release_bf16(lg, vocab());
             }
-            pool.release_bf16(out, HIDDEN);
+            pool.release_bf16(out, gb10_inference::dflash2::hidden());
         }
     }
     check("trunk logits identical capture-on vs capture-off (no behavior change)", lg1 == lg3);
@@ -7112,7 +7409,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     for pos in 0..64 {
         for l in 0..5 {
             let mut s = 0f32;
-            for k in 0..HIDDEN { let v = taps_a[pos * TAP_CONCAT_DIM + l * HIDDEN + k]; s += v * v; }
+            for k in 0..hidden() { let v = taps_a[pos * gb10_inference::dflash2::tap_concat_dim() + l * hidden() + k]; s += v * v; }
             norms[l] += s.sqrt();
         }
     }
@@ -7126,11 +7423,11 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     // ---- Part R2: the integrated round vs the extended mirror ----------------
     println!("\n== R2: integrated round vs mirror (EXACT on identical inputs) ==");
     let taps_gen = SyntheticTables::new(gb10_inference::dflash2::SYNTH_TAP_SEED);
-    let tap_scale = 1.0f32 / (TAP_CONCAT_DIM as f32).sqrt();
+    let tap_scale = 1.0f32 / (gb10_inference::dflash2::tap_concat_dim() as f32).sqrt();
     let gen_taps = |c: usize| -> Vec<f32> {
-        let mut t = Vec::with_capacity(c * TAP_CONCAT_DIM);
+        let mut t = Vec::with_capacity(c * gb10_inference::dflash2::tap_concat_dim());
         for i in 0..c {
-            t.extend_from_slice(&taps_gen.row(SyntheticTables::TABLE_TAPS, i as u32, TAP_CONCAT_DIM, tap_scale));
+            t.extend_from_slice(&taps_gen.row(SyntheticTables::TABLE_TAPS, i as u32, gb10_inference::dflash2::tap_concat_dim(), tap_scale));
         }
         t
     };
@@ -7170,7 +7467,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     let mut n_rounds = 0usize;
 
     for fx in &fixtures {
-        println!("\n-- fixture {} ({} x {}) --", fx.name, fx.c, TAP_CONCAT_DIM);
+        println!("\n-- fixture {} ({} x {}) --", fx.name, fx.c, gb10_inference::dflash2::tap_concat_dim());
         let tm = std::time::Instant::now();
         let taps_bf16 = m::rb_clone(&fx.taps);
         let (_, th_m) = m::round_tap_project_dsp(&cfg, &art.weights.fc, &art.weights.hidden_norm, &taps_bf16, fx.c);
@@ -7184,18 +7481,18 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
         }
         println!("    mirror ctx built in {:.1}s", tm.elapsed().as_secs_f32());
 
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+        let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
         // the FULL mirror th (all c rows) for the per-chunk gate
         let (th_raw_all, th_all) = m::round_tap_project_dsp(&cfg, &art.weights.fc, &art.weights.hidden_norm, &taps_bf16, fx.c);
-        let k4_all = m::round_draft_kv_dsp(&cfg, &art.weights.layers[gb10_inference::dflash2::N_LAYERS - 1], &th_all, fx.c, 0, &cos, &sin);
+        let k4_all = m::round_draft_kv_dsp(&cfg, &art.weights.layers[gb10_inference::dflash2::n_layers() - 1], &th_all, fx.c, 0, &cos, &sin);
         round.reset();
         let mut pos = 0usize;
         let mut chunk_bad = 0usize;
         while pos < fx.c {
             let n = gb10_inference::dflash2::block().min(fx.c - pos);
             for mi in 0..n {
-                for k in 0..TAP_CONCAT_DIM {
-                    staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(fx.taps[(pos + mi) * TAP_CONCAT_DIM + k]);
+                for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                    staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(fx.taps[(pos + mi) * gb10_inference::dflash2::tap_concat_dim() + k]);
                 }
             }
             round.upload_chunk(&staged, n).expect("upload chunk");
@@ -7205,8 +7502,8 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 // upstream explains an all-layers k divergence; a clean th localizes to the
                 // k chain)
                 let th_d = round.dump_th().unwrap();
-                let th_m = &th_all[pos * HIDDEN..(pos + n) * HIDDEN];
-                if th_d[..n * HIDDEN] != th_m[..n * HIDDEN] {
+                let th_m = &th_all[pos * hidden()..(pos + n) * hidden()];
+                if th_d[..n * hidden()] != th_m[..n * hidden()] {
                     // PROOF PATH: the device norm's `inv` comes from rsqrt.approx.f32 (MUFU,
                     // <=2 ulp — see the PTX), so a 1-f32-ulp inv shift near a bf16 rounding
                     // boundary flips the stored element. Scan inv candidates around the
@@ -7214,30 +7511,30 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                     // residue is fully explained by the hardware rsqrt approximation.
                     let mut bad_rows = 0usize; let mut explained_rows = 0usize;
                     for r in 0..n {
-                        if th_d[r * HIDDEN..(r + 1) * HIDDEN] == th_m[r * HIDDEN..(r + 1) * HIDDEN] { continue; }
+                        if th_d[r * hidden()..(r + 1) * hidden()] == th_m[r * hidden()..(r + 1) * hidden()] { continue; }
                         bad_rows += 1;
                         let mut nd = 0usize; let mut fi = 0usize;
-                        for i in 0..HIDDEN {
-                            if th_d[r * HIDDEN + i] != th_m[r * HIDDEN + i] { nd += 1; if fi == 0 { fi = i; } }
+                        for i in 0..hidden() {
+                            if th_d[r * hidden() + i] != th_m[r * hidden() + i] { nd += 1; if fi == 0 { fi = i; } }
                         }
-                        let raw = &th_raw_all[(pos + r) * HIDDEN..(pos + r + 1) * HIDDEN];
+                        let raw = &th_raw_all[(pos + r) * hidden()..(pos + r + 1) * hidden()];
                         let w_n = &art.weights.hidden_norm;
-                        let base = m::rms_norm_rows_inv_exact(raw, w_n, HIDDEN, cfg.rms_eps);
+                        let base = m::rms_norm_rows_inv_exact(raw, w_n, hidden(), cfg.rms_eps);
                         let mut best = (0i32, 0usize); // (bit offset, matched count)
                         for off in -8i32..=8 {
                             let inv_c = f32::from_bits((base.to_bits() as i32 + off) as u32);
                             let mut matched = 0usize;
-                            for i in 0..HIDDEN {
-                                if bf16::from_f32(raw[i] * inv_c * w_n[i]).to_f32() == th_d[r * HIDDEN + i] { matched += 1; }
+                            for i in 0..hidden() {
+                                if bf16::from_f32(raw[i] * inv_c * w_n[i]).to_f32() == th_d[r * hidden() + i] { matched += 1; }
                             }
                             if matched > best.1 { best = (off, matched); }
                         }
-                        let explained = best.1 == HIDDEN;
+                        let explained = best.1 == hidden();
                         if explained { explained_rows += 1; }
                         if bad_rows <= 3 {
                             println!("      th chunk@{} row {}: {}/{} elems differ (first at {}: dev {:+e} mir {:+e}); inv candidate {:+} ulp reproduces {}/{} -> {}",
-                                     pos, pos + r, nd, HIDDEN, fi, th_d[r * HIDDEN + fi], th_m[r * HIDDEN + fi],
-                                     best.0, best.1, HIDDEN,
+                                     pos, pos + r, nd, hidden(), fi, th_d[r * hidden() + fi], th_m[r * hidden() + fi],
+                                     best.0, best.1, hidden(),
                                      if explained { "EXPLAINED (rsqrt.approx)" } else { "UNEXPLAINED" });
                         }
                     }
@@ -7267,26 +7564,26 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
         check(&format!("{}: nprev == c after incremental prime", fx.name), round.nprev() == fx.c);
 
         // the device th holds ONLY the last chunk's 8 rows (the incremental path)
-        let th_last = &th_m[(fx.c - gb10_inference::dflash2::block()) * HIDDEN..];
+        let th_last = &th_m[(fx.c - gb10_inference::dflash2::block()) * hidden()..];
         let th_dev = round.dump_th().expect("th");
         let th_bit = th_dev == th_last;
         let th_rl = rel_l2(&th_dev, th_last);
         println!("    th (last 8 rows): bitwise {} (rel-L2 {th_rl:.3e})", if th_bit { "EQUAL" } else { "DIFF" });
         check(&format!("{}: th == mirror (bitwise, last chunk)", fx.name), th_bit || th_rl < 1e-6);
 
-        // ring row j%RING holds ctx row j IFF j is the LAST position mapping there
-        // (j > c-1-RING); at c<=RING that is every row, at c=4096=2*RING the second pass.
+        // ring row j%ring() holds ctx row j IFF j is the LAST position mapping there
+        // (j > c-1-ring()); at c<=ring() that is every row, at c=4096=2*ring() the second pass.
         // the ring cache is [nkv, stride, hd]: row j's (h,d) element at (h*stride + j)*hd + d.
         // ALL 5 layers; mismatching elements are classified by bf16 ulp distance (a <=4-ulp
         // tail on <0.1% of elements with bitwise-exact th AND bitwise-exact per-chunk k is a
         // mirror-fidelity artifact — DECISION; anything larger is a wiring bug).
-        let kv_lo = fx.c.saturating_sub(RING);
+        let kv_lo = fx.c.saturating_sub(ring());
         let mut kv_tot = 0usize; let mut kv_max_ulp = 0u32; let mut kv_examples = 0usize;
         let mut kv_max_rel = 0f32; // |dev-mir| / row MAX |k| (units of the row rounding quantum)
-        for li in 0..gb10_inference::dflash2::N_LAYERS {
+        for li in 0..gb10_inference::dflash2::n_layers() {
             let (kr, _vr) = round.dump_ring_kv(li).expect("ring kv");
             for j in kv_lo..fx.c {
-                let rj = j % RING;
+                let rj = j % ring();
                 // this row's mirror k MAX magnitude (the rounding-quantum scale of the row)
                 let mut row_max = 0f32;
                 for h in 0..8usize { for d2 in 0..128usize {
@@ -7310,17 +7607,17 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 }
             }
         }
-        let kv_n = (fx.c - kv_lo) * (8 * 128) * gb10_inference::dflash2::N_LAYERS;
+        let kv_n = (fx.c - kv_lo) * (8 * 128) * gb10_inference::dflash2::n_layers();
         println!("    ring k all layers: {kv_tot}/{kv_n} mismatched, max ulp {kv_max_ulp}, max |dev-mir|/rowMAX {kv_max_rel:.3e} (bf16 half-ulp at max = 3.9e-3)");
         if kv_tot > 0 {
             // ulp histogram + the worst 5 (anything past ~4 ulp is NOT an rsqrtf-class
             // approximation artifact and must be explained before this gate can pass)
             let mut b = [0usize; 5]; // 1, 2-4, 5-16, 17-64, >64
             let mut worst: Vec<(u32, usize, usize, usize, usize, f32, f32)> = Vec::new();
-            for li in 0..gb10_inference::dflash2::N_LAYERS {
+            for li in 0..gb10_inference::dflash2::n_layers() {
                 let (kr, _vr) = round.dump_ring_kv(li).expect("ring kv");
                 for j in kv_lo..fx.c {
-                    let rj = j % RING;
+                    let rj = j % ring();
                     for h in 0..8usize {
                         for d2 in 0..128usize {
                             let dv = kr[(h * 2056 + rj) * 128 + d2];
@@ -7358,13 +7655,13 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             let mut emb_worst = 0f64;
             for &anchor in &anchors {
                 let dev = round.embed_probe(anchor).expect("embed probe");
-                let mut emb16 = vec![bf16::default(); gb10_inference::dflash2::block() * HIDDEN];
-                m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN, anchor as usize, ep_gs,
-                                 &mut emb16[..HIDDEN]);
+                let mut emb16 = vec![bf16::default(); gb10_inference::dflash2::block() * hidden()];
+                m::embed_row_mma(&ep_pack, &ep_sc, hidden(), anchor as usize, ep_gs,
+                                 &mut emb16[..hidden()]);
                 for r in 1..gb10_inference::dflash2::block() {
-                    m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN,
-                                     gb10_inference::dflash2::MASK_TOKEN_ID as usize, ep_gs,
-                                     &mut emb16[r * HIDDEN..(r + 1) * HIDDEN]);
+                    m::embed_row_mma(&ep_pack, &ep_sc, hidden(),
+                                     gb10_inference::dflash2::mask_token_id() as usize, ep_gs,
+                                     &mut emb16[r * hidden()..(r + 1) * hidden()]);
                 }
                 let mir: Vec<f32> = emb16.iter().map(|b| b.to_f32()).collect();
                 let bit = dev == mir;
@@ -7376,18 +7673,18 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             if !emb_ok {
                 // layout debug: the first 6 elements of anchor 12345 on both paths
                 let dev = round.embed_probe(12345).unwrap();
-                let mut e16 = vec![bf16::default(); HIDDEN];
-                m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN, 12345, ep_gs, &mut e16);
+                let mut e16 = vec![bf16::default(); hidden()];
+                m::embed_row_mma(&ep_pack, &ep_sc, hidden(), 12345, ep_gs, &mut e16);
                 let mir: Vec<f32> = e16.iter().map(|b| b.to_f32()).collect();
                 println!("    embed dbg anchor 12345: dev {:?}…", &dev[..6.min(dev.len())]);
                 println!("    embed dbg anchor 12345: mir {:?}…", &mir[..6.min(mir.len())]);
                 // per-row rel-L2 (row 0 = anchor, rows 1..7 = MASK) + first differing element
                 for r in 0..gb10_inference::dflash2::block() {
-                    let dr = &dev[r * HIDDEN..(r + 1) * HIDDEN];
-                    let mr = &mir[r * HIDDEN..(r + 1) * HIDDEN];
+                    let dr = &dev[r * hidden()..(r + 1) * hidden()];
+                    let mr = &mir[r * hidden()..(r + 1) * hidden()];
                     let rl = rel_l2(dr, mr);
                     let mut ne = 0usize; let mut ex = (0usize, 0f32, 0f32);
-                    for i in 0..HIDDEN {
+                    for i in 0..hidden() {
                         if dr[i].to_bits() != mr[i].to_bits() {
                             if ne == 0 { ex = (i, dr[i], mr[i]); }
                             ne += 1;
@@ -7448,10 +7745,10 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                         }
                     }
                     // the trunk's own dequant at the probe tile-row (device-side cross-check)
-                    let dq = round.dequant_probe(771, embed_p.qweight, embed_p.scales, embed_p.gs, HIDDEN).unwrap();
-                    let dq9 = &dq[9 * HIDDEN..10 * HIDDEN];
+                    let dq = round.dequant_probe(771, embed_p.qweight, embed_p.scales, embed_p.gs, hidden()).unwrap();
+                    let dq9 = &dq[9 * hidden()..10 * hidden()];
                     let mut dq_mir = 0usize; let mut dq_dev = 0usize;
-                    for i in 0..HIDDEN {
+                    for i in 0..hidden() {
                         if dq9[i] == mir[i] { dq_mir += 1; }
                         if dq9[i] == dev[i] { dq_dev += 1; }
                     }
@@ -7469,12 +7766,12 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
 
             let blk_live = gb10_inference::dflash2::block();
             let block_pos: Vec<usize> = (fx.c..fx.c + blk_live).collect();
-            let mut emb16 = vec![bf16::default(); blk_live * HIDDEN];
-            m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN, anchor as usize, ep_gs, &mut emb16[..HIDDEN]);
+            let mut emb16 = vec![bf16::default(); blk_live * hidden()];
+            m::embed_row_mma(&ep_pack, &ep_sc, hidden(), anchor as usize, ep_gs, &mut emb16[..hidden()]);
             for r in 1..gb10_inference::dflash2::block() {
-                m::embed_row_mma(&ep_pack, &ep_sc, HIDDEN,
-                                 gb10_inference::dflash2::MASK_TOKEN_ID as usize, ep_gs,
-                                 &mut emb16[r * HIDDEN..(r + 1) * HIDDEN]);
+                m::embed_row_mma(&ep_pack, &ep_sc, hidden(),
+                                 gb10_inference::dflash2::mask_token_id() as usize, ep_gs,
+                                 &mut emb16[r * hidden()..(r + 1) * hidden()]);
             }
             let emb = m::rb_clone(&emb16.iter().map(|b| b.to_f32()).collect::<Vec<f32>>());
             let mut h = emb.clone();
@@ -7485,11 +7782,11 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             // DF2 block-16: the mirror's h_final must have the LIVE block's row count, not the
             // BLOCK const — otherwise the device (block rows) and mirror (8 rows) lengths differ.
             let h_final = m::rb_clone(&m::rms_norm_rows(&h, &art.weights.norm,
-                                       gb10_inference::dflash2::block(), HIDDEN, cfg.rms_eps));
+                                       gb10_inference::dflash2::block(), hidden(), cfg.rms_eps));
             let hf_rl = rel_l2(&out.h_final, &h_final);
 
-            let hsel: Vec<f32> = (1..gb10_inference::dflash2::block()).flat_map(|r| h_final[r * HIDDEN..(r + 1) * HIDDEN].to_vec()).collect();
-            let lg_m = m::head_logits_mirror(&head_bf16, &hsel, blk_live - 1, HIDDEN, hp_gs, VOCAB);
+            let hsel: Vec<f32> = (1..gb10_inference::dflash2::block()).flat_map(|r| h_final[r * hidden()..(r + 1) * hidden()].to_vec()).collect();
+            let lg_m = m::head_logits_mirror(&head_bf16, &hsel, blk_live - 1, hidden(), hp_gs, vocab());
             let lg_d = out.logits.as_ref().unwrap();
             let lg_rl = rel_l2(lg_d, &lg_m);
 
@@ -7497,7 +7794,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             // block() of columns; the trailing column is garbage-but-unread at block 8, and at
             // block 16 the 15th/16th column likewise). Mirror the READ width, not the write width.
             let hp_m = m::rb_clone(&m::linear_gemm_dsp(&art.weights.hidden_projection, &hsel,
-                                                       gb10_inference::dflash2::SELECTOR_RANK, HIDDEN,
+                                                       gb10_inference::dflash2::selector_rank(), hidden(),
                                                        gb10_inference::dflash2::block() - 1));
             let hp_d = out.hp.as_ref().unwrap();
             let hp_bit = *hp_d == hp_m;
@@ -7505,7 +7802,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             // GATE E: top16 EXACT on IDENTICAL logits (device bf16 logits through the mirror)
             let mut e_ok = true;
             for p in 0..out.tokens.len() {
-                let row: Vec<f32> = (0..VOCAB).map(|v| lg_d[p * VOCAB + v]).collect();
+                let row: Vec<f32> = (0..vocab()).map(|v| lg_d[p * vocab() + v]).collect();
                 let (vals, ids) = oracle.top16(&row);
                 for k in 0..16 {
                     if vals[k].to_bits() != out.unary[p * 16 + k].to_bits()
@@ -7519,7 +7816,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             let nlv_r = out.tokens.len();
             let (tok_m, sc_m) = m::round_walk_mirror(hp_d, &out.candidates, &out.unary, anchor,
                                                      &pred_cb, &succ_cb,
-                                                     gb10_inference::dflash2::SELECTOR_RANK, nlv_r);
+                                                     gb10_inference::dflash2::selector_rank(), nlv_r);
             let f_bit = tok_m == out.tokens && sc_m == out.scores;
             if f_bit { n_exact_walk += 1; }
 
@@ -7527,11 +7824,11 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             let mut cand_m = vec![0u32; nlv_r * 16];
             let mut un_m = vec![0f32; nlv_r * 16];
             for p in 0..nlv_r {
-                let (vals, ids) = oracle.top16(&lg_m[p * VOCAB..(p + 1) * VOCAB]);
+                let (vals, ids) = oracle.top16(&lg_m[p * vocab()..(p + 1) * vocab()]);
                 for k in 0..16 { cand_m[p * 16 + k] = ids[k]; un_m[p * 16 + k] = vals[k]; }
             }
             let (tok_e2e, _) = m::round_walk_mirror(&hp_m, &cand_m, &un_m, anchor, &pred_cb, &succ_cb,
-                                                    gb10_inference::dflash2::SELECTOR_RANK, nlv_r);
+                                                    gb10_inference::dflash2::selector_rank(), nlv_r);
             let g_eq = tok_e2e == out.tokens;
             if g_eq { n_exact_path += 1; }
             println!("    anchor {anchor}: h_final {hf_rl:.3e} | logits {lg_rl:.3e} | hp bitwise {hp_bit} | top16 {} | walk {} | path {}",
@@ -7549,13 +7846,13 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     println!("\n== R3: negative controls ==");
     let prime = |round: &mut Df2Round, taps: &[f32], c: usize, stop: usize| {
         round.reset();
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+        let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
         let mut pos = 0usize;
         while pos < stop {
             let n = gb10_inference::dflash2::block().min(stop - pos);
             for mi in 0..n {
-                for k in 0..TAP_CONCAT_DIM {
-                    staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(pos + mi) * TAP_CONCAT_DIM + k]);
+                for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                    staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(taps[(pos + mi) * gb10_inference::dflash2::tap_concat_dim() + k]);
                 }
             }
             round.upload_chunk(&staged, n).unwrap();
@@ -7573,8 +7870,8 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
             round.draft_round(12345, 2048, false, false, false).unwrap().tokens
         };
         let mut swapped = taps.clone();
-        for k in 0..TAP_CONCAT_DIM {
-            swapped.swap(510 * TAP_CONCAT_DIM + k, 511 * TAP_CONCAT_DIM + k);
+        for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+            swapped.swap(510 * gb10_inference::dflash2::tap_concat_dim() + k, 511 * gb10_inference::dflash2::tap_concat_dim() + k);
         }
         let pert = {
             prime(&mut round, &swapped, c, c);
@@ -7645,7 +7942,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                     let mut nd = 0usize; let mut first = 0usize;
                     for k in 0..a.len() { if a[k] != b[k] { nd += 1; if first == 0 { first = k; } } }
                     println!("      depth {depth} (L0..={}): DIVERGES at rep {i}: {nd}/{} elems, first at row {} col {}: {:+e} vs {:+e}",
-                             depth - 1, a.len(), first / HIDDEN, first % HIDDEN, a[first], b[first]);
+                             depth - 1, a.len(), first / hidden(), first % hidden(), a[first], b[first]);
                     break;
                 }
                 None => println!("      depth {depth} (L0..={}): 30 reps identical", depth - 1),
@@ -7683,7 +7980,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
                 let mut nd = 0usize; let mut first = 0usize;
                 for k in 0..a.len() { if a[k] != b[k] { nd += 1; if first == 0 { first = k; } } }
                 println!("      stage {name}: round {i} first diverges: {nd}/{} elems, first at elem {first} (row {}, col {}): {:+e} vs {:+e}",
-                         a.len(), first / HIDDEN, first % HIDDEN, a[first], b[first]);
+                         a.len(), first / hidden(), first % hidden(), a[first], b[first]);
             } else {
                 println!("      stage {name}: all 50 rounds identical");
             }
@@ -7703,7 +8000,7 @@ let div_idx = outs.iter().enumerate().skip(1).find(|(_, o)| {
                     if a1.h_final[i] != a2.h_final[i] { nd += 1; if first == 0 { first = i; } }
                 }
                 println!("      h_final: {nd}/{} differ, first at row {} col {}: {:+e} vs {:+e}",
-                         a1.h_final.len(), first / HIDDEN, first % HIDDEN, a1.h_final[first], a2.h_final[first]);
+                         a1.h_final.len(), first / hidden(), first % hidden(), a1.h_final[first], a2.h_final[first]);
             }
             if a1.logits.as_ref().unwrap() != a2.logits.as_ref().unwrap() {
                 let (l1, l2) = (a1.logits.as_ref().unwrap(), a2.logits.as_ref().unwrap());
@@ -7712,7 +8009,7 @@ let div_idx = outs.iter().enumerate().skip(1).find(|(_, o)| {
                     if l1[i] != l2[i] { nd += 1; if first == 0 { first = i; } }
                 }
                 println!("      logits: {nd}/{} differ, first at flat {first} (row {}, col {}): {:+e} vs {:+e}",
-                         l1.len(), first / VOCAB, first % VOCAB, l1[first], l2[first]);
+                         l1.len(), first / vocab(), first % vocab(), l1[first], l2[first]);
             }
             if a1.candidates != a2.candidates {
                 for i in 0..a1.candidates.len() {
@@ -7745,10 +8042,10 @@ let div_idx = outs.iter().enumerate().skip(1).find(|(_, o)| {
         prime(&mut round, &taps, c, c);
         round.refresh_block_pos().unwrap();
         let _ = round.draft_round(12345, 2048, false, false, false).unwrap(); // warm
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+        let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
         for mi in 0..8 {
-            for k in 0..TAP_CONCAT_DIM {
-                staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(c - 8 + mi) * TAP_CONCAT_DIM + k]);
+            for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(taps[(c - 8 + mi) * gb10_inference::dflash2::tap_concat_dim() + k]);
             }
         }
         let mut tot: Vec<f64> = Vec::with_capacity(100);
@@ -7780,10 +8077,10 @@ let div_idx = outs.iter().enumerate().skip(1).find(|(_, o)| {
         let c = 512usize;
         let taps = gen_taps(c);
         prime(&mut round, &taps, c, c - 8);
-        let mut staged: Vec<bf16> = vec![bf16::default(); TAP_CONCAT_DIM * gb10_inference::dflash2::block()];
+        let mut staged: Vec<bf16> = vec![bf16::default(); gb10_inference::dflash2::tap_concat_dim() * gb10_inference::dflash2::block()];
         for mi in 0..8 {
-            for k in 0..TAP_CONCAT_DIM {
-                staged[mi * TAP_CONCAT_DIM + k] = bf16::from_f32(taps[(c - 8 + mi) * TAP_CONCAT_DIM + k]);
+            for k in 0..gb10_inference::dflash2::tap_concat_dim() {
+                staged[mi * gb10_inference::dflash2::tap_concat_dim() + k] = bf16::from_f32(taps[(c - 8 + mi) * gb10_inference::dflash2::tap_concat_dim() + k]);
             }
         }
         for &mm in &[1usize, 4, 8] {
@@ -8461,6 +8758,13 @@ fn run_cluster_node_once(port: u16, udp: u16) {
     gb10_inference::tp::set_tp_config(tpc.clone());
     let node_rank = tpc.node_rank;
     let world = tpc.world as i32;
+    if tpc.exl3_mode.starts_with("naive-") {
+        // NAIVE S5b: the Naive-N0.5 node loads the shipped shard dir
+        if let Err(e) = run_naive_tp_node(&tpc, &dir, head_ip, stream) {
+            eprintln!("node naive tp error: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
     if tpc.exl3 {
         // TP-A: the EXL3 engine, zero-config knobs. Legacy: the local pack at the head's path (UNCHECKED —
         // the manifest check was removed, owner 074c669). B32 (always, for Qwen3.8-Flash-Next): the rank's shard dir the
@@ -9254,6 +9558,102 @@ fn exl3_head_bring_up_watched(streams: &[std::net::TcpStream], world: i32) -> an
 /// "serve:<json argv>"), so the node resolves every serve knob exactly as the head does (AGENTS §7:
 /// knobs ride TpConfig), then both ranks load their shard, agree the resolved config, and the head
 /// binds HTTP once the node's mirror is armed.
+/// NAIVE S5: the head of a Naive-N0.5 TP session (`mode` = "serve" | "probe"): ship the config (the pack
+/// path, the argv, the program) to the nodes through the cluster sync, bring up the RDMA link, run.
+fn run_naive_tp_head(args: &[String], model_dir: &str, mode: &str) {
+    let world = parse_tp_world(args).unwrap_or(2);
+    if world != 2 && world != 4 { eprintln!("Naive-N0.5 TP: --tp 2 or --tp 4 (got {world})"); std::process::exit(2); }
+    let dir_abs = std::fs::canonicalize(model_dir).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| model_dir.to_string());
+    let explicit = parse_arg(args, "--nodes").map(|s| {
+        s.split(',').map(|p| {
+            let p = p.trim();
+            if p.contains(':') { p.parse::<std::net::SocketAddr>().expect("bad --nodes addr (ip:port)") }
+            else { std::net::SocketAddr::new(p.parse::<std::net::IpAddr>().expect("bad --nodes ip"), 29500) }
+        }).collect::<Vec<_>>()
+    });
+    let wait = std::time::Duration::from_secs(parse_arg(args, "--discover-wait").and_then(|s| s.parse().ok()).unwrap_or(3));
+    let layers: usize = parse_arg(args, "--layers").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let tokens: usize = parse_arg(args, "--tokens").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let max_pos: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+    let mut tpc = gb10_inference::tp::TpConfig::from_opts();
+    tpc.world = world;
+    tpc.mode_serve = true;
+    tpc.exl3 = true;              // the cluster sync ships NO artifacts: every rank reads its own pack copy
+    tpc.exl3_pack_dir = dir_abs.clone();
+    tpc.max_seq_len = max_pos;
+    let mut node_args: Vec<String> = args.to_vec();
+    if let Some(i) = node_args.iter().position(|a| a == "--model-dir") { if i + 1 < node_args.len() { node_args[i + 1] = dir_abs.clone(); } }
+    tpc.exl3_mode = match mode {
+        "serve" => format!("naive-serve:{}", serde_json::to_string(&node_args).expect("argv json")),
+        _ => format!("naive-probe:{}", serde_json::to_string(&(layers, tokens, args.iter().any(|a| a == "--probe-naive-tp-engine"), parse_arg(args, "--prefill-chunk").and_then(|s| s.parse::<usize>().ok()).unwrap_or(gb10_inference::naive::serve::PREFILL_CHUNK), node_args.clone())).expect("probe json")),
+    };
+    // ISSUES 98: the sharded drafter loads its shard on EVERY rank, so the head ships the drafter dir through the
+    // cluster sync's draft round (content-addressed blob cache: a node that has it re-fetches nothing); the node
+    // rewrites its --draft-dir to the cache path (run_naive_tp_node). No hand copy on the nodes any more.
+    if mode == "serve" {
+        if let Some(d) = gb10_inference::naive::serve::head_draft_dir(args, &dir_abs) {
+            tpc.df2_draft_dir = std::fs::canonicalize(&d).map(|p| p.to_string_lossy().to_string()).unwrap_or(d);
+            println!("[head] Naive drafter {} ships to every node (cluster sync, blob cache)", tpc.df2_draft_dir);
+        }
+    }
+    gb10_inference::tp::set_tp_config(tpc.clone());
+    println!("[head] Naive-N0.5 TP={world} {mode}: pack {dir_abs}, max_pos {max_pos}");
+    let streams = match gb10_inference::cluster::run_head_retain(std::path::Path::new(&dir_abs), explicit, wait, &tpc) {
+        Ok((_, s)) => s,
+        Err(e) => { eprintln!("head error: {e:#}"); std::process::exit(1); }
+    };
+    let r = gb10_inference::cluster::watch_nodes_during_bring_up(&streams).and_then(|watch| {
+        let ctx = gb10_inference::tp::TpContext::bring_up_head(world as i32)?;
+        if mode == "serve" {
+            gb10_inference::naive::serve::run_head(args, &dir_abs, ctx, streams, watch)
+        } else {
+            watch.disarm(&streams);
+            let chunk: usize = parse_arg(args, "--prefill-chunk").and_then(|s| s.parse().ok()).unwrap_or(gb10_inference::naive::serve::PREFILL_CHUNK);
+            // the node streams ride along: the full-depth probe's load barrier runs over them
+            gb10_inference::naive::serve::run_probe(&dir_abs, ctx, layers, tokens, None, args.iter().any(|a| a == "--probe-naive-tp-engine"), chunk, args, streams)
+        }
+    });
+    if let Err(e) = r { eprintln!("head naive tp error: {e:#}"); std::process::exit(1); }
+}
+
+/// NAIVE S5b: the node of a Naive-N0.5 TP session loads the SHIPPED shard dir (B32: the head ships this
+/// rank's experts and pre-sliced row quads through the blob cache; `naive::shipplan`). No local copy, no
+/// path override (owner rule 2026-10-17: every model ships its shards).
+fn run_naive_tp_node(tpc: &gb10_inference::tp::TpConfig, shard_dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: std::net::TcpStream) -> anyhow::Result<()> {
+    let dir = shard_dir.to_string_lossy().to_string();
+    if !tpc.ship_shards || !gb10_inference::naive::config::NaiveConfig::is_naive_dir(&dir) {
+        let why = format!("Naive-N0.5 node: expected this rank's SHIPPED shard dir (ship_shards {}), got {dir}", tpc.ship_shards);
+        gb10_inference::cluster::node_report_failure(&mut stream, &why);
+        anyhow::bail!(why);
+    }
+    let ctx = match gb10_inference::tp::TpContext::bring_up_node(head_ip, tpc.node_rank, tpc.world as i32) {
+        Ok(c) => c,
+        Err(e) => {
+            let e = e.context("the node's RDMA data-plane link bring-up failed");
+            gb10_inference::cluster::node_report_failure(&mut stream, &format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    if let Some(j) = tpc.exl3_mode.strip_prefix("naive-probe:") {
+        let (layers, tokens, engine, chunk, argv): (usize, usize, bool, usize, Vec<String>) = serde_json::from_str(j)?;
+        return gb10_inference::naive::serve::run_probe(&dir, ctx, layers, tokens, Some(stream), engine, chunk, &argv, Vec::new());
+    }
+    // the head's argv (shipped) carries the serve knobs both ranks must agree on (--layers)
+    let mut head_argv: Vec<String> = tpc.exl3_mode.strip_prefix("naive-serve:").and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    // ISSUES 98: the head shipped its drafter through the sync (tpc.df2_draft_dir = the assembled cache dir here):
+    // point this rank's --draft-dir at it, so the node never opens the head's filesystem path
+    if !tpc.df2_draft_dir.is_empty() {
+        match head_argv.iter().position(|a| a == "--draft-dir") {
+            Some(i) if i + 1 < head_argv.len() => head_argv[i + 1] = tpc.df2_draft_dir.clone(),
+            _ => { head_argv.push("--draft-dir".into()); head_argv.push(tpc.df2_draft_dir.clone()); }
+        }
+        println!("[node] Naive drafter from the head's sync: {}", tpc.df2_draft_dir);
+    }
+    let layers = parse_arg(&head_argv, "--layers").and_then(|s| s.parse().ok());
+    let chunk = parse_arg(&head_argv, "--prefill-chunk").and_then(|s| s.parse().ok()).unwrap_or(gb10_inference::naive::serve::PREFILL_CHUNK);
+    gb10_inference::naive::serve::run_node(&dir, tpc.max_seq_len, layers, chunk, &head_argv, ctx, stream)
+}
+
 fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
     // (--rdma-dev is a registry option: parsed at startup, node-local, never shipped)
     gb10_inference::dprintln!("{}", gb10_inference::exl3_forward::xtp::identity_line("head rank=0 (serve)"));
@@ -9300,6 +9700,14 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
         &dir_abs, gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096)).0;
     if args.iter().any(|a| a == "--tp-trace") { tpc.trace = true; }
     exl3_tp_cli_knobs(args, &mut tpc);
+    // FLASHNEXT-DF2-C (ISSUES 116): ship the DFlash2 drafter to the nodes exactly as the nvfp4 head
+    // does — cluster.rs's DraftManifest reads `spec_source` + `df2_draft_dir`; the node assembles the
+    // artifact in its blob cache and loads it from there (no local copy, never the head's path).
+    tpc.spec_source = gb10_inference::exl3_serve::resolve_spec_source_exl3(args).cli_name().to_string();
+    tpc.df2_draft_dir = gb10_inference::exl3_serve::tp_head_draft_dir(args).unwrap_or_default();
+    if !tpc.df2_draft_dir.is_empty() {
+        gb10_inference::dprintln!("[head] EXL3 TP serve: DFlash2 drafter {} ships to every node through the sync", tpc.df2_draft_dir);
+    }
     gb10_inference::dprintln!("[head] EXL3 TP serve config: deal {} options shipped {:?}; node argv {:?}", tpc.exl3_ep_deal,
              gb10_inference::opts::snapshot(), node_args);
     gb10_inference::tp::set_tp_config(tpc.clone());
@@ -9824,6 +10232,7 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
         }
         TpBranch::Generate => {}
         TpBranch::Exl3Xtp => anyhow::bail!("the EXL3 xtp program runs through exl3_forward::xtp::run_tp_xtp, never tp_serve"),
+        TpBranch::Naive => anyhow::bail!("the Naive-N0.5 program runs through naive::serve, never tp_serve"),
     }
     let t0 = std::time::Instant::now();
     // E29-B2: the capture sink accumulates MTP-calibration steps at load (batch==1 too) — reset
@@ -13109,6 +13518,10 @@ fn run_sweep_gemm(args: &[String]) {
 fn run_df2_bake(args: &[String], fp8: bool) {
     use safetensors::{SafeTensors, Dtype, tensor::TensorView};
     let src = gb10_inference::opt_or_arg(args, "--draft-dir").expect("--draft-dir <src artifact> required");
+    // FLASHNEXT-DF2-NVFP4: the inventories follow the SOURCE artifact's geometry (its config.json),
+    // not the 27B defaults — a missing/unreadable config is a hard stop, never a silent 27B bake.
+    gb10_inference::dflash2::install_geom_from_dir(&src)
+        .unwrap_or_else(|e| panic!("--draft-dir {src}: cannot read the artifact geometry (config.json): {e:#}"));
     let out_dir = parse_arg(args, "--out").expect("--out <baked dir> required");
     let outd = std::path::Path::new(&out_dir);
     std::fs::create_dir_all(outd).expect("create --out dir");
@@ -13221,6 +13634,8 @@ fn run_df2_bake(args: &[String], fp8: bool) {
 fn run_df2_quant_fidelity(args: &[String]) {
     use safetensors::SafeTensors;
     let src = gb10_inference::opt_or_arg(args, "--draft-dir").expect("--draft-dir <src artifact> required");
+    gb10_inference::dflash2::install_geom_from_dir(&src)
+        .unwrap_or_else(|e| panic!("--draft-dir {src}: cannot read the artifact geometry (config.json): {e:#}"));
     let path = std::path::Path::new(&src).join("model.safetensors");
     let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let st = SafeTensors::deserialize(&raw).expect("parse src safetensors");
@@ -15347,6 +15762,13 @@ fn run_server(args: &[String]) {
         eprintln!("error: --model-dir {model_path} does not exist on this box (TP nodes do not need it; the head does)");
         std::process::exit(2);
     }
+    // NAIVE S5: a Naive-N0.5 pack serves TP-only (137 GB; no single GB10 holds it): this box is the head
+    if gb10_inference::naive::config::NaiveConfig::is_naive_dir(&model_path) {
+        match parse_tp_world(args) {
+            Some(w) if w >= 2 => { run_naive_tp_head(args, &model_path, "serve"); return; }
+            _ => { eprintln!("Naive-N0.5: the pack needs --tp 2 (two GB10s); start the node with `--node` on the other box"); std::process::exit(2); }
+        }
+    }
     if gb10_inference::exl3_serve::is_exl3_pack(&model_path) {
         // TP-D: --server --tp 2 on an EXL3 pack = the TP=2 served head (rank 0; node = --node)
         if parse_tp_world(args).map_or(false, |w| w >= 2) {
@@ -15367,7 +15789,22 @@ fn run_server(args: &[String]) {
         if f >= 1.0 { gb10_inference::opts::set(gb10_inference::opt!("rope-yarn-factor"), f.to_string()); }
     }
     let max_seq_len = gb10_inference::opt_or_arg(args, "--max-seq-len").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
-    let max_batch = parse_arg(args, "--max-batch").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+    // PREHARD1 [ISSUES 104] (owner ruling 2026-10-10 §1b-bis#8; MAXBATCH1's EXL3 pattern ported
+    // to the trunk NVFP4 serve path): at most 16 lanes serve at once. A larger --max-batch BOOTS
+    // ANYWAY at the cap — one clear line says what was asked and what runs instead, further
+    // requests wait in the queue, and /metrics velogb10_max_batch{,_requested} carry both numbers.
+    // Every rank parses the same argv, so the clamp is SPMD-identical before TpConfig ships it.
+    // (EXL3's boot-anyway memory clamp — fewer lanes when the asked --max-seq-len does not fit —
+    // stays EXL3: the trunk has no fit planner. Nothing refuses; nothing silently cuts context.)
+    let max_batch_raw = parse_arg(args, "--max-batch").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+    let max_batch = max_batch_raw.min(gb10_inference::batch::SERVE_MAX_LANES);
+    gb10_inference::metrics::set_max_batch_requested(max_batch_raw);
+    if max_batch_raw > max_batch {
+        gb10_inference::boot_report::notice(&format!(
+            "--max-batch {max_batch_raw}: this server serves at most {} lanes at once (the same \
+             cap as the EXL3 server); booting with {max_batch} — further requests wait in the queue",
+            gb10_inference::batch::SERVE_MAX_LANES));
+    }
     // W3 (Phase 13): fail FAST on an unsupported KV-mode x lane-width combination — before the
     // model load and before any node contact. Used to surface as a panic inside the attention
     // dispatch after a full load (owner's TP4 k8v8 repro).
@@ -15415,7 +15852,7 @@ fn run_server(args: &[String]) {
         return;
     }
     // Model name for /v1/models. Public model id (v0.7.3, issue #8.3): --model-name >
-    // --served-model-name (alias) > the model card's `base_model:` (e.g.
+    // --served-model-name (alias) > the model card's `model_name:` > its `base_model:` (e.g.
     // Qwen/Qwen3.8-27B) > dir name — see server::resolve_model_name.
     let model_name = gb10_inference::server::resolve_model_name(
         parse_arg(args, "--model-name"), parse_arg(args, "--served-model-name"), &model_path);
@@ -15545,6 +15982,8 @@ fn run_server(args: &[String]) {
             // DF2 block-16: ship the resolved block so every rank sizes the identical round and
             // verify (SPMD — a one-sided block is a collective mismatch).
             tpc.df2_block = gb10_inference::dflash2::block();
+            // DFLASH2-GEN: ship the resolved mask-row override (SPMD, same resolution as block).
+            tpc.df2_mask_override = gb10_inference::dflash2::mask_override();
             // DF2_CARRY: ship the prefix-cache carry toggle (SPMD-critical — a one-sided carry
             // would desync the verify all-reduce; every rank must make the same admit decision).
             tpc.df2_carry = matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
@@ -15824,6 +16263,8 @@ fn run_server(args: &[String]) {
                                                    "on" | "true" | "1" | "yes");
                     // DF2 block-16: same as the pre-TP fill above (SPMD).
                     tpc.df2_block = gb10_inference::dflash2::block();
+                    // DFLASH2-GEN: same as the pre-TP fill above (SPMD).
+                    tpc.df2_mask_override = gb10_inference::dflash2::mask_override();
                     // DF2_CARRY: same as the pre-TP fill above (SPMD).
                     tpc.df2_carry = matches!(parse_arg(args, "--df2-carry").unwrap_or("off"),
                                              "on" | "true" | "1" | "yes");
@@ -16202,8 +16643,13 @@ fn run_server(args: &[String]) {
         // `admit` re-checks per request (its clamp is authoritative).
         let decode_headroom = gb10_inference::batch::decode_headroom(mtp_active_at_start);
         gb10_inference::metrics::set_max_batch(max_batch);
+        // FLASHNEXT-DF2-B (ISSUES work[113]): the pack's generation_config.json decides the
+        // unsent-field sampler defaults (LEGACY 0.7/0.8/20 only when the pack has none).
+        let (sampling_defaults, sd_src) = gb10_inference::server::SamplingDefaults::from_pack(
+            &model_path, gb10_inference::server::SamplingDefaults::LEGACY);
+        println!("[serve] {}", sampling_defaults.describe(sd_src));
         let state = AppState {
-            sampling_defaults: gb10_inference::server::SamplingDefaults::LEGACY,
+            sampling_defaults,
             scheduler: stx,
             tokenizer: Arc::new(tokenizer),
             model_name: model_name.clone(),
@@ -16550,4 +16996,30 @@ fn probe_vision_tower(args: &[String]) -> anyhow::Result<()> {
         println!("VIS_DUMP_STATES {} states + merger -> {od}", states.len());
     }
     Ok(())
+}
+
+/// PREHARD1 [ISSUES 84]: the bare CLI path (no subcommand) honors --model-dir — it stands in for
+/// --model when --model is absent, the tokenizer defaults INSIDE that dir, and a missing model
+/// path is ONE clear line + exit 2, not a bare "os error 2" from a CWD-relative default.
+#[cfg(test)]
+mod prehard1_cli_model_dir_tests {
+    #[test]
+    fn bare_cli_honors_model_dir_with_one_clear_failure_line() {
+        let src = include_str!("main.rs");
+        let start = src.find("fn run_cli").expect("run_cli exists");
+        let end = src[start + 1..].find("\nfn ").map(|e| start + 1 + e).unwrap_or(src.len());
+        let body = &src[start..end];
+        // --model-dir stands in for --model.
+        assert!(body.contains(".or_else(|| parse_arg(args, \"--model-dir\"))"),
+            "run_cli: --model falls back to --model-dir");
+        // The tokenizer defaults INSIDE the resolved dir.
+        assert!(body.contains("tokenizer.json\", parse_arg(args, \"--model-dir\")"),
+            "run_cli: the tokenizer defaults into --model-dir");
+        // ONE clear failure line and exit 2, before any load is attempted.
+        assert!(body.contains("model path not found"), "the clear one-line failure");
+        assert!(body.contains("std::process::exit(2)"), "exit code 2");
+        // The old CWD-relative tokenizer default no longer shadows the derived one.
+        assert!(!body.contains("unwrap_or(\"model/tokenizer.json\")"),
+            "run_cli: no CWD-relative tokenizer default left");
+    }
 }

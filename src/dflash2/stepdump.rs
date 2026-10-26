@@ -32,7 +32,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::dflash2::capture::Df2PrimeSink;
-use crate::dflash2::{block, HIDDEN, TAP_CONCAT_DIM, TAP_LAYERS};
+use crate::dflash2::{block, hidden, tap_concat_dim, tap_layers};
 
 /// The number of steps whose RAW h_final is retained (the oracle-replay window).
 pub const RAW_STEPS: usize = 64;
@@ -237,15 +237,15 @@ impl StepDump {
                      prime: Option<&Arc<Df2PrimeSink>>, dev: &Arc<cudarc::driver::CudaDevice>) {
         if let Some(ps) = prime {
             if let Ok(cols) = dev.dtoh_sync_copy(&ps.taps) {
-                let n = plen.min(cols.len() / TAP_CONCAT_DIM);
+                let n = plen.min(cols.len() / tap_concat_dim());
                 self.taps_from = 0;
                 self.taps_n = n;
                 self.taps_max = n;
                 self.taps.clear();
-                self.taps.reserve(n * TAP_CONCAT_DIM);
+                self.taps.reserve(n * tap_concat_dim());
                 for c in 0..n {
-                    for k in 0..TAP_CONCAT_DIM {
-                        self.taps.push(cols[c * TAP_CONCAT_DIM + k].to_f32());
+                    for k in 0..tap_concat_dim() {
+                        self.taps.push(cols[c * tap_concat_dim() + k].to_f32());
                     }
                 }
                 eprintln!("[df2-dump] job {}: plen={plen} prime taps rows={n}", self.job_tag);
@@ -266,14 +266,14 @@ impl StepDump {
             // The accumulation may skip positions if the first verify's span doesn't start at
             // taps_from (it does — the first step's span starts at plen = taps_from); pad any
             // gap with zeros so rows stay position-indexed.
-            self.taps.resize((self.taps_n + need) * TAP_CONCAT_DIM, 0.0);
+            self.taps.resize((self.taps_n + need) * tap_concat_dim(), 0.0);
             self.taps_n += need;
         }
         let base = pos.saturating_sub(self.taps_from);
         for m in 0..n {
             let row = base + m;
-            for k in 0..TAP_CONCAT_DIM {
-                self.taps[row * TAP_CONCAT_DIM + k] = staging[m * TAP_CONCAT_DIM + k].to_f32();
+            for k in 0..tap_concat_dim() {
+                self.taps[row * tap_concat_dim() + k] = staging[m * tap_concat_dim() + k].to_f32();
             }
         }
         self.taps_max = self.taps_max.max(pos + n);
@@ -281,11 +281,11 @@ impl StepDump {
 
     /// Per-layer × per-column checksums of the fed-span staging (the JSONL tap fingerprint).
     pub fn tap_checksums(staging: &[half::bf16]) -> Vec<u64> {
-        let mut ck = Vec::with_capacity(TAP_LAYERS.len() * block());
-        for li in 0..TAP_LAYERS.len() {
+        let mut ck = Vec::with_capacity(tap_layers().len() * block());
+        for li in 0..tap_layers().len() {
             for m in 0..block() {
-                let off = m * TAP_CONCAT_DIM + li * HIDDEN;
-                let words: Vec<u16> = staging[off..off + HIDDEN].iter().map(|b| b.to_bits()).collect();
+                let off = m * tap_concat_dim() + li * hidden();
+                let words: Vec<u16> = staging[off..off + hidden()].iter().map(|b| b.to_bits()).collect();
                 ck.push(fnv64(&words));
             }
         }
@@ -309,7 +309,7 @@ impl StepDump {
         let _ = self.jsonl.write_all(line.as_bytes());
         let _ = self.jsonl.write_all(b"\n");
         if let Some(hf) = h_final {
-            if r.step < RAW_STEPS as u64 && hf.len() == block() * HIDDEN {
+            if r.step < RAW_STEPS as u64 && hf.len() == block() * hidden() {
                 let bytes: &[u8] = bytemuck::cast_slice(hf);
                 let _ = self.hfinal.write_all(bytes);
             }

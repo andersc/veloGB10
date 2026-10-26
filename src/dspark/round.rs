@@ -247,7 +247,7 @@ impl DsparkRound {
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_batch")?;
         let kptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_KERNELS);
         let kfnames = ["gemm_dsp_b_m8_r4", "gemm_tiled_b", "bf16tof32", "f32tobf16",
-            "kernel_build_id", "df2_top256_b", "df2_head_rerank_b"];
+            "kernel_build_id", "df2_top256_b", "df2_head_rerank_b", "df2_tap_hcmean_b"];
         dev.load_ptx(kptx, "gpu_kernels", &kfnames)?;
         crate::gpu::GpuModel::assert_kernel_build_id(&dev, "gpu_kernels")?;
         let sptx = cudarc::nvrtc::Ptx::from_src(crate::ptx_embed::GPU_DSPARK);

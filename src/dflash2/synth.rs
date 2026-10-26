@@ -33,7 +33,7 @@ use half::bf16;
 use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 
-use crate::dflash2::{inventory, N_PARAMS, N_TENSORS, SYNTH_SEED};
+use crate::dflash2::{inventory, n_params, n_tensors, SYNTH_SEED};
 
 /// xorshift64* (Vigna): the single documented PRNG for the whole generator. Deterministic; a
 /// bijection on nonzero u64, so a nonzero seed never collapses to zero.
@@ -141,7 +141,7 @@ fn gen_tensor(rng: &mut SynthRng, name: &str, shape: &[usize]) -> Vec<u8> {
         return bytes;
     }
     let scale = if name.contains("codebook") {
-        1.0f32 / (crate::dflash2::SELECTOR_RANK as f32).sqrt()
+        1.0f32 / (crate::dflash2::selector_rank() as f32).sqrt()
     } else {
         1.0f32 / (shape[shape.len() - 1] as f32).sqrt()
     };
@@ -159,7 +159,7 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("create {}: {e}", dir))?;
 
     let inv = inventory();
-    anyhow::ensure!(inv.len() == N_TENSORS, "inventory has {} tensors, want {N_TENSORS}", inv.len());
+    anyhow::ensure!(inv.len() == n_tensors(), "inventory has {} tensors, want {}", inv.len(), n_tensors());
 
     let mut rng = SynthRng::new(seed);
     let mut bufs: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::with_capacity(inv.len());
@@ -169,10 +169,11 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
         n_params += shape.iter().map(|&d| d as u64).product::<u64>();
         bufs.push((name.clone(), shape.clone(), bytes));
     }
-    anyhow::ensure!(bufs.len() == N_TENSORS, "generated {} tensors, want {N_TENSORS}", bufs.len());
+    anyhow::ensure!(bufs.len() == n_tensors(), "generated {} tensors, want {}", bufs.len(), n_tensors());
+    let want_params = crate::dflash2::n_params();
     anyhow::ensure!(
-        n_params == N_PARAMS,
-        "generated {n_params} params, want {N_PARAMS} (the reconciled count)"
+        n_params == want_params,
+        "generated {n_params} params, want {want_params} (the reconciled count)"
     );
 
     let path = Path::new(dir).join("model.safetensors");
@@ -193,34 +194,34 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
     let cfg = serde_json::json!({
         "architectures": ["DFlash2DraftModel"],
         "model_type": "qwen3",
-        "hidden_size": crate::dflash2::HIDDEN,
-        "num_hidden_layers": crate::dflash2::N_LAYERS,
-        "num_attention_heads": crate::dflash2::NUM_HEADS,
-        "num_key_value_heads": crate::dflash2::NUM_KV_HEADS,
-        "head_dim": crate::dflash2::HEAD_DIM,
-        "intermediate_size": crate::dflash2::INTER,
-        "vocab_size": crate::dflash2::VOCAB,
-        "rms_norm_eps": crate::dflash2::RMS_EPS,
-        "max_position_embeddings": crate::dflash2::MAX_POSITIONS,
-        "num_target_layers": 64,
-        "is_causal": crate::dflash2::IS_CAUSAL,
-        "layer_types": vec!["sliding_attention"; 5],
+        "hidden_size": crate::dflash2::hidden(),
+        "num_hidden_layers": crate::dflash2::n_layers(),
+        "num_attention_heads": crate::dflash2::num_heads(),
+        "num_key_value_heads": crate::dflash2::num_kv_heads(),
+        "head_dim": crate::dflash2::head_dim(),
+        "intermediate_size": crate::dflash2::inter(),
+        "vocab_size": crate::dflash2::vocab(),
+        "rms_norm_eps": crate::dflash2::rms_eps(),
+        "max_position_embeddings": crate::dflash2::max_positions(),
+        "num_target_layers": crate::dflash2::num_target_layers(),
+        "is_causal": crate::dflash2::is_causal(),
+        "layer_types": vec!["sliding_attention"; crate::dflash2::n_layers()],
         "use_sliding_window": true,
-        "sliding_window": crate::dflash2::SLIDING_WINDOW,
-        "max_window_layers": 5,
+        "sliding_window": crate::dflash2::sliding_window(),
+        "max_window_layers": crate::dflash2::n_layers(),
         "tie_word_embeddings": false,
         "rope_parameters": {
-            "rope_theta": crate::dflash2::ROPE_THETA,
+            "rope_theta": crate::dflash2::rope_theta(),
             "rope_type": "default"
         },
         "dflash_config": {
             "block_size": crate::dflash2::block(),
-            "conv_group_size": crate::dflash2::CONV_GROUP,
-            "conv_kernel_size": crate::dflash2::CONV_KERNEL,
-            "mask_token_id": crate::dflash2::MASK_TOKEN_ID,
-            "selector_rank": crate::dflash2::SELECTOR_RANK,
-            "selector_top_k": crate::dflash2::SELECTOR_TOP_K,
-            "target_layer_ids": crate::dflash2::TAP_LAYERS
+            "conv_group_size": crate::dflash2::conv_group(),
+            "conv_kernel_size": crate::dflash2::conv_kernel(),
+            "mask_token_id": crate::dflash2::mask_token_id(),
+            "selector_rank": crate::dflash2::selector_rank(),
+            "selector_top_k": crate::dflash2::selector_top_k(),
+            "target_layer_ids": crate::dflash2::tap_layers()
         },
         "synthetic": true,
         "generator_seed": seed
@@ -236,11 +237,13 @@ pub fn generate(dir: &str, seed: u64) -> Result<GenSummary, anyhow::Error> {
         format!(
             "# SYNTHETIC DFlash2 artifact\n\n\
              This directory holds a **synthetic**, deterministic, license-clean weight artifact\n\
-             that is SHAPE-IDENTICAL to the incoai/Qwen3.8-27B-DFlash2 checkpoint (81 tensors,\n\
-             {N_PARAMS} params, all BF16). It is **NOT** the real checkpoint — generated by\n\
+             that is SHAPE-IDENTICAL to the live-geometry draft checkpoint ({} tensors,\n\
+             {} params, all BF16). It is **NOT** the real checkpoint — generated by\n\
              `--gen-dflash2-synth` (seed {seed}). No embedding table and no lm_head, exactly like\n\
              the real checkpoint: both are borrowed from the target at runtime.\n\n\
-             Do not redistribute or use as a real model.\n"
+             Do not redistribute or use as a real model.\n",
+            crate::dflash2::n_tensors(),
+            crate::dflash2::n_params()
         ),
     )
     .map_err(|e| anyhow::anyhow!("write SYNTHETIC_README.md: {e}"))?;

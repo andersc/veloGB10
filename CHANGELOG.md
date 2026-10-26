@@ -3,71 +3,67 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
-## v0.7.5 — EXL3 everywhere: all five EXL3 packs serve everywhere, graceful `--max-batch`, the stable cut
+## v0.7.5 — EXL3 everywhere + the Naive-N0.5-Flash family + DFlash2 drafts under TP everywhere
 
-This is the "EXL3 everywhere" release: the EXL3 path is the default way to serve this model
-family, on every topology, and a `--max-batch` the hardware cannot run no longer refuses to boot.
-It is cut from one commit and verified end-to-end on two machines before shipping: readiness
-request, losslessness ×5 per model, scheduler state probe, batch-invariance, 32-way overload
-sweeps at TP=2, and 1000-token decodes at production sampling (requests that send no sampler
-settings; thinking on and off as separate cells).
+Re-cut of the previously deleted v0.7.5: this build contains everything that cut contained (all
+five EXL3 packs serving everywhere, graceful `--max-batch`, the stable cut) plus everything since
+— the Naive-N0.5-Flash family, `--prefill-interleave` on by default, DFlash2 drafts under TP on
+every path, and the KV-spill hardening. Verified end-to-end before staging: a 12-cell serving
+matrix across four model families at TP=1/2/4 with the owner's exact launch flags (9 bootable
+cells green — boot, gates, streamed generation with per-cell decode tok/s and code-emission
+checks), the LANERES3-TP4 quick rung (TP=4 boot+serve, KV-spill capture/restore across all four
+ranks, lane reservation), and a 969/0 unit suite on the naive port before it merged.
 
 ### What is in this build
 
-- **All five EXL3 packs serve.** Dense 27B at 3.05 and 3.5 bpw, dense 9B at 3.5, the 35B-A3B
-  mixture-of-experts at 3.5, and the 27B "Flash-Next" at 3.05 — every one of them: loads, serves
-  HTTP, speculates, and passes the losslessness probe (`--bench-mtp` ×5 each: `LOSSLESS_OK`), on
-  both test machines, plus the recurrent-state probe (`RESULT: EXACT`). TP=2 works on all five;
-  TP=4 on 9B / 35B / 27B-3.05 / 27B-3.5.
-- **`--max-batch` boots anyway.** Asking for more concurrent requests than the memory can hold
-  no longer kills the boot. The server starts on the most lanes that fit — the context length is
-  kept, never truncated — prints one line saying what it serves and why, and counts what it had
-  to queue on `/metrics`. With the full 262,144-token context and q8 KV that is 4–6 lanes on one
-  machine and ~11 on a TP=2 pair; 16 lanes fit at a 90K context (or TP=2 at reduced context).
-  A 32-way burst against an 11-lane boot was fully served: every request queued, waited, and
-  completed — zero failures, engine alive throughout.
-- **DFlash2 drafting on the EXL3 path** (TP=1; see the limits below for TP>1 and concurrency).
-- **KV-cache spill at TP=1**: a long-context lane's KV can spill and be re-prefilled later,
-  with evictions and re-prefills counted on `/metrics`.
-- **The trunk NVFP4 path as it was** (unchanged in this cut), including the packed-verify map
-  and per-bit-width EXL3 kernel dispatch.
+- **All five EXL3 packs serve** (from the first v0.7.5 cut, unchanged): dense 27B at 3.05 and
+  3.5 bpw, dense 9B at 3.5, the 35B-A3B MoE at 3.5, the 27B Flash-Next at 3.05 — losslessness
+  probe x5 each, on both test machines; TP=2 on all five, TP=4 on 9B/35B/27B-3.05/27B-3.5.
+- **`--max-batch` boots anyway** — the server starts on the most lanes that fit, keeps the
+  context length (never truncated), prints one line saying what it serves and why, and counts
+  what it had to queue on `/metrics`.
+- **The Naive-N0.5-Flash family (new in this re-cut):** TP=2/TP=4 serving, DSpark-drafter
+  speculation, expert-parallel MoE, lane reservation, prefix reuse, TP levers.
+- **`--prefill-interleave` defaults to 1** — a joining stream no longer stalls the running
+  streams (9.1 s to 1.7 s join at TP=2); `--prefill-interleave 0` restores the old behavior;
+  engagement counters on `/metrics` and in `scripts/owner_check.py`.
+- **DFlash2 drafts are head-authoritative under TP on every path** — sampled drafts carry their
+  drawn weights and the 16-candidate table per position, greedy drafts too; the drafter ships
+  through the EXL3 TP sync and the boot agreement hashes the DF2 outcome; `--df2-k` caps verify
+  width; `--df2-mask-override`; bake inventories follow the artifact geometry.
+- **KV-spill hardened and off by default:** the TP=4 capture vote accepts its own frames and a
+  failed vote stops admission with its real message; whole-plane snapshots; payloads carry only
+  the rows the conversation uses; single-strip restore (every capture was rejected before);
+  restore resends reasoning+content; the peer-miss names its reason. Verified at TP=4:
+  capture-then-restore across 4 ranks, 959 prompt tokens restored with no re-prefill.
+- **Unsent sampler fields resolve from the pack's `generation_config.json`** on both servers,
+  with one boot line naming the resolved values.
+- **Large prompts tokenize off the single request thread**; the debug generation log no longer
+  re-tokenizes every reply.
+- **Lane reservation:** one scoped admit per TP iteration with apply-time requeue — never refuse.
+- **Flash-Next 1.5/2.0 bpw packs** (KFIX1 GEMM pipeline, draft-round CUDA graph) and the EXL3 DF2
+  tap fix (hyper-connection mean; band-attention smem bounded by the window).
+- Four static-review fixes in the DFlash2 ring/verify paths (one measured re-alignment was
+  rejected and backed out — it cost sampled acceptance).
 
 ### What this build does NOT do (plain words)
 
-- **TP=4 was exercised by hand only on this cut** — no automated gate chain ran at TP=4; the
-  numbers quoted below are TP=1 and TP=2.
-- **The over-cap counter is not wired on TP=2 heads.** A TP=1 server counts every arrival beyond
-  its lane cap (`velogb10_over_cap_arrivals_total{disposition="queued"}` — verified: 17 arrivals
-  against a 6-lane boot counted exactly 11). A TP=2 head queues and serves exactly the same
-  traffic correctly (32-way sweep, zero failures) but never increments the counter. Fix comes
-  after this release.
-- **DFlash2 at TP>1 needs `--draft-dir` and is not the fast path**: without it the server prints
-  one line and falls back to pack MTP; with it (TP=2, engaged on both ranks) it measured slower
-  than pack MTP under concurrency, and it takes no concurrent lanes.
-- **EXL3 needs the pack staged on every node** — a TP=2 boot does not ship the model to the peer.
-- **The EXL3 bench/probe tooling has gaps**: `--bench-mtp` and `--probe-state` print their EXL3
-  result lines only at `--log-level debug` (at default flags they are silent), and
-  `--probe-binv` has no EXL3 route at all (it verifies the NVFP4 trunk path).
-- **q8 KV (the default) has a reproduced quality finding** — prefer `--kv-cache f16` when
-  quality matters; the investigation is open.
-- **The trunk NVFP4 path is not lane-capped yet** (an open issue; fix after this release).
+- **The serving-matrix numbers are single-rep smokes**, not benchmarks — the benchmark tables in
+  this README remain the measured reference.
+- **Naive-N0.5-Flash at TP=2 and the 35B-A3B at TP=2 deterministically produce no visible answer
+  for a pure-code prompt at an 8192-token budget** — the run is thinking-dominated and the
+  prompt-seeded sampler reproduces the same stream; TP=1/TP=4 of the same models emit the answer.
+  A higher token budget completes them.
+- Some Flash-Next and 27B-exl3 cells hit the 8192-token budget mid-answer (truncated code).
+- **The TP=2 head's over-cap counter is still not wired** — the TP=1 server counts every arrival
+  beyond its lane cap; the TP=2 head queues and serves the same traffic correctly but never
+  increments the counter.
+- **`--kv-spill` is off by default** — turn it on explicitly; at TP=4 it is verified by the quick
+  rung (capture/restore across 4 ranks), not by the full concurrency ladder.
+- **The full LANERES3-TP4 ladder (concurrency cells + churn x2) was descoped** — TP=4 is verified
+  by the 3-rung quick test (all PASS) plus the serving matrix's TP=4 cells.
+- Everything the v0.7.4-era notes list as not-done remains true unless addressed above.
 
-### Numbers, with the request class each was measured on
-
-All on one pair of GB10 machines, release build `b269406c` (asset) / `d21b7456` (verified
-identical code), commit `da01c02f`, 2026-10-22. Production sampling throughout: requests that
-send no sampler settings and get the pack defaults; thinking on and off are separate cells.
-
-| Cell | Class | Result |
-|---|---|---|
-| 27B-3.05 TP=1 decode, 1000 tokens | code workload, thinking on | 31.5 tok/s, finish=length |
-| 27B-3.05 TP=1 decode, 1000 tokens | code workload, thinking off | 43.0 tok/s, finish=length |
-| 27B-3.05 TP=1 prefill | 2,452-token prompt, 16 gen | 172 tok/s wall (14.25 s) |
-| 27B-3.05 TP=1, repeat 8.6K prompt | prefix cache hit | 131 ms to first token (13.7 s cold) |
-| 27B-3.05 TP=2 (ctx 90K, 16 lanes), 32-way burst | agent turns, thinking on/off | aggregate 22.5 / 9.7 tok/s, 64/64 served, 0 failures |
-| 27B-3.05 TP=2 (ctx 262144, 11 lanes), 32-way burst | agent turns, thinking on | aggregate ~27 tok/s, 0 failures |
-| Boot to serving | 27B-3.05 pack | 30–35 s single, ~58 s TP=2 |
-| Losslessness | `--bench-mtp` ×5 per pack ×2 machines | LOSSLESS_OK, 50/50 EXL3 runs |
 
 ## v0.7.4 — tool-call parsing fixes, speculation that re-arms, per-row attention regime, vision-tower recovery, option-parsing guards, lane packing on by default, first stream chunk at the first token
 

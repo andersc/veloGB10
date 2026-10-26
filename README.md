@@ -47,6 +47,9 @@ compiling anything.
 
 ## Update — Qwen3.8-Flash-Next support (veloGB10 v0.7.1)
 
+**New in v0.7.5 — the Naive-N0.5-Flash family is served too:** TP=2/TP=4 on GB10s with
+DSpark-drafter speculation, expert-parallel MoE, lane reservation and prefix reuse.
+
 **veloGB10 now serves EXL3 (ExLlamaV3 trellis) packs directly, and the model on that path is
 [Qwen3.8-Flash-Next](https://huggingface.co/doth4580/Qwen3.8-Flash-Next-EXL3-3.05bpw) — a 125B
 mixture-of-experts model with ~6B active parameters, running on one, two or four GB10s

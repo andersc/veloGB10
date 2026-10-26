@@ -249,13 +249,13 @@ impl DHead {
         let delta: f32 = env_or(crate::opt!("dhead-delta"), 4.0f32);
         let (dq, mse) = screen_quant(bits)
             .ok_or_else(|| anyhow::anyhow!("--dhead-bits={bits} unsupported (1|2|4)"))?;
-        let (k, n, hbits) = (q.k as usize, q.n as usize, q.bits);
+        let (k, n, hbits) = (q.k as usize, q.n as usize, q.k2); // hbits = k2 (2*K + half)
         let nblk = n / 128;
         let kb = k / 16;
         anyhow::ensure!(k % 128 == 0 && k <= 4096, "K {k}: need K % 128 == 0 and K <= 4096");
         anyhow::ensure!(k % (128 / bits as usize) == 0, "K {k} not a multiple of the {bits}-bit chunk");
         anyhow::ensure!(n % 128 == 0 && nblk >= 1 && nblk <= 256 * DH_KPT, "N {n}: need N % 128 == 0, N <= {}", 128 * 256 * DH_KPT);
-        anyhow::ensure!((2..=8).contains(&hbits), "head trellis bits {hbits} outside 2..=8");
+        anyhow::ensure!((3..=16).contains(&hbits), "head trellis k2 {hbits} outside 3..=16");
         anyhow::ensure!((1..=DH_TCAP).contains(&tmax), "--dhead-t={tmax} outside 1..={DH_TCAP}");
         anyhow::ensure!(delta.is_finite() && delta >= 0.0, "--dhead-delta={delta}");
         let s = (1..=kb.min(255)).find(|&s| kb % s == 0 && kb / s <= DH_RMAX)
@@ -493,7 +493,7 @@ impl FwdModel {
         anyhow::ensure!(i < 256 && i < sc.dconf.len() && i < sc.d_dev.len(), "dhead_pass: pass {i}");
         self.dhead_screen(l, sc, dh, q)?;
         let geom: i64 = dh.geom(i);
-        let smem = (dh.r * 8 * 32 * dh.hbits as usize) as u32; // [8 warps][R rows][2 * hbits x 16 B]
+        let smem = (dh.r * 8 * 16 * dh.hbits as usize) as u32; // [8 warps][R rows][k2 uint4 x 16 B]
         xqlaunch!(l, "xq_dh_rescore", (dh.s as u32, dh.tmax as u32, 1), (256, 1, 1), smem,
                   (&q.tr, &sc.chain_xh, &q.svh, &dh.bsig, &dh.ws,
                    &mut sc.argmax, &mut sc.dconf, &mut sc.d_dev, &mut sc.toks,
@@ -615,7 +615,7 @@ impl FwdModel {
         self.dhead_screen(l, sc, dh, q)?;
         let ga: i64 = dh.geom(i) | ((PEN_RING_LOG2 as i64) << 48) | ((p.cap as i64) << 53);
         let gb: i64 = ((dh.n as u64) | ((dh.delta.to_bits() as u64) << 32)) as i64;
-        let ring = dh.r * 8 * 32 * dh.hbits as usize;          // [8 warps][R rows][2 * hbits x 16 B]
+        let ring = dh.r * 8 * 16 * dh.hbits as usize;          // [8 warps][R rows][k2 uint4 x 16 B]
         let smem_a = ring.max(2 * dh.tmax * 128 * 4) as u32;    // + pass A's C1 window counts
         xqlaunch!(l, "xq_dh_rescore_pa", (dh.s as u32, dh.tmax as u32, 1), (256, 1, 1), smem_a,
                   (&q.tr, &sc.chain_xh, &q.svh, &dh.bsig, &dh.ws, &p.pws,

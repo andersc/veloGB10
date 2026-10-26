@@ -727,6 +727,242 @@ extern "C" __global__ void tp_wait_add_4way(tp_dev_ctx* c, __nv_bfloat16* out, c
     if (threadIdx.x == 0) tp_st_release(tp_flag(c, TP_F_RX_DONE), e);   // consumed watermark
 }
 
+// K1 one-shot, MULTI-BLOCK (NAIVE lever 1c, the uniform one-shot ctx only): the single-block tp_gate_copy_signal
+// spends ~14 us per decode reduce copying 16 KB into the mapped host send ring from ONE block with 4 B stores (the
+// 2026-10-20 TP4 census: 105 launches per token = 1.5 ms of a 22 ms step, on every rank, on the critical path of
+// every reduce). Same protocol, same bytes, same order of publication: every block waits the I3 reuse gate on
+// exactly the QPs epoch e-R was posted to (the qp_mask ring; a uniform ctx posts every epoch to all peers),
+// copies its grid-stride share with 16 B stores, fences at system scope and arrives on a device counter; the LAST
+// block records this epoch's qp_mask (all peers), writes the generation-tagged tail LAST, publishes the len tag
+// and releases gpu_ready (I1) -- K1's publish sequence after ALL blocks' payload stores. c->epoch is advanced by
+// the last block (every block computed e from the pre-kernel value), so the K2 that follows in stream order reads
+// the new epoch. nbytes % 16 == 0 (the host passes fp32 payloads of n % 4 == 0 floats). Bitwise-neutral: the wire
+// bytes and their placement are those of K1.
+extern "C" __global__ void tp_gate_copy_signal_os_mb(tp_dev_ctx* c, const void* src, unsigned nbytes, unsigned* arrive) {
+    const unsigned long long e = c->epoch + 1;
+    const unsigned s = (unsigned)(e & (TP_RING_SLOTS - 1));
+    __shared__ int s_ab;
+    if (threadIdx.x == 0) {
+        s_ab = 0;
+        if (e > TP_RING_SLOTS) {
+            const unsigned long long tgt = e - TP_RING_SLOTS;
+            const unsigned qmask = c->qp_mask ? c->qp_mask[tgt & (TP_QPMASK_SLOTS - 1)] : 0u;
+            const unsigned long long* ab = tp_flag(c, TP_F_ABORT);
+            for (int p = 0; p < (int)c->world && !s_ab; p++) {
+                if (!(qmask & (1u << p))) continue;              // only the QPs e-R was posted to
+                const unsigned long long* ret = tp_nway_flagp(c, p, TP_NWAY_TX_OFF);
+                if (blockIdx.x == 0 && tp_ld_relaxed(ret) < tgt) c->gate_waits += 1;
+                unsigned long long deadline = tp_globaltimer() + K1_GATE_WAIT_NS;
+                unsigned ns = 64, cap = 2048u;
+                while (tp_ld_relaxed(ret) < tgt) {
+                    if (tp_ld_relaxed(ab)) { s_ab = 1; break; }
+                    if (tp_globaltimer() >= deadline) {
+                        tp_st_release(tp_flag(c, TP_F_ABORT), 11);
+                        if (blockIdx.x == 0)
+                            printf("[K1os-mb-gate-timeout] rank=%d epoch=%llu peer=%d tgt=%llu qmask=%x\n",
+                                   c->rank, e, p, (unsigned long long)tgt, qmask);
+                        s_ab = 1;
+                        break;
+                    }
+                    __nanosleep(ns);
+                    if (ns < cap) ns <<= 1;
+                }
+            }
+            if (!s_ab) tp_fence_acquire();
+        }
+    }
+    __syncthreads();
+    unsigned char* slot = c->send_ring + (size_t)s * c->slot_stride;
+    if (!s_ab) {
+        uint4* dst = (uint4*)slot;
+        const uint4* s4 = (const uint4*)src;
+        const unsigned n16 = nbytes >> 4;
+        for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += gridDim.x * blockDim.x) dst[i] = s4[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();                         // this block's payload stores, system scope
+        const unsigned prev = atomicAdd(arrive, 1u);    // device-memory counter (GPU-only line)
+        if (prev == gridDim.x - 1) {
+            __threadfence_system();                     // acquire side of the last-block pattern
+            *arrive = 0u;                               // the next launch is stream-ordered behind us
+            c->epoch = e;                               // advances even on abort, like K1 (I9 no-op)
+            if (c->world > 2 && c->qp_mask)             // a one-shot epoch: posted to ALL peers' QPs
+                c->qp_mask[e & (TP_QPMASK_SLOTS - 1)] = ((1u << c->world) - 1u) & ~(1u << c->rank);
+            if (!tp_ld_relaxed(tp_flag(c, TP_F_ABORT))) {
+                const unsigned wire = (nbytes + 7u) & ~7u;
+                *(unsigned long long*)(slot + wire) = e;                 // tail epoch, written LAST
+                c->len_local[e & (TP_LEN_EPOCHS - 1)] = TP_LEN_TAG(e, wire);
+                tp_st_release(tp_flag(c, TP_F_GPU_READY), e);            // watermark (I1)
+            }
+        }
+    }
+}
+
+// K2 one-shot, fp32 wire (NAIVE lever 1, `--tp-reduce single` on the Naive TP=4 path): the all-peers single
+// hop of a UNIFORM one-shot ctx (net_shim oneshot_uniform), gated exactly like the EXL3 path's
+// xq_tp_wait_add_dec_single: per peer, the proxy's validated RELEASE `cpu_done[p] >= e` (the proxy checked
+// that peer's commit hint, len tag and generation-tagged tail at the sender-indexed slot, then fenced and
+// released) AND the slot's tail == e (the R9 watermark check: cpu_done is a per-peer watermark, so it can
+// pass for e before e's own slot is the validated one). This kernel never writes a tail: on this ctx the
+// proxy owns tail validation, and a GPU-side "receive-side clean" of a stale tail races the proxy's
+// (possibly lagging) validation of the previous occupant of the slot — that race is exactly what the first
+// served boot of this lever hit (TAIL-EPOCH GUARD (nway): tail=0 expected 1351, abort 2).
+// The partials are fp32 on the wire (4 B/elem, what the Naive path reduces: MoE / attention partial sums,
+// the sampler's exchange buffers, the drafter's hidden) and the result stays fp32, IN PLACE (`out` may alias
+// `local`: every thread reads its own element before it writes it). The sum is formed as
+//     out = (p0 + p2) + (p1 + p3)          p_r = rank r's fp32 partial (own = `local`)
+// which is EXACTLY the association of the Naive path's R10-aligned recursive-doubling tree (the first
+// K1 of a logical reduce pre-increments the epoch to an odd value -> round 1 -> partner rank^2, so stage 0
+// pairs {0,2},{1,3}; stage 1 (partner rank^1) adds the two pair sums; fp32 add is commutative, so the order
+// inside a pair -- which differs per rank -- cannot change a bit). Every rank reads the same four buffers
+// and forms the same two pair sums, so the result is bit-identical across ranks AND bit-identical to the
+// two-stage tree it replaces (tp_xport::single_tree_reference is the host-side statement of this).
+// Only valid on a uniform one-shot ctx: EVERY epoch is an all-peers push, so K1's qp_mask and the proxy's
+// dispatch agree by construction as long as n*4 <= payload_bytes -- the host enforces that bound and
+// routes wider reduces to the tree on the primary ctx.
+extern "C" __global__ void tp_wait_add_4way_f32(tp_dev_ctx* c, float* out, const float* local, int n) {
+    const unsigned long long e = c->epoch;
+    tp_stamp(c, e, TP_GTS_K2_IN);
+
+    asm volatile("griddepcontrol.launch_dependents;");   // E9 edge, exactly as tp_wait_add_4way
+
+    const unsigned len = (unsigned)n * 4u;  // fp32 partial (4 B/elem)
+    const unsigned wire = (len + 7u) & ~7u;
+    const unsigned long long* ab = tp_flag(c, TP_F_ABORT);
+
+    __shared__ int s_ab;
+    if (threadIdx.x == 0) {
+        s_ab = 0;
+        for (int p = 0; p < (int)c->world && !s_ab; p++) {
+            if (p == (int)c->rank) continue;
+            const unsigned long long* done = tp_nway_flagp(c, p, TP_NWAY_CPU_OFF);
+            const unsigned char* slot = c->oneshot_recv
+                + ((unsigned long long)p * (unsigned long long)TP_RING_SLOTS
+                   + (e & (TP_RING_SLOTS - 1))) * (unsigned long long)c->slot_stride;
+            const unsigned long long* tail = (const unsigned long long*)(slot + wire);
+            unsigned long long tight_until = tp_globaltimer() + 2000ull;   // tight spin first (us-scale arrivals)
+            unsigned ns = 64, cap = 512u;
+            while (tp_ld_relaxed(done) < e || tp_ld_relaxed(tail) != e) {
+                if (tp_ld_relaxed(ab)) { s_ab = 1; break; }   // the proxy's guards abort a lost payload (I9)
+                if (tp_globaltimer() < tight_until) continue;
+                __nanosleep(ns);
+                if (ns < cap) ns <<= 1;
+            }
+        }
+        if (!s_ab) tp_fence_acquire();
+    }
+    __syncthreads();
+    if (s_ab) return;                       // I9 no-op through the stream
+    tp_stamp(c, e, TP_GTS_K2_GO);
+
+    const float* parts[4];
+    #pragma unroll
+    for (int p = 0; p < 4; p++) {
+        parts[p] = (p == (int)c->rank)
+            ? local
+            : (const float*)(c->oneshot_recv
+                + ((unsigned long long)p * (unsigned long long)TP_RING_SLOTS
+                   + (e & (TP_RING_SLOTS - 1))) * (unsigned long long)c->slot_stride);
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float a0 = parts[0][i], a1 = parts[1][i], a2 = parts[2][i], a3 = parts[3][i];
+        out[i] = (a0 + a2) + (a1 + a3);
+    }
+}
+
+// K2 one-shot, fp32 wire, GPU-VALIDATED receive (NAIVE lever 1b, `--tp-gpu-recv on` on the Naive single-stage
+// ctx): the same reduce as tp_wait_add_4way_f32, but on a uniform one-shot ctx whose proxy runs in the v2 receive
+// mode (net_set_recv_mode gpu=1: it posts the wire and never validates or releases on the receive side), so this
+// kernel is the receive side -- exactly tp_wait_add_4way's discipline on an fp32 wire: stage A arms the deadlines
+// on the 3 peers' non-trusted commit hints (I5; a lost / slow hint only forces the long stage-B bound), stage B
+// proves placement by each sender-indexed slot's generation-tagged tail == e (a stale tail is cleaned first, guarded
+// != e -- safe here because nothing on the host reads these tails in this mode), fence, reduce, publish rx_done
+// (the watchdog's v2 debt signal). Removes the CPU bounce (proxy validation -> cpu_done release -> GPU) from every
+// decode-width reduce; the sum and its association are the same as tp_wait_add_4way_f32 (bitwise the tree).
+extern "C" __global__ void tp_wait_add_4way_f32g(tp_dev_ctx* c, float* out, const float* local, int n) {
+    const unsigned long long e = c->epoch;
+    tp_stamp(c, e, TP_GTS_K2_IN);
+
+    asm volatile("griddepcontrol.launch_dependents;");   // E9 edge, exactly as tp_wait_add_4way
+
+    const unsigned len = (unsigned)n * 4u;  // fp32 partial (4 B/elem)
+    const unsigned wire = (len + 7u) & ~7u;
+    const unsigned long long* ab = tp_flag(c, TP_F_ABORT);
+
+    __shared__ int s_any_timeout;
+    if (threadIdx.x == 0) {
+        s_any_timeout = 0;
+        for (int p = 0; p < (int)c->world; p++) {
+            if (p == (int)c->rank) continue;
+            const unsigned long long* hint = tp_nway_flagp(c, p, TP_NWAY_PEER_OFF);
+            unsigned long long deadline = tp_globaltimer() + TP_HINT_WAIT_NS;
+            unsigned long long tight_until = tp_globaltimer() + 2000ull;
+            unsigned ns = 64, cap = 512u;
+            while (tp_ld_relaxed(hint) < e) {
+                if (tp_ld_relaxed(ab)) { s_any_timeout = 1; break; }
+                if (tp_globaltimer() >= deadline) break;              // hint lost/slow: stage B proves placement
+                if (tp_globaltimer() < tight_until) continue;
+                __nanosleep(ns);
+                if (ns < cap) ns <<= 1;
+            }
+            if (s_any_timeout) break;
+        }
+    }
+    __syncthreads();
+    if (s_any_timeout) return;              // I9 no-op (a peer aborted)
+
+    if (threadIdx.x == 0) {
+        for (int p = 0; p < (int)c->world; p++) {
+            if (p == (int)c->rank) continue;
+            const unsigned char* slot = c->oneshot_recv
+                + ((unsigned long long)p * (unsigned long long)TP_RING_SLOTS
+                   + (e & (TP_RING_SLOTS - 1))) * (unsigned long long)c->slot_stride;
+            // NO receive-side clean here (tp_wait_add_4way / tp_wait_add_g store 0 over a tail != e "defensively"):
+            // that store races the NIC's write of THIS epoch's tail -- load sees the old generation, the NIC lands
+            // tail == e, the GPU's 0 lands last, and stage B waits 5 s on a tail that will never reappear. Seen
+            // once in ~450K epochs on the served TP4 cluster (2026-10-20, epoch 170380, peer 2, abort 11). The
+            // equality test needs no clean: a stale tail is a different generation (e - 8k) and can never equal e.
+            unsigned long long deadline = tp_globaltimer() + TP_TAIL_LONG_WAIT_NS;
+            unsigned long long tight_until = tp_globaltimer() + 4000ull;
+            unsigned ns = 64, cap = 512u;
+            while (tp_ld_relaxed((const unsigned long long*)(slot + wire)) != e) {
+                if (tp_ld_relaxed(ab)) { s_any_timeout = 1; break; }
+                if (tp_globaltimer() >= deadline) {
+                    tp_st_release(tp_flag(c, TP_F_ABORT), 11);
+                    printf("[4way-f32g-stageB-timeout] rank=%d epoch=%llu peer=%d\n", c->rank, e, p);
+                    s_any_timeout = 1;
+                    break;
+                }
+                if (tp_globaltimer() < tight_until) continue;
+                __nanosleep(ns);
+                if (ns < cap) ns <<= 1;
+            }
+            if (s_any_timeout) break;
+        }
+        if (!s_any_timeout) tp_fence_acquire();
+    }
+    __syncthreads();
+    if (s_any_timeout) return;
+    tp_stamp(c, e, TP_GTS_K2_GO);
+
+    const float* parts[4];
+    #pragma unroll
+    for (int p = 0; p < 4; p++) {
+        parts[p] = (p == (int)c->rank)
+            ? local
+            : (const float*)(c->oneshot_recv
+                + ((unsigned long long)p * (unsigned long long)TP_RING_SLOTS
+                   + (e & (TP_RING_SLOTS - 1))) * (unsigned long long)c->slot_stride);
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float a0 = parts[0][i], a1 = parts[1][i], a2 = parts[2][i], a3 = parts[3][i];
+        out[i] = (a0 + a2) + (a1 + a3);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) tp_st_release(tp_flag(c, TP_F_RX_DONE), e);   // consumed watermark (the v2 debt signal)
+}
+
 // ================= TP-F: the PREFILL transport pair (fp32 mode-2 payloads, any world) =================
 // The single-block K1/K2 above move a 1 MiB prefill epoch at ~12 GB/s and run strictly K1(e) ->
 // K2(e) -> K1(e+1): copy, wire and add never overlap (TP-E ledger §5: 590-630 ms of a 1.47 s chunk).

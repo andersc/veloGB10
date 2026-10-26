@@ -40,18 +40,22 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 // ===========================================================================================
 
 /// The pack dimensions the DF2 artifact was trained against (trunk df2_round_compatible):
-/// hidden 5120 (Qwen3.8-Flash-Next backbone), vocab 248320 (the EXL3 pack's head), more than
-/// 61 backbone layers. A pack that disagrees cannot use the artifact: the ring reads the
-/// backbone's hidden stream and the selector's codebooks at these widths.
-pub(crate) const DF2_WANT_HIDDEN: usize = 5120;
-pub(crate) const DF2_WANT_VOCAB: usize = 248_320;
-pub(crate) const DF2_MIN_LAYERS: usize = 61;
+/// hidden 5120 (the Qwen3.8-27B backbone the S4F artifact was trained on), vocab 248320 (the
+/// EXL3 pack's head), more backbone layers than the artifact's deepest tap. A pack that
+/// disagrees cannot use the artifact: the ring reads the backbone's hidden stream and the
+/// selector's codebooks at these widths. (Doc bug fixed 2026-10-23: this trunk is the 27B,
+/// NOT Flash-Next — Flash-Next is hidden 2560 / 48 layers / taps [5,15,25,35,45].)
+/// DFLASH2-GEN: the DF2 round dims are LIVE geometry (installed from the draft config.json);
+/// these consts remain only as the 27B default the geometry falls back to.
+pub(crate) fn df2_want_hidden() -> usize { crate::dflash2::hidden() }
+pub(crate) fn df2_want_vocab() -> usize { crate::dflash2::vocab() }
+pub(crate) fn df2_min_layers() -> usize { *crate::dflash2::tap_layers().last().unwrap() }
 
 /// EXL3 mirror of main.rs `resolve_spec_source` -- the SAME parse, the SAME default
 /// (`dflash2-auto`, S8F), and the SAME error text, so a typo dies identically whichever
 /// backend the pack routes to. (main.rs already validates the flag before the exl3 dispatch;
 /// this mirror keeps the lib self-contained and the two checks can never disagree.)
-fn resolve_spec_source_exl3(args: &[String]) -> crate::batch::SpecSource {
+pub fn resolve_spec_source_exl3(args: &[String]) -> crate::batch::SpecSource {
     use crate::batch::SpecSource;
     match arg(args, "--spec-source").map(str::to_lowercase) {
         None => SpecSource::DFlash2Auto,
@@ -77,7 +81,18 @@ fn df2_load_round(model: &mut Arc<FwdModel>, dir: &str, max_c: usize, sha_pin: O
     use crate::dflash2::capture::{Df2PrimeSink, Df2TapSink};
     use crate::dflash2::round::{BorrowedW, Df2Round};
     let (embed_ptr, head_ptr) = model.df2_boot_ptrs()?;
-    let head = BorrowedW::Bf16 { ptr: head_ptr };
+    // S-EXL3-DF2Q (2026-10-18): two-stage quantized head by default — the DSV4 serving default.
+    // The plain Bf16 borrow costs ~126 ms/round through gemm_binv_b (measured, 1.5bpw trunk);
+    // coarse-NVFP4 (0.63 GB) + exact bf16 re-rank of a top-256 shortlist costs ~3 ms and keeps
+    // EXACT ranking. Escape hatch: --no-df2-q2stage (plain bf16, the old behavior).
+    let head = if crate::opts::var(crate::opt!("no-df2-q2stage")).is_err() {
+        match model.df2_q_head_ptrs() {
+            Some(q) => BorrowedW::TwoStage { q, bf16_ptr: head_ptr },
+            None => BorrowedW::Bf16 { ptr: head_ptr },
+        }
+    } else {
+        BorrowedW::Bf16 { ptr: head_ptr }
+    };
     let embed = BorrowedW::Bf16 { ptr: embed_ptr };
     let mut round = Df2Round::load_tp_pinned(dir, Some(head), Some(embed), max_c, None, sha_pin)?;
     let tap = std::sync::Arc::new(Df2TapSink::new(model.dev()));
@@ -119,21 +134,31 @@ fn parse_df2_round_shard(v: Option<&str>) -> Result<bool> {
 /// Reasons (the boot line prints them verbatim inside the FALLBACK parens):
 ///   `source`                          -- the resolved spec source is not a DFlash2 source
 ///   `no --draft-dir`                  -- no artifact dir given (dflash2-auto default boots here)
-///   `dims hidden=<h>x5120 vocab=<v> layers=<l>` -- the pack is not the Flash-Next shape
+///   `dims hidden=<h>x<want_h> vocab=<v>x<want_v> layers=<l> (need ><taps>)` -- the pack is
+///   not the shape the DRAFT's config.json describes (27B defaults when no draft ships)
 ///   `ctx <got>><cap>`                 -- --max-seq-len beyond the DF2 ring's safe ceiling
 ///   (RETIRED 2026-10-21, EXL27D item 2) `tp=<n>>1` -- the TP-DF2 leg now serves DF2 at TP>1
 pub(crate) fn df2_gate_reason(src: crate::batch::SpecSource, draft_dir: Option<&str>,
                               hidden: usize, vocab: usize, layers: usize,
                               max_c: usize, tp_world: usize) -> Option<String> {
     if !crate::batch::is_df2_src(src) { return Some("source".into()); }
-    let Some(_) = draft_dir else { return Some("no --draft-dir".into()); };
+    let Some(dir) = draft_dir else { return Some("no --draft-dir".into()); };
     // (a dir that does not exist / does not load is NOT this gate's business: it engages here
     //  and the load produces the `load failed: <e>` FALLBACK reason — the brief's table.)
-    if hidden != DF2_WANT_HIDDEN || vocab != DF2_WANT_VOCAB || layers <= DF2_MIN_LAYERS {
-        return Some(format!("dims hidden={hidden}x{DF2_WANT_HIDDEN} vocab={vocab} layers={layers}"));
+    // DFLASH2-GEN: the want-dims come from the draft's OWN config.json when it ships one —
+    // installed here so an Ornith-geometry draft is not refused against 27B defaults. A
+    // missing/unreadable config keeps the 27B defaults and the load fails loudly later.
+    // (FLASHNEXT-DF2-B: a dir whose config.json is not readable on THIS box leaves the 27B
+    //  default geometry in place — the caller prints a second line naming that fact next to
+    //  the dims reason; the reason table itself stays pure for the tests below.)
+    let _ = crate::dflash2::geom::install_geom_from_dir(dir);
+    let (want_h, want_v, need_layers) = (df2_want_hidden(), df2_want_vocab(), df2_min_layers());
+    if hidden != want_h || vocab != want_v || layers <= need_layers {
+        return Some(format!(
+            "dims hidden={hidden}x{want_h} vocab={vocab}x{want_v} layers={layers} (need >{need_layers})"));
     }
-    if max_c > crate::dflash2::MAX_CTX_SAFE {
-        return Some(format!("ctx {max_c}>{}", crate::dflash2::MAX_CTX_SAFE));
+    if max_c > crate::dflash2::max_ctx_safe() {
+        return Some(format!("ctx {max_c}>{}", crate::dflash2::max_ctx_safe()));
     }
     // EXL27D item 2 (2026-10-21): the `tp={n}>1` reason is RETIRED. The TP-DF2 leg ships
     // the artifact and the head's argv to the node (TpConfig v12 `df2_draft_dir` /
@@ -145,12 +170,41 @@ pub(crate) fn df2_gate_reason(src: crate::batch::SpecSource, draft_dir: Option<&
     None
 }
 
+/// FLASHNEXT-DF2-C (ISSUES 116): the draft dir this rank loads. Under an EXL3 TP serve (world > 1)
+/// the SHIPPED `TpConfig` decides: on the head it is the absolute `--draft-dir` the head put there
+/// before its sync, on a node it is the blob-cache dir the sync assembled (`run_cluster_node_once`
+/// rewrites it) or empty when the head shipped no drafter — so a node never reads the head's
+/// filesystem path and a missing local copy can no longer turn into a silent 27B-default gate.
+/// A single-box boot reads `--draft-dir` as before.
+pub fn df2_draft_dir_for_boot(args: &[String], cfg: Option<&crate::tp::TpConfig>) -> Option<String> {
+    match cfg {
+        Some(c) if c.mode_serve && c.exl3 && c.world > 1 => {
+            if c.df2_draft_dir.is_empty() { None } else { Some(c.df2_draft_dir.clone()) }
+        }
+        _ => arg(args, "--draft-dir").map(str::to_string),
+    }
+}
+
+/// FLASHNEXT-DF2-C (ISSUES 116): the draft dir the EXL3 TP HEAD ships to its nodes — the
+/// absolute `--draft-dir` when the resolved spec source is a DFlash2-class source (the sync's
+/// `DraftManifest` reads `spec_source` + `df2_draft_dir`, exactly the nvfp4 head's contract);
+/// None otherwise (no `--draft-dir`, a non-DF2 source, or a path that cannot be canonicalized —
+/// the head's own gate then says why).
+pub fn tp_head_draft_dir(args: &[String]) -> Option<String> {
+    let src = resolve_spec_source_exl3(args);
+    if !crate::batch::is_df2_src(src) { return None; }
+    let dir = arg(args, "--draft-dir")?;
+    std::fs::canonicalize(dir).ok().map(|p| p.to_string_lossy().to_string())
+}
+
 /// The engaged boot line, exactly as the owner's brief specifies it:
-/// `[exl3-serve] df2: ENGAGED draft=<dir> block=<n> round-shard=<on|off> (DFlash2 chain on EXL3, TP=1)`
-pub(crate) fn df2_boot_line_engaged(dir: &str, block: usize, shard: bool, tp: usize) -> String {
+/// `[exl3-serve] df2: ENGAGED draft=<dir> sha256=<hex> block=<n> round-shard=<on|off> (DFlash2 chain on EXL3, TP=<n>)`
+pub(crate) fn df2_boot_line_engaged(dir: &str, sha: &str, block: usize, shard: bool, tp: usize) -> String {
     // EXL27D item 2: the world size is in the line — the receipt must say which topology
     // the chain serves on (TP=1 stayed the literal before; a TP=2 boot printed "TP=1").
-    format!("[exl3-serve] df2: ENGAGED draft={dir} block={block} round-shard={} (DFlash2 chain on EXL3, TP={}; chain verify k<={} = the pack MTP wide-verify width)",
+    // FLASHNEXT-DF2 Phase 4: the artifact sha the loader VERIFIED is in the line (the
+    // receipt names which artifact drafted; `unverified` = a path that skipped the hash).
+    format!("[exl3-serve] df2: ENGAGED draft={dir} sha256={sha} block={block} round-shard={} (DFlash2 chain on EXL3, TP={}; chain verify k<={} = the pack MTP wide-verify width)",
             if shard { "on" } else { "off" }, tp, crate::exl3_forward::MTP_MAX_K)
 }
 
@@ -174,6 +228,8 @@ static DF2_ENGAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static DF2_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DF2_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DF2_FALLBACK_MTP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// FLASHNEXT-DF2-117: sampled DF2 rounds whose draft rode the control plane (head sends / node adopts).
+static DF2_SHIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DF2_REANCHOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DF2_DDS_BYPASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -218,6 +274,8 @@ pub fn df2_metrics_append(o: &mut String) {
     o.push_str(&format!("exl3_df2_rounds_total {}\n", DF2_ROUNDS.load(Relaxed)));
     o.push_str("# HELP exl3_df2_tokens_accepted_total Draft tokens the EXL3 verify accepted from the DFlash2 chain.\n# TYPE exl3_df2_tokens_accepted_total counter\n");
     o.push_str(&format!("exl3_df2_tokens_accepted_total {}\n", DF2_ACCEPTED.load(Relaxed)));
+    o.push_str("# HELP exl3_df2_shipped_drafts_total Sampled DF2 rounds whose draft was head-authoritative under TP (head: frames sent per node; node: frames adopted) — ISSUES 117.\n# TYPE exl3_df2_shipped_drafts_total counter\n");
+    o.push_str(&format!("exl3_df2_shipped_drafts_total {}\n", DF2_SHIPPED.load(Relaxed)));
     o.push_str("# HELP exl3_df2_fallback_mtp_total Rounds that used the pack-MTP chain although DF2 was engaged (stale DF2 ring for the lane).\n# TYPE exl3_df2_fallback_mtp_total counter\n");
     o.push_str(&format!("exl3_df2_fallback_mtp_total {}\n", DF2_FALLBACK_MTP.load(Relaxed)));
     o.push_str("# HELP exl3_df2_reanchor_total Solo fallback rounds that rewound the DF2 ring to a lane behind the frontier (prefix-cached follow-up request).\n# TYPE exl3_df2_reanchor_total counter\n");
@@ -669,6 +727,88 @@ impl TpSync {
         }
     }
 
+    /// FLASHNEXT-DF2-117 (ISSUES 117): ONE sampled DFlash2 draft per round for every rank. The head
+    /// ships ITS walk's result (`mine`) to every node and keeps using it (returns None); a node
+    /// blocks here at the same program point, adopts the head's draft (returns Some) and never
+    /// draws its own. No control plane (the harness, TP=1) = None: the caller uses its own draw.
+    /// `lane`/`p` ride the frame as the out-of-step tripwire.
+    pub(crate) fn df2_draft(&mut self, lane: usize, p: usize,
+                            mine: Option<&crate::dflash2::round::Df2SampleOut>)
+                            -> Result<Option<crate::dflash2::round::Df2SampleOut>> {
+        use crate::tp_serve::ServingMsg;
+        if self.ctl.is_empty() { return Ok(None); }
+        if self.rank == 0 {
+            let m = mine.ok_or_else(|| anyhow::anyhow!("df2 draft ship: the head has no sampled draft to ship"))?;
+            let msg = ServingMsg::Df2Draft {
+                lane: lane as u32, p: p as u64, tokens: m.tokens.clone(),
+                q_rows: m.q_rows.iter().map(|x| x.to_bits()).collect(), cand_tok: m.cand_tok.clone(),
+                cand_q: m.cand_q.iter().map(|x| x.to_bits()).collect(),
+            };
+            for s in self.ctl.iter_mut() { crate::tp_serve::send_serving(s, &msg)?; }
+            DF2_SHIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        } else {
+            match crate::tp_serve::recv_serving(&mut self.ctl[0])? {
+                ServingMsg::Df2Draft { lane: l, p: pp, tokens, q_rows, cand_tok, cand_q } => {
+                    anyhow::ensure!(l as usize == lane && pp as usize == p,
+                        "TP control plane out of step: the head's DF2 draft is for lane {l} at p {pp}; this rank is at lane {lane} p {p}");
+                    DF2_SHIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Some(crate::dflash2::round::Df2SampleOut {
+                        tokens, q_rows: q_rows.into_iter().map(f32::from_bits).collect(), cand_tok,
+                        cand_q: cand_q.into_iter().map(f32::from_bits).collect(),
+                    }))
+                }
+                other => anyhow::bail!("TP control plane out of step: expected Df2Draft, got {other:?}"),
+            }
+        }
+    }
+    /// Whether this rank sits on a serve control plane (false in the harness / at TP=1).
+    pub(crate) fn has_ctl(&self) -> bool { !self.ctl.is_empty() }
+
+    /// `spill_agree` at world > 2: the head hub, generic over the transport so the four-rank mock runs the real
+    /// frame + verdict (ISSUES 121: the verdict had never passed on hardware and no test reached it).
+    pub(crate) fn spill_agree_hub<X: crate::net::HubXport>(&mut self, x: &mut X, ok: bool) -> Result<bool> {
+        use crate::tp_lockstep as ls;
+        let all = crate::net::hub_all(x, &ls::spill_frame(ok), ls::SPILL_WIRE)
+            .map_err(|e| self.hub_fail("spill agree", &format!("{e:#}")))?;
+        ls::spill_verdict(&all, self.world as usize).map_err(|why| self.hub_fail("spill agree", &why))
+    }
+
+    /// LANERES3: the spill tier's lockstep bit — the symmetric sibling of `head_flag`.
+    /// Every rank contributes whether its local disk op succeeded (capture write /
+    /// restore read) and the verdict is the AND of all ranks. Called from the
+    /// admission-phase spill hooks, which every rank executes at the same program point
+    /// of the same shipped admit sequence, so the rendezvous pairs up the same way
+    /// HeadFlag frames pair up inside a prefill. This keeps the replicated
+    /// `kv_spill::Policy` identical on every rank: a key no rank-local disk state can
+    /// back on ALL ranks is dropped everywhere (counted), never acted on by one rank
+    /// alone — a disk that diverged can never desync the pair.
+    fn spill_agree(&mut self, ok: bool) -> Result<bool> {
+        use crate::tp_serve::ServingMsg;
+        if self.world > 2 {
+            let mut x = crate::net::link_hub(self.deadline_ms)?;
+            return self.spill_agree_hub(&mut x, ok);
+        }
+        if self.ctl.is_empty() {
+            return Ok(ok); // no control plane (harness paths): local truth, ranks symmetric by construction
+        }
+        if self.rank == 0 {
+            crate::tp_serve::send_serving(&mut self.ctl[0], &ServingMsg::SpillFlag { ok })?;
+            match crate::tp_serve::recv_serving(&mut self.ctl[0])? {
+                ServingMsg::SpillFlag { ok: peer } => Ok(ok && peer),
+                other => anyhow::bail!("TP control plane out of step: expected SpillFlag, got {other:?}"),
+            }
+        } else {
+            match crate::tp_serve::recv_serving(&mut self.ctl[0])? {
+                ServingMsg::SpillFlag { ok: peer } => {
+                    crate::tp_serve::send_serving(&mut self.ctl[0], &ServingMsg::SpillFlag { ok })?;
+                    Ok(ok && peer)
+                }
+                other => anyhow::bail!("TP control plane out of step: expected SpillFlag, got {other:?}"),
+            }
+        }
+    }
+
     /// TP-E: the per-step "go" of a LIVE engine over the RDMA link instead of the TCP control stream.
     /// Measured (TP-E [tp-wait]): the node waited ~0.53 ms per round in the TCP recv of an EMPTY Step
     /// (kernel TCP over the CX7 netdev: NIC interrupt moderation + wakeup), and the head then waited
@@ -1021,7 +1161,9 @@ pub(crate) fn tp_lane_width_fits(world: u32, max_batch: usize) -> std::result::R
 /// above 16 now BOOTS WITH 16: one plain line at the boot, `velogb10_max_batch` reports 16, the KV
 /// is sized for 16, and the head ships 16 to the TP nodes (the same resolver on the same argv).
 /// Further requests wait in the queue — `--max-waiting` semantics are unchanged.
-pub(crate) const EXL3_MAX_LANES: usize = 16;
+/// PREHARD1 [ISSUES 104]: ONE authority — this is `batch::SERVE_MAX_LANES`, the cap the trunk
+/// (NVFP4) serve path now shares; the two can no longer diverge.
+pub(crate) const EXL3_MAX_LANES: usize = crate::batch::SERVE_MAX_LANES;
 
 /// `--max-batch` as the serve resolves it from an argv: the ONE parser (`build_serve` and the
 /// pre-network refusal below), so the two cannot come to read different defaults.
@@ -1689,13 +1831,16 @@ fn parse_prefill_interleave(v: Option<&str>) -> Result<usize> {
 }
 
 /// The interleave the scheduler runs with, and the boot line that says so (None = flag off, no
-/// line: default boot logs are unchanged). Under TP it is forced to 0 on every rank: a rank-local
-/// step between prefill chunks would break the SPMD lockstep (the head drives every step).
+/// line: default boot logs are unchanged). PERFFIX1: under TP too — every rank reads the value from
+/// the head's shipped registry (`prefill-interleave` is SPMD, in the boot agree's digest) and runs the
+/// SAME steps at the SAME chunk boundaries (the boundary is the per-chunk HeadFlag exchange; a step
+/// is lockstep work on every rank, its cancels come from the head's outer loop), so no rank steps alone.
 fn resolve_prefill_interleave(n: usize, tp: bool, chunk: usize) -> (usize, Option<String>) {
     match (n, tp) {
         (0, _) => (0, None),
-        (n, true) => (0, Some(format!("[exl3-serve] --prefill-interleave {n} IGNORED under TP (single-box only): \
-                                       every rank runs with interleave 0, the whole prompt prefills before the next step"))),
+        (n, true) => (n, Some(format!("[exl3-serve] prefill interleave ON under TP (--prefill-interleave {n}): every rank runs up to {n} \
+                                       scheduler step(s) for the lanes already decoding after each non-final prefill chunk (chunk {chunk} \
+                                       tokens), in lockstep; the chunk grid and the joining request's bytes are unchanged, its first token is later"))),
         (n, false) => (n, Some(format!("[exl3-serve] prefill interleave ON (--prefill-interleave {n}): up to {n} scheduler step(s) for the \
                                         lanes already decoding after each non-final prefill chunk (chunk {chunk} tokens); \
                                         the chunk grid and the joining request's bytes are unchanged, its first token is later"))),
@@ -1715,9 +1860,9 @@ fn kv_lane_occupancy(active_pos: Option<usize>, prefill_pos: Option<usize>, cach
 
 /// Does the hook run after the chunk that ended at `end` of a prefill to `n`? Never after the final
 /// chunk (the seam step and the head prime follow it directly), never for a non-cancellable
-/// internal prefill (`cancellable` false: the WP16 XCHECK's reference run), never under TP.
-fn interleave_point(interleave: usize, tp: bool, cancellable: bool, end: usize, n: usize) -> bool {
-    interleave > 0 && !tp && cancellable && end < n
+/// internal prefill (`cancellable` false: the WP16 XCHECK's reference run). Every topology (PERFFIX1).
+fn interleave_point(interleave: usize, cancellable: bool, end: usize, n: usize) -> bool {
+    interleave > 0 && cancellable && end < n
 }
 
 /// C1 v2: prefill scratch rows — the merged-chunk cap with tail checkpoints on (2C - 1; under TP
@@ -1858,7 +2003,7 @@ impl Exl3Scheduler {
             // --prefill-interleave: this chunk's rows, checkpoint and head-fill carry are complete
             // (interleave_steps drains the device first), so the lanes that were decoding before
             // this prompt arrived get their steps now.
-            if interleave_point(self.interleave, self.tp.is_some(), tx.is_some(), end, n) {
+            if interleave_point(self.interleave, tx.is_some(), end, n) {
                 let t_il = std::time::Instant::now();
                 let ran = self.interleave_steps(slot)?;
                 il_points += usize::from(ran > 0);
@@ -1867,6 +2012,7 @@ impl Exl3Scheduler {
             }
         }
         if il_steps > 0 {
+            crate::metrics::prefill_interleave(il_points as u64, il_steps as u64);
             crate::drprintln!("[exl3-serve] prefill-interleave slot={slot}: {il_steps} scheduler step(s) at {il_points} of {} chunk boundaries, \
                               {il_ms:.1} ms of decode (not counted in the prefill line's ms / tok/s)", nchunks.saturating_sub(1));
         }
@@ -1990,7 +2136,7 @@ impl Exl3Scheduler {
             if let Some(old) = self.cache[slot].clone() {
                 let own = old.len() <= end && key[..old.len()] == old[..];
                 if !own {
-                    self.spill_capture_slot(slot, &old);
+                    self.spill_capture_slot(slot, &old)?;
                 }
             }
         }
@@ -2002,7 +2148,7 @@ impl Exl3Scheduler {
         // snapshot state and the normal `reuse > 0` branch below runs unchanged. Cost-model
         // gated; every miss/drop/error falls back to the plain prefill and is counted.
         if reuse == 0 && self.spill.is_some() {
-            if let Some(n) = self.spill_restore_slot(slot, key, end) {
+            if let Some(n) = self.spill_restore_slot(slot, key, end)? {
                 reuse = n;
             }
         }
@@ -2982,6 +3128,10 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
         // (plain steps stay plain); None = exactly set_sampling (the match rule, today).
         let rq = if plain_step { None } else { self.rq_stage(s) };
         let rq_ratio = rq.map_or(false, |r| r.mode == 2);
+        // FLASHNEXT-DF2-B 2026-10-23: the greedy-lane divert to pack MTP that lived here
+        // (interim for ISSUES work[112]: a graphed greedy DF2 draft overflowed the band
+        // kernel's dynamic smem on replay) is GONE — the real fix sizes the smem to the
+        // window bound (dflash2::band_smem); greedy lanes take the DF2 round like every other.
         self.model.set_spec_sampling(&mut self.sc, if plain_step { &rows[..1] } else { &rows }, rq)?;
         // WP15: the same penalty params on every row of the round (and the draft mirror's row 0).
         self.model.set_penalties(&mut self.sc, &vec![pen; if plain_step { 1 } else { k + 1 }])?;
@@ -3002,13 +3152,12 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
         if !plain_step && solo && p >= 1
             && self.df2.as_ref().map_or(false, |r| r.nprev() + 1 > p)
         {
-            // rewind to `p-1` so the gate (nprev+1 == p) matches THIS round: the DF2
-            // round takes it directly. Its tap staging is one-request stale (the sink
-            // holds request 1's frontier hiddens) — that costs at most the first round's
-            // acceptance, never correctness: the verify always commits the target's own
-            // tokens. The round itself refreshes the sink; round 2 onwards is fully
-            // fresh. (Measured with rewind(p): the Fix2 reprime after an adaptive round
-            // lands one PAST the lane — 98 reanchors, 0 DF2 rounds — 2026-10-21.)
+            // ISSUES 126: rewind to `p` so the gate (nprev == p, the trunk's invariant) matches THIS
+            // round. Ring rows below p are the previous request's (exact over a shared prefix,
+            // stale otherwise — ISSUES 114): that costs acceptance, never correctness (the verify
+            // commits the target's own tokens). (The old one-behind convention rewound to p-1 and
+            // admitted nprev+1 == p: the block then started one position early and the seam's tap
+            // was never in context.)
             if let Some(r) = self.df2.as_mut() { r.rewind(p - 1); }
             df2_count_reanchor();
         }
@@ -3052,7 +3201,10 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             // same MtpRoundOut, so `round_account` / `round_emit` are the MTP path's. The
             // plain CONTROL round above is untouched — the DF2 economics are still measured
             // against it.
-            let k_df2 = self.df2_k.min(crate::exl3_forward::MTP_MAX_K);
+            // ISSUES 127: ONE width for the whole DF2 round — the scheduler's k_eff (remaining budget, end of the KV
+            // window, the QSA dense/sparse switch: a round never straddles it) caps --df2-k like it caps the MTP depth.
+            // k_eff >= 1 here (k_eff == 0 is a plain step).
+            let k_df2 = self.df2_k.min(crate::exl3_forward::MTP_MAX_K).min(k_eff);
             // EXL27D-RQ (item 1): a sampled lane re-stages its sampler rows at the DF2
             // verify width (k_df2+1; the shared staging above sized the MTP depth k_eff —
             // a mismatch would stage fewer ratio rows than the verify judges) and drafts
@@ -3060,26 +3212,71 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             // position — the trunk lane's exact convention (batch.rs df2_lane_step_sample_rq);
             // tau = the staged draft temperature (--draft-temperature or the request's).
             let rq2 = if rq_ratio { self.rq_stage(s) } else { None };
+            // ISSUES 127: sampler AND penalty rows at the DF2 verify width for greedy lanes too (they were staged at the
+            // MTP depth k+1 above, so a wider DF2 verify judged its extra rows with stale rows).
+            let (rows_df2, seed) = {
+                let l = self.lanes[s].as_ref().unwrap();
+                (l.samp_rows(k_df2 + 1), l.seed)
+            };
+            self.model.set_spec_sampling(&mut self.sc, &rows_df2, if rq_ratio { rq2 } else { rq })?;
+            self.model.set_penalties(&mut self.sc, &vec![pen; k_df2 + 1])?;
             if rq_ratio {
-                let (rows_df2, seed) = {
-                    let l = self.lanes[s].as_ref().unwrap();
-                    (l.samp_rows(k_df2 + 1), l.seed)
-                };
-                self.model.set_spec_sampling(&mut self.sc, &rows_df2, rq2)?;
-                self.model.set_penalties(&mut self.sc, &vec![pen; k_df2 + 1])?;
                 let seeds: Vec<u32> = (0..crate::dflash2::levels())
                     .map(|j| crate::batch::rng_u32(seed, crate::batch::RNG_DOM_DF2_SEL, j))
                     .collect();
                 let tau = rq2.map(|r| r.tau).unwrap_or(1.0);
+                // FLASHNEXT-DF2-117 (ISSUES 117): ONE sampled draft per round on every rank. Only
+                // the head (or a single box) runs the selector walk; under TP the head ships its
+                // tokens + candidate table to every node and the nodes adopt them instead of
+                // drawing their own — a replicated walk over residuals that differ across ranks
+                // in the low bits drafted differently and tripped the lockstep agree (TP=2 within
+                // ~600 rounds, TP=4 after ~10k tokens on the owner's traffic). Greedy drafts never
+                // needed this (a graph replay whose top-1 agreed over thousands of rounds).
+                let draws_here = self.tp.as_ref().map_or(true, |t| t.rank == 0 || !t.has_ctl());
+                let mine = if draws_here {
+                    Some(self.model.df2_draft_sample(self.df2.as_mut().unwrap(), b as u32, &seeds, tau)?)
+                } else { None };
+                let sample = match self.tp.as_mut() {
+                    Some(t) => match t.df2_draft(s, p, mine.as_ref())? {
+                        Some(theirs) => theirs,
+                        None => mine.expect("the head keeps the draft it shipped"),
+                    },
+                    None => mine.expect("single-box: the local draw"),
+                };
+                {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if let Some(t) = self.tp.as_ref() {
+                        if t.has_ctl() && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            crate::reprintln!("[exl3-serve] df2: DF2 drafts are head-authoritative under TP={} (greedy and sampled: the head's draft ships to every node per round; exl3_df2_shipped_drafts_total counts them — ISSUES 117)", t.world);
+                        }
+                    }
+                }
                 let o = self.model.df2_round(&mut self.sc, self.df2.as_mut().unwrap(), s, k_df2, b, p,
-                                             Some((seeds.as_slice(), tau)),
+                                             Some((seeds.as_slice(), tau)), Some(sample),
                                              [t0, t0, t0])?;
                 df2_count_round(o.a);
                 df2_served = true;
                 (o, 0.0, Vec::new())
             } else {
+                // FLASHNEXT-DF2-117 (greedy twin): the greedy top-1 flips across ranks on near-ties as
+                // well (TP=2 proof: one greedy round in ~1,500 after the sampled rounds were fixed), so
+                // the greedy draft is head-authoritative too — tokens only, no candidate table.
+                let draws_here = self.tp.as_ref().map_or(true, |t| t.rank == 0 || !t.has_ctl());
+                let mine = if draws_here {
+                    Some(crate::dflash2::round::Df2SampleOut {
+                        tokens: self.model.df2_draft_greedy(self.df2.as_mut().unwrap(), b as u32)?,
+                        q_rows: Vec::new(), cand_tok: Vec::new(), cand_q: Vec::new(),
+                    })
+                } else { None };
+                let sample = match self.tp.as_mut() {
+                    Some(t) => match t.df2_draft(s, p, mine.as_ref())? {
+                        Some(theirs) => theirs,
+                        None => mine.expect("the head keeps the draft it shipped"),
+                    },
+                    None => mine.expect("single-box: the local draw"),
+                };
                 let o = self.model.df2_round(&mut self.sc, self.df2.as_mut().unwrap(), s, k_df2, b, p,
-                                             None, [t0, t0, t0])?;
+                                             None, Some(sample), [t0, t0, t0])?;
                 df2_count_round(o.a);
                 df2_served = true;
                 (o, 0.0, Vec::new())
@@ -3146,7 +3343,16 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             w.extend(out.drafts.iter().map(|&x| x as u32));
             w.extend(confs.iter().map(|c| c.to_bits()));
             let m = if plain_step { 1 } else { out.drafts.len() + 1 };
-            self.tp_round(if plain_step { "plain-round" } else { "mtp-round" }, out.a, m, &w, ms, plain_ms, captured_local, false)?
+            match self.tp_round(if plain_step { "plain-round" } else { "mtp-round" }, out.a, m, &w, ms, plain_ms, captured_local, false) {
+                Ok(t) => t,
+                Err(e) => {
+                    // P7-TP2 bisect: both ranks print their round view at the mismatch; diff the
+                    // logs to see whether the chain diverges at draft[0] (input/ring) or mid-chain.
+                    eprintln!("[df2-tp2] p={:?} plain={} accept={} drafts={:?} emitted={:?} confs={:?}",
+                              p, plain_step, out.a, out.drafts, out.emitted, confs);
+                    return Err(e);
+                }
+            }
         } else {
             (ms, plain_ms, captured_local)
         };
@@ -3879,10 +4085,55 @@ the [gen] line says stop_p=na", stats));
     /// store error counts as a recompute-miss and the snapshot is simply lost (today's
     /// behavior). Key = FNV-1a of the cached tokens, so a later request whose prompt extends
     /// them finds it by prefix scan. The disk write is async (the store's writer thread).
-    fn spill_capture_slot(&mut self, slot: usize, old: &[u32]) {
-        let Some(st) = self.spill.as_ref() else { return };
+    /// Err only under TP, when the cross-rank agree itself failed (the link is aborted by then): the admission must stop
+    /// there with this message (ISSUES 121: it used to be parked in `self.fatal` while the admission ran on, and the
+    /// next lockstep's 'transport already aborted' message replaced it).
+    fn spill_capture_slot(&mut self, slot: usize, old: &[u32]) -> Result<()> {
+        let Some(st) = self.spill.clone() else { return Ok(()) };
         let key = crate::kv_spill::conv_key(old);
         let tokens = old.len() as u64;
+        // LANERES3 (TP>=2): every decision in this hook must come out IDENTICALLY on all
+        // ranks — the policy state it feeds decides future restores in lockstep. So under
+        // TP the budget gate reads the deterministic policy bytes (not the live writer
+        // queue), the write is synchronous at this lockstep point (no async completion to
+        // race), and the outcome is agreed across ranks with one SpillFlag: a disk that
+        // failed on ANY rank drops the key EVERYWHERE (counted), so the replicated policy
+        // can never diverge. One capture is in flight at a time (admission is serial), so
+        // the sync write costs the round one D2H + one local NVMe write at an eviction —
+        // the same transient the single-box path pays, minus the queue.
+        if self.tp.is_some() {
+            let est = tokens * crate::kv_spill::KV_BYTES_PER_TOKEN;
+            if self.spill_pol.bytes() + est > self.spill_pol.cap_bytes() {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::drprintln!("[kv-spill] capture refused: policy over budget ({} + est {est} bytes)", self.spill_pol.bytes());
+                return Ok(());
+            }
+            let mut buf = Vec::new();
+            if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
+                crate::metrics::kv_spill_miss_recompute();
+                crate::dreprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
+                return Ok(());
+            }
+            crate::kv_spill::finalize_header(&mut buf, tokens);
+            let wrote = st.put_sync(key, self.spill_rank, &buf);
+            let all_ok = match self.tp.as_mut().map(|t| t.spill_agree(wrote.is_ok())) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => anyhow::bail!("kv spill: capture agree failed slot={slot}: {e:#}"),
+                None => wrote.is_ok(),
+            };
+            if !all_ok {
+                st.remove(key, self.spill_rank);
+                crate::metrics::kv_spill_capture_peer_drop();
+                crate::dreprintln!("[kv-spill] capture dropped: a rank's write failed (agreed across ranks; re-prefill on return)");
+                return Ok(());
+            }
+            let bytes = wrote.unwrap_or(0);
+            for v in self.spill_pol.put(key, bytes, tokens) {
+                st.remove(v, self.spill_rank);
+            }
+            crate::metrics::kv_spill_write(bytes, tokens);
+            return Ok(());
+        }
         // Pre-check the queue budget BEFORE the GiB-scale capture exists: a refusal here is
         // free; one after the D2H transiently pumps ~4 GB through malloc and can cross the
         // box's memwatch floor under churn (the b5x10 lesson).
@@ -3893,14 +4144,14 @@ the [gen] line says stop_p=na", stats));
             {
                 crate::drprintln!("[kv-spill] capture refused: queue over budget (est {} bytes)", tokens * crate::kv_spill::KV_BYTES_PER_TOKEN);
                 crate::metrics::kv_spill_miss_recompute();
-                return;
+                return Ok(());
             }
         }
         let mut buf = Vec::new();
         if let Err(e) = self.model.spill_capture(slot, old.len(), &mut buf) {
             crate::metrics::kv_spill_miss_recompute();
             crate::drprintln!("[exl3-serve] kv spill: capture failed slot={slot} ({e}); snapshot dropped");
-            return;
+            return Ok(());
         }
         crate::kv_spill::finalize_header(&mut buf, tokens);
         match st.put_prebuilt(key, self.spill_rank, buf) {
@@ -3915,42 +4166,91 @@ the [gen] line says stop_p=na", stats));
                 crate::drprintln!("[exl3-serve] kv spill: store put failed ({e}); snapshot dropped");
             }
         }
+        Ok(())
     }
 
     /// Own-snapshot miss: try the spill store. Returns the restored token count (the new
     /// `reuse`) or None (miss / cost-model drop / any error — re-prefill, counted). The read
     /// is synchronous in the admission path, like the prefill it replaces, only ~50x shorter.
-    fn spill_restore_slot(&mut self, slot: usize, key: &[u32], end: usize) -> Option<usize> {
+    /// Err only under TP, when the cross-rank agree failed or a restore failed AFTER every rank agreed to it (the ranks'
+    /// KV would differ): the admission stops there with this message (ISSUES 121, as `spill_capture_slot`).
+    fn spill_restore_slot(&mut self, slot: usize, key: &[u32], end: usize) -> Result<Option<usize>> {
         if self.spill.is_none() || self.spill_pol.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let st = self.spill.as_ref().unwrap();
+        let st = self.spill.clone().unwrap();
         let Some((conv, _)) = self.spill_pol.lookup(key, crate::kv_spill::NVME_READ_BPS, crate::kv_spill::PREFILL_TPS) else {
             crate::metrics::kv_spill_miss_recompute();
-            return None;
+            return Ok(None);
         };
-        let payload = match st.get(conv, self.spill_rank) {
+        // LANERES3 (TP>=2): the lookup and cost model are pure replicated state (identical
+        // on every rank); the local read's outcome is agreed with one SpillFlag, so a
+        // snapshot only ONE rank can read is dropped on BOTH (counted) and both re-prefill
+        // — the rounds stay identical, never a one-sided restore.
+        let read = st.get(conv, self.spill_rank);
+        // LANERES3: agree the PARSE outcome, not just the read — the payload must pass
+        // `spill_restore_check` (magic/version/shape vs THIS model) on BOTH ranks before
+        // either restores. A payload any rank cannot read OR parse (e.g. a file from a
+        // pre-LANERES3 capture format) is dropped everywhere and both re-prefill: the
+        // policy stays replicated-identical and neither rank acts alone.
+        if self.tp.is_some() {
+            let local_ok = matches!(&read, Ok((_, p)) if self.model.spill_restore_check(slot, p).is_ok());
+            let all_ok = match self.tp.as_mut().map(|t| t.spill_agree(local_ok)) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => anyhow::bail!("kv spill: restore agree failed slot={slot}: {e:#}"),
+                None => local_ok,
+            };
+            if !all_ok {
+                // One rank could not read or parse it: drop everywhere (symmetric), re-prefill.
+                let rerr = match &read {
+                    Ok(_) => String::new(),
+                    Err(e) => format!("read: {e}"),
+                };
+                let cerr = match &read {
+                    Ok((_, p)) => match self.model.spill_restore_check(slot, p) {
+                        Ok(_) => String::new(),
+                        Err(e) => format!("check: {e:#}"),
+                    },
+                    Err(_) => String::new(),
+                };
+                crate::dreprintln!(
+                    "[kv-spill] restore dropped: conv {conv:016x} slot={slot} rank={} \
+                     local read=({}) local check=({}) - dropped on all ranks, re-prefill",
+                    self.spill_rank, rerr, cerr);
+                self.spill_pol.remove(conv);
+                st.remove(conv, self.spill_rank);
+                crate::metrics::kv_spill_restore_peer_miss();
+                return Ok(None);
+            }
+        }
+        let payload = match read {
             Ok((_, p)) => p,
             Err(_) => {
                 self.spill_pol.remove(conv);
                 st.remove(conv, self.spill_rank);
                 crate::metrics::kv_spill_miss_recompute();
-                return None;
+                return Ok(None);
             }
         };
         let n = match self.model.spill_restore(slot, &payload) {
             Ok(n) => n,
             Err(e) => {
+                // LANERES3 (TP>=2): after the cross-rank agree a one-sided failure means
+                // the ranks' KV would differ — fatal-grade, reported loudly, never a
+                // silent re-prefill (single-box keeps the graceful re-prefill).
+                if self.tp.is_some() {
+                    anyhow::bail!("kv spill: restore failed slot={slot} ({e}) after the cross-rank agree — ranks would diverge");
+                }
                 crate::metrics::kv_spill_miss_recompute();
                 crate::drprintln!("[exl3-serve] kv spill: restore failed slot={slot} ({e}); re-prefill");
-                return None;
+                return Ok(None);
             }
         };
         self.spill_pol.remove(conv);
         st.remove(conv, self.spill_rank);
         crate::metrics::kv_spill_hit(n as u64);
         crate::drprintln!("[exl3-serve] kv spill: restored slot={slot}: {n} of {end} prompt tokens (read {} MiB)", payload.len() >> 20);
-        Some(n)
+        Ok(Some(n))
     }
 
     // ---------------------------------------------------------- LANERES1: --lane-reserve
@@ -4469,6 +4769,87 @@ impl Exl3Scheduler {
                     Some(_) => {}
                 }
             }
+            // LANERES3: plan-driven admission under TP — the same single-box policy
+            // (`lane_reserve::plan`), head-authoritative. The node never runs the policy:
+            // each admit's scoping rides the wire (`WireRequest::reserve`), so both ranks
+            // restrict `admit_req`'s pick identically and hold the same slot tables.
+            // --lane-reserve 0 (default) takes the plain FIFO body: byte-for-byte today.
+            if self.reserve.is_some() {
+                // LANERES3 fix (2026-10-22): EXACTLY ONE scoped admit per iteration. The
+                // plan's `allowed` set is computed from `self.lanes` HERE, but admits apply
+                // later (the events-apply phase below) — a sweep of several admits plans
+                // them all against the same stale view, two can target one lane, and the
+                // second then finds `free ∩ allowed = {}` and the request was REFUSED
+                // ("server busy"), the §1b-bis.8 anti-pattern (9/60 requests at conc 4 in
+                // the first structural cells run; the FIFO path is immune because its pick
+                // recomputes the free set at apply time). One admit per iteration keeps
+                // every plan's view equal to the state its admit acts on; bursts take one
+                // extra scheduler iteration per request.
+                waiting.retain(|r| !r.tx.is_closed());
+                if free > 0 && !waiting.is_empty() {
+                    let now = std::time::Instant::now();
+                    let slots = self.slot_views();
+                    let wvs: Vec<crate::lane_reserve::WaitView> = waiting.iter().map(|r| crate::lane_reserve::WaitView {
+                        arrived_at: r.received_at,
+                        own_slot: self.own_snapshot_slot(&r.prompt),
+                    }).collect();
+                    if let Some(cfg) = self.reserve {
+                        match crate::lane_reserve::plan(&cfg, &mut self.reserve_st, now, &slots, &wvs) {
+                            crate::lane_reserve::Plan::Admit { waiting_index, allowed, kind } => {
+                                if let Some(mut req) = waiting.remove(waiting_index) {
+                                    if !req.tx.is_closed() {
+                                        if let Some(why) = exl3_reject(&req) {
+                                            let _ = req.tx.send(TokEvent::Finish { reason: why });
+                                        } else {
+                                            if req.seed.is_none() {
+                                                req.seed = Some(entropy_seed()); // head-resolved: every rank samples one stream
+                                            }
+                                            let mut w = WireRequest::from(&req);
+                                            w.reserve = Some(crate::tp_serve::Scoping { allowed: allowed.clone(), kind: kind as u8 });
+                                            if let Some(e) = req.image_embeds.as_ref().filter(|_| !req.image_spans.is_empty()) {
+                                                // VIS-4: the rows ride the binary channel right after this step's frame
+                                                let (bytes, digest) = crate::tp_serve::image_rows_wire(e);
+                                                w.image_bytes = bytes.len() as u64;
+                                                w.image_digest = digest;
+                                                payloads.push(bytes);
+                                            }
+                                            events.push(TpEvent::Admit(w));
+                                            admits.push_back(req);
+                                            free -= 1;
+                                        }
+                                    }
+                                }
+                            }
+                            crate::lane_reserve::Plan::Wait { until } => {
+                                // Admission holds: every free lane is reserved for a waiting
+                                // conversation's own snapshot. With a round running there is
+                                // nothing to wait for HERE — the next step re-plans. With every
+                                // lane free the head ticks (20 ms) for a new arrival or the
+                                // next deadline, the single-box shape (no busy spin, no lost
+                                // work: the patience deadline still forces a take).
+                                if self.lanes.iter().all(|l| l.is_none()) {
+                                    loop {
+                                        if self.fatal.is_some() {
+                                            break;
+                                        }
+                                        if until.map_or(true, |d| std::time::Instant::now() >= d) {
+                                            break;
+                                        }
+                                        match rx.try_recv() {
+                                            Ok(req) => {
+                                                waiting.push_back(req);
+                                                break;
+                                            }
+                                            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                crate::metrics::lane_reserve_waiting(waiting.len() as u64);
+            } else {
             while free > 0 {
                 let Some(mut req) = waiting.pop_front() else { break };
                 if req.tx.is_closed() {
@@ -4492,6 +4873,7 @@ impl Exl3Scheduler {
                 events.push(TpEvent::Admit(w));
                 admits.push_back(req);
                 free -= 1;
+            }
             }
             if !waiting.is_empty() {
                 waiting.retain(|r| !r.tx.is_closed());
@@ -4524,9 +4906,26 @@ impl Exl3Scheduler {
                             l.log_cancel(lane);
                         }
                     }
-                    TpEvent::Admit(_) => {
+                    TpEvent::Admit(w) => {
                         let req = admits.pop_front().context("admit queue out of step")?;
-                        self.admit(req);
+                        // LANERES3: apply the same scoping we shipped (`WireRequest::reserve`)
+                        // or the head's own slot table diverges from the mirrors' from the
+                        // very first scoped admit. A scoped admit whose allowed lanes are no
+                        // longer free at apply time NEVER refuses (§1b-bis.8): the request
+                        // returns to the waiting deque, the next iteration re-plans, and the
+                        // mirror skips the event identically (same replicated lane state).
+                        match w.reserve {
+                            Some(sc) => {
+                                if !crate::lane_reserve::allowed_free(&self.lanes, &sc.allowed) {
+                                    crate::metrics::lane_reserve_tp_requeued();
+                                    crate::dreprintln!("[exl3-serve] TP scoped admit requeued (no allowed lane free; replanning)");
+                                    waiting.push_back(req);
+                                } else {
+                                    self.admit_scoped(req, &sc.allowed, crate::lane_reserve::Kind::from_wire(sc.kind));
+                                }
+                            }
+                            None => self.admit(req),
+                        }
                     }
                 }
                 if let Some(f) = self.fatal.clone() {
@@ -4617,13 +5016,31 @@ impl Exl3Scheduler {
                             TpEvent::Admit(w) => {
                                 let (tx, _rx, _bl) = crate::server::tok_channel(); // mirror dummy; LR-5 gated off under TP
                                 let min_p = w.min_p;
+                                // LANERES3: the head's reservation scoping rides the wire;
+                                // the mirror restricts its pick identically so every rank
+                                // lands the same lane (the pick is a pure function of
+                                // replicated state, and the restriction is part of that
+                                // state now).
+                                let scoping = w.reserve.clone();
                                 let mut req = w.into_request(tx);
                                 req.min_p = min_p;
                                 // PR #17: this admit's image rows were already read (in admit
                                 // order) right after the Step frame — see payloads above.
                                 req.image_embeds = payload_iter.next().flatten();
                                 admitted += 1;
-                                self.admit(req);
+                                match scoping {
+                                    Some(sc) => {
+                                        if !crate::lane_reserve::allowed_free(&self.lanes, &sc.allowed) {
+                                            // LANERES3: the head requeued this admit (no allowed lane free
+                                            // at apply time); the mirror skips it identically or the slot
+                                            // tables diverge. The request re-arrives as a fresh admit event.
+                                            crate::metrics::lane_reserve_tp_requeued();
+                                        } else {
+                                            self.admit_scoped(req, &sc.allowed, crate::lane_reserve::Kind::from_wire(sc.kind));
+                                        }
+                                    }
+                                    None => self.admit(req),
+                                }
                             }
                         }
                         if let Some(f) = self.fatal.clone() {
@@ -4787,6 +5204,15 @@ fn tp_boot_agree(s: &mut Exl3Scheduler) -> Result<()> {
         let mut d = 0x811c9dc5u32;
         for b in why.bytes() { d = (d ^ b as u32).wrapping_mul(0x01000193); }
         w.extend([0x5F50_4B46, why.is_empty() as u32, d]);
+    }
+    // FLASHNEXT-DF2-C (ISSUES 116): the DFlash2 chain's boot outcome — pushed only on a rank that
+    // ENGAGED it (a boot without DF2 keeps the pre-existing hash), so a head that engaged while a
+    // node fell back (no artifact on that node, a different artifact, block or verify width)
+    // refuses HERE with a named reason instead of diverging at the first round.
+    if s.df2.is_some() {
+        let sha = crate::dflash2::load::last_load_sha().unwrap_or("unverified");
+        w.extend([0xDF20_0001, crate::dflash2::block() as u32, s.df2_k as u32,
+                  fnv32(0xD5A, sha.bytes().map(|b| b as u32))]);
     }
     w.extend(s.eos.iter().copied());
     w.extend(tune.bytes().map(|b| b as u32));
@@ -5490,7 +5916,10 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     // takes. (main's pre-dispatch resolve_draft_dir already exits on an explicit
     // artifact-REQUIRING source with no dir; dflash2-auto — the default — without a dir is the
     // silent-ignore case this gate fixes, with a loud FALLBACK line.)
-    let df2_draft_dir = arg(args, "--draft-dir").map(str::to_string);
+    // FLASHNEXT-DF2-C (ISSUES 116): under an EXL3 TP serve the SHIPPED config decides the draft
+    // dir (the head's absolute path on rank 0, the blob-cache dir the sync assembled on a node,
+    // empty = the head shipped no drafter); a node never opens the head's filesystem path.
+    let df2_draft_dir = df2_draft_dir_for_boot(args, crate::tp::tp_config());
     // --df2-block <n>: the artifact's block size (default: dflash2::block(), 8; 16 on the wide
     // selector artifact). The round's chain-verify depth is k = block - 1.
     let mut df2_block = parse_df2_block(arg(args, "--df2-block"))?;
@@ -5622,7 +6051,19 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     match df2_gate_reason(df2_src, df2_draft_dir.as_deref(), model.cfg.hidden_size,
                           model.cfg.vocab_size, model.cfg.num_layers, max_seq_len,
                           tp_world as usize) {
-        Some(reason) => println!("{}", df2_boot_line_fallback(&reason)),
+        Some(reason) => {
+            println!("{}", df2_boot_line_fallback(&reason));
+            // FLASHNEXT-DF2-B (TP=2 boot 2026-10-23): a node re-parses the head's argv and reads
+            // --draft-dir from ITS OWN disk (the EXL3 TP sync ships the pack, not the drafter). A
+            // node without the artifact fell to the 27B default geometry, reported a "dims
+            // mismatch" and served MTP while the head ENGAGED — the pair diverged at the first
+            // round. Say so, next to the reason.
+            if let Some(dir) = df2_draft_dir.as_deref() {
+                if !std::path::Path::new(dir).join("config.json").is_file() {
+                    println!("[exl3-serve] df2: note — {dir}/config.json is not readable on this box, so the dims above assume the 27B default geometry; under TP every rank needs the artifact at this path (rank {})", tp_rank.map_or(0, |r| r as usize));
+                }
+            }
+        }
         None => {
             // EXL27C: the unsharded round kernel's ring band is structurally 8 rows
             // (write_kv_b ring rows [RING, RING+8)); block 16 is the SHARDED (TP) shape.
@@ -5638,8 +6079,19 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             let pin = arg(args, "--sha256");
             let dir = df2_draft_dir.clone().unwrap_or_default();
             match df2_load_round(&mut model, &dir, max_seq_len, pin) {
-                Ok(r) => {
-                    println!("{}", df2_boot_line_engaged(&dir, df2_block, df2_shard, tp_world as usize));
+                Ok(mut r) => {
+                    // S5F parity (batch.rs:1682): capture the draft-round CUDA graph once at boot.
+                    // The eager EXL3 chain measured 149 ms/round (df2-trace, 2026-10-18, .12);
+                    // the graph replay collapses launch/sync overhead. Opt-out: --no-df2-graph.
+                    if crate::opts::var(crate::opt!("no-df2-graph")).is_err() {
+                        if r.capture_round_graph() {
+                            println!("[exl3-serve] df2: draft-round CUDA graph captured (eager fallback via --no-df2-graph)");
+                        } else {
+                            println!("[exl3-serve] df2: draft-round graph capture unsupported — staying eager");
+                        }
+                    }
+                    let sha = crate::dflash2::load::last_load_sha().unwrap_or("unverified");
+                    println!("{}", df2_boot_line_engaged(&dir, sha, df2_block, df2_shard, tp_world as usize));
                     df2_mark_engaged();
                     df2 = Some(r);
                 }
@@ -5647,7 +6099,22 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
             }
         }
     }
-    let df2_k = (df2_block - 1).min(crate::exl3_forward::MTP_MAX_K);
+    // FLASHNEXT-DF2-B: `--df2-k <n>` caps the DF2 verify width (the walk still drafts block-1
+    // tokens; only the first n are verified). Default = block-1. Applied and shown, never a
+    // refusal (AGENTS §1b-bis.8): out-of-range values clamp into 1..=block-1.
+    let df2_k_max = (df2_block - 1).min(crate::exl3_forward::MTP_MAX_K);
+    let df2_k = match arg(args, "--df2-k") {
+        None => df2_k_max,
+        Some(v) => {
+            let want: usize = v.parse().unwrap_or(df2_k_max);
+            let k = want.clamp(1, df2_k_max);
+            if df2.is_some() {
+                println!("[exl3-serve] df2: verify width k={k} (--df2-k {v}{}; default {df2_k_max} = block-1; the chain still drafts {} and verifies the first k)",
+                         if k != want { ", clamped" } else { "" }, df2_block - 1);
+            }
+            k
+        }
+    };
     // SURFACE2 item 4: the boot lines that describe HOW this server speculates print only when it
     // does. With --mtp off (or the hatch) the WP23 DDS line, the lane-order line, the shared-step
     // line and the spec-sampling line described rounds that never run.
@@ -5969,7 +6436,10 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     // --prefill-interleave N (public PR #23; default 0 = off = no code path change). Every TP rank
     // parses the same argv and resolves 0, so the node needs nothing and the lockstep is untouched.
     let (interleave, il_line) = resolve_prefill_interleave(
-        parse_prefill_interleave(arg(args, "--prefill-interleave"))?, tp_rank.is_some(), chunk);
+        // PERFFIX1: from the registry (SPMD: a node gets the head's value; its own argv never carries the flag)
+        // owner 2026-10-24: default 1 — an unset flag takes the REGISTRY default (never a hard-coded 0 that would drift)
+        parse_prefill_interleave(Some(crate::opts::var(crate::opt!("prefill-interleave")).ok()
+            .unwrap_or_else(|| crate::opt!("prefill-interleave").def().def.to_string()).as_str()))?, tp_rank.is_some(), chunk);
     if let Some(line) = il_line { crate::drprintln!("{line}"); }
     if width > 1 && spec_live {
         crate::dprintln!("[exl3-serve] load-adaptive batching (--spec-lanes-max): {} (--max-batch {width})", match spec_policy {
@@ -5986,13 +6456,15 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     } else {
         crate::mtp_reprobe::ReProbeCfg::default()
     };
-    // LANERES1: --lane-reserve R --lane-reserve-patience P --lane-reserve-swap S. A single-box
-    // admission policy: under TP the head ships every admit to the nodes, so the policy is
-    // inactive there (one boot line). Default R=0 = today's admission, byte-for-byte.
+    // LANERES1: --lane-reserve R --lane-reserve-patience P --lane-reserve-swap S. LANERES3:
+    // the policy is now head-authoritative at every topology — under TP the head runs
+    // `lane_reserve::plan` in its admit sweep and ships each admit's scoping on the wire
+    // (`WireRequest::reserve`), so the node restricts its lane pick identically and both
+    // ranks hold the same slot tables. Default R=0 = today's admission, byte-for-byte.
     let lr_r = crate::opts::ranged(crate::opt!("lane-reserve")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
     let lr_p = crate::opts::ranged(crate::opt!("lane-reserve-patience")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
     let lr_s = crate::opts::ranged(crate::opt!("lane-reserve-swap")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
-    let reserve_cfg = if lr_r > 0 && tp_rank.is_none() {
+    let reserve_cfg = if lr_r > 0 {
         Some(crate::lane_reserve::Cfg::on(lr_r, lr_p, lr_s))
     } else {
         None
@@ -6000,12 +6472,19 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
     // LANERES2: --kv-spill <auto|off|PATH> --kv-spill-gb N. An SSD spill tier for evicted lane
     // snapshots: a hard eviction is captured to NVMe (async writer thread) and restored on the
     // conversation's next arrival when the read beats the re-prefill (kv_spill::Policy::lookup).
-    // Default auto = /tmp/gb10_kv_spill; --kv-spill-gb 0 or "off" = today's behavior.
-    // TP>=2: node-side capture needs the node command set — NOT active in this build (one boot
-    // line says so; every eviction re-prefills and is counted). Single-box: fully active.
-    let ks_mode = crate::opts::var(crate::opt!("kv-spill")).map(|v| v.to_string()).unwrap_or_else(|_| "auto".to_string());
+    // Default OFF since 2026-10-23 (owner: a snapshot copies the whole lane, so it cost more than it saved on typical
+    // prompts; ISSUES 123); auto = /tmp/gb10_kv_spill; --kv-spill-gb 0 or "off" = no tier.
+    // LANERES3: active at TP>=2 as well — every rank runs the same capture/restore hooks in
+    // lockstep, writes ITS rank's shard to ITS OWN local SSD (the file name carries the rank;
+    // snapshot bytes never cross the wire), and the outcome is agreed across ranks with one
+    // SpillFlag rendezvous, so the replicated policy — and with it every later restore
+    // decision — can never diverge on a disk fault (a key any rank cannot back is dropped
+    // everywhere and counted).
+    // owner 2026-10-23: default OFF (the registry default; read from the registry so the two cannot drift apart)
+    let ks_mode = crate::opts::var(crate::opt!("kv-spill")).map(|v| v.to_string())
+        .unwrap_or_else(|_| crate::opt!("kv-spill").def().def.to_string());
     let ks_gb = crate::opts::ranged(crate::opt!("kv-spill-gb")).map_err(|e| anyhow::anyhow!("{e}"))? as u64;
-    let (spill_on, spill_dir) = if tp_rank.is_some() || ks_mode == "off" || ks_gb == 0 {
+    let (spill_on, spill_dir) = if ks_mode == "off" || ks_gb == 0 {
         (false, String::new())
     } else {
         let d = if ks_mode == "auto" { "/tmp/gb10_kv_spill".to_string() } else { ks_mode.clone() };
@@ -6020,11 +6499,12 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         (None, crate::kv_spill::Policy::new(0))
     };
     crate::rprintln!("{}", if spill_on {
-        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text-only snapshots; restores when the NVMe read beats the re-prefill it replaces)", tp_rank.unwrap_or(0))
-    } else if tp_rank.is_some() && ks_mode != "off" && ks_gb > 0 {
-        "[exl3-serve] kv spill: requested but TP>=2 node-side capture is not wired in this build — running without the tier (admission unchanged; evictions re-prefill and count on /metrics)".to_string()
+        let tp_note = if tp_rank.is_some() {
+            "; TP: per-rank local shards, capture/restore agreed across ranks in-round"
+        } else { "" };
+        format!("[exl3-serve] kv spill: on, cap {ks_gb} GiB, dir {spill_dir} (rank {}; text-only snapshots; restores when the NVMe read beats the re-prefill it replaces){tp_note}", tp_rank.unwrap_or(0))
     } else {
-        "[exl3-serve] kv spill: off (--kv-spill off or --kv-spill-gb 0: today's admission, byte-for-byte)".to_string()
+        "[exl3-serve] kv spill: off (the default; --kv-spill auto or a directory turns it on)".to_string()
     });
     let sched = Exl3Scheduler {
         model: model.clone(), sc, width,
@@ -6053,10 +6533,12 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         // after the lane-order line: `speculation_boot_lines_follow_the_switch` pins that line directly behind its guard
         crate::rprintln!("[exl3-serve] packed speculative verify (--lane-pack): {}", lane_pack.name());
     }
-    // LANERES1: one line for the lane-reservation posture (active, off, or inactive under TP).
+    // LANERES1: one line for the lane-reservation posture — active at every topology since
+    // LANERES3 (head-authoritative under TP), or off.
     match reserve_cfg {
-        Some(c) => crate::rprintln!("[exl3-serve] lane reservation: R {} s, patience {} s, swap {} s (--lane-reserve: keep a conversation's lane and its prefix cache; andrei.gnezdilov's design)", c.reserve.as_secs(), c.patience.as_secs(), c.swap.as_secs()),
-        None if tp_rank.is_some() && lr_r > 0 => crate::rprintln!("[exl3-serve] lane reservation: INACTIVE under TP (--lane-reserve {lr_r} ignored: the head ships every admit; single-box only) — admission unchanged"),
+        Some(c) => crate::rprintln!("[exl3-serve] lane reservation: R {} s, patience {} s, swap {} s (--lane-reserve: keep a conversation's lane and its prefix cache; andrei.gnezdilov's design{})",
+            c.reserve.as_secs(), c.patience.as_secs(), c.swap.as_secs(),
+            if tp_rank.is_some() { "; TP: head-authoritative, the node applies the shipped admit scoping" } else { "" }),
         None => crate::rprintln!("[exl3-serve] lane reservation: off (--lane-reserve 0: today's admission, byte-for-byte)"),
     }
     println!("[exl3-serve] liveness: sticky CUDA error / scheduler thread crash -> {}",
@@ -6096,8 +6578,14 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
             &crate::otel::topology_from_world(if tp_rank.is_some() { Some(tp_world) } else { None }))),
         _ => None,
     };
+    // FLASHNEXT-DF2-B (ISSUES work[113]): the pack's generation_config.json decides the
+    // unsent-field sampler defaults (the Qwen3.8 card values only when the pack has none; a
+    // Qwen3.8 pack's file holds exactly the card's thinking triple, so this is identity there).
+    let (sampling_defaults, sd_src) = crate::server::SamplingDefaults::from_pack(
+        model_dir, crate::server::SamplingDefaults::QWEN38_CARD);
+    println!("[exl3-serve] {}", sampling_defaults.describe(sd_src));
     let state = AppState {
-        sampling_defaults: crate::server::SamplingDefaults::QWEN38_CARD,
+        sampling_defaults,
         scheduler: stx,
         tokenizer: tok,
         model_name: model_name.clone(),
@@ -7686,10 +8174,10 @@ mod prefill_interleave_tests {
         assert_eq!(parse_prefill_interleave(arg(&a, "--prefill-interleave")).unwrap(), 3);
     }
 
-    /// Off is silent (default boot logs unchanged); on says so; under TP it is forced to 0 on every
-    /// rank and the line says it is ignored.
+    /// Off is silent (default boot logs unchanged); on says so, at TP=1 and (PERFFIX1) under TP, where every
+    /// rank runs the same steps at the same chunk boundaries.
     #[test]
-    fn the_resolved_value_is_zero_under_tp_and_the_boot_line_says_so() {
+    fn the_resolved_value_is_the_flag_at_every_topology_and_the_boot_line_says_so() {
         assert_eq!(resolve_prefill_interleave(0, false, 4095), (0, None));
         assert_eq!(resolve_prefill_interleave(0, true, 4095), (0, None));
         let (n, line) = resolve_prefill_interleave(2, false, 1024);
@@ -7697,20 +8185,20 @@ mod prefill_interleave_tests {
         let line = line.unwrap();
         assert!(line.starts_with("[exl3-serve] prefill interleave ON (--prefill-interleave 2)") && line.contains("chunk 1024 tokens"), "{line}");
         let (n, line) = resolve_prefill_interleave(2, true, 1024);
-        assert_eq!(n, 0);
-        assert!(line.unwrap().contains("--prefill-interleave 2 IGNORED under TP"));
+        assert_eq!(n, 2, "PERFFIX1: every rank runs the flag's value under TP");
+        let line = line.unwrap();
+        assert!(line.contains("prefill interleave ON under TP (--prefill-interleave 2)") && line.contains("in lockstep"), "{line}");
     }
 
     /// The hook never runs after the final chunk (the seam step follows it), for a non-cancellable
-    /// internal prefill, under TP, or with the flag off.
+    /// internal prefill, or with the flag off (at every topology since PERFFIX1).
     #[test]
-    fn the_hook_runs_only_between_chunks_of_a_cancellable_single_box_prefill() {
-        assert!(interleave_point(1, false, true, 1024, 20_000));
-        assert!(interleave_point(4, false, true, 19_999, 20_000));
-        assert!(!interleave_point(1, false, true, 20_000, 20_000), "final chunk");
-        assert!(!interleave_point(0, false, true, 1024, 20_000), "flag off");
-        assert!(!interleave_point(1, true, true, 1024, 20_000), "TP");
-        assert!(!interleave_point(1, false, false, 1024, 20_000), "WP16 XCHECK reference prefill");
+    fn the_hook_runs_only_between_chunks_of_a_cancellable_prefill() {
+        assert!(interleave_point(1, true, 1024, 20_000));
+        assert!(interleave_point(4, true, 19_999, 20_000));
+        assert!(!interleave_point(1, true, 20_000, 20_000), "final chunk");
+        assert!(!interleave_point(0, true, 1024, 20_000), "flag off");
+        assert!(!interleave_point(1, false, 1024, 20_000), "WP16 XCHECK reference prefill");
     }
 
     /// Every served grid ends exactly at `n`, whatever its options (realign, tail split, absorb-tail),
@@ -7728,7 +8216,7 @@ mod prefill_interleave_tests {
         ] {
             let grid = plan_grid(from, n, c, realign, tail, psc_rows(c, false), absorb, true);
             assert_eq!(grid.last().copied(), Some(n), "the grid ends at n");
-            let points = grid.iter().filter(|&&e| interleave_point(1, false, true, e, n)).count();
+            let points = grid.iter().filter(|&&e| interleave_point(1, true, e, n)).count();
             assert_eq!(points, grid.len() - 1, "grid {grid:?}");
         }
     }
@@ -7737,7 +8225,10 @@ mod prefill_interleave_tests {
     #[test]
     fn the_flag_is_registered_without_an_environment_variable() {
         let o = crate::opt!("prefill-interleave").def();
-        assert_eq!((o.flag, o.env, o.def), ("prefill-interleave", "", "0"));
+        assert_eq!((o.flag, o.env, o.def), ("prefill-interleave", "", "1"), "owner 2026-10-24: default 1");
+        // the server's unset fallback is the registry default, not a literal
+        let serve: String = include_str!("exl3_serve.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(serve.contains(".unwrap_or_else(|| crate::opt!(\"prefill-interleave\").def().def.to_string())"), "unset -> registry default");
         assert!(matches!(o.ty, crate::opts::Ty::Int));
         assert_eq!(o.scope, crate::opts::Scope::Spmd);
     }
@@ -8748,7 +9239,7 @@ mod vision_drill_flag_tests {
     /// S-B9-REL-VISIONFIX2 V5 (the list of bare-and-still-misread names is empty and may not grow).
     #[test]
     fn no_registry_flag_is_read_with_a_value_readers_is_some() {
-        const TAKES_A_VALUE: [&str; 3] = ["server-port", "bench-file", "model-dir"];
+        const TAKES_A_VALUE: [&str; 4] = ["server-port", "bench-file", "model-dir", "model"];
         const BARE_AND_STILL_MISREAD: [&str; 0] = [];
         let serve = include_str!("exl3_serve.rs");
         assert_eq!(serve.matches(&["vision_boot(model_dir, ", "vision_fail_gemm_armed())"].concat()).count(), 1, "the serve path asks the registry");
@@ -9323,12 +9814,12 @@ mod df2_gate_tests {
     #[test]
     fn df2_gate_dims_reason_reports_got_and_want() {
         assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 3072, 248_320, 62, 262_144, 1).as_deref(),
-                   Some("dims hidden=3072x5120 vocab=248320 layers=62"));
+                   Some("dims hidden=3072x5120 vocab=248320x248320 layers=62 (need >61)"));
         assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 5120, 151_936, 62, 262_144, 1).as_deref(),
-                   Some("dims hidden=5120x5120 vocab=151936 layers=62"));
+                   Some("dims hidden=5120x5120 vocab=151936x248320 layers=62 (need >61)"));
         // layers must be MORE than 61: the Flash-Next backbone
         assert_eq!(df2_gate_reason(SpecSource::DFlash2, DIR, 5120, 248_320, 61, 262_144, 1).as_deref(),
-                   Some("dims hidden=5120x5120 vocab=248320 layers=61"));
+                   Some("dims hidden=5120x5120 vocab=248320x248320 layers=61 (need >61)"));
     }
 
     #[test]
@@ -9344,10 +9835,11 @@ mod df2_gate_tests {
 
     #[test]
     fn df2_boot_lines_are_verbatim() {
-        assert_eq!(df2_boot_line_engaged("/d", 8, false, 1),
-                   "[exl3-serve] df2: ENGAGED draft=/d block=8 round-shard=off (DFlash2 chain on EXL3, TP=1; chain verify k<=7 = the pack MTP wide-verify width)");
-        assert_eq!(df2_boot_line_engaged("/d2", 16, true, 2),
-                   "[exl3-serve] df2: ENGAGED draft=/d2 block=16 round-shard=on (DFlash2 chain on EXL3, TP=2; chain verify k<=7 = the pack MTP wide-verify width)");
+        let sha = "0123456789abcdef".repeat(4);
+        assert_eq!(df2_boot_line_engaged("/d", &sha, 8, false, 1),
+                   format!("[exl3-serve] df2: ENGAGED draft=/d sha256={sha} block=8 round-shard=off (DFlash2 chain on EXL3, TP=1; chain verify k<=7 = the pack MTP wide-verify width)"));
+        assert_eq!(df2_boot_line_engaged("/d2", &sha, 16, true, 2),
+                   format!("[exl3-serve] df2: ENGAGED draft=/d2 sha256={sha} block=16 round-shard=on (DFlash2 chain on EXL3, TP=2; chain verify k<=7 = the pack MTP wide-verify width)"));
         assert_eq!(df2_boot_line_fallback("source"),
                    "[exl3-serve] df2: FALLBACK to pack MTP (source)");
         assert_eq!(df2_boot_line_fallback("no --draft-dir"),
@@ -9365,5 +9857,64 @@ mod df2_gate_tests {
                        "exl3_df2_dds_bypass_total "] {
             assert!(o.contains(series), "missing series `{series}` in:\n{o}");
         }
+    }
+}
+
+/// ISSUES 121: the world > 2 spill agree end to end over the four-rank mock hub (the real `hub_all`, frame and
+/// verdict): healthy writes agree on every rank, one rank's failed write drops the snapshot on every rank, and no rank
+/// aborts its link either way. The shipped build failed this on every rank at the first TP=4 capture.
+#[cfg(test)]
+mod spill_agree_tests {
+    use super::*;
+    use crate::net::hub_mock::{run_ranks, Net};
+
+    #[test]
+    fn ranks_agree_on_a_capture_and_drop_it_together_when_one_write_failed() {
+        for world in [3usize, 4] {
+            for failed in [None, Some(0usize), Some(world - 1)] {
+                let net = Net::new(world, true);
+                let outs = run_ranks(&net, None, |rank, hub| {
+                    let mut t = TpSync::new(rank as i32, world as i32);
+                    (0..3).map(|_| t.spill_agree_hub(hub, Some(rank) != failed).map_err(|e| format!("{e:#}")))
+                          .collect::<Vec<_>>()
+                });
+                for (rank, v) in outs.iter().enumerate() {
+                    for r in v {
+                        assert_eq!(r, &Ok(failed.is_none()), "world {world}, failed write on {failed:?}: rank {rank}");
+                    }
+                }
+                assert!((0..world).all(|r| net.abort_code(r) == 0), "no rank aborts its link on a healthy vote");
+                assert!(net.clobbers().is_empty(), "{:?}", net.clobbers());
+            }
+        }
+    }
+}
+
+/// ISSUES 127 / 128 (static review P0s): source pins for the DF2 width clamp and the draft slot staging (the ISSUES 126
+/// ring re-alignment was measured and NOT kept: archive/reviewfix1-issue126-attempt). The behaviour needs a GPU; these keep a later edit from quietly restoring the old code.
+#[cfg(test)]
+mod review_p0_pins {
+    fn code(src: &str) -> String {
+        src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn df2_round_width_is_clamped_and_staged_for_greedy_and_sampled() {
+        let s = code(include_str!("exl3_serve.rs"));
+        // 127: one clamped width, staged for greedy and sampled alike
+        assert!(s.contains("let k_df2 = self.df2_k.min(crate::exl3_forward::MTP_MAX_K).min(k_eff);"), "DF2 width clamp");
+        let k = s.find("let k_df2 = self.df2_k").unwrap();
+        let branch = &s[k..k + 2500];
+        let stage = branch.find("self.model.set_penalties(&mut self.sc, &vec![pen; k_df2 + 1])?;").expect("penalty rows at k_df2+1");
+        assert!(stage < branch.find("if rq_ratio {\n").unwrap(), "rows staged before the sampled/greedy split");
+    }
+
+    #[test]
+    fn served_draft_chains_stage_the_lane_slot_in_every_regime() {
+        let s = code(include_str!("exl3_forward.rs"));
+        assert!(!s.contains(&["if dqsa { self.dev.htod_copy_into(vec![slot as i32; sc.slot_ids", ".len()], &mut sc.slot_ids)?; }"].concat()),
+                "the fixed chain no longer stages the slot only for a sparse last pass");
+        assert!(!s.contains(&["if self.qsa_live(p + kmax - 1) {\n            if stage {\n                let st = sc.wp05", ""].concat()),
+                "the adaptive chain no longer stages the slot only for a sparse last pass");
     }
 }
