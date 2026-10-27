@@ -50,10 +50,12 @@ pub fn sample(logits: &[f32], temperature: f32, top_k: usize, top_p: f32) -> u32
 
     let inv_temp = 1.0 / temperature;
 
-    // Top-k: find indices of the k largest logits (O(n) via partition)
-    let k = top_k.min(v);
+    // Top-k: find indices of the k largest logits (O(n) via partition). 0 means no truncation.
+    let k = if top_k == 0 { v } else { top_k.min(v) };
     let mut indices: Vec<usize> = (0..v).collect();
-    indices.select_nth_unstable_by(k, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    if k < v {
+        indices.select_nth_unstable_by(k, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    }
     // indices[0..k] are the top-k token indices
 
     // Temperature-scaled softmax over top-k
@@ -85,4 +87,33 @@ pub fn sample(logits: &[f32], temperature: f32, top_k: usize, top_p: f32) -> u32
         if r < acc { return idx as u32; }
     }
     nucleus[nucleus.len() - 1].0 as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_k_zero_keeps_full_vocab() {
+        let logits = [0.1f32, 2.0, -1.0, 0.5];
+        for _ in 0..64 {
+            assert!((sample(&logits, 0.7, 0, 1.0) as usize) < logits.len());
+        }
+    }
+
+    #[test]
+    fn top_k_at_or_above_vocab_len() {
+        let logits = [0.1f32, 2.0, -1.0, 0.5];
+        for k in [4usize, 5, usize::MAX] {
+            for _ in 0..16 {
+                assert!((sample(&logits, 0.7, k, 0.9) as usize) < logits.len());
+            }
+        }
+    }
+
+    #[test]
+    fn top_k_one_is_argmax() {
+        let logits = [0.1f32, 2.0, -1.0, 0.5];
+        assert_eq!(sample(&logits, 0.7, 1, 0.9), 1);
+    }
 }

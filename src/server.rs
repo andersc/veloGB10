@@ -1048,10 +1048,14 @@ fn default_top_k() -> usize { 20 }
 /// OpenAI-compatible convention, e.g. `-1`); mapped to 0, which the samplers treat as off.
 fn deserialize_top_k<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
     use serde::Deserialize;
-    match Option::<i64>::deserialize(d)? {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TopK { Unsigned(u64), Signed(i64) }
+    match Option::<TopK>::deserialize(d)? {
         None => Ok(None),
-        Some(k) if k < 0 => Ok(Some(0)),
-        Some(k) => usize::try_from(k).map(Some).map_err(serde::de::Error::custom),
+        Some(TopK::Signed(k)) if k < 0 => Ok(Some(0)),
+        Some(TopK::Signed(k)) => usize::try_from(k).map(Some).map_err(serde::de::Error::custom),
+        Some(TopK::Unsigned(k)) => usize::try_from(k).map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -3061,6 +3065,15 @@ mod top_k_parse_tests {
         assert_eq!(c.top_k, Some(0));
         let c: CompletionRequest = serde_json::from_str(r#"{"prompt":"x"}"#).unwrap();
         assert_eq!(c.top_k, None);
+    }
+
+    #[test]
+    fn full_unsigned_range_still_parses() {
+        assert_eq!(chat("9223372036854775807"), Ok(Some(i64::MAX as usize)));
+        assert_eq!(chat("9223372036854775808"), Ok(Some(1usize << 63)));
+        assert_eq!(chat("18446744073709551615"), Ok(Some(u64::MAX as usize)));
+        assert_eq!(chat("-9223372036854775808"), Ok(Some(0)));
+        assert!(chat("18446744073709551616").is_err());
     }
 }
 
