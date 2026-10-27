@@ -3,6 +3,42 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.7.6 — LOADFAST staged loader for Naive TP + TP cold-boot bring-up fix
+
+_Released 2026-10-27 · tag `v0.7.6` · asset `velogb10-v0.7.6-gb10-sm121.tar.gz` (+ `SHA256SUMS.txt`, `PROVENANCE.txt`) · binary sha256 `cf1501159f68ae0cb6f3c748cab8759285f3b144c7e363dbb456c20cf3e7a265`_
+
+### What is in this build
+
+- **LOADFAST: staged-layer loader for Naive TP.** After the first boot, ranks stage decoded weights
+  from a per-rank local cache instead of re-decoding the pack: sha256-verified, resumable, staged by
+  a claim-bounded parallel pipeline (deadlock-free by construction; unit-test regression included),
+  and rank-0 stages from the local cache on subsequent boots. New flags: `--naive-load-cache`,
+  `--naive-load-verify`, `--naive-load-workers`.
+- **TP cold-boot bring-up fix (ISSUES 153).** A cold-cache TP head ships its world-1 ranks
+  sequentially (about 19 minutes at 0.10 GB/s), and the old fixed dial/accept budgets (300 s dial /
+  600 s accept / 20 s for world == 2) expired mid-ship: every node died with "nway connect:
+  Connection refused" on the FIRST cold boot (a warm blob cache hides it — a warm sync takes
+  seconds). The dial/accept loops now retry while the head's control stream is alive — the node
+  registers its fd and the shim peeks it with MSG_PEEK without consuming protocol bytes — abort the
+  instant the stream closes or resets, and keep a 1-hour hard cap with 60-second progress notes.
+  Unit test: `head_liveness_peek_sees_peer_close`.
+- **Issue #19 corrected: YaRN is already supported** (E5/YARN1 + YARN512K receipts) — the close-out
+  retracted the wrong answer; no code change needed.
+- The Flash-Next TP scaling assessment (agent-trace profile, per-turn budget, static findings
+  S1–S6: double render+tokenize per request on the head, short-suffix chunk fixed cost, TP=4
+  GPU-side receive, sampled full-row logit gather, deep-context KV-pair attention) is published in
+  the dev reports; it proposes levers, none of which are code in this build.
+
+### What this build does NOT do (plain words)
+
+- **UNVERIFIED ON GPU as packaged**: this release session ran no model work and no serving run was
+  made from this tarball. The new code paths carry their dev-session unit tests (the LOADFAST
+  staging regression; the liveness peek test) but have no end-to-end GPU receipts of their own.
+- LOADFAST pays only on REPEAT boots of a Naive TP server from the same pack on the same rank
+  (the first boot is unchanged); no startup numbers are claimed here.
+- The cold-boot fix changes retry/abort timing only — no bandwidth or protocol change.
+- Everything the v0.7.5 notes list as not-done remains true unless addressed above.
+
 ## v0.7.5 — EXL3 everywhere + the Naive-N0.5-Flash family + DFlash2 drafts under TP everywhere + reduced draft vocabulary
 
 _Released 2026-10-27 · tag `v0.7.5` · asset `velogb10-v0.7.5-gb10-sm121.tar.gz` (+ `SHA256SUMS.txt`, `PROVENANCE.txt`) · binary sha256 `7ff7ef98e8909ed408589623b018324c509b5c22d6b9ccd8636800ec512038f4`_

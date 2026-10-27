@@ -245,6 +245,35 @@ void net_set_opts(unsigned long long spin_us, int tail_drill, int oneshot, int t
  * the K1 reuse gate waits on all three QPs. One-shot by design: consumed (and cleared) by that init, so no
  * other ctx — rail 1, rail 2 — is ever affected. The legacy --tp-oneshot global is untouched. */
 static int g_oneshot_uniform_once = 0;
+
+/* ISSUES 153 (2026-10-27): liveness-tied bring-up. A cold-cache head ships its world-1 ranks
+ * SEQUENTIALLY (~0.10 GB/s, minutes per rank) and opens its per-pair listeners only afterwards,
+ * so the old fixed budgets (300 s dial / 600 s accept) expired mid-ship and EVERY node died with
+ * "nway connect: Connection refused" on the first cold boot (warm blob cache hid it — the whole
+ * sync takes seconds). The dial/accept loops below now retry as long as the head's control
+ * stream is alive: the node process registers that fd (net_set_abort_fd), and a MSG_PEEK never
+ * consumes protocol bytes, so the stream stays usable by the control protocol. A hard 1 h cap
+ * backstops a registered-fd-less (bench) or pathological case. */
+static int g_abort_fd = -1;      /* Rust-owned fd of the node's control stream to the head */
+void net_set_abort_fd(int fd) { g_abort_fd = fd; }
+static const char* g_abort_why = NULL;
+static int bringup_aborted(void) {
+    if (g_abort_fd < 0) return 0;
+    unsigned char b;
+    ssize_t r = recv(g_abort_fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) { g_abort_why = "head control stream closed"; return 1; }
+    if (r < 0 && (errno == ECONNRESET || errno == EPIPE || errno == ETIMEDOUT)) {
+        g_abort_why = "head control stream reset"; return 1;
+    }
+    return 0;
+}
+/* exposed for the Rust unit test + diagnostics: 1 iff the registered head stream is dead */
+int net_abort_check(void) { return bringup_aborted(); }
+static uint64_t now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+#define BRINGUP_CAP_MS 3600000ull   /* hard cap on any bring-up retry loop */
 void net_set_oneshot_uniform_once(int on) { g_oneshot_uniform_once = on; }
 static inline uint64_t tp_spin_budget_ns(void) {
     uint64_t v = __atomic_load_n(&g_tp_spin_ns, __ATOMIC_RELAXED);
@@ -376,11 +405,22 @@ static int tcp_exchange(int rank, const char* peer_ip, int port, Exch* lo, Exch*
         if (sock<0){ LOGE("accept"); return -1; }
         if (peer_out) inet_ntop(AF_INET, &pa.sin_addr, peer_out, peer_out_len);
     } else {
-        sock = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in a; memset(&a,0,sizeof(a));
         a.sin_family=AF_INET; a.sin_port=htons(port); inet_pton(AF_INET,peer_ip,&a.sin_addr);
-        int ok=-1; for(int i=0;i<400;i++){ if(connect(sock,(struct sockaddr*)&a,sizeof(a))==0){ok=0;break;} usleep(50000);}
-        if (ok){ LOGE("connect %s:%d: %s",peer_ip,port,strerror(errno)); return -1; }
+        /* ISSUES 153: liveness-tied dial (was 400 x 50 ms = 20 s — a cold TP2 ship is ~12 min).
+         * Fresh socket per attempt (a socket that has seen a failed connect() must not be
+         * re-connected), abort the instant the head's control stream dies, 1 h hard cap. */
+        sock = -1;
+        for (uint64_t t0 = now_ms(), last_note = t0;;) {
+            if (bringup_aborted()) { LOGE("connect %s:%d: giving up — %s", peer_ip, port, g_abort_why); return -1; }
+            uint64_t el = now_ms() - t0;
+            if (el > BRINGUP_CAP_MS) { LOGE("connect %s:%d: no listener within %llu s (cap)", peer_ip, port, (unsigned long long)(el/1000)); return -1; }
+            if (el - last_note >= 60000) { LOGE("connect %s:%d: still retrying (%llu s — cold-cache head still shipping?)", peer_ip, port, (unsigned long long)(el/1000)); last_note += 60000; }
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) { LOGE("socket"); return -1; }
+            if (connect(sock,(struct sockaddr*)&a,sizeof(a))==0) break;
+            close(sock); usleep(50000);
+        }
         if (peer_out) snprintf(peer_out, peer_out_len, "%s", peer_ip);
     }
     if (write(sock,lo,sizeof(*lo))!=(ssize_t)sizeof(*lo)){ LOGE("w exch"); close(sock); return -1; }
@@ -427,14 +467,23 @@ static int nway_tcp_exchange(int my_rank, int peer_rank, const char* peer_ip, in
         // A peer that REPORTS its failure is handled earlier and faster by the head's node watch (cluster.rs).
         {
             struct pollfd pfd; memset(&pfd, 0, sizeof(pfd)); pfd.fd = ls; pfd.events = POLLIN;
-            int pr;
-            do { pr = poll(&pfd, 1, NWAY_ACCEPT_TIMEOUT_MS); } while (pr < 0 && errno == EINTR);
-            if (pr <= 0) {
-                LOGE("nway accept: rank %d never dialled rank %d on port %d within %d s (%s) — the peer did not "
-                     "reach its link bring-up; check its log", peer_rank, my_rank, port, NWAY_ACCEPT_TIMEOUT_MS / 1000,
-                     pr == 0 ? "timeout" : strerror(errno));
-                close(ls);
-                return -1;
+            /* ISSUES 153: sliced accept — the old single 600 s poll expired on cold boots where a
+             * lower rank waits (world-1) x ship-time for the LAST rank to reach its dial. */
+            int pr = 0;
+            uint64_t t0 = now_ms(), last_note = t0;
+            for (;;) {
+                if (bringup_aborted()) { LOGE("nway accept: giving up on rank %d — %s", peer_rank, g_abort_why); close(ls); return -1; }
+                do { pr = poll(&pfd, 1, 1000); } while (pr < 0 && errno == EINTR);
+                if (pr > 0) break;
+                if (pr < 0) { LOGE("nway accept poll: %s", strerror(errno)); close(ls); return -1; }
+                uint64_t el = now_ms() - t0;
+                if (el > BRINGUP_CAP_MS) {
+                    LOGE("nway accept: rank %d never dialled rank %d on port %d within %llu s (timeout) — the peer did not "
+                         "reach its link bring-up; check its log", peer_rank, my_rank, port, (unsigned long long)(el/1000));
+                    close(ls);
+                    return -1;
+                }
+                if (el - last_note >= 60000) { LOGE("nway accept: rank %d still waiting for rank %d's dial (%llu s — cold-cache ship?)", my_rank, peer_rank, (unsigned long long)(el/1000)); last_note += 60000; }
             }
         }
         sock = accept(ls, (struct sockaddr*)&pa, &plen); close(ls);
@@ -446,10 +495,15 @@ static int nway_tcp_exchange(int my_rank, int peer_rank, const char* peer_ip, in
         // ((0,1) then (0,2) then (0,3) ...). A node therefore reaches this connect before the head's
         // listener for its pair exists and must keep retrying across the whole sync + handshake skew.
         // Each retry needs a FRESH socket: a socket that has seen a failed connect() cannot be
-        // re-connected on Linux. Budget = 6000 * 50 ms = 300 s (the world==2 tcp_exchange path keeps
-        // its proven 20 s window — this arm is only entered for world > 2).
+        // re-connected on Linux. ISSUES 153: liveness-tied dial — the old 6000 x 50 ms = 300 s
+        // budget expired while a cold head was still shipping (sequential, minutes per rank);
+        // now we retry while the head's control stream is alive, with a 1 h hard cap.
         int ok = -1;
-        for (int i = 0; i < 6000; i++) {
+        for (uint64_t t0 = now_ms(), last_note = t0;;) {
+            if (bringup_aborted()) { LOGE("nway connect %s:%d: giving up — %s", peer_ip, port, g_abort_why); return -1; }
+            uint64_t el = now_ms() - t0;
+            if (el > BRINGUP_CAP_MS) { LOGE("nway connect %s:%d: no listener within %llu s (cap)", peer_ip, port, (unsigned long long)(el/1000)); return -1; }
+            if (el - last_note >= 60000) { LOGE("nway connect %s:%d: still retrying (%llu s — cold-cache head still shipping?)", peer_ip, port, (unsigned long long)(el/1000)); last_note += 60000; }
             sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock < 0) { LOGE("nway socket"); return -1; }
             struct sockaddr_in a; memset(&a,0,sizeof(a));

@@ -166,7 +166,7 @@ pub struct GpuModel {
 // The stream handle is only ever used from the thread that owns the model (the serve loop / a probe).
 unsafe impl Send for GpuModel {}
 
-fn f16_bits_of(pack: &NaivePack, name: &str) -> Result<Vec<u16>> {
+pub(crate) fn f16_bits_of(pack: &NaivePack, name: &str) -> Result<Vec<u16>> {
     let m = pack.plain_tensor(name)?;
     let raw = m.read_bytes(&pack.dir)?;
     Ok(match m.dtype.as_str() {
@@ -176,7 +176,7 @@ fn f16_bits_of(pack: &NaivePack, name: &str) -> Result<Vec<u16>> {
         other => bail!("{name}: dtype {other}"),
     })
 }
-fn f32_of(pack: &NaivePack, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn f32_of(pack: &NaivePack, name: &str) -> Result<Vec<f32>> {
     let m = pack.plain_tensor(name)?;
     let raw = m.read_bytes(&pack.dir)?;
     Ok(match m.dtype.as_str() {
@@ -207,20 +207,9 @@ impl GpuModel {
         ensure!(ring.is_power_of_two() && ring >= 2 * c.sliding_window, "ring {ring} must be a power of two >= 2*window");
         load_module(&dev)?;
         let t0 = std::time::Instant::now();
-        let (h, hd, vd) = (c.hidden_size, c.head_dim, c.v_head_dim);
-        let embed = {
-            let m = pack.plain_tensor("model.embed_tokens.weight")?;
-            ensure!(m.dtype == "BF16", "embed dtype {}", m.dtype);
-            dev.htod_sync_copy(&le_u16(&m.read_bytes(&pack.dir)?))?
-        };
-        let norm = dev.htod_sync_copy(&f16_bits_of(pack, "model.norm.weight")?)?;
-        let (lm_head, v0, vl) = if shard.world == 1 {
-            (upload_quad(&dev, pack, pack.quad("lm_head")?)?, 0, c.vocab_size)
-        } else {
-            let (a, n) = shard.span(c.vocab_size)?;
-            ensure!(a % 128 == 0 && n % 128 == 0, "vocabulary slice not 128-aligned");
-            (super::shard::upload_quad_cols(&dev, pack, pack.quad("lm_head")?, a, a + n)?.0, a, n)
-        };
+        // LOADFAST (stage.rs): staged host images — cache + worker pipeline. The pre section
+        // (embed/norm/lm_head) arrives first, then the layers, uploaded in order as staged.
+        let opts = super::stage::LoadOpts::from_opts();
         let etp = etp_of(pack, &shard);
         crate::metrics::NAIVE_MOE_TP.store(etp, std::sync::atomic::Ordering::Relaxed);
         // expert TP: every expert is local (identity map); else the interleaved ownership map
@@ -234,10 +223,30 @@ impl GpuModel {
                       hardware; --naive-moe-shard tp asks for it)");
         }
         let mut layers = Vec::with_capacity(n_layers);
-        for l in 0..n_layers {
-            layers.push(Self::load_layer(&dev, pack, l, max_pos, ring, n_slots, &shard)?);
-            crate::dprintln!("[naive] layer {l} ({:?}, {}) loaded, {:.1} s", c.attn[l], if c.moe[l] { "moe" } else { "dense" }, t0.elapsed().as_secs_f64());
-        }
+        let (mut embed, mut norm, mut lm_head) = (None, None, None);
+        let (mut v0, mut vl) = (0usize, c.vocab_size);
+        super::stage::run(pack, n_layers, shard, &opts, |item| -> Result<()> {
+            match item {
+                super::stage::Item::Pre(pre) => {
+                    embed = Some(dev.htod_sync_copy(pre.plain("model.embed_tokens.weight")?)?);
+                    norm = Some(dev.htod_sync_copy(pre.plain("model.norm.weight")?)?);
+                    lm_head = Some(pre.quad("lm_head")?.upload(&dev)?);
+                    if shard.world != 1 {
+                        let (a, n) = shard.span(c.vocab_size)?;
+                        v0 = a; vl = n;
+                    }
+                    Ok(())
+                }
+                super::stage::Item::Layer(l, s) => {
+                    layers.push(Self::upload_layer(&dev, &c, l, max_pos, ring, n_slots, &shard, etp, s)?);
+                    crate::dprintln!("[naive] layer {l} ({:?}, {}) loaded, {:.1} s", c.attn[l], if c.moe[l] { "moe" } else { "dense" }, t0.elapsed().as_secs_f32());
+                    Ok(())
+                }
+            }
+        })?;
+        let embed = embed.context("staged pre section: embed missing")?;
+        let norm = norm.context("staged pre section: norm missing")?;
+        let lm_head = lm_head.context("staged pre section: lm_head missing")?;
         let stream = dev.fork_default_stream().context("fork stream")?;
         // AGENTS.md S2 rule 2: `alloc_zeros` does NOT zero (async alloc). Both buffers below are read by
         // kernels on the FIRST decode step. `sids_buf` in particular is written by ONLY the
@@ -265,9 +274,18 @@ impl GpuModel {
     }
 
     /// One layer's weights + caches on the device: this rank's shard (`Shard::single()` = whole layer).
+    /// One layer's weights + caches on the device: this rank's shard (`Shard::single()` = whole layer).
+    /// The classic one-shot path (stage + upload inline, no cache) — probes keep this shape.
     pub fn load_layer(dev: &Arc<CudaDevice>, pack: &NaivePack, l: usize, max_pos: usize, ring: usize, n_slots: usize, shard: &super::shard::Shard) -> Result<GpuLayer> {
-        use super::shard::{upload_quad_cols, upload_quad_rows};
-        let c = &pack.cfg;
+        let s = super::stage::stage_layer(pack, l, shard)?;
+        Self::upload_layer(dev, &pack.cfg, l, max_pos, ring, n_slots, shard, etp_of(pack, shard), &s)
+    }
+
+    /// The device half of a staged layer (the old `load_layer`'s upload side, verbatim): quads are
+    /// found by name prefix (staging decided whole/slice; the name records which), plains by name.
+    /// The interm_div guard runs HERE, so cold (pack) and warm (cache) loads validate identically.
+    fn upload_layer(dev: &Arc<CudaDevice>, c: &NaiveConfig, l: usize, max_pos: usize, ring: usize, n_slots: usize,
+                    shard: &super::shard::Shard, etp: bool, s: &super::stage::StagedLayer) -> Result<GpuLayer> {
         let (h, hd, vd) = (c.hidden_size, c.head_dim, c.v_head_dim);
         {
             let p = format!("model.layers.{l}.");
@@ -275,126 +293,77 @@ impl GpuModel {
             let (q0, nh_l) = shard.q_heads(c.num_heads)?;
             let (k0, kv_l) = shard.kv_heads(c.num_heads, kv_total)?;
             let kv = kv_l;
-            let quad = |name: &str| upload_quad(&dev, pack, pack.quad(&format!("{p}{name}")).unwrap());
-            let qd = |name: &str| pack.quad(&format!("{p}{name}"));
             let slots = if c.attn[l] == AttnKind::Swa { ring } else { max_pos };
             let kc = dev.alloc_zeros::<u16>(kv * slots * hd * n_slots)?;
             let vc = dev.alloc_zeros::<u16>(kv * slots * vd * n_slots)?;
             // attention projections: q columns of this rank's heads, k/v columns of its kv heads
             // (v is stored per-head padded to hd), o rows of its heads' values
             let (q, k, v, o, k_off, v_off) = if shard.world == 1 {
-                (quad("self_attn.q_proj")?, quad("self_attn.k_proj")?, quad("self_attn.v_proj")?, quad("self_attn.o_proj")?, 0, 0)
+                (s.quad(&format!("{p}self_attn.q_proj"))?.upload(dev)?,
+                 s.quad(&format!("{p}self_attn.k_proj"))?.upload(dev)?,
+                 s.quad(&format!("{p}self_attn.v_proj"))?.upload(dev)?,
+                 s.quad(&format!("{p}self_attn.o_proj"))?.upload(dev)?,
+                 0, 0)
             } else {
-                let (q, _) = upload_quad_cols(dev, pack, qd("self_attn.q_proj")?, q0 * hd, (q0 + nh_l) * hd)?;
-                let (k, k_off) = upload_quad_cols(dev, pack, qd("self_attn.k_proj")?, k0 * hd, (k0 + kv_l) * hd)?;
-                let (v, v_off) = upload_quad_cols(dev, pack, qd("self_attn.v_proj")?, k0 * hd, (k0 + kv_l) * hd)?;
-                // a shipped shard carries o_proj PRE-SLICED to this rank's rows (k == nh_l * vd); the whole pack is sliced here
-                let oq = qd("self_attn.o_proj")?;
-                let o = if oq.k == nh_l * vd { upload_quad(dev, pack, oq)? } else { upload_quad_rows(dev, pack, oq, q0 * vd, (q0 + nh_l) * vd)? };
-                (q, k, v, o, k_off, v_off)
+                // a staged shard carries o_proj PRE-SLICED to this rank's rows (k == nh_l * vd);
+                // the whole pack was sliced at staging time
+                let ks = s.quad(&format!("{p}self_attn.k_proj"))?;
+                let vs = s.quad(&format!("{p}self_attn.v_proj"))?;
+                let k_off = ks.col_off;
+                let v_off = vs.col_off;
+                (s.quad(&format!("{p}self_attn.q_proj"))?.upload(dev)?, ks.upload(dev)?, vs.upload(dev)?,
+                 s.quad(&format!("{p}self_attn.o_proj"))?.upload(dev)?, k_off, v_off)
             };
             let idx = if c.attn[l] == AttnKind::Dsa {
                 Some(GpuIndexer {
-                    wq: quad("self_attn.indexer.wq")?,
-                    wk: quad("self_attn.indexer.wk")?,
-                    wp: quad("self_attn.indexer.weights_proj")?,
-                    kn_w: dev.htod_sync_copy(&f16_bits_of(pack, &format!("{p}self_attn.indexer.k_norm.weight"))?)?,
-                    kn_b: dev.htod_sync_copy(&f16_bits_of(pack, &format!("{p}self_attn.indexer.k_norm.bias"))?)?,
+                    wq: s.quad(&format!("{p}self_attn.indexer.wq"))?.upload(dev)?,
+                    wk: s.quad(&format!("{p}self_attn.indexer.wk"))?.upload(dev)?,
+                    wp: s.quad(&format!("{p}self_attn.indexer.weights_proj"))?.upload(dev)?,
+                    kn_w: dev.htod_sync_copy(s.plain(&format!("{p}self_attn.indexer.k_norm.weight"))?)?,
+                    kn_b: dev.htod_sync_copy(s.plain(&format!("{p}self_attn.indexer.k_norm.bias"))?)?,
                     kq: dev.alloc_zeros::<u8>(max_pos * c.index_head_dim * n_slots)?,
                     ks: dev.alloc_zeros::<f32>(max_pos * n_slots)?,
                 })
             } else { None };
             let sink = if c.has_sink(l) {
-                let all = f16_bits_of(pack, &format!("{p}self_attn.attention_sink_bias"))?;
-                Some(dev.htod_sync_copy(&all[q0..q0 + nh_l])?)
+                Some(dev.htod_sync_copy(s.plain(&format!("{p}self_attn.attention_sink_bias"))?)?)
             } else { None };
             let mlp = if c.moe[l] {
                 let (e, mi) = (c.num_experts, c.moe_intermediate_size);
-                let etp = etp_of(pack, shard);
                 let mi_l = if etp { mi / shard.world } else { mi };
-                ensure!(mi_l % 128 == 0, "expert TP: the intermediate slice {mi_l} is not 128-aligned at world {}", shard.world);
-                let (ia, ib) = (shard.rank * mi_l, (shard.rank + 1) * mi_l);
                 let experts: Vec<usize> = if etp { (0..e).collect() } else { shard.local_experts(e) };
-                let mut g_tr = Vec::new(); let mut u_tr = Vec::new(); let mut d_tr = Vec::new();
-                let (mut suh_g, mut svh_g, mut suh_u, mut svh_u, mut suh_d, mut svh_d) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                let mut bpb = 0usize;
-                for &ex in &experts {
-                    let q = |w: &str| pack.quad(&format!("{p}mlp.experts.{ex}.{w}"));
-                    let (g, u, d) = (q("gate_proj")?, q("up_proj")?, q("down_proj")?);
-                    // whole experts (the full pack, or the expert-parallel deal) or pre-sliced ones (an expert-TP shard)
-                    let pre = etp && g.n == mi_l && mi_l != mi;
-                    let (gn, dk) = if pre { (mi_l, mi_l) } else { (mi, mi) };
-                    ensure!(g.k == h && g.n == gn && u.k == h && u.n == gn && d.k == dk && d.n == h, "expert geometry @{l} e{ex}: gate {}x{} up {}x{} down {}x{}", g.k, g.n, u.k, u.n, d.k, d.n);
-                    ensure!(g.bits == u.bits && g.bits == d.bits && (bpb == 0 || bpb == g.bits.words()), "expert widths @{l} e{ex}");
-                    bpb = g.bits.words();
-                    let (gt, ut, dt) = (le_u16(&g.trellis.read_bytes(&pack.dir)?), le_u16(&u.trellis.read_bytes(&pack.dir)?), le_u16(&d.trellis.read_bytes(&pack.dir)?));
-                    let (gsv, usv, dsu) = (le_u16(&g.svh.read_bytes(&pack.dir)?), le_u16(&u.svh.read_bytes(&pack.dir)?), le_u16(&d.suh.read_bytes(&pack.dir)?));
-                    if etp && !pre {
-                        // slice here (the head's whole pack): gate/up keep tile columns [ia/16, ib/16) of every tile row
-                        // and that svh range; down keeps tile rows [ia/16, ib/16) and that suh range
-                        let (kb, nb, w) = (h / 16, mi / 16, bpb);
-                        let cols = |t: &[u16]| -> Vec<u16> {
-                            let mut o = Vec::with_capacity(kb * (mi_l / 16) * w);
-                            for r in 0..kb { o.extend_from_slice(&t[(r * nb + ia / 16) * w..(r * nb + ib / 16) * w]); }
-                            o
-                        };
-                        g_tr.extend(cols(&gt)); u_tr.extend(cols(&ut));
-                        d_tr.extend_from_slice(&dt[(ia / 16) * (h / 16) * w..(ib / 16) * (h / 16) * w]);
-                        svh_g.extend_from_slice(&gsv[ia..ib]); svh_u.extend_from_slice(&usv[ia..ib]);
-                        suh_d.extend_from_slice(&dsu[ia..ib]);
-                    } else {
-                        g_tr.extend(gt); u_tr.extend(ut); d_tr.extend(dt);
-                        svh_g.extend(gsv); svh_u.extend(usv); suh_d.extend(dsu);
-                    }
-                    suh_g.extend(le_u16(&g.suh.read_bytes(&pack.dir)?));
-                    suh_u.extend(le_u16(&u.suh.read_bytes(&pack.dir)?));
-                    svh_d.extend(le_u16(&d.svh.read_bytes(&pack.dir)?));
-                }
-                // The converter's interm_div shows in the pack: up_proj's input scale vector is 1/div of
-                // gate_proj's. Verify the config's divisor against the data before applying it, so a pack
-                // converted WITHOUT the division (or with a different one) is refused, not served 128x off.
-                let mean_abs = |v: &[u16]| v.iter().map(|b| half::f16::from_bits(*b).to_f32().abs() as f64).sum::<f64>() / v.len().max(1) as f64;
-                let ratio = mean_abs(&suh_u) / mean_abs(&suh_g).max(1e-12);
-                let div = c.moe_interm_div[l];
-                if div != 1.0 {
-                    ensure!((ratio * div as f64 - 1.0).abs() < 0.5, "layer {l}: config says the pack's up_proj is stored /{div} (exllamav3 interm_div) but its input scale is {ratio:.4} of gate_proj's (expected ~{:.4})", 1.0 / div as f64);
-                    println!("  layer {l}: routed up_proj stored /{div} (up/gate input-scale ratio {ratio:.4}); routing weights scaled x{div} (exllamav3 naive_n05 interm_div)");
-                } else {
-                    ensure!(ratio > 0.1, "layer {l}: the pack's up_proj input scale is {ratio:.4} of gate_proj's: the converter divided it (interm_div) but the config has no divisor for this layer");
-                }
-                let g_words = ((h / 16) * (mi_l / 16) * bpb) as u64;
-                let d_words = ((mi_l / 16) * (h / 16) * bpb) as u64;
-                let el = experts.len() as u64;
-                ensure!(g_tr.len() as u64 == el * g_words && d_tr.len() as u64 == el * d_words && svh_g.len() == experts.len() * mi_l && suh_d.len() == experts.len() * mi_l,
+                let el = experts.len();
+                let m = s.moe.as_ref().with_context(|| format!("layer {l}: staged image has no MoE planes"))?;
+                super::stage::check_interm_div(l, m, c.moe_interm_div[l])?;
+                let g_words = ((h / 16) * (mi_l / 16) * m.bpb) as u64;
+                let d_words = ((mi_l / 16) * (h / 16) * m.bpb) as u64;
+                ensure!(m.g_tr.len() as u64 == el as u64 * g_words && m.d_tr.len() as u64 == el as u64 * d_words && m.svh_g.len() == el * mi_l && m.suh_d.len() == el * mi_l,
                         "layer {l}: expert planes do not match {el} experts x mi {mi_l}");
-                let offs_g = dev.htod_sync_copy(&(0..el).map(|i| i * g_words).collect::<Vec<u64>>())?;
-                let offs_d = dev.htod_sync_copy(&(0..el).map(|i| i * d_words).collect::<Vec<u64>>())?;
+                let offs_g = dev.htod_sync_copy(&(0..el as u64).map(|i| i * g_words).collect::<Vec<u64>>())?;
+                let offs_d = dev.htod_sync_copy(&(0..el as u64).map(|i| i * d_words).collect::<Vec<u64>>())?;
                 GpuMlp::Moe(GpuMoe {
-                    router: dev.htod_sync_copy(&f16_bits_of(pack, &format!("{p}mlp.gate.weight"))?)?,
-                    bias: dev.htod_sync_copy(&f32_of(pack, &format!("{p}mlp.gate.e_score_correction_bias"))?)?,
-                    g_tr: dev.htod_sync_copy(&g_tr)?, u_tr: dev.htod_sync_copy(&u_tr)?, d_tr: dev.htod_sync_copy(&d_tr)?,
-                    suh_g: dev.htod_sync_copy(&suh_g)?, svh_g: dev.htod_sync_copy(&svh_g)?,
-                    suh_u: dev.htod_sync_copy(&suh_u)?, svh_u: dev.htod_sync_copy(&svh_u)?,
-                    suh_d: dev.htod_sync_copy(&suh_d)?, svh_d: dev.htod_sync_copy(&svh_d)?,
-                    g_words, u_words: g_words, d_words, bpb, offs_g, offs_d,
-                    scale: c.pack_router_scale(l), mi_l, el: el as usize,
+                    router: dev.htod_sync_copy(s.plain(&format!("{p}mlp.gate.weight"))?)?,
+                    bias: dev.htod_sync_copy(s.plain32(&format!("{p}mlp.gate.e_score_correction_bias"))?)?,
+                    g_tr: dev.htod_sync_copy(&m.g_tr)?, u_tr: dev.htod_sync_copy(&m.u_tr)?, d_tr: dev.htod_sync_copy(&m.d_tr)?,
+                    suh_g: dev.htod_sync_copy(&m.suh_g)?, svh_g: dev.htod_sync_copy(&m.svh_g)?,
+                    suh_u: dev.htod_sync_copy(&m.suh_u)?, svh_u: dev.htod_sync_copy(&m.svh_u)?,
+                    suh_d: dev.htod_sync_copy(&m.suh_d)?, svh_d: dev.htod_sync_copy(&m.svh_d)?,
+                    g_words, u_words: g_words, d_words, bpb: m.bpb, offs_g, offs_d,
+                    scale: c.pack_router_scale(l), mi_l, el,
                 })
-            } else if shard.world == 1 {
-                GpuMlp::Dense { gate: quad("mlp.gate_proj")?, up: quad("mlp.up_proj")?, down: quad("mlp.down_proj")? }
             } else {
-                let (i0, il) = shard.span(c.intermediate_size)?;
-                ensure!(i0 % 128 == 0 && il % 128 == 0, "dense intermediate slice not 128-aligned");
-                let dq = qd("mlp.down_proj")?;
+                // dense MLP: the staged quad under each name is whole (world 1) or already
+                // column/row-sliced to this rank (world > 1) — staging made that decision
                 GpuMlp::Dense {
-                    gate: upload_quad_cols(dev, pack, qd("mlp.gate_proj")?, i0, i0 + il)?.0,
-                    up: upload_quad_cols(dev, pack, qd("mlp.up_proj")?, i0, i0 + il)?.0,
-                    down: if dq.k == il { upload_quad(dev, pack, dq)? } else { upload_quad_rows(dev, pack, dq, i0, i0 + il)? },
+                    gate: s.quad(&format!("{p}mlp.gate_proj"))?.upload(dev)?,
+                    up: s.quad(&format!("{p}mlp.up_proj"))?.upload(dev)?,
+                    down: s.quad(&format!("{p}mlp.down_proj"))?.upload(dev)?,
                 }
             };
             Ok(GpuLayer {
                 kind: c.attn[l], nh_l, kv_l, k_off, v_off,
-                in_norm: dev.htod_sync_copy(&f16_bits_of(pack, &format!("{p}input_layernorm.weight"))?)?,
-                post_norm: dev.htod_sync_copy(&f16_bits_of(pack, &format!("{p}post_attention_layernorm.weight"))?)?,
+                in_norm: dev.htod_sync_copy(s.plain(&format!("{p}input_layernorm.weight"))?)?,
+                post_norm: dev.htod_sync_copy(s.plain(&format!("{p}post_attention_layernorm.weight"))?)?,
                 q, k, v, o, sink, idx, mlp, kc, vc, slots,
             })
         }

@@ -39,3 +39,4 @@ pub mod tp;
 pub mod serve;
 pub mod decode;
 pub mod shipplan;
+pub mod stage;

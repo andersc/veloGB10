@@ -20,6 +20,11 @@ extern "C" {
     /// CLI-1: the transport's options (the shim reads no env) — call before every net_init.
     fn net_set_opts(spin_us: u64, tail_drill: c_int, oneshot: c_int, tp_diag: c_int);
     fn net_set_probe(hold_ms: u32);
+    /// ISSUES 153: the node registers its head control stream fd so the C bring-up retry loops
+    /// abort the instant the head goes away (MSG_PEEK inside the shim — protocol bytes are
+    /// never consumed). net_abort_check is the test/diagnostic probe of that liveness.
+    fn net_set_abort_fd(fd: c_int);
+    fn net_abort_check() -> c_int;
     fn net_init(rank: c_int, world: c_int, peer_ips: *const *const c_char, n_peers: c_int,
                 tcp_port: c_int, dev_name: *const c_char,
                 gid_idx: c_int, fp32_capacity_bytes: c_int, payload_bytes: c_int) -> *mut NetCtx;
@@ -838,7 +843,8 @@ fn push_net_opts() {
     let diag = opts::var(opt!("tp-diag")).is_ok() as c_int;
     let probe: u32 = opts::var(opt!("tp-race-probe")).ok()
         .and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-    unsafe { net_set_opts(spin, tail, oneshot, diag); net_set_probe(probe) }
+    unsafe { net_set_opts(spin, tail, oneshot, diag); net_set_probe(probe);
+              net_set_abort_fd(HEAD_LIVENESS_FD.load(std::sync::atomic::Ordering::Relaxed)) }
 }
 
 impl TpLink {
@@ -1532,5 +1538,65 @@ mod agree16b_tests {
                 assert_ne!(agree_word(k, h ^ drill_hash_flip(1)), agree_word(k, h), "an armed node against an honest head");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ISSUES 153 (2026-10-27): liveness-tied TP bring-up.
+//
+// A cold-cache head ships its world-1 ranks SEQUENTIALLY (~0.10 GB/s, minutes per rank) and
+// opens its per-pair RDMA listeners only afterwards, so the shim's old fixed retry budgets
+// (300 s dial / 600 s accept) expired mid-ship and every node died with
+// "nway connect: Connection refused" on the FIRST cold boot (a warm blob cache hides it: the
+// whole sync takes seconds). The dial/accept loops now retry while the head's control stream
+// is alive and give up the moment it closes/resets, with a 1 h hard cap.
+// ---------------------------------------------------------------------------
+
+/// fd of the head's control stream on a node process, peeked by the C bring-up loops. -1 on
+/// the head and on bench paths that drop the stream before bring-up: no abort source, the
+/// retry loops fall back to the cap alone.
+static HEAD_LIVENESS_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Node serve paths call this BEFORE `bring_up_node` — the stream must outlive the bring-up
+/// (it always does: it is the session's control channel).
+pub fn set_head_liveness(stream: &std::net::TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    HEAD_LIVENESS_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+    // Push now (the loops can start before the next push_net_opts) — idempotent with it.
+    unsafe { net_set_abort_fd(fd) }
+}
+
+/// Clear a registration when the owning stream is about to be dropped (bench paths), so a
+/// recycled fd number can never be mistaken for the head's liveness.
+pub fn clear_head_liveness() {
+    HEAD_LIVENESS_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
+    unsafe { net_set_abort_fd(-1) }
+}
+
+#[cfg(test)]
+mod nway_liveness_tests {
+    use super::*;
+
+    /// ISSUES 153: the abort signal behind the liveness-tied bring-up retry. A registered
+    /// stream reads ALIVE while the peer holds it and DEAD after the peer closes, without
+    /// consuming a single protocol byte.
+    #[test]
+    fn head_liveness_peek_sees_peer_close() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let ours = l.accept().unwrap().0;
+        set_head_liveness(&ours);
+        assert_eq!(unsafe { net_abort_check() }, 0, "fresh pair must read alive");
+        drop(peer);
+        // EOF lands asynchronously; allow a few seconds.
+        let mut dead = false;
+        for _ in 0..250 {
+            if unsafe { net_abort_check() } != 0 { dead = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(dead, "peer close must flip the peek to dead");
+        clear_head_liveness();
+        assert_eq!(unsafe { net_abort_check() }, 0, "cleared registration must read alive");
     }
 }

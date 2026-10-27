@@ -8790,6 +8790,9 @@ fn run_cluster_node_once(port: u16, udp: u16) {
         return;
     }
     println!("NODE SYNCED (rank {node_rank}/{world}) — model ready at {}", dir.display());
+    // ISSUES 153: every branch below either brings the link up with this stream still alive
+    // (the dial/accept loops abort if it dies) or drops it (cleared first).
+    gb10_inference::net::set_head_liveness(&stream);
     let r = if tpc.mode_serve && is_dsv4_bundle(&dir) {
         // DSV4 persistent server: load once, loop over broadcast_prompt → decode. The control
         // stream stays RETAINED when the head runs --server-dspark (item 3.4: the head ships
@@ -8810,10 +8813,12 @@ fn run_cluster_node_once(port: u16, udp: u16) {
     } else if is_dsv4_bundle(&dir) {
         // P4: DSV4 N-way deferred (still TP=2). DSV4 bench/first-light session: the minimal
         // Dsv4GpuModel SPMD greedy path (no head req).
+        gb10_inference::net::clear_head_liveness();
         drop(stream);
         dsv4_tp_serve(&dir.to_string_lossy(), gb10_inference::tp::TpContext::bring_up_node(head_ip, 1, 2), None)
     } else {
         // Bench session: one-shot SPMD bench/generate (unchanged). The retained stream is dropped.
+        gb10_inference::net::clear_head_liveness();
         drop(stream);
         tp_serve(&dir.to_string_lossy(), gb10_inference::tp::TpContext::bring_up_node(head_ip, node_rank, world), None)
     };
@@ -8949,6 +8954,8 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
 fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: std::net::TcpStream,
                  tpc: &gb10_inference::tp::TpConfig) -> anyhow::Result<()> {
     use gb10_inference::tp_serve::{recv_serving, send_serving, ServingMsg};
+    // ISSUES 153: the bring-up dial/accept loops abort the moment THIS stream dies (head gone).
+    gb10_inference::net::set_head_liveness(&stream);
     let mut ctx = gb10_inference::tp::TpContext::bring_up_node(head_ip, tpc.node_rank, tpc.world as i32)?;
     ctx.sanity()?;
     println!("NODE (rank {}/{}) — TP LINK UP (serving mode)", ctx.rank, ctx.world);
@@ -9628,6 +9635,9 @@ fn run_naive_tp_head(args: &[String], model_dir: &str, mode: &str) {
 /// rank's experts and pre-sliced row quads through the blob cache; `naive::shipplan`). No local copy, no
 /// path override (owner rule 2026-10-17: every model ships its shards).
 fn run_naive_tp_node(tpc: &gb10_inference::tp::TpConfig, shard_dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: std::net::TcpStream) -> anyhow::Result<()> {
+    // ISSUES 153: liveness for the RDMA bring-up retry loops — the cold-cache head ships the
+    // other ranks for many minutes AFTER this node is READY; the dial must wait, not expire.
+    gb10_inference::net::set_head_liveness(&stream);
     let dir = shard_dir.to_string_lossy().to_string();
     if !tpc.ship_shards || !gb10_inference::naive::config::NaiveConfig::is_naive_dir(&dir) {
         let why = format!("Naive-N0.5 node: expected this rank's SHIPPED shard dir (ship_shards {}), got {dir}", tpc.ship_shards);
@@ -9753,6 +9763,8 @@ fn run_exl3_tp_serve_head(args: &[String], model_dir: &str) {
 /// the head's watch treats as "the node quit").
 fn run_exl3_tp_node(tpc: &gb10_inference::tp::TpConfig, head_ip: std::net::IpAddr,
                     mut stream: std::net::TcpStream) -> anyhow::Result<()> {
+    // ISSUES 153: liveness for the RDMA bring-up retry loops (see net.rs).
+    gb10_inference::net::set_head_liveness(&stream);
     let program = match exl3_tp_node_prelink(tpc) {
         Ok(p) => p,
         Err(e) => { gb10_inference::cluster::node_report_failure(&mut stream, &format!("{e:#}")); return Err(e); }
