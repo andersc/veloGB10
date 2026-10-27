@@ -820,6 +820,8 @@ struct TrieNode {
 struct Vocab {
     nodes: Vec<TrieNode>,
     by_id: HashMap<u32, Vec<u8>>,
+    /// Longest piece in bytes: an upper bound on the characters one token adds to a string.
+    max_piece: usize,
 }
 
 impl Vocab {
@@ -834,6 +836,7 @@ impl Vocab {
             if bytes.is_empty() {
                 continue;
             }
+            v.max_piece = v.max_piece.max(bytes.len());
             v.by_id.insert(id, bytes.clone());
             let mut cur = 0usize;
             for &b in &bytes {
@@ -882,6 +885,10 @@ pub struct SchemaMask {
     /// `state -> allowed bitset`. Computed on demand; states are interned so identical machine
     /// snapshots share one entry.
     cache: Mutex<HashMap<u32, Arc<Vec<u32>>>>,
+    /// `mask key -> allowed bitset` (see [`SchemaMask::mask_key`]): states that differ only in a
+    /// string's character count, where the count cannot change the allowed set, share one entry.
+    /// Without it every token inside a free-text string is a new state and a full trie walk.
+    mask_cache: Mutex<HashMap<Machine, Arc<Vec<u32>>>>,
     /// Shared, immutable byte trie of the model vocabulary (see [`VocabTable`]): built once per
     /// process and handed to every request's mask, instead of rebuilding a 248K-entry trie per
     /// request.
@@ -936,10 +943,41 @@ impl SchemaMask {
         if let Some(hit) = lock(&self.cache).get(&state).cloned() {
             return hit;
         }
-        let bits = self.compute_allowed(state);
-        let arc = Arc::new(bits);
+        let key = self.machine(state).map(|m| self.mask_key(&m));
+        let hit = key.as_ref().and_then(|k| lock(&self.mask_cache).get(k).cloned());
+        let arc = match hit {
+            Some(a) => a,
+            None => {
+                let a = Arc::new(self.compute_allowed(state));
+                if let Some(k) = key { lock(&self.mask_cache).insert(k, a.clone()); }
+                a
+            }
+        };
         lock(&self.cache).insert(state, arc.clone());
         arc
+    }
+
+    /// The machine with every value string's character count replaced by what the next token
+    /// can observe of it: the distance to `minLength` and the room left below `maxLength`, each
+    /// capped at one more than the longest piece (a token adds at most that many characters).
+    /// Two states with the same key allow exactly the same tokens. Strings whose content is
+    /// kept (enum values) are left exact.
+    fn mask_key(&self, m: &Machine) -> Machine {
+        let cap = self.vocab.max_piece as u64 + 1;
+        let mut k = m.clone();
+        for f in k.stack.iter_mut() {
+            if let Frame::Str { si, st } = f {
+                let s = &self.schemas[*si as usize];
+                if !s.enum_str.is_empty() {
+                    continue;
+                }
+                let cp = st.cp as u64;
+                let to_min = s.min_len.map_or(0, |lo| lo.saturating_sub(cp).min(cap));
+                let room = s.max_len.map_or(cap, |hi| hi.saturating_sub(cp).min(cap));
+                st.cp = ((to_min << 16) | room) as u32;
+            }
+        }
+        k
     }
 
     /// Advance the machine by ONE EMITTED TOKEN. `None` when the token is unknown, empty, or its
@@ -994,6 +1032,7 @@ impl SchemaMask {
         self.vocab_size = table.size;
         self.words = vocab_words(table.size);
         lock(&self.cache).clear();
+        lock(&self.mask_cache).clear();
     }
 
     /// Defer the constraint until the lane emits `tok` (see the `defer_until` field).
@@ -1808,6 +1847,7 @@ fn build_mask(schema: &Value, depth: usize, via: &str) -> Result<SchemaMask, Str
         start: 0,
         interner: Mutex::new(Interner::default()),
         cache: Mutex::new(HashMap::new()),
+        mask_cache: Mutex::new(HashMap::new()),
         vocab: Arc::new(Vocab::default()),
         vocab_size: 0,
         words: 0,
@@ -2446,6 +2486,35 @@ mod tests {
         assert_eq!(canon_match("a\u{1}b", b"a\\u0001b"), (true, true));
         assert_eq!(canon_match("ab", b"a"), (true, false));
         assert_eq!(canon_match("ab", b"abc"), (false, false));
+    }
+
+    #[test]
+    fn mask_key_shares_free_string_states() {
+        let m = mask(r#"{"type":"object","properties":{"t":{"type":"string"}}}"#);
+        let a = walk(&m, r#"{"t":"a"#).unwrap();
+        let b = walk(&m, r#"{"t":"abcdef"#).unwrap();
+        assert_ne!(a, b, "distinct machine states");
+        assert!(Arc::ptr_eq(&m.allowed(a), &m.allowed(b)), "one cached mask for both");
+    }
+
+    #[test]
+    fn mask_key_is_exact_near_length_bounds() {
+        // multi-byte pieces, so a token can add several characters at once
+        let mut pieces = byte_vocab();
+        let n = pieces.len() as u32;
+        for (i, p) in ["ab", "abc", "abcd\"", "\"}", "xyz"].iter().enumerate() {
+            pieces.push((n + i as u32, p.as_bytes().to_vec()));
+        }
+        for schema in [r#"{"type":"object","properties":{"t":{"type":"string","minLength":3,"maxLength":7}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","maxLength":4}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","minLength":5}}}"#] {
+            let mut m = mask(schema);
+            m.set_vocab(pieces.clone());
+            for len in 0..9 {
+                let Some(st) = walk(&m, &format!(r#"{{"t":"{}"#, "q".repeat(len))) else { continue };
+                assert_eq!(*m.allowed(st), m.compute_allowed(st), "{schema}: {len} chars");
+            }
+        }
     }
 
     #[test]
