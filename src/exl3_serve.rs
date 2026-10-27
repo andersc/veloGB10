@@ -364,7 +364,47 @@ struct Lane {
     fcfs_credit: usize,
     // S-B9-CF-PACK4: an image request (its slot carries a 3-axis RoPE map) — never packed in v1.
     img: bool,
+    // Log probabilities for every emitted token (`BatchRequest::logprobs`): Some(n) = a
+    // `TokEvent::Logprob` with the n most likely alternatives before each `Tok`. Such a lane
+    // never speculates (mtp = None), so every token comes from a plain step's logits row.
+    logprobs: Option<u8>,
     tx: crate::server::TokTx,
+}
+
+/// Log-softmax of one f16 logits row: the natural-log probability of `tok` and the `n`
+/// most likely tokens (logprob descending, ties by id ascending; only finite logits — a token a
+/// mask removed has probability 0 and is never listed). The sum runs in f64. None when `tok` is
+/// outside the row or its logit, or the row's maximum, is not finite.
+fn token_logprobs(row: &[u16], tok: u32, n: usize) -> Option<(f32, Vec<(u32, f32)>)> {
+    let lg = |b: u16| half::f16::from_bits(b).to_f32();
+    let xt = lg(*row.get(tok as usize)?);
+    let mut lmax = f32::NEG_INFINITY;
+    for &b in row {
+        let x = lg(b);
+        if x > lmax { lmax = x; } // NaN compares false: never the maximum
+    }
+    if !xt.is_finite() || !lmax.is_finite() { return None; }
+    let mut sum = 0f64;
+    for &b in row {
+        let x = lg(b);
+        if x.is_finite() { sum += ((x - lmax) as f64).exp(); }
+    }
+    let lse = lmax as f64 + sum.ln();
+    let lp = |x: f32| (x as f64 - lse) as f32;
+    let mut top: Vec<(u32, f32)> = Vec::new();
+    if n > 0 {
+        let mut idx: Vec<u32> = (0..row.len() as u32).filter(|&i| lg(row[i as usize]).is_finite()).collect();
+        // logit descending, then id ascending (deterministic; total_cmp is a total order)
+        let cmp = |a: &u32, b: &u32| lg(row[*b as usize]).total_cmp(&lg(row[*a as usize])).then(a.cmp(b));
+        let k = n.min(idx.len());
+        if k > 0 && k < idx.len() {
+            idx.select_nth_unstable_by(k - 1, cmp);
+            idx.truncate(k);
+        }
+        idx.sort_by(cmp);
+        top = idx.into_iter().map(|i| (i, lp(lg(row[i as usize])))).collect();
+    }
+    Some((lp(xt), top))
 }
 
 /// S-B9-CF-PACK4: host-side anatomy of the packed rounds since boot: wall ms of the three stages
@@ -3618,6 +3658,20 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
     /// rank holds a full logits row (the line says `na`). A greedy row checks itself — its token
     /// must be the row's top logit (`stop_info_checked`); if it is not, the row read is not the row
     /// that chose the token, nothing is sent and one line per boot says so.
+    /// The log probability of `tok` (the choice of the plain step's logits row `row` in
+    /// `self.sc`) and the `n` most likely alternatives, sent as a `TokEvent::Logprob` just before
+    /// the token itself. A failed readback sends nothing (the handler then has no entry for that
+    /// token and reports the gap) — it never stops the request.
+    fn send_logprob(&self, tx: &crate::server::TokTx, row: usize, tok: u32, n: u8) {
+        match self.model.logits_row(&self.sc, row) {
+            Ok(r) => match token_logprobs(&r, tok, n as usize) {
+                Some((logprob, top)) => { let _ = tx.send(TokEvent::Logprob { logprob, top }); }
+                None => crate::dreprintln!("[exl3-serve] logprob unavailable (row {row}, token {tok}): non-finite logits"),
+            },
+            Err(e) => crate::reprintln!("[exl3-serve] logprob readback failed (row {row}): {e:#}"),
+        }
+    }
+
     fn send_stop_info(&self, s: usize, row: usize, tok: u32, packed: bool) {
         if self.tp.is_some() { return; }
         let Some(lane) = self.lanes[s].as_ref() else { return };
@@ -3856,6 +3910,11 @@ the [gen] line says stop_p=na", stats));
             // item 5(a): ids[j] is the choice of the step's logits row j
             if finish && reason == "stop" { self.send_stop_info(s, j, t, false); }
             if finish { self.publish_kv(); } // issue #24: the lane's final position (the peaks include the round that ends the request)
+            // ids[j] is also the choice of logits row j for the log probabilities
+            if let Some(n) = self.lanes[s].as_ref().and_then(|l| l.logprobs).filter(|_| !tp_on) {
+                let tx = self.lanes[s].as_ref().unwrap().tx.clone();
+                self.send_logprob(&tx, j, t, n);
+            }
             let lane = self.lanes[s].as_mut().unwrap();
             // TP-D: under TP a failed send is not a cancel here (the head's next sweep ships it)
             if lane.tx.send(TokEvent::Tok(t)).is_err() && !tp_on {
@@ -4392,6 +4451,13 @@ the [gen] line says stop_p=na", stats));
             });
             return;
         }
+        if req.logprobs.is_some() && self.tp.is_some() {
+            // the logits row is read on the head at TP=1 only (exl3_reject refuses it first)
+            let _ = req.tx.send(TokEvent::Finish {
+                reason: "error: bad request: logprobs are not supported on the exl3 TP serve path".into(),
+            });
+            return;
+        }
         if req.prompt.is_empty() {
             let _ = req.tx.send(TokEvent::Finish { reason: "error: empty prompt".into() });
             return;
@@ -4518,6 +4584,9 @@ the [gen] line says stop_p=na", stats));
                 return;
             }
         }
+        if let Some(n) = req.logprobs.filter(|_| self.tp.is_none()) {
+            self.send_logprob(&req.tx, 0, last, n);
+        }
         if req.tx.send(TokEvent::Tok(last)).is_err() && self.tp.is_none() {
             // WP02: the client is gone — no lane (the prefix snapshot stays valid). TP-D: under TP
             // the lane is created on every rank and the head's next sweep cancels it.
@@ -4542,7 +4611,10 @@ the [gen] line says stop_p=na", stats));
         // seam decode step's sc.resid — exact, same composition as the bench-mtp
         // prime and every round's re-prime), then feed the head the last prompt
         // token with that tap (round 1's draft-extend reuses tap_row 0).
-        let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() {
+        // A lane that reports log probabilities never speculates: each token's logits row is
+        // then the plain step's row for that token.
+        let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt()
+            && req.logprobs.is_none() {
             match self.mtp_prime(free, *req.prompt.last().unwrap(), plen) {
                 Ok(()) => {
                     if crate::exl3_forward::a_xcheck_on() {
@@ -4609,6 +4681,7 @@ the [gen] line says stop_p=na", stats));
             admit_seq,
             fcfs_credit: 0,
             img: is_img,
+            logprobs: req.logprobs,
             tx: req.tx,
         });
     }
@@ -4621,6 +4694,9 @@ the [gen] line says stop_p=na", stats));
 fn exl3_reject(req: &BatchRequest) -> Option<String> {
     if req.schema.is_some() {
         return Some("error: json-schema constraint not supported on the exl3 serve path yet".into());
+    }
+    if req.logprobs.is_some() {
+        return Some("error: bad request: logprobs are not supported on the exl3 TP serve path".into());
     }
     if req.prompt.is_empty() {
         return Some("error: empty prompt".into());
@@ -6831,6 +6907,7 @@ fn wp24_gate_arm(sched: &mut Exl3Scheduler, arm: GateArm, prompt: &[u32], t: f32
                 image_embeds: None,
                 image_spans: Vec::new(),
                 schema: None,
+                logprobs: None,
             });
             if let Some(f) = sched.fatal.as_ref() { anyhow::bail!("WP24 gate: engine fatal at admit: {f}"); }
             rxs.push((rx, bl));
@@ -6854,6 +6931,7 @@ fn wp24_gate_arm(sched: &mut Exl3Scheduler, arm: GateArm, prompt: &[u32], t: f32
                     // #8.2: admission telemetry — no action for a gate drain.
                     TokEvent::Admitted { .. } => {}
                     TokEvent::StopInfo { .. } => {}
+                    TokEvent::Logprob { .. } => {} // not requested by this drain
                 }
             }
             anyhow::ensure!(reason.as_deref() == Some("length") && toks.len() == positions,
@@ -7276,7 +7354,7 @@ fn spec_arm(sched: &mut Exl3Scheduler, arm: SpecArm, prompt: &[u32], gen: usize)
         rep_penalty: 1.0, presence_penalty: 0.0, frequency_penalty: 0.0, min_p: 0.0, min_new: 0,
         ignore_eos: false, tx, seed: Some(0x7C0D_E5EE_D000_0001), ckpt_at: None,
         domain: crate::batch::Domain::General, received_at: std::time::Instant::now(),
-        image_embeds: None, image_spans: Vec::new(), schema: None,
+        image_embeds: None, image_spans: Vec::new(), schema: None, logprobs: None,
     });
     if let Some(f) = sched.fatal.as_ref() { anyhow::bail!("spec: engine fatal at admit: {f}"); }
     if arm == SpecArm::Plain {
@@ -7298,6 +7376,7 @@ fn spec_arm(sched: &mut Exl3Scheduler, arm: SpecArm, prompt: &[u32], gen: usize)
             // #8.2: admission telemetry — no action for a spec gate drain.
             TokEvent::Admitted { .. } => {}
             TokEvent::StopInfo { .. } => {}
+            TokEvent::Logprob { .. } => {} // not requested by this drain
         }
     }
     anyhow::ensure!(!reason.starts_with("error"), "spec: {} request failed: {reason}", arm.name());
@@ -9916,5 +9995,36 @@ mod review_p0_pins {
                 "the fixed chain no longer stages the slot only for a sparse last pass");
         assert!(!s.contains(&["if self.qsa_live(p + kmax - 1) {\n            if stage {\n                let st = sc.wp05", ""].concat()),
                 "the adaptive chain no longer stages the slot only for a sparse last pass");
+    }
+}
+
+#[cfg(test)]
+mod token_logprobs_tests {
+    use super::token_logprobs;
+
+    fn row(xs: &[f32]) -> Vec<u16> { xs.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect() }
+
+    #[test]
+    fn log_softmax_and_top_n() {
+        let r = row(&[1.0, 3.0, 2.0, 3.0, f32::NEG_INFINITY]);
+        let lse = (1f64.exp() + 3f64.exp() + 2f64.exp() + 3f64.exp()).ln();
+        let (lp, top) = token_logprobs(&r, 2, 3).unwrap();
+        assert!((lp as f64 - (2.0 - lse)).abs() < 1e-5);
+        // logit descending, ties by id ascending
+        assert_eq!(top.iter().map(|t| t.0).collect::<Vec<_>>(), vec![1, 3, 2]);
+        assert!((top[0].1 as f64 - (3.0 - lse)).abs() < 1e-5);
+        let p: f64 = (0..4).map(|i| (token_logprobs(&r, i, 0).unwrap().0 as f64).exp()).sum();
+        assert!((p - 1.0).abs() < 1e-5, "probabilities sum to 1 over the finite logits");
+    }
+
+    #[test]
+    fn masked_tokens_are_never_listed() {
+        let r = row(&[f32::NEG_INFINITY, 0.5, f32::NEG_INFINITY]);
+        let (lp, top) = token_logprobs(&r, 1, 20).unwrap();
+        assert_eq!(lp, 0.0);
+        assert_eq!(top, vec![(1, 0.0)]);
+        assert!(token_logprobs(&r, 0, 1).is_none(), "a masked token was not emitted by a sampler");
+        assert!(token_logprobs(&r, 9, 1).is_none(), "out of the row");
+        assert!(token_logprobs(&row(&[f32::NAN, f32::NAN]), 0, 1).is_none());
     }
 }
