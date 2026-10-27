@@ -264,6 +264,18 @@ impl QwenTokenizer {
         self.tokenizer.get_vocab(true).into_iter().map(|(s, id)| (id as u32, s.into_bytes())).collect()
     }
 
+    /// The exact output bytes of ONE token: the ordinary-token piece bytes (the same tables the
+    /// stream decoder and the JSON-schema mask use), else what `decode(&[id], skip_special)`
+    /// prints for it (an added token's literal text; nothing for a skipped special token). A
+    /// piece is not always valid UTF-8 on its own (a multi-byte character can span tokens), so
+    /// the bytes of a token sequence concatenate to its decoded text.
+    pub fn token_bytes(&self, id: u32, skip_special: bool) -> Vec<u8> {
+        if let Some(c) = &self.cache {
+            if let Some(b) = c.stream.piece(id) { return b.to_vec(); }
+        }
+        self.decode(&[id], skip_special).unwrap_or_default().into_bytes()
+    }
+
     pub fn stop_token_ids(&self, config_eos: u32) -> Vec<u32> {
         let vocab = self.tokenizer.get_vocab(true);
         let mut ids: Vec<u32> = vec![config_eos];

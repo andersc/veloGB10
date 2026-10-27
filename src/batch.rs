@@ -66,6 +66,13 @@ pub enum TokEvent {
     /// Log-only: it feeds `stop_p` / `stop_rank` / `stop_p_law` of the `[gen]` line. An engine
     /// that never sends it logs `na` for all three.
     StopInfo { p: f32, rank: u32, sampled: bool },
+    /// Sent right BEFORE the `Tok` it describes, only for a request that asked for log
+    /// probabilities (`BatchRequest::logprobs`) on an engine that computes them: the natural log
+    /// of the emitted token's probability and the `top` most likely alternatives (token id,
+    /// logprob; most likely first). Computed by a log-softmax over the step's logits row after
+    /// the repetition / presence / frequency penalties and any JSON-schema mask, before
+    /// temperature and top-k / top-p / min-p truncation.
+    Logprob { logprob: f32, top: Vec<(u32, f32)> },
 }
 
 /// A request submitted to the scheduler.
@@ -106,6 +113,10 @@ pub struct BatchRequest {
     /// Compiled ONCE by the server from `response_format`; the scheduler advances it per committed
     /// token and hands the sampler a per-step vocabulary mask.
     pub schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    /// Log probabilities for every emitted token: `Some(n)` = send a `TokEvent::Logprob` before
+    /// each `Tok`, with the n (0..=20) most likely alternatives. `None` = none (no extra work).
+    /// Honoured by the EXL3 serve path at TP=1 (such a lane decodes plain, no speculation).
+    pub logprobs: Option<u8>,
 }
 
 struct Lane {
@@ -2126,6 +2137,7 @@ impl BatchScheduler {
                 image_embeds: None,
                 image_spans: Vec::new(),
                 schema: None,
+                logprobs: None,
             });
             // The bench harness has no scheduler loop of its own, so it drains the cursor inline —
             // the SAME window sequence (one window per call), just without interleaving. This keeps
@@ -2151,6 +2163,7 @@ impl BatchScheduler {
                     // #8.2: admission telemetry — no action for a bench drain.
                     TokEvent::Admitted { .. } => {}
                     TokEvent::StopInfo { .. } => {} // [gen]-line data only
+                    TokEvent::Logprob { .. } => {} // not requested by this drain
                 }
             }
             // Keep the source set for the next job's ADMIT (the lane priming consults it).
@@ -2175,6 +2188,13 @@ impl BatchScheduler {
     pub fn set_cov_trace(&mut self, on: bool) { self.cov_trace = on; }
 
     fn admit(&mut self, req: BatchRequest) {
+        if req.logprobs.is_some() {
+            // this scheduler does not compute log probabilities (the EXL3 serve path does)
+            let _ = req.tx.send(TokEvent::Finish {
+                reason: "error: bad request: logprobs are not supported by this engine".into(),
+            });
+            return;
+        }
         // W2: the request's compiled schema (moved into the lane below).
         let req_schema = req.schema.clone();
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.
