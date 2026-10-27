@@ -1393,6 +1393,11 @@ impl SchemaMask {
         // Trailing whitespace after a complete document (top = DocEnd) is not counted: the
         // completed state stays one interned state, and the scheduler ends the turn there anyway.
         let structural_ws = is_ws(b) && !m.in_string() && !matches!(m.stack.last(), Some(Frame::DocEnd));
+        // No whitespace before the root value: the document starts at its first value byte (a
+        // leading run carries no information and only spends tokens).
+        if structural_ws && m.stack.len() == 2 && matches!(m.stack[1], Frame::Value { .. }) {
+            return false;
+        }
         if structural_ws && m.ws >= MAX_WS_RUN {
             // Refused without touching the stack: both callers discard the machine (step) or
             // roll it back (trie_walk) on `false`.
@@ -2156,10 +2161,10 @@ mod tests {
         assert_eq!(words, 1);
 
         let s0 = m.start_state();
-        // At the start only tokens whose whole byte run is accepted may fire: `{`, `{"`, a space
-        // (leading whitespace is legal) and the complete document.
-        assert_eq!(m.allowed(s0).as_slice(), bits(&[1, 8, 11, 12], words).as_slice());
-        for bad in [2u32, 3, 4, 5, 6, 7, 9, 10] {
+        // At the start only tokens whose whole byte run is accepted may fire: `{`, `{"` and the
+        // complete document (no whitespace before the root value).
+        assert_eq!(m.allowed(s0).as_slice(), bits(&[1, 8, 12], words).as_slice());
+        for bad in [2u32, 3, 4, 5, 6, 7, 9, 10, 11] {
             assert_eq!(m.step(s0, bad), None, "token {bad} must not be usable at the start");
         }
 
@@ -2447,8 +2452,9 @@ mod tests {
     fn structural_whitespace_is_capped() {
         let m = mask(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#);
         let lead = " ".repeat(MAX_WS_RUN as usize);
-        assert!(ok(&m, &format!("{lead}{{\"a\":\"x\"}}")), "a run up to the cap is fine");
-        assert!(walk(&m, &format!("{lead} ")).is_none(), "one more is refused");
+        assert!(walk(&m, " ").is_none(), "no whitespace before the root value");
+        assert!(ok(&m, &format!("{{{lead}\"a\":\"x\"}}")), "a run up to the cap is fine");
+        assert!(walk(&m, &format!("{{{lead} ")).is_none(), "one more is refused");
         assert!(ok(&m, &format!("{{\"a\":\"{}\"}}", " ".repeat(100))), "string content is not structural");
         assert!(ok(&m, &format!("{{{lead}\"a\"{lead}:{lead}\"x\"{lead}}}")), "the run resets at every token");
     }
