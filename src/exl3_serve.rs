@@ -373,36 +373,43 @@ struct Lane {
 
 /// Log-softmax of one f16 logits row: the natural-log probability of `tok` and the `n`
 /// most likely tokens (logprob descending, ties by id ascending; only finite logits — a token a
-/// mask removed has probability 0 and is never listed). The sum runs in f64. None when `tok` is
-/// outside the row or its logit, or the row's maximum, is not finite.
+/// mask removed has probability 0 and is never listed). None when `tok` is outside the row or
+/// its logit, or the row's maximum, is not finite.
+///
+/// One counting pass over the row's f16 bit patterns, then the normalizer as a sum over the
+/// distinct values present (exp once per value, accumulated in f64) and a second pass that
+/// collects only the ids at or above the n-th largest value — no per-call f32 copy or index
+/// vector of the whole vocabulary.
 fn token_logprobs(row: &[u16], tok: u32, n: usize) -> Option<(f32, Vec<(u32, f32)>)> {
     let lg = |b: u16| half::f16::from_bits(b).to_f32();
     let xt = lg(*row.get(tok as usize)?);
-    let mut lmax = f32::NEG_INFINITY;
-    for &b in row {
-        let x = lg(b);
-        if x > lmax { lmax = x; } // NaN compares false: never the maximum
-    }
-    if !xt.is_finite() || !lmax.is_finite() { return None; }
-    let mut sum = 0f64;
-    for &b in row {
-        let x = lg(b);
-        if x.is_finite() { sum += ((x - lmax) as f64).exp(); }
-    }
-    let lse = lmax as f64 + sum.ln();
+    if !xt.is_finite() { return None; }
+    let mut cnt = vec![0u32; 1 << 16];
+    for &b in row { cnt[b as usize] += 1; }
+    // finite values, largest first: +65504 .. +0 are 0x7BFF down to 0x0000, -0 .. -65504 are
+    // 0x8000 up to 0xFBFF (infinities and NaN patterns lie outside both ranges)
+    let desc = || (0x0000u32..=0x7BFF).rev().chain(0x8000..=0xFBFF).filter(|&p| cnt[p as usize] > 0);
+    let lmax = lg(desc().next()? as u16) as f64;
+    let sum: f64 = desc().map(|p| cnt[p as usize] as f64 * (lg(p as u16) as f64 - lmax).exp()).sum();
+    let lse = lmax + sum.ln();
     let lp = |x: f32| (x as f64 - lse) as f32;
     let mut top: Vec<(u32, f32)> = Vec::new();
     if n > 0 {
-        let mut idx: Vec<u32> = (0..row.len() as u32).filter(|&i| lg(row[i as usize]).is_finite()).collect();
-        // logit descending, then id ascending (deterministic; total_cmp is a total order)
-        let cmp = |a: &u32, b: &u32| lg(row[*b as usize]).total_cmp(&lg(row[*a as usize])).then(a.cmp(b));
-        let k = n.min(idx.len());
-        if k > 0 && k < idx.len() {
-            idx.select_nth_unstable_by(k - 1, cmp);
-            idx.truncate(k);
+        // the n-th largest value present (ties included)
+        let mut acc = 0usize;
+        let mut vth = f32::NEG_INFINITY;
+        for p in desc() {
+            acc += cnt[p as usize] as usize;
+            vth = lg(p as u16);
+            if acc >= n { break; }
         }
-        idx.sort_by(cmp);
-        top = idx.into_iter().map(|i| (i, lp(lg(row[i as usize])))).collect();
+        let mut cand: Vec<(u32, f32)> = row.iter().enumerate()
+            .filter_map(|(i, &b)| { let x = lg(b); (x.is_finite() && x >= vth).then_some((i as u32, x)) })
+            .collect();
+        // value descending, then id ascending (finite values: partial_cmp is total here)
+        cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+        cand.truncate(n);
+        top = cand.into_iter().map(|(i, x)| (i, lp(x))).collect();
     }
     Some((lp(xt), top))
 }
@@ -10042,6 +10049,17 @@ mod token_logprobs_tests {
         assert!((top[0].1 as f64 - (3.0 - lse)).abs() < 1e-5);
         let p: f64 = (0..4).map(|i| (token_logprobs(&r, i, 0).unwrap().0 as f64).exp()).sum();
         assert!((p - 1.0).abs() < 1e-5, "probabilities sum to 1 over the finite logits");
+    }
+
+    /// host cost per token at the model's vocabulary size (run with --ignored --nocapture)
+    #[test]
+    #[ignore]
+    fn host_cost_full_vocab() {
+        let v = 248_320usize;
+        let r: Vec<u16> = (0..v).map(|i| half::f16::from_f32(((i * 7919) % 2003) as f32 / 97.0 - 10.0).to_bits()).collect();
+        let t = std::time::Instant::now();
+        for i in 0..100 { std::hint::black_box(token_logprobs(&r, i as u32, 20)); }
+        eprintln!("token_logprobs (248K vocab, top 20): {:.3} ms per call", t.elapsed().as_secs_f64() * 10.0);
     }
 
     #[test]
