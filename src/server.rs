@@ -931,7 +931,7 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(default)]
     top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_top_k")]
     top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
@@ -1043,6 +1043,17 @@ fn completions_usage_chunk(id: &str, created: i64, model: &str, prompt_tokens: u
 fn default_temperature() -> f32 { 0.7 }
 fn default_top_p() -> f32 { 0.8 }
 fn default_top_k() -> usize { 20 }
+
+/// `top_k`: a non-negative integer, or any negative integer for "no top-k truncation" (the
+/// OpenAI-compatible convention, e.g. `-1`); mapped to 0, which the samplers treat as off.
+fn deserialize_top_k<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    use serde::Deserialize;
+    match Option::<i64>::deserialize(d)? {
+        None => Ok(None),
+        Some(k) if k < 0 => Ok(Some(0)),
+        Some(k) => usize::try_from(k).map(Some).map_err(serde::de::Error::custom),
+    }
+}
 
 fn deserialize_stop<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     use serde::Deserialize;
@@ -2794,7 +2805,7 @@ struct CompletionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_top_k")]
     top_k: Option<usize>,
     #[serde(default)]
     stream: bool,
@@ -3026,6 +3037,31 @@ pub(crate) fn prompt_token_ids(items: &[serde_json::Value], vocab: usize) -> Res
         Some(id) if id < vocab as u64 => Ok(id as u32),
         _ => Err(format!("'prompt' ids must be integers in [0, {vocab}) (got {it})")),
     }).collect()
+}
+
+#[cfg(test)]
+mod top_k_parse_tests {
+    use super::{ChatCompletionRequest, CompletionRequest};
+
+    fn chat(top_k: &str) -> Result<Option<usize>, String> {
+        let body = format!(r#"{{"messages":[],"top_k":{top_k}}}"#);
+        serde_json::from_str::<ChatCompletionRequest>(&body).map(|r| r.top_k).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn negative_top_k_means_off() {
+        assert_eq!(chat("-1"), Ok(Some(0)));
+        assert_eq!(chat("-7"), Ok(Some(0)));
+        assert_eq!(chat("0"), Ok(Some(0)));
+        assert_eq!(chat("20"), Ok(Some(20)));
+        assert_eq!(chat("null"), Ok(None));
+        assert!(chat("1.5").is_err());
+        assert!(chat("\"5\"").is_err());
+        let c: CompletionRequest = serde_json::from_str(r#"{"prompt":"x","top_k":-1}"#).unwrap();
+        assert_eq!(c.top_k, Some(0));
+        let c: CompletionRequest = serde_json::from_str(r#"{"prompt":"x"}"#).unwrap();
+        assert_eq!(c.top_k, None);
+    }
 }
 
 #[cfg(test)]
