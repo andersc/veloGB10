@@ -1937,7 +1937,8 @@ impl BatchScheduler {
                     let projected = self.num_active() + pending.len() + usize::from(self.pf.is_some());
                     if projected >= self.max_batch || self.lanes[projected].is_some() { break; }
                     match self.rx.try_recv() {
-                        Ok(req) => pending.push(req),
+                        // rejected here, before any `Admit` is shipped: the mirror would admit it
+                        Ok(req) => pending.extend(Self::refuse_logprobs(req)),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => { closed = true; break; }
                     }
@@ -1947,7 +1948,7 @@ impl BatchScheduler {
                 if self.num_active() == 0 && pending.is_empty() && self.pf.is_none() && !closed {
                     crate::metrics::sched_idle(); // H3: about to block for work (busy must not stick at 1)
                     match self.rx.recv().await {
-                        Some(req) => pending.push(req),
+                        Some(req) => pending.extend(Self::refuse_logprobs(req)),
                         None => closed = true,
                     }
                 }
@@ -2187,14 +2188,18 @@ impl BatchScheduler {
     /// (the TP node mirror — the flag arrives via TpConfig; on the head it is implied by the dump).
     pub fn set_cov_trace(&mut self, on: bool) { self.cov_trace = on; }
 
+    /// This scheduler does not compute log probabilities (the EXL3 serve path does): finish a
+    /// request that asks for them with an error and return None; pass any other request through.
+    fn refuse_logprobs(req: BatchRequest) -> Option<BatchRequest> {
+        if req.logprobs.is_none() { return Some(req); }
+        let _ = req.tx.send(TokEvent::Finish {
+            reason: "error: bad request: logprobs are not supported by this engine".into(),
+        });
+        None
+    }
+
     fn admit(&mut self, req: BatchRequest) {
-        if req.logprobs.is_some() {
-            // this scheduler does not compute log probabilities (the EXL3 serve path does)
-            let _ = req.tx.send(TokEvent::Finish {
-                reason: "error: bad request: logprobs are not supported by this engine".into(),
-            });
-            return;
-        }
+        let Some(req) = Self::refuse_logprobs(req) else { return };
         // W2: the request's compiled schema (moved into the lane below).
         let req_schema = req.schema.clone();
         // R9: register the live gpu+state once so net::agree's mismatch path can dump GDN state.
