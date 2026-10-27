@@ -387,6 +387,11 @@ enum SchemaStep {
     Invalid,
 }
 
+/// The finish reason of a schema turn that reached a state no token can continue (or emitted a
+/// token the state refuses): an error, so the client never reads the partial document as a
+/// completed one.
+const SCHEMA_DEAD_END: &str = "error: json-schema constrained decoding reached a state with no valid continuation";
+
 /// W2-EXL3: advance a schema lane's FSM by one emitted token (pure; unit-tested).
 fn schema_feed(sm: &crate::json_schema::SchemaMask, state: &mut u32, armed: &mut bool, tok: u32) -> SchemaStep {
     if !*armed {
@@ -3928,19 +3933,25 @@ the [gen] line says stop_p=na", stats));
                     (true, "length")
                 } else if self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new {
                     (true, "stop")
-                } else if lane.loop_feed(t) {
-                    (true, "loop_detected") // WP08
-                } else if let Some(sm) = lane.schema.clone() {
-                    // W2-EXL3: a schema turn ends at the end of its JSON document
+                } else if let Some(sm) = lane.schema.clone().filter(|_| lane.schema_armed) {
+                    // W2-EXL3: a schema turn ends at the end of its JSON document. The loop
+                    // detector does not run on an armed lane: the mask bounds the output, and a
+                    // valid document may legitimately repeat (a long array of equal values).
                     match schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t) {
                         SchemaStep::Continue => (false, ""),
                         SchemaStep::Complete => (true, "stop"),
                         SchemaStep::Invalid => {
-                            crate::reprintln!("[schema] slot {s}: token {t} is invalid in the current schema state \
-                                               — finishing the turn (must not happen with the mask armed)");
-                            (true, "stop")
+                            crate::reprintln!("[schema] slot {s}: token {t} leaves no valid continuation \
+                                               — ending the turn with an error");
+                            (true, SCHEMA_DEAD_END)
                         }
                     }
+                } else if lane.loop_feed(t) {
+                    (true, "loop_detected") // WP08
+                } else if let Some(sm) = lane.schema.clone() {
+                    // not armed yet (reasoning): this token may be the one that arms it
+                    schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t);
+                    (false, "")
                 } else {
                     (false, "")
                 }
@@ -4655,9 +4666,9 @@ the [gen] line says stop_p=na", stats));
                     return;
                 }
                 SchemaStep::Invalid => {
-                    crate::reprintln!("[schema] slot {free}: first token {last} is invalid in the schema's start state \
-                                       — finishing the turn (must not happen with the mask armed)");
-                    let _ = req.tx.send(TokEvent::Finish { reason: "stop".into() });
+                    crate::reprintln!("[schema] slot {free}: first token {last} leaves no valid continuation \
+                                       — ending the turn with an error");
+                    let _ = req.tx.send(TokEvent::Finish { reason: SCHEMA_DEAD_END.into() });
                     return;
                 }
             }
@@ -6735,6 +6746,8 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         // exl3 snapshots at the prompt end: no ckpt_at render needed — except C1 tail checkpoints,
         // which take one at the message boundary (ckpt_at) of every prompt
         prefix_cache: prefix_on && tail_ckpt_boot,
+        // the EXL3 scheduler arms a schema after the think-close token (schema_feed)
+        schema_defer: true,
         vision_tower,
         vision_gpu,
         vision_cpu: false,
