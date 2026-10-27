@@ -504,7 +504,15 @@ fn print_help() {
     println!("                           FFN/experts) — draft path carries reduce sites; DEFAULT ON");
     println!("  --net-test               Transport + FP32-partial audit, 2 procs (--rank 0|1 --peer)");
     println!("  --sweep-gemm             GEMM shape sweep");
-    println!("  --quantize               bf16 dir -> NVFP4/FP8 artifact (--model-dir <in> --out <dir> --recipe <r>)");
+    println!("  --quantize               bf16 dir -> NVFP4/FP8 artifact (--model-dir <in> --out <dir> [--recipe <spec>])");
+    println!("                           Recipe = comma-separated entries, each 'group' or 'group:fmt';");
+    println!("                           fmt = nvfp4 (default) | fp8 | bf16; prefix '-' drops the group.");
+    println!("                           Groups: all mlp attn gdn lmhead embed mtp router expert hc");
+    println!("                           ple pletable. A later entry wins. Default recipe: all,gdn:fp8");
+    println!("                           Recipes used in practice:");
+    println!("                             all            everything NVFP4 (cheapest, +9.3% PPL on 9B)");
+    println!("                             all,gdn:fp8    NVFP4, GDN in/out-proj FP8 (DEFAULT; +5.4% PPL)");
+    println!("                             all:fp8        everything FP8 (+0.7% PPL, closest to bf16)");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
@@ -570,7 +578,7 @@ fn print_help() {
     println!("  --probe-fold-xchain-compare <a.bin>,<b.bin>");
     println!("                           fold-vs-nofold per-layer comparison (FOLDX dumps from the");
     println!("                           TP head via --fold-xchain-dump=<path>)");
-    println!("  --draft-vocab N          FR-Spec draft vocab subset; 0=off");
+    println!("  --draft-vocab <V>        MTP drafter vocab subset (FR-Spec): on (Qwen default)|off|N|P%|0.F");
     println!("  --rdma-dev <d1[,d2]>     RoCE device(s) (per box: rail 1[,rail 2])");
     println!();
     println!("  NO ENVIRONMENT VARIABLES (AGENTS.md §7, CLI-1): every engine option is a command-line");
@@ -14609,16 +14617,32 @@ fn mtp_calib_cache_path(model_path: &str) -> Option<std::path::PathBuf> {
     let dir = exe.parent()?.join("mtp_calib");
     let base = std::path::Path::new(model_path.trim_end_matches('/'))
         .file_name()?.to_string_lossy().replace(['/', ' '], "_");
-    Some(dir.join(format!("{base}.json")))
+    // --draft-vocab changes r(d) (the draft chain reads a smaller head): an explicit setting gets its
+    // own file, so switching it never thrashes one cache; the unflagged default keeps the plain name.
+    let dv = mtp_calib_draft_vocab_key().map(|k| format!(".dv-{}", k.replace(['/', ' ', '%', '.'], "_"))).unwrap_or_default();
+    Some(dir.join(format!("{base}{dv}.json")))
+}
+/// The --draft-vocab / --draft-vocab-file setting that shapes the draft chain's cost, when one was
+/// GIVEN (None = the model's default, which is per family: quant::DraftVocab::default_for). An explicit
+/// `off` is a key of its own: the Qwen default is on, so off must never share the default's file.
+fn mtp_calib_draft_vocab_key() -> Option<String> {
+    let dv = gb10_inference::opts::var(gb10_inference::opt!("draft-vocab")).ok();
+    let file = gb10_inference::opts::var(gb10_inference::opt!("draft-vocab-file")).ok();
+    match (dv, file) {
+        (None, None) => None,
+        (d, f) => Some(format!("{}{}", d.unwrap_or_default(), f.map(|f| format!("+file:{f}")).unwrap_or_default())),
+    }
 }
 fn mtp_calib_stamp(model_path: &str) -> String {
-    // Invalidate on a rebuild (binary mtime changes = new kernels) or a different model.
+    // Invalidate on a rebuild (binary mtime changes = new kernels), a different model, or a different
+    // --draft-vocab (a calibration taken with the full-vocab drafter overprices a reduced one).
     let bin_mtime = std::env::current_exe().ok()
         .and_then(|e| std::fs::metadata(e).ok())
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs()).unwrap_or(0);
-    format!("bin_mtime={bin_mtime};model={}", model_path.trim_end_matches('/'))
+    let dv = mtp_calib_draft_vocab_key().map(|k| format!(";draft_vocab={k}")).unwrap_or_default();
+    format!("bin_mtime={bin_mtime};model={}{dv}", model_path.trim_end_matches('/'))
 }
 fn read_mtp_calib(path: &Option<std::path::PathBuf>, stamp: &str) -> Option<Vec<(usize, Vec<(usize, f32)>)>> {
     let txt = std::fs::read_to_string(path.as_ref()?).ok()?;

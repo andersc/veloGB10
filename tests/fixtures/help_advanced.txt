@@ -1,0 +1,951 @@
+
+ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
+
+  SERVING
+    --cpu-sample                       sample on the CPU instead of the GPU  [off]
+    --exit-on-fatal <on|off>           sticky CUDA error / scheduler panic: exit 70 so a supervisor restarts (default; off = engine DEAD, /health 503)  [on]
+    --exl3-no-prefill-warmup           skip the serve-boot prefill warmup  [off]
+    --host <TEXT>                      HTTP API bind address: an IPv4/IPv6 address or a host name (e.g. 127.0.0.1 = this machine only). 0.0.0.0 (default) = every interface  [0.0.0.0]
+    --image-max-edge <N>               vision (D-VIS-RESIZE, owner 2026-09-30): every input image is resized so its LONGER side is at most N px, aspect ratio kept, before the model's own 32-px grid snap; never a size 400. 0 = no cap (the preprocessor's 16.7 MP limit still applies)  [1024]
+    --keep-tools-when-tool-choice-none vLLM-compatible tool_choice:"none": keep the tool definitions in the prompt (the same tools block a normal request renders, so the prefix cache / WP16 checkpoints survive a compaction/summary turn), append a do-not-call instruction to the last message, and return the reply as plain content (never parsed into tool_calls; a stray <tool_call> stays text). Default off = legacy behaviour (tools removed from the prompt for "none"), byte-identical. Changes the prompt of tool_choice:"none" requests only  [off]
+    --kv-spill <PATH>                  SSD spill tier: when a new conversation takes over a lane that holds another one, save the old conversation's prompt state to disk and restore it when it returns (only when the disk read beats re-reading the prompt; text only). Default off (owner decision 2026-10-23). A snapshot carries only the rows the conversation uses plus the recurrent state (about 80 MB per machine for a 4K-token conversation at TP=4). auto = on, in /tmp/gb10_kv_spill; a directory = on, there; off = no tier. Under TP every machine writes its own share and the machines agree on every save and restore  [off]
+    --kv-spill-gb <N>                  the spill store's size cap in GiB; the least recently spilled snapshot is shifted out (its file deleted) when the cap would be exceeded; 0 = the spill tier is off. Default 64 (~128 snapshots of a 38K-token prefix)  [64]
+    --lane-reserve <N>                 keep a lane reserved for its conversation this many seconds after a NORMAL finish (stop / length / a stop string / a tool call), so its prefix cache survives while conversations outnumber the lanes: a waiting request whose prompt-end snapshot sits in a free lane is admitted first, into that lane; a lane whose request finished normally less than N seconds ago is not handed to a different conversation before --lane-reserve-patience has passed, and such forced takes happen at most once per --lane-reserve-swap seconds; a lane that must change owner picks an empty lane, else the deepest WP16 checkpoint among the allowed lanes, else the least recently released lane (never slot 0 by default). Default 0 = off = today's admission path, byte-for-byte. Recommended for agent loads (qwen-code: several conversations of one project over one shared prefix): --lane-reserve 20. Single-box only: under TP the policy is inactive and one boot line says so  [0]
+    --lane-reserve-patience <N>        a waiting request may take a lane that is reserved for another conversation after waiting this many seconds (the queue must never be starved by an idle reservation); needs --lane-reserve > 0  [150]
+    --lane-reserve-swap <N>            at most one forced take (a queue head older than --lane-reserve-patience taking a reserved lane) per this many seconds, so conversations swap lanes in runs of hot calls instead of every call cold; 0 = no rate limit; needs --lane-reserve > 0  [60]
+    --log-level <normal|debug>         boot output: normal = lean uniform report (stage lines + one SERVING line + warnings/errors/notices); debug = everything the boot printed before OUT1, verbatim, plus the new lines  [normal]
+    --max-seq-len <N>                  max context / KV depth (the DSV4 TP paths honour it as the override)  [per mode]
+    --max-waiting <N>                  LR-4: refuse with 503 + Retry-After at N or more requests waiting beyond the lanes (counts handler lifetime via the in-flight guard, not just queue wait; a burst can overshoot by the requests admitted between check and send; 0 = unlimited)  [256]
+    --no-decode-graphs                 disable decode CUDA graphs (diagnostic)  [off]
+    --prefill-interleave <N>           EXL3 serve, every topology (public PR #23): after each non-final prefill chunk of a prompt that joins while other requests are decoding, run up to N scheduler steps for those requests, so a long joining prompt no longer freezes every running stream for its whole prefill (a 20K-token joiner at --prefill-chunk 1024: one stall of the whole prefill becomes stalls of about one chunk). Default 1 (owner decision 2026-10-24); 0 = off: the whole prompt prefills before the next step, as before. The chunk grid and the joining request's bytes are unchanged. The running requests' bytes are unchanged whenever their text does not depend on which requests share a decode step; the one known such dependence (a request at or below 2,051 tokens of context sharing steps with a longer one) is what the per-row attention regime addresses (--qsa-row-regime, on by default, gated at the default --prefill-interleave 0). With N = 1 the joining and the running requests were measured byte-identical to N = 0 (greedy, TP=2 and TP=4, 2026-10-23). The joining prompt's time to first token grows by the steps run. Smaller --prefill-chunk = more interleave points. Under TP every rank runs the same steps at the same chunk boundaries, in lockstep  [1]
+    --prefill-sched <cursor|inline>    NVFP4 server: how a joining prompt's prefill is scheduled against the requests already generating. cursor (default) = the prefill advances one window per scheduler step, between decode steps, so running streams keep moving; inline = the whole prompt prefills inside admission and every running stream waits for it (the earlier schedule; A/B and emergency escape). Schedule only: the prefill windows and the output are unchanged. Not read by the EXL3 server (see --prefill-interleave). Rides TpConfig  [cursor]
+    --rope-yarn-factor <X>             trunk YaRN rope factor: >1 rescales the trunk rope tables to factor x native window with the vLLM per-dim ramp + mscale (EXL3 and NVFP4 trunks; the drafts keep native rope and GDN layers take no rope). Wins over the pack config's rope_scaling block; rides TpConfig so every TP rank builds identical tables  [1.0]
+    --scrub-tool-secrets <off|provenance|pattern|all>
+                                       server (TOOLSCRUB1, opt-in hardening): redact tool-result-derived secrets from SERVED text only - streamed SSE deltas and non-streaming bodies: reasoning_content, content and tool-call arguments; the model's own context is never modified and the tool-call parser still sees raw text. off (default) = no served byte changes, zero cost. provenance = redact echoes of credential-shaped strings that appeared in THIS conversation's tool results (exact + width-10 shingle matches; [redacted:tool-secret]). pattern = redact key-shaped text anywhere (sk-, AKIA, gh[pousr]_, JWT shape, hex runs of 16+ digits incl. UUID/IPv6 shapes, high-entropy runs; [redacted:key-shape]). all = both layers. Redactions are counted on /metrics as velogb10_scrub_hits_total. Deployers serving agentic traffic where tool results carry credentials may want this on; the engine imposes no system prompt (D3 rejected 2026-10-13)  [off]
+    --sse-keepalive <N>                streamed responses of the NVFP4 and EXL3 HTTP servers (the DSV4 server sends no keep-alive frames): after N seconds without an event on an open stream (queue wait, prefill, a tool call being buffered) send one SSE comment frame, the line ": keep-alive" (no data field, no JSON; SSE clients ignore comment lines). 1 to 3600; 0 = off, no such line is ever sent. Frames are sent only while the WHOLE scheduler keeps completing work: once it has completed no decode round and no prefill chunk, of any request, for 60 s they stop on every stream, so a hung engine cannot hold a client open for ever. The signal is server-wide, not per request: a request that never gets an event while other requests make progress keeps receiving frames, and a stream opened on an engine that is already hung can still receive frames during its first 60 s. Independent of this option, the first chunk with a choices entry (the role chunk) is sent when the request's first token has been generated, or immediately before the error / finish chunk of a request that generates none  [10]
+    --sse-keepalive-frame <comment|data>
+                                       the shape of the idle keep-alive frames of the NVFP4 and EXL3 HTTP servers (WHETHER they are sent is --sse-keepalive): comment (default) = today, the SSE comment line : keep-alive (no data field, no JSON; SSE clients ignore comment lines); data = an SSE data frame carrying a chat-completions chunk with an EMPTY choices array ({"id":"...","object":"chat.completion.chunk","created":...,"model":"...","choices":[]}; /v1/completions streams get the matching text_completion.chunk shape), which SDKs whose stream guard only counts chunks with a choices entry never yield to the caller but which still resets client idle timers that count received SSE data frames. The default rule stands: no choices entry is ever sent before the request's first real token  [comment]
+    --stream-backlog-events <N>        LR-5: cancel a stream whose unconsumed event backlog reaches N (fires at >= N; ~11 min at 100 tok/s; 0 = unlimited)  [65536]
+    --tool-block-end <after-function|first>
+                                       XML tool calls: where a <tool_call> block ends. after-function (default; the popular engines' rule: in vLLM's Qwen3 parser the only thing that ends a call inside its arguments is </function>, and </tool_call> is looked for only after it) = a </tool_call> ends the block only where the call has ended: the text before it must end with </function> or </parameter> (a block that starts with {: with }), and it must not close a quoted <tool_call> that the block itself opened (a quoted complete block inside an argument is text; when that leaves no close, the quoted openers are ignored and only the first condition applies). A </tool_call> that follows prose inside an argument is text, so a file that explains the format is written whole. When no close qualifies, the first one ends the block as before; a block that never closes is dropped under both settings (counted: velogb10_toolcall_unclosed_total). first = the next </tool_call> in the text (v0.7.3): an argument that contains the text </tool_call> loses everything after it and the rest of the call comes back as prose (a JSON-bodied block already ends at the first close that follows }, under both settings). WHAT after-function STILL GETS WRONG (each pinned by a test): a value that says to end every block with </tool_call> and then quotes two calls returns the cut call AND a phantom call made of the quoted text unless --tool-quote-pairing on or cost reads the value (first cut the block at the mention and lost the content instead); a value that ends with a quoted </function> and a quoted </tool_call> and then nothing more is indistinguishable from a real call  [after-function]
+    --tool-quote-pairing <off|on|cost> XML tool calls: how the end of an argument value is found when the value itself contains tool-call tags (an agent writing a file ABOUT tool calls). off = the rule of v0.7.3, byte-identical: a </parameter> ends the value when a <parameter=, a call tag, </function> or the end of the block follows it. Under off an argument that quotes a complete call with two or more parameters is cut at the first quoted </parameter>, and an argument that quotes two calls can come back as two calls, the second one made of the quoted text. on = first pair the tags of quoted calls: inside a value, after a <function= tag, every <parameter= with a non-blank value is owed one </parameter>, which is then content. The paired close is used only when nothing opens again between the last such close and it, and, when the request's tools are known, unless the catalogue contradicts it (what follows it is a parameter this tool does not declare or was already given, or a call to a tool that is not offered, while what follows the v0.7.3 close fits); otherwise the v0.7.3 rule decides. on returns such arguments whole and does not return the quoted calls. on is WRONG where off is right for a value that opens more quoted parameters than it closes (a sentence that mentions the tags is enough), in a block where a later value holds a lone </parameter> (a close tag that no quoted open tag accounts for): the value runs on to that close, and the arguments or the call in between are lost. cost = read the whole block: every </parameter> that could end a value is scored together with everything that follows from it (a value that ends in a close tag after prose, a close tag with no open before it inside a value, an empty value, a parameter given twice or not declared, a call to a tool that is not offered, an extra call, a required parameter missing; passing over a close that the v0.7.3 rule would accept costs too) and the cheapest reading of the block wins, ties going to fewer calls and then to the v0.7.3 close (a block above the model's work budget is read by the v0.7.3 rule and counted in velogb10_toolcall_cost_declined_total). cost reads what on reads wrongly in a quoted document and what on never sees (a quoted call that is not balanced), and it loses in its own cases: it cannot tell apart an argument that holds a lone open tag followed by a real second call (the open tag and the first call's real close look like a balanced quotation, so the second call can be read as part of the first argument), nor a value that quotes the close of a parameter next to a quoted parameter that is not complete (old_string = a quoted '</parameter>' line, new_string = another) from two quoted values read as one, nor a value that ends with a forged close and call from two real calls. Under every setting a value that ends in a forged closing sequence is indistinguishable from two real calls, and a quoted call whose last argument is blank lets a quoted call after it through as a call: the format has no escaping. A well-formed block whose values hold no tool-call tags parses the same under every setting (a malformed block, with text between a close tag and the next tag, can differ)  [off]
+    --tool-shadow-cost <off|on>        XML tool calls, diagnostics only: also read every response that holds a <tool_call> block under the cost model (--tool-quote-pairing cost) when that is not the served rule, and COUNT where it reads the text differently (velogb10_toolcall_parse_disagreement_total{other="cost"}; nothing of it is served). off (default) = the shadow comparison reads the cheap rules only (quote pairing on, and the other block rule): each is one more parse of the response, as dear as the served parse itself (ordinary responses: tens of microseconds; the worst shape measured, 64 blocks of 8 KB with 100 tools offered: 6 ms). on = the cost model is read too. It costs the thread that parses the response (on the EXL3 server the one thread that serves every stream, /health and /metrics) up to its work budget per response (200,000 work units, measured 3.4 ms of one GB10 core in the worst case, a response of 64 blocks that each quote 60 calls under 100 offered tools); a typical response costs under 0.1 ms. A block over the budget is skipped and counted (velogb10_toolcall_cost_declined_total{role="shadow"}). Changes no served byte  [off]
+    --tool-unclosed <complete|drop>    XML tool calls: a response whose <tool_call> block never got its </tool_call>. drop (default) = v0.7.3 byte for byte: the whole block is dropped (counted: velogb10_toolcall_unclosed_total{outcome=returned|dropped_cut|dropped_length}). complete = when the model ended by itself (finish stop) every <function=...>...</function> element that IS closed comes back as a call (vLLM's qwen3 parser does this: its state machine ends a call at </function>, the wrapper is only preamble); an element cut inside an argument is still dropped, and a response cut by the token limit, cancelled by the client or ended in an engine error is dropped whole, as before; a JSON body inside the unclosed wrapper is dropped too (vLLM's XML parser makes no call of it). Why drop is the default: on 36 recorded outputs with an unclosed wrapper none was a clean case of a closed function element whose wrapper close is missing, and the one output that complete changed was a junk call parsed from prose about the call format. WHAT complete STILL GETS WRONG: a model that wrote one element and forgot the wrapper close is served, but a model that was about to write a second element is served just the same (only the counter can tell the two apart); an element cut inside an argument is NOT returned, where vLLM's stream hands out its partial arguments as they arrive.  [drop]
+    --tool-value-trim <one|all>        XML tool calls: which newlines around an argument value are the format's own. one (default) = exactly ONE leading and ONE trailing newline are removed (the template writes <parameter=k>, a newline, the value, a newline, </parameter>), nothing else: vLLM's rule, byte for byte (only \n, one at each end; a \r\n loses its \n only). A file the model ends with a blank line arrives with its final newline, a file that begins with a blank line keeps it, and a short value (a path, a command) that the model followed with a blank line before the close ends in a newline: that is what the model wrote. all = every leading and every trailing newline is removed (v0.7.3 and earlier: every file written through a tool call arrived without a final newline, whatever the model wrote). The value rule and the block rule are not changed by this option  [one]
+    --unclosed-think <reasoning|content>
+                                       Non-streaming chat responses whose generation ends INSIDE the think block the prompt opened, i.e. the generated text has no closing tag: the token budget ran out while the model was reasoning, a stop string hit there, OR the model ended its reply on a natural stop token without ever closing the block. content = the behaviour of v0.7.3 and earlier: the whole text is returned as message.content and reasoning_content is absent. reasoning = the text is returned as message.reasoning_content and message.content is empty, which is what the streaming path has always sent for the same request and what a reasoning parser does; a client that makes non-streaming calls with a small max_tokens (title generation) then reads an empty content. The exception under reasoning: when the text holds a tool-call marker (<tool_call) and tool parsing is on for the request, the text before the marker is the reasoning and what starts at the marker is the content the tool parser reads (a parsed call becomes tool_calls; a block that does not parse stays visible as content). Streaming responses, and every response whose think block was closed, are identical either way. The DSV4 server does not read this option (it has its own response path)  [reasoning]
+    --vision-cpu                       vision (NVFP4 server only; the EXL3 server always builds the GPU tower and says so if this is given): force the CPU reference tower for image requests (the GPU tower is not built). Much slower than the GPU tower. Measured on one big core of an idle box (the 3.05 pack's tower, --vision-cpu-threads 1): 55 s for a 224 x 224 image and 173 s for 448 x 448 (31 s at --vision-cpu-threads 8). NOT measured at the default --image-max-edge 1024 (4,096 patches): projected from those figures it is many minutes at one thread (linear in the patch count for the GEMMs, quadratic for attention). A diagnostic escape; --vision-cpu=off or no flag = the GPU tower serves  [off]
+    --vision-cpu-threads <N>           vision: threads of the CPU reference tower (1..64). The CPU tower answers an image request only when the GPU tower failed (the fallback), and it is much slower than the GPU tower, growing with the image. N > 1 splits its token rows over N threads on the server's worker cores; the embeddings are bit-identical for every thread count N (no dot product changes; tested at 1, 2, 3, 7, 16 and 64 threads). Default 1 = single-threaded  [1]
+    --wp01-off                         WP01 tokenizer cache escape  [off]
+
+  TENSOR PARALLEL
+    --ep-deal <interleave|contig|freq> EXL3 TP static expert deal; freq = committed per-layer frequency-balanced table (world 2 and world 4; opt-in, output-changing)  [interleave]
+    --exl3-tp-fastctl <on|off>         EXL3 TP fast control plane  [on]
+    --exl3-tp-preverify <on|off>       EXL3 TP pre-verify agree  [on]
+    --gid-idx <N>                      RoCE GID index for the TP data plane (integer N, or omit for auto-detect). Auto-detect picks the first IPv4-mapped RoCE v2 GID from sysfs (logged at bring-up with the sysfs evidence); fallback if none found: the static default 3. An explicit N binds EXACTLY index N on EVERY rail (the second rail and the single-stage context use the same resolved index); a wrong N fails loudly at bind — it is never re-scanned  [auto] (per box)
+    --naive-lane-ctx <on|off>          Naive --naive-lanes > 1 with speculation (2026-10-21): on (default) = every lane keeps its own drafter context (each shared step feeds every lane's row, ~0.7 ms per extra lane at TP4), so any request left alone speculates; off = one context, fed only by the request admitted into an idle engine (the only one that can speculate)  [on]
+    --naive-lanes <N>                  Naive TP=2/TP=4 concurrent requests (G1): 0 (default) = follow --max-batch (owner 2026-10-21), capped at 4; N >= 1 overrides it (1 = one request at a time). Up to N requests share each step (one row each, N KV slots); shared steps do not speculate, a request left alone does  [0]
+    --naive-moe-shard <auto|ep|tp>     Naive TP=2/TP=4 experts: auto (default, owner 2026-10-21) = tp at TP=4, ep at TP=2; ep = each rank holds whole experts (e % world); tp = every rank holds 1/world of EVERY expert (gate/up columns, down rows), so no rank waits for the one that drew the most experts. tp sums the MoE partials over K slices (a different fp32 order: tolerance class, not bitwise vs ep); the nodes' shards ship under their own cache id  [auto]
+    --naive-tp-k1 <multi|single>       Naive TP=4 single-stage reduce (lever 1c): the K1 that copies a rank's partial into the RDMA send ring. multi (default) = several blocks with 16 B stores; single = the one-block K1 (~14 us per reduce on GB10). Same bytes and publication order either way (bitwise)  [multi]
+    --naive-tp-prefill-xport <pipe|serial>
+                                       Naive TP=2/TP=4 prefill all-reduces (ISSUES 100): pipe (default) = the pipelined multi-block transport (several epochs in flight, the EXL3 TP-F mechanism); serial = one-block K1/K2 pairs over 1 MiB epochs. Bitwise either way; decode-width reduces are untouched  [pipe]
+    --pp-head-ip <TEXT>                PP prefill node: the head IP to dial  [unset] (per box)
+    --rdma-dev <TEXT>                  RDMA device(s): <rail1>[,<rail2>]  [rocep1s0f1] (per box)
+    --tp-cache <PATH>                  node blob cache dir  [~/.cache] (per box)
+    --tp-dds-prior <TEXT>              WP23 cost-guard prior on TP lanes: on = 2.7 ms/draft at TP=2, 2.1 at TP=4 (estimate), off = 6.0, or <ms>  [on]
+    --tp-dec-blocks <N>                EXL3 TP decode K2 grid blocks  [8]
+    --tp-dec-grecv <on|off>            EXL3 TP decode GPU receive (off = cpu_done only)  [on]
+    --tp-dec-xport <on|off>            EXL3 TP decode transport (off = the serial pair)  [on]
+    --tp-dh-shard <on|off>             EXL3 TP sharded MTP-head screen  [on]
+    --tp-fp32-partials                 NVFP4 TP fp32 partials  [off]
+    --tp-gpu-recv <on|off>             NVFP4 TP GPU-direct all-reduce receive (on / off; unset = the shipped config). Naive TP=4 (lever 1b): `on` makes the single-stage reduce ctx's K2 validate every peer's NIC-written tail itself (the proxy skips its CPU receive stage); unset/off = the CPU bounce. Not GPUDirect RDMA: the payload lands in pinned host memory either way  [auto (TpConfig)]
+    --tp-graph                         NVFP4 TP decode graphs  [off]
+    --tp-k2-prefetch <on|off>          EXL3 TP=2/TP=4 decode (TP-4Z2): while a reduce's K2 waits for the peer, its idle threads pull the NEXT hc mixer's int8 weights into L2 (bitwise: a prefetch hint, no data path). on (default) | off  [on]
+    --tp-ks-target <N>                 EXL3 TP split-K target  [auto]
+    --tp-lockstep-timeout-ms <N>       EXL3 TP world > 2: per-wait lockstep deadline in ms (peer alive but not progressing -> abort code 12); 0 = unbounded  [30000 at world > 2 (unused at world 2)]
+    --tp-oneshot                       TP=4 one-shot all-peers push  [off]
+    --tp-prefill-overlap <TEXT>        EXL3 TP prefill all-reduce overlap: off|on|inline[:ROWS]|dual[:ROWS]|fold  [dual:128 at TP=2]
+    --tp-prefill-payload <N>           NVFP4 TP prefill all-reduce chunk cap (bytes)  [built-in]
+    --tp-prefill-xport <off|single|on|dual>
+                                       EXL3 TP prefill transport (off = serial pair, single = one rail, dual = both rails; dual is the default at every world, at --tp 4 the second rail is a full N-way link; single/off are loud perf opt-outs)  [dual]
+    --tp-reduce <auto|rd|single>       EXL3 TP=4 decode/verify all-reduce (TP-4F2, default flipped by TP-4Z1): auto = single at world 4 (with the folded decode transport), rd elsewhere (default); rd = two recursive-doubling stages per reduce; single = ONE all-peers stage on a dedicated transport (bit-identical sum; third proxy thread on core 17, TCP base +40). `single` is refused at world != 4; prefill reduces are untouched. Naive TP=4 (lever 1): auto = single on a dedicated fp32-wire one-shot ctx (sum (p0+p2)+(p1+p3), bitwise the tree) for every reduce up to 256 KiB, the tree for prefill chunks; at world 2 `single` falls back to the tree with one line  [auto]
+    --tp-reduce-fuse <on|off>          NVFP4 TP fused reduce+residual+norm epilogue (on / off; unset = the shipped config)  [auto (TpConfig)]
+    --tp-route-fold <on|off>           EXL3 TP route-ep fold into the router tail  [on]
+    --tp-seq-parallel <TEXT>           EXL3 TP=2/TP=4 sequence-parallel prefill (on|hc|router|off); TP=4 = quarter rows (TP-4S)  [hc (on)]
+    --tp-shard-mtp <on|off>            NVFP4 TP MTP-block sharding  [on]
+    --tp-shared-repl                   EXL3 TP replicated shared expert (diagnostic A/B)  [off]
+    --tp-spin-us <N>                   TP transport spin microseconds  [built-in]
+    --tp-sync-only                     B32: sync every node (blob cache), print the bytes each node needed and its cache footprint, then exit (head and nodes) — no model load. Rides TpConfig.sync_only  [off]
+    --tp-vp-head <on|off>              EXL3 TP vocab-parallel lm_head for greedy rows  [on]
+    --tp-vp-sampled <TEXT>             EXL3 TP=2/TP=4 vocab-parallel lm_head for sampled / penalized / ratio-rule rows (on|off; default on at world 2 and 4)  [on]
+    --tp-xport-blocks <N>              EXL3 TP prefill transport blocks  [16]
+    --tp-xport-lookahead <N>           EXL3 TP prefill transport epochs in flight per rail  [4]
+
+  KV / PREFIX CACHE
+    --kv-mirror-budget <N>             packed-KV mirror budget (positions)  [32768]
+    --prefix-grid-reuse <on|off>       prefix-cache grid reuse  [on]
+    --prefix-tail-ckpt <0|1|2>         tail (message-boundary) prefix checkpoints (tunable prefix.tail_ckpt override; owner default 1)  [1]
+    --wp16-off                         WP16 prefix-cache checkpoint escape  [off]
+
+  SPECULATION
+    --df2-mirror-threads <N>           DFlash2 mirror worker threads  [auto]
+    --df2-qhead                        DFlash2: plain-q head borrow (bf16 borrow only)  [off]
+    --dhead-bits <1|2|4>               DHEAD screen bits  [2]
+    --dhead-delta <X>                  DHEAD rescore margin  [4.0]
+    --dhead-off                        DHEAD escape: the full draft head  [off]
+    --dhead-t <N>                      DHEAD candidate count  [16]
+    --dheadp-cap <N>                   DHEADP expansion cap (tunable dheadp.cap override)  [256]
+    --dheadp-off <on|off>              DHEADP escape (tunable dheadp.off override)  [off]
+    --draft-vocab <TEXT>               NVFP4 server: the MTP drafter proposes only from a reduced vocabulary (FR-Spec), so each draft step reads that share of the LM head instead of all of it. on (DEFAULT for Qwen3.5/3.6/3.8 packs; hy_v3 default off) = the 65536 most frequent token ids plus the special-token tail (~27% of a Qwen vocabulary); off = full vocabulary; or <rows>, <percent>% or <fraction>. The verify still scores the full vocabulary: greedy output is unchanged, only acceptance and draft cost move (sampled requests stay distribution-exact). Use off for non-Latin-script workloads (Chinese, Japanese, Korean, Arabic, Hindi, Thai...): most of their tokens are outside the subset, so drafts rarely land. NVFP4, FP8 or bf16 LM heads, dense and MoE, any TP; on qwen4_exp (Flash-Next) it is never applied (an explicit value prints one line). The boot prints `draft head: N of V tokens`; /metrics counts the draft steps it served. Rides TpConfig  [on]
+    --draft-vocab-file <PATH>          NVFP4 server, OPT-IN: the --draft-vocab subset read from a file of token ids (whitespace-separated; the special-token tail is always added). Turns the reduced draft head on by itself. Under TP every machine must have the file at the same path  [unset]
+    --exl3-dds-depth-bins <on|off>     WP23 depth bins (default: on iff depth > the legacy max)  [auto]
+    --exl3-dds-guard <on|off>          WP23 cost guard (default: on iff depth > the legacy max)  [auto]
+    --exl3-mtp-head-n <N>              EXL3 MTP head count override  [auto]
+    --exl3-mtp-k <N>                   EXL3 MTP depth k override  [auto]
+    --exl3-no-mtp                      EXL3 server: speculation off. The older, EXL3-only spelling of --mtp off, kept for existing command lines (a diagnostics switch: speculation is the served default)  [off]
+    --exl3-pen-draft <on|off>          penalties applied to drafts  [on]
+    --exl3-reprime <0|full|on>         device re-prime mode (0 = off, full)  [on]
+    --exl3-reprime-eager               eager device re-prime  [off]
+    --exl3-reprime-graph <on|off>      graphed device re-prime (tunable override)  [on]
+    --lane-order <rr|fcfs>             Order of the SERIAL speculative rounds (CF-FCFS): rr (default) = today, every scheduler step gives each busy MTP-capable lane one round in slot order, so n concurrent requests each run at 1/n of the single-lane speed and all of them finish late; fcfs = run to completion, one lane at a time, first come first served by admission order, with a --lane-quantum cap. Aggregate throughput is unchanged (the same serial rounds run); fcfs cuts the MEAN turn-completion time (measured at TP=1: 23% lower with 2 and 30% lower with 3 concurrent equal-length requests; the last request's completion time and the aggregate tokens/s unchanged within noise; with unequal lengths the gain depends on which request arrives first) at the cost of the waiting lanes' time-to-first-token. Applies ONLY to the serial-speculation arm: MTP-off lanes still batch together, and when the policy picks the shared plain step (--spec-lanes-max) every lane rides that step, so fcfs has no effect there. Greedy output is byte-identical in both orders (it changes only WHICH lane steps when, never a lane's own computation)  [rr]
+    --lane-pack <TEXT>                 EXL3 server, TP=1, TP=2 and TP=4; ON by default since v0.7.4: on|off|2. on (= 2, the default) = two concurrent requests share ONE packed speculative verify per round instead of one verify each; with three busy requests it packs a pair and runs the third alone, the lone role rotating; four = two pairs. off = every request verifies alone, exactly as before v0.7.4. It applies whenever --spec-lanes-max keeps serial speculation (a round that the load-adaptive policy gives to the shared plain step is not a speculative round). WHAT IT NEEDS: the EXL3 server, a live MTP draft head, --lane-order rr, --max-batch >= 2, --graph-precapture on, --kv-cache q8, the default --exl3-mtp-k, --qsa-row-regime on and the default --a-ctrl. A posture it cannot serve is not refused: the boot runs with packed rounds INACTIVE, prints ONE line saying what was asked and what this boot does instead, and /metrics velogb10_lane_pack_active{reason=...} carries why (scripts/owner_check.py prints it); --lane-pack off silences that line. WHAT IT COSTS: about 1.8 GiB of device memory per machine (a second 16-row decode scratch plus one CUDA graph per packed width, regime and sampler family, all captured at boot, none while serving; the boot line prints the count and the free memory after the boot), also for a server that never has two requests at once. A scratch or graph that cannot be built at boot (memory) falls back to inactive with one line; it does not abort the boot. Greedy AND sampled requests pack, in any combination (two greedy, two sampled, or one of each): every verify row carries its own request's sampler parameters, seed and counter, so a request's draws never depend on the request it shares a verify with. Each request's GREEDY output is byte-identical with the flag on or off (the packed verify is bit-identical per request to the lone one, including the recurrent state it commits). A SAMPLED request draws from the same distribution on or off; its bytes for a given seed are not reproducible across runs (the dynamic draft stop and the control cadence depend on timing and on the other requests), except in the fixed-depth diagnostic posture (--draft-confidence 0 --a-ctrl off --spec-lanes-max 0), where a packed sampled request equals its lone run byte for byte. WHAT NEVER PACKS: a request with its own repetition / presence / frequency penalty, a request with images, a request with speculation off, requests on opposite sides of the 2,051-token sparse-attention switch, and a single busy request (all run the unchanged lone path; the reasons are counted in /metrics velogb10_lane_pack_skip_total, lane rounds served by packed verifies by kind in velogb10_lane_pack_lane_rounds_total). UNPENALIZED means no penalty of the request's own AND none from the server's defaults: with --default-presence-penalty 1.5 (or any non-zero --default-*-penalty) every request that sends no penalty field is a penalized request, none of them packs, and lane packing changes nothing for that traffic (counted as skip reason penalty; the boot prints a WARNING). A packed-round error turns the arm off for the rest of the boot (velogb10_lane_pack_disabled; under TP it ends the session loudly on both ranks). Speed factors are measured per build and are not quoted here: they depend on the model pack, the content, the prompt length and the number of concurrent requests (a single request is untouched). Under TP the pair's two lanes are drafted on every rank, ONE pre-verify lockstep exchange agrees the pack (total rows, slots, positions, drafts) before the packed verify launches, and one post-verify agree takes the head's timing; the packed graph set and the decision are agreed at the boot (a rank that differs refuses the boot) and the head's value ships to the nodes. Under TP, GREEDY and SAMPLED requests pack by default (--lane-pack-sampled-tp on; off = only greedy requests pack there and sampled requests run their own lone round, counted as skip reason sampled). HARDWARE: ran its gate chains at TP=1 and at TP=2 on one machine pair (2026-10-10; the 3.05 pack, unpenalized default-sampled streamed chat, thinking on and off); TP=4 and warm multi-turn traffic were exercised by hand by the maintainer, no automated gate chain ran there; a penalized request never packs  [on]
+    --lane-pack-sampled-tp <on|off>    EXL3 server under TP with --lane-pack on: on (default) = sampled requests join packed verify rounds, as they do on one box; off = under TP only greedy requests pack and every sampled request runs its own round (the behaviour of builds before 2026-10-10, kept as an escape). The sampled packed round ran its hardware gates at TP=2 on ONE machine pair (S-B9-CF-PACK5G, 2026-10-10: unpenalized default-sampled STREAMED chat requests, the 3.05 pack); it has never run at TP=4. No effect on one box (sampled requests pack there) or with --lane-pack off  [on]
+    --lane-quantum <N>                 The --lane-order=fcfs quantum in generated tokens: a front lane runs speculative rounds alone until it has generated this many tokens since it became front, then it rotates to the back and the next-oldest lane runs to completion (a lane that stops, hits its length or is cancelled before that frees its turn at once). Only bounds a pathologically long turn; 256 tokens is far longer than a coding agent's tool call. No effect with --lane-order=rr  [256]
+    --mtp <auto|on|off>                Multi-token (MTP) speculative decoding. off = plain decoding only, on every server: no draft head runs and the boot banner says 'MTP OFF (--mtp off)' (the EXL3 server of v0.7.3 and earlier ignored this option). auto (default) = speculation on with the profitability control (NVFP4: calibrated at boot and re-picked live; EXL3: the per-request auto-off and re-probe). on = force it (NVFP4, benchmarking; on EXL3 the same as auto). Greedy verification is lossless (a draft is kept only when it is the model's own next token) and sampled requests stay distribution-exact. Older spellings still accepted: 1 / true = on, 0 / false = off, and the EXL3-only --exl3-no-mtp = off. Rides to the TP nodes  [auto]
+    --mtp-lanes <on|off>               NVFP4 server, EXPERIMENTAL: batched MTP verify across lanes — the draft chains of several concurrent greedy requests are packed into ONE verify instead of one verify per request (lossless; needs the full verify checkpoint region). off (default) = each request verifies alone. Not read by the EXL3 server, whose lanes are scheduled by --spec-lanes-max and --lane-order. Rides TpConfig  [off]
+    --mtp-reprobe <auto|off>           What happens after the per-request speculation auto-off (the profitability control that compares speculative cost against plain decoding): auto = the request's draft head stays primed and speculation re-arms for a short probe window after a doubling plain-step backoff (256 doubling to 4096; reset on a successful probe), so a stretch of hard-to-predict text no longer ends speculation for the whole request; off = the off decision is final for that request (the previous behaviour)  [auto]
+    --no-df2-graph                     DFlash2: no round graph (escape)  [off]
+    --no-df2-inject-graph              DFlash2: no inject graph (escape)  [off]
+    --no-df2-q2stage                   DFlash2: no q2 staging (escape)  [off]
+    --spec-block <N>                   Naive: verify block = 1 + drafts per round (2..16)  [7]
+    --spec-conf <X>                    Naive: verify only the leading drafts whose confidence >= this (0 = the whole block)  [0.45 at --tp 2|4, else 0.25]
+    --spec-draft-temp <X>              Naive: sampled drafts from the drafter's q at F x the request temperature (0 = argmax drafts, exact residual)  [0]
+    --spec-drafter <auto|head|sharded> Naive: where the drafter runs under TP (auto = sharded on every rank at TP > 1)  [auto]
+    --spec-guard-off <X>               Naive: accepted-per-round EMA below which a request runs plain steps  [0.5 at --tp 4, 1.2 at --tp 2, else 0.8]
+    --spec-guard-on <X>                Naive: accepted-per-round EMA at which a paused request resumes speculation  [0.8 at --tp 4, 1.6 at --tp 2, else 1.1]
+    --spec-lanes-max <TEXT>            EXL3 load-adaptive batching (CF-P1e): speculative (MTP) rounds run one lane at a time, so aggregate speed stops scaling past one lane, while ONE plain batched step serves every busy lane. auto (default) = each round picks the arm with the higher estimated aggregate tokens/s (measured per-lane speculative speed vs the measured shared-step time; speculation pays more on high-acceptance content, batching wins as lanes grow); N = share one plain step only with MORE than N busy lanes; 0 = never (always serial speculation). The lanes' MTP heads stay in sync across shared steps, so speculation resumes as load drops; a single busy lane always speculates (single-stream path unchanged). Greedy output is identical in every mode  [auto]
+    --spec-pass <TEXT>                 spec-pass mode (diagnostic)  [default]
+    --spec-pass-q <X>                  spec-pass q  [built-in]
+    --spec-pass-skew <N>               spec-pass skew  [unset]
+    --spec-probe-every <N>             Naive: plain steps before a paused request re-probes with speculative rounds  [16]
+    --spec-ratio-dhead <on|off>        real-q (ratio) draft passes on DHEAD (tunable spec.ratio_dhead override; owner default on)  [on]
+    --spec-sampler <auto|rows|batched> Naive: the verify block's sampler exchange: batched = one per phase for all rows (auto at TP > 1), rows = 8 per row  [auto]
+    --tp-dflash                        NVFP4 TP DFlash drafter one-shot generate  [off]
+
+  EXL3 ENGINE LEVERS
+    --a-ctrl <new|fixed128|old|off>    WP-A escape: lane control (fixed128 / old = the pre-WP03 control; off = gate diagnostics only: no cadence control round runs, so a request's speculative rounds depend on its own content and seeds alone and the per-request cost control never turns speculation off — not a serving posture)  [new]
+    --a-off                            WP-A escape: every WP-A lane fix off (the pre-WP03 behaviour)  [off]
+    --a-remclamp <on|off>              WP-A escape: remaining-budget clamp (off = unclamped)  [on]
+    --a-seam <new|headprime|old>       WP-A escape: prime seam (headprime / old)  [new]
+    --a-taps <lane|shared>             WP-A escape: shared = one tap buffer for every lane (the pre-WP03 clobber)  [lane]
+    --attn-flash <on|off>              EXL3 flash attention path (off = the pre-flash kernels)  [on]
+    --exl3-a1b3 <on|off>               A-once 3-bit expert entry (tunable moe.a1b3 override)  [on]
+    --exl3-chain-pair <on|off>         paired same-input chains (tunable override)  [on]
+    --exl3-conv-serial                 prefill conv serial (tunable pf.conv_par=0)  [off]
+    --exl3-dense-v3 <on|off>           WP13 dense attention v3 (tunable override)  [on]
+    --exl3-draft-attn <legacy>         draft attention: legacy = the pre-WP path  [new]
+    --exl3-draft-graph <on|off>        EXL3 draft graphs (tunable override)  [on]
+    --exl3-dump8 <on|off>              EXL3 8-bit trellis dump path at load  [on]
+    --exl3-gdn-ring <on|off>           GDN state ring (off = the pre-ring path)  [on]
+    --exl3-gdn-tc-min <N>              GDN tensor-core chunk min rows  [built-in]
+    --exl3-gdn-tc-prec <TEXT>          GDN tensor-core precision variant  [default]
+    --exl3-gu-kch <N>                  EXL3 MoE 10..16-row calls (packed verify / >8 lanes): K-chunks the gate/up A-once staging (CF-P1e 16-row class; bit-identical, keeps 2-3 CTAs per SM): 2 (default) | 4 | 0 = off (the legacy barrier body at those widths). Rows <= 9 are unaffected  [2]
+    --exl3-head-fill <on|off>          EXL3 head fill  [on]
+    --exl3-head-qsa <on|off>           EXL3 QSA on the draft head (off = dense)  [on]
+    --exl3-moe-devroute <on|off>       EXL3 device-side MoE routing  [on]
+    --exl3-moe-grouped <on|off>        prefill grouped expert launches (tunable override)  [on]
+    --exl3-moe-recon-min <N>           MoE reconstruct min rows  [0]
+    --exl3-no-graph                    EXL3: no CUDA graphs (diagnostic escape)  [off]
+    --exl3-no-ple                      EXL3: no PLE (diagnostic)  [off]
+    --exl3-pdl <on|off>                PDL per graph family (tunable override)  [off]
+    --exl3-prime-batch <on|off>        C4PRIMEA: batch the shared plain step's per-lane head-row prime writes into one xq_gather_tap_rows + ONE re-prime pass + xq_attn_kv_prefill_pairs (off = the per-lane loop)  [on]
+    --exl3-prime-batch-xcheck <on|off> C4PRIMEA: on the FIRST batched prime of a boot, bit-compare the legacy per-lane head-KV rows against the batched ones (one-time GPU identity gate on the real path)  [on]
+    --exl3-qsa-splits-dec <N>          QSA decode splits (N-class tunable override)  [32]
+    --exl3-r16 <on|off>                router fold + HC row-batched mixer at 9..16 rows (m <= 8 unaffected)  [on]
+    --exl3-recon-min <N>               dense reconstruct min rows  [17]
+    --exl3-router-fused <on|off>       fused router (tunable override)  [on]
+    --exl3-router-ks <TEXT>            router split-K list  [built-in]
+    --exl3-router-rows <on|off>        prefill router rows32 twin (tunable override)  [on]
+    --exl3-score-mr <0|off|1|on|generic>
+                                       WP04 bucket-free scorer (0 = bucketed; generic body)  [on]
+    --exl3-score-mr-ctas <N>           WP04 scorer CTAs/SM (tunable override)  [4]
+    --exl3-sel-gather <TEXT>           WP04 gather variant pin (tunable override)  [-1 (auto)]
+    --exl3-sel-vec <on|off>            legacy gather float4 twin (tunable override)  [on]
+    --exl3-topk-v2 <on|off>            WP04 top-k asc2 (tunable override)  [on]
+    --exl3-wide-mt <1|2|4|8>           wide-M trellis GEMM m-tiles per CTA (engine override; also the --bench-exl3-wide MT)  [0 (the MT rule; 4 for dense)]
+    --hc-fp16                          EXL3 hyper-connection mixers in bit-exact fp16 (int8 is the default)  [off]
+    --hc-fuse <on|off>                 EXL3 hc fuse  [on]
+    --hc-int8 <on|off>                 EXL3 int8 hc mixers (off = fp16; prefer --hc-fp16)  [on]
+    --hc-mix4 <on|off>                 shared inject reduction tree (tunable override)  [on]
+    --hc-rb <on|off>                   row-batched int8 hc mixer (tunable override)  [on]
+    --lmh-had <on|off>                 W3/LMH fused output Hadamard (tunable override)  [on]
+    --lmh-nst <4|6|8>                  W3/LMH cp.async ring depth (tunable override)  [6]
+    --lmh-off <on|off>                 W3/LMH escape (tunable override)  [off]
+    --moe-coop <on|off>                cooperative expert stream (tunable override)  [off]
+    --moe-fh <on|off>                  fused per-expert Hadamards (tunable override)  [off]
+    --moe-gu-fold <N>                  fold xq_had_suh_multi into the WP20 gate/up prologue up to width N, 0..16 (tunable moe.gu_fold override)  [6 (tuned)]
+    --moe-shovl <on|off>               shared-expert overlap on the WP20 path (tunable override)  [on]
+    --pf-gdn-scan <on|off>             chunkwise GDN prefill scan re-scheduled tc2 (tunable override)  [on]
+    --pf-hc-fuse <on|off>              prefill hc inject+norm / mix fused (tunable override)  [on]
+    --pf-moe-fold <on|off>             prefill MoE glue folded into the expert epilogues (tunable override)  [on]
+    --pf-moe-kernel <on|off>           pipelined prefill MoE expert kernel (tunable override)  [on]
+    --pf-moe-mt-pe <on|off>            WP19 per-expert MT (tunable override)  [on]
+    --pf-moe-pf2 <N>                   prefill MoE smem trellis ring mask 0..15 (tunable override)  [3]
+    --pfx1-off <TEXT>                  PFX1 escape (1|all|<parts>)  [unset]
+    --pfx1-rows8-max <N>               PFX1 rows8 max rows  [built-in]
+    --pq8-flash <0|off|1|on|causal>    PQ8 prefill flash kernel (0 = flash256, 1 = bitwise twin, causal = default)  [causal]
+    --pq8-gather <on|off>              PQ8 q8 prefill gather (tunable override)  [on]
+    --pq8-kvw <on|off>                 PQ8 row-parallel KV writer (tunable override)  [on]
+    --pq8-off <on|off>                 PQ8 escape (every PQ8 item off)  [off]
+    --psk <on|off>                     PSK opt-in (tunable override)  [off]
+    --psk-g <TEXT>                     PSK persistent split-K grid per shape  [0 (auto)]
+    --psk-off <on|off>                 PSK escape  [off]
+    --psk-pf <N>                       PSK trellis L2 prefetch distance 0..127  [1]
+    --qsa-exl3 <on|off>                EXL3 QSA (off = dense attention)  [on]
+    --qsa-key-rope <half|full>         EXL3 QSA indexer (past 2051 visible tokens): full = rope the pooled block keys over all rotary dims (the reference; NVFP4 engine's table; default, owner 2026-10-02); half = the old table that left dims rdim/2..rdim at zero (pre-v0.7.1 bytes, for A/B only). Output-changing past the dense window  [full]
+    --qsa-pool <on|off>                EXL3 QSA pooling  [on]
+    --qsa-row-regime <on|off>          EXL3 decode steps: choose dense or sparse (QSA) attention PER ROW from the row's own position (on, default). A request at or below the sparse switch (2,051 tokens of context on Flash-Next) that shares a batched decode step with a longer request keeps the dense kernels it runs alone, so its greedy text no longer depends on what else is being served; and a speculative round stops at the switch instead of straddling it (a few shorter rounds once per request). off (0) = the previous rule, one regime per step or round from its largest position: rows at or below the switch in such a step take the sparse kernels (same attention, different rounding), for A/B. Rides to the TP nodes  [on]
+    --qsa-select <on|off>              latency-lean QSA top-k select asc3 (tunable override)  [on]
+    --router-coal <on|off>             router fold with coalesced weight staging (tunable override)  [on]
+    --w4dense <on|off>                 W4/DENSE package opt-in  [off]
+    --w4dense-fix <on|off>             W4/DENSE split-K fixup (tunable override)  [on]
+    --w4dense-g <TEXT>                 W4/DENSE grid per shape  [tuned]
+    --w4dense-gsat <N>                 W4/DENSE G-picker saturation (tunable override)  [36]
+    --w4dense-multi <on|off>           W4/DENSE attention groups (tunable override)  [on]
+    --w4dense-nst <4|6|8>              W4/DENSE ring depth (tunable override)  [6]
+    --w4dense-off <on|off>             W4/DENSE escape  [off]
+    --w4dense-silu <on|off>            W4/DENSE silu-down (tunable override)  [on]
+    --w4dense-suh <on|off>             W4/DENSE fused suh (tunable override)  [on]
+    --w4hc-fuse <on|off>               W4/HC regridded mixer (tunable override)  [on]
+    --w4hc-g <N>                       W4/HC grid target (tunable override)  [96]
+    --w4hc-inj <on|off>                W4/HC deferred inject + norm (tunable override)  [on]
+    --w4hc-la <N>                      W4/HC phase-A L2 look-ahead 0..7 (tunable override)  [0]
+    --w4hc-m1 <on|off>                 W4/HC at m = 1 (tunable override)  [on]
+    --w4hc-mix <on|off>                W4/HC mix fused behind the mixer (tunable override)  [on]
+    --w4hc-off <on|off>                W4/HC escape (tunable override)  [off]
+    --w4hc-pf <0|1|2>                  W4/HC phase-B L2 prefetch mode (tunable override)  [1]
+    --w4moe                            W4/MOE package opt-in  [off]
+    --w4moe-g <N>                      W4/MOE persistent grid pin (tunable override)  [0 (auto)]
+    --w4moe-minm <N>                   W4/MOE min rows  [1]
+    --w4moe-nst <4|8>                  W4/MOE ring depth pin (tunable override)  [0 (the plan rule)]
+    --w4moe-off <TEXT>                 W4/MOE escape (1|all|gu,dn,fold)  [unset]
+    --w4moe-order <il|IL|1|0|seq>      W4/MOE item order (il = interleaved; tunable override)  [0 (seq)]
+    --w4moe-shovl <on|off>             W4/MOE shared-expert overlap (tunable override)  [off]
+    --w4qsa <on|off>                   W4/QSA union gather opt-in  [off]
+    --w4qsa-off <on|off>               W4/QSA escape  [off]
+    --w4s-off <TEXT>                   W4/SMALL escape (1|all|router,gdn,dattn,ple,draft)  [unset]
+    --wp05-off <TEXT>                  WP05 escape (parts)  [unset]
+    --wp09-argmax <on|off>             WP09 one-launch argmax (tunable override)  [on]
+    --wp09-off <on|off>                WP09 umbrella escape (tunable override)  [off]
+    --wp09-ple <on|off>                WP09 k-major PLE (tunable override)  [on]
+    --wp10-gemv <on|off>               WP10 GEMV lane remap (tunable override)  [on]
+    --wp10-off <on|off>                WP10 routing-fold escape (tunable override)  [off]
+    --wp11-cvt <on|off>                WP11 PRMT int8 convert (tunable override)  [on]
+    --wp11-off <on|off>                WP11 umbrella escape (tunable override)  [off]
+    --wp11-r1 <0|1|2>                  WP11 R1 L2 prefetch mode (tunable override)  [1]
+    --wp11-r2 <on|off>                 WP11 R2 regridded mix (tunable override)  [on]
+    --wp11-r3 <on|off>                 WP11 R3 k-major q_up (tunable override)  [on]
+    --wp11-r4 <on|off>                 WP11 R4 hn staging (tunable override)  [on]
+    --wp12-off <TEXT>                  WP12 escape (1|all|step,diet,conv,ab)  [unset]
+    --wp18-off                         WP18 escape  [off]
+    --wp18-rows <N>                    WP18 rows  [256]
+    --wp20-diet <on|off>               WP20 word diet (tunable override)  [on]
+    --wp20-epi <TEXT>                  WP20 epilogue rung (tunable override)  [unset]
+    --wp20-off <on|off>                WP20 escape (tunable override)  [off]
+    --wp21-ks-off <TEXT>               WP21: listed ks keep the 3-launch tail  [unset]
+    --wp21-off                         WP21 escape  [off]
+    --wp22r1-off                       WP22 R1 escape  [off]
+    --wp27-forks <TEXT>                WP27 capture-DAG forks (all|none|<list>; tunable override)  [all]
+    --wp27-graphs <TEXT>               WP27 graph classes (all|none|<list>; tunable override)  [all]
+    --wp27-off <on|off>                WP27 escape  [off]
+    --wp27-prio <on|off>               WP27 node priorities (tunable override)  [off]
+
+  NVFP4 / MXFP4 ENGINE LEVERS
+    --attn-p3                          NVFP4 P3 attention variant (opt-in)  [off]
+    --device-loop <on|off>             device-resident token loop (NVFP4; under TP rides TpConfig)  [off]
+    --e8-no-shard                      E8 escape: keep the shared expert replicated under TP  [off]
+    --e9-no-fold                       E9 escape: no programmatic dependent-launch overlap  [off]
+    --fa-prefill <on|off>              NVFP4 tensor-core flash-attention prefill  [on]
+    --fp8-prefill <on|off>             native e4m3 W8A8 prefill lane  [on]
+    --fuse-residual                    FFN-epilogue residual fusion (E14)  [off]
+    --gdn-chunk                        NVFP4 chunkwise GDN prefill (v1)  [off]
+    --gdn-chunk2 <on|off>              NVFP4 chunkwise GDN prefill v2  [on]
+    --gdn-oldstage                     NVFP4 GDN old staging kernel  [off]
+    --gdn-rollback-d2d                 NVFP4 GDN rollback via D2D copies (escape)  [off]
+    --gdn-split                        NVFP4 split chunked GDN prefill (diagnostic variant)  [off]
+    --moe-fold                         E12 fold the shared expert into the grouped MoE launches (opt-in)  [off]
+    --moe-grouped-min <N>              NVFP4 grouped MoE min rows  [built-in]
+    --moe-grouped-wide <on|off>        NVFP4 wide grouped MoE  [on]
+    --moe-native-pf                    NVFP4 native MoE prefill  [off]
+    --moe-no-fold                      E12 fold escape (the separate-launch shared MLP)  [off]
+    --moe-variant <plain|u4|x2|rast|lb5|lb4|pdl>
+                                       NVFP4 MoE kernel variant  [plain]
+    --mxfp4                            MXFP4-native serving mode (fp4 decode/verify GEMMs on the OMMA path)  [off]
+    --mxfp4-allow-experts              MXFP4: allow expert tensors  [off]
+    --mxfp4-economy                    MXFP4 economy (drop the bf16 copies)  [off]
+    --mxfp4-fused                      MXFP4 fused kernels  [off]
+    --mxfp4-fused-prefill <on|off>     MXFP4 fused prefill  [on]
+    --mxfp4-mtp-native                 MXFP4: native MTP head (allowlist escape)  [off]
+    --mxfp4-prefill                    MXFP4 native prefill  [off]
+    --no-attn-e                        NVFP4: no attention-E path  [off]
+    --no-fused-perhead-rope            NVFP4: unfused per-head rope (escape)  [off]
+    --no-gqpack                        NVFP4: no GQA packing (escape)  [off]
+    --no-pf-qkv-fast                   NVFP4: disable the fast prefill qkv path  [off]
+    --no-qkv-view                      NVFP4: old qkv pipeline (escape)  [off]
+    --no-verify-graph                  NVFP4: no verify graph (escape; some probes set it)  [off]
+    --pf-mixer4 <TEXT>                 NVFP4 prefill 4-bit mixer set (safe | all)  [unset]
+    --pf-rm-nocache                    NVFP4 prefill: no row-major cache  [off]
+    --prefill-bf16-binv <on|off>       NVFP4 bf16 prefill batch-invariance path  [on]
+    --prefill-scalar                   scalar prefill path  [off]
+    --q4-dense-attn                    NVFP4 q4 dense attention  [off]
+    --qsa-scalar                       NVFP4 scalar QSA  [off]
+    --qsa-sel-v1                       NVFP4 QSA select v1  [off]
+    --splitk-gemm [N]                  NVFP4 serving-GEMM split-K (bare = per-shape auto; 0 = off; N>=2 forces N, single-node only)  [off]
+    --state-tap <on|off>               NVFP4 state tap  [on]
+    --tail-fixed                       NVFP4 fixed tail  [off]
+    --w4a4-lmhead-narrow <on|off>      W4A4 narrow lm_head (on / off; unset = the pack config)  [model config]
+    --w4a4-n8 <on|off>                 W4A4 narrow 8-row MMA kernel (off = the wide 128-row kernel)  [on]
+    --w4a4-prefill <TEXT>              W4A4 prefill groups (expert,mlp,attn,gdn)  [unset]
+    --w4a4-verify <TEXT>               W4A4 verify groups (attn,mlp,gdn)  [unset]
+
+  DSV4 / DSPARK
+    --dspark-attn <TEXT>               DSpark round attention selector (diagnostic)  [default]
+    --dspark-chain-a                   DSpark legacy chain A  [off]
+    --dspark-d0-plain                  DSpark legacy plain d0  [off]
+    --dspark-fp8-logits                DSpark fp8 draft LM head (also --dspark-fp8-head on the TP head)  [off]
+    --dspark-graph                     DSpark graphed round  [off]
+    --dspark-nomscale                  DSpark: no mscale (legacy)  [off]
+    --dspark-norm-g1                   DSpark: legacy norm g1  [off]
+    --dspark-rope-il                   DSpark interleaved rope (legacy)  [off]
+    --dspark-tap-rev                   DSpark reversed tap order  [off]
+    --dspark-tap-shift <N>             DSpark tap shift  [0]
+    --exact-gemm                       select the locked bit-exact GEMM kernels (tolerance-class fast paths are the default)  [off]
+    --graph                            DSV4 decode graphs  [off]
+    --graph-upload                     DSV4 graph upload  [off]
+    --packed-cache                     DSV4 packed fp4 cache  [off]
+    --pair-seq                         DSV4 sequential pair attention  [off]
+    --verify-seq                       DSV4 sequential verify  [off]
+
+  LOADING / MEMORY
+    --dequant-at-load                  dequantize weights at load  [off]
+    --load-force <1|unsafe>            bypass the load memory guard (unsafe = also on qwen4_exp)  [off]
+    --load-pipe-cap-gb <N>             load pipeline cap (GB)  [built-in]
+    --load-sync-upload                 load: synchronous uploads  [off]
+    --load-workers <N>                 load worker threads  [8]
+    --mem-watchdog-gb <X>              host-memory watchdog floor in GB (0 = off)  [5] (per box)
+    --ple-headroom-per-lane-gb <X>     Opt-in: extra --ple-ram auto headroom, this many GiB per ADDITIONAL decode lane on top of the 16 GiB base (e.g. 2 with --max-batch 10 -> 16 + 2*9 = 34 GiB). Default 0 = the pre-port fixed 16 GiB decision, bit-identical  [0]
+    --ple-offload <ssd|none|off|gpu>   qwen4_exp: keep the ~31 GB PLE n-gram table on SSD (ssd) or device-resident (none)  [none]
+    --ple-ram <auto|ram|ssd|on|off>    EXL3 n-gram (PLE) table location: ram = load it into memory (~31 GB on Qwen3.8-Flash-Next 3.05); ssd = read rows from disk through the page cache (frees that memory for lanes / context; identical output, ~1-2% slower decode); auto = decide after the boot has allocated everything else: RAM iff the table + 16 GiB stay free. on/off = old spellings of ram/ssd  [auto]
+    --ple-ssd-cache-rows <N>           PLE SSD row cache capacity  [262144]
+    --ple-ssd-threads <N>              PLE SSD reader threads  [32]
+
+  PERPLEXITY TOOL (--perplexity)
+    --max-windows <N>                  --perplexity: stop after this many windows (a trailing partial window of >= 2 tokens counts as one)  [8] (per box)
+    --perplexity                       MODE: perplexity of held-out text, a measuring tool (it serves nothing). Needs --model-dir and --text <file> (or --ppl-ids <file>). An EXL3 pack is scored on the SERVED chunked prefill (--prefill-chunk, --kv-cache f32|f16|fp8|q8 as served) with every row of every window passed through the lm_head; any other model runs the legacy window scorer (raw text, no BOS, windows independent). Prints one line per window and a final RESULT line; exits 1 and prints no RESULT line when a check fails: an lm_head that wrote nothing, or a top-1 accuracy or perplexity outside --ppl-min-top1 / --ppl-min-ppl / --ppl-max-ppl (a broken run is a FAILED run, never a number). In the tool, an option repeated with DIFFERENT values is refused (the registry options are last-wins and --model-dir / --kv-cache / --prefill-chunk / --max-seq-len are first-wins elsewhere, so which one would be measured is ambiguous), and a value-less --text / --ppl-ids / --ppl-csv / --ppl-dump-ids / --ppl-label / --model-dir whose next argument is another flag is refused (a value-less path or text option takes the next argument as its value, so it would swallow that flag). --perplexity and --perplexity=on run the mode, --perplexity off does not  [off] (per box)
+    --ppl-csv <PATH>                   --perplexity, EXL3 packs: write the per-token NLL here (CSV: label,window,pos,target,nll,nll_decode; nll_decode is filled for the windows --ppl-ref-windows re-ran)  [unset] (per box)
+    --ppl-dump-ids <PATH>              --perplexity, EXL3 packs: write the token ids of the scored windows (JSON) for an external runtime to score the same tokens  [unset] (per box)
+    --ppl-ids <PATH>                   --perplexity, EXL3 packs: score these token ids (a JSON array, or whitespace-separated numbers) instead of tokenizing --text; this is how an external runtime is fed the exact windows. Not together with --text  [unset] (per box)
+    --ppl-label <TEXT>                 --perplexity, EXL3 packs: a name written into the identity line and the first CSV column  [ppl] (per box)
+    --ppl-max-ppl <X>                  --perplexity, EXL3 packs: FAIL the run when the final perplexity is above this. The first version of this tool reported 724390.96 for the 4.05 pack when its lm_head kernel wrote nothing. Raise it only for text a model really cannot predict, or for very short windows (a 2-token window scores one position with no context)  [1000] (per box)
+    --ppl-min-ppl <X>                  --perplexity, EXL3 packs: FAIL the run when the final perplexity is below this (>= 1). A perplexity near 1 means the model was told its own answers (a causal-mask or window-offset defect), not that it is good  [1.05] (per box)
+    --ppl-min-top1 <X>                 --perplexity, EXL3 packs: FAIL the run (exit 1, no RESULT line) when the top-1 accuracy over the scored tokens is below this fraction, checked after every window so a broken lm_head stops after its first window. Chance for this vocabulary is about 4e-6; a head that wrote nothing scores about 0.0003, a healthy model on natural text 0.5 to 0.8. Lower it (0 = off) only for text a model really cannot predict, such as random bytes  [0.02] (per box)
+    --ppl-ref-windows <N>              --perplexity, EXL3 packs: also run the first N windows token by token through the single-token decode path (different kernels from the chunked prefill) and report the per-token difference; 0 = off. The decode path runs at m = 1 and costs about one decode step per token  [0] (per box)
+    --text <PATH>                      --perplexity (and --dump-argmax): the raw text file to score, tokenized without a chat template and without BOS. Not together with --ppl-ids  [unset] (per box)
+    --window <N>                       --perplexity: tokens per scored window (default 1024; >= 2, since a scored position needs two tokens, and not above --max-seq-len). A window of n tokens scores n-1 positions; windows are consecutive, non-overlapping and independent. Also read by --dump-argmax (default 512) and --tp-barrier-bench (barriers in flight, default 1024)  [1024] (per box)
+
+  DIAGNOSTICS / TEST DRILLS
+    --a-xcheck                         WP03 cross-lane tap bit-compare every round (syncs)  [off]
+    --accept-debug                     NVFP4 MTP: print per-step acceptance / draft details  [off]
+    --attn-e-debug                     NVFP4 attention-E path debug prints  [off]
+    --bench-logits-hash                bench: print a logits hash per step  [off]
+    --binv-section <wp18|moe_pf|pf_hc|gdn_tc>
+                                       EXL3 --probe-binv: run only this section  [all]
+    --bisect-len <N>                   DSV4 TP bench: pad/truncate the prompt to exactly N tokens  [unset]
+    --bmtp-diag <plain|noprime>        EXL3 bench-mtp diagnostic mode  [unset]
+    --cap-debug                        graph-capture debug prints  [off]
+    --dbg-mtp-only <TEXT>              NVFP4 MTP debug: restrict the debug dump to this sub-stage  [unset]
+    --debug-hash                       NVFP4 per-step debug hashes  [off]
+    --df2-carry-len-only               DF2 carry diagnostic: carry the ring length only  [off]
+    --df2-det-dual                     DF2 determinism probe: dual run  [off]
+    --df2-det-only                     DF2 determinism probe: determinism check only  [off]
+    --df2-det-post                     DF2 determinism probe: post-round check  [off]
+    --df2-gate-dump                    DF2 gate dump  [off]
+    --df2-step-log                     DFlash2 per-step log  [off]
+    --dflash-attn-eager                DFlash v1: eager (untiled) drafter attention  [off]
+    --dflash-debug                     DFlash v1 debug prints  [off]
+    --dflash-step-log                  DFlash v1 per-step log  [off]
+    --dflash-tapdump <PATH>            DFlash v1: dump the trunk taps to this path  [unset]
+    --dflash2-synth-dir <PATH>         DFlash2 synthetic-table dir (offline tools)  [built-in]
+    --dhead-xcheck                     DHEAD eager cross-check vs the full head  [off]
+    --dispatch-log <1|count|assert>    dispatch assertion posture (count / assert)  [off]
+    --dspark-bisect                    DSpark bisect mode  [off]
+    --dspark-block-pos <N>             DSpark block position override  [0]
+    --dspark-debug                     DSpark debug prints  [off]
+    --dspark-debug-ring                DSpark ring debug prints  [off]
+    --dspark-dump-step0 <PATH>         DSpark: dump step 0 to this dir  [unset]
+    --dspark-dump-steps <N>            DSpark: number of steps to dump  [unset]
+    --dspark-phase-ms                  DSpark per-phase ms timing (syncs)  [off]
+    --dspark-ring-blind                DSpark ring-blind diagnostic  [off]
+    --dspark-round-bisect <N>          DSpark round layer bisect  [unset]
+    --dspark-round-trace               DSpark round trace  [off]
+    --dspark-step-log                  DSpark per-step log  [off]
+    --dspark-synth-dir <PATH>          DSpark synthetic-table dir (offline tools)  [built-in]
+    --dump-pfhash                      NVFP4 prefill hash dumps  [off]
+    --dump-prompt                      server: dump rendered prompts  [off]
+    --dump-tokens                      server: dump tokens  [off]
+    --dump-tools                       server: for every request that offers tools, log the text the tool-call parser was given: the line '[req] raw model output' (its first 1200 characters; without this flag it is logged only when nothing parsed) and a line '[dump-tools] {"raw": ...}' with the WHOLE text as one JSON object, which examples/toolparse_replay.rs replays through the parser offline. These lines are model output: treat the log as user data  [off]
+    --exl3-chain-pair-check            EXL3 chain-pair eager cross-check (graphs off)  [off]
+    --exl3-dense-xcheck                WP13 dense attention eager cross-check  [off]
+    --exl3-esel-hist                   EXL3 expert-selection histogram (printed cumulatively at every request finish and at exit)  [off]
+    --exl3-gather-xcheck               WP14 QSA gather eager cross-check  [off]
+    --exl3-gdn-ring-check              GDN ring eager check  [off]
+    --exl3-gdn-xcheck                  GDN tensor-core eager cross-check  [off]
+    --exl3-moe-epi-check               EXL3 MoE epilogue check  [off]
+    --exl3-ple-dump <PATH>             EXL3 diagnostic (CF-P1g oracle): after the n-gram table is built, write the production-path embeddings of 1,536 deterministic token positions (tokens, row ids, 2,560 fp16 values each) to FILE and exit; scripts/ple_oracle.py compares them with exllamav3's own hashing + codec  [unset]
+    --exl3-poison                      EXL3 scratch poisoning  [off]
+    --exl3-round-prof                  per-round phase profiler  [off]
+    --exl3-route-check                 EXL3 routing check (graphs off)  [off]
+    --exl3-route-log <PATH>            EXL3 diagnostic: write every decode/verify MoE call's expert ids (layer, rows, ids) to DIR/route_NNNN.bin at each request finish (cross-lane expert-overlap study)  [unset]
+    --exl3-router-xcheck               fused router eager cross-check  [off]
+    --exl3-score-xcheck                WP04 scorer eager cross-check  [off]
+    --exl3-sel-xcheck                  WP04 gather eager cross-check  [off]
+    --exl3-topk-xcheck                 WP04 top-k eager cross-check  [off]
+    --exl3-tp-ident                    EXL3 TP served ident digests across ranks every lockstep point  [off]
+    --f9-xhash [N]                     NVFP4 F9 cross-hash dumps (1|2|3)  [off]
+    --fake-quant <TEXT>                fake-quant spec (layer:format,...)  [unset]
+    --fold-xchain-dump <PATH>          NVFP4 fold cross-chain dump path  [unset]
+    --gdn-time                         NVFP4 GDN per-layer timing (syncs)  [off]
+    --gdn-xcheck                       NVFP4 GDN eager cross-check  [off]
+    --graph-debug                      DSV4 graph debug prints  [off]
+    --graph-noupdates                  DSV4 graph: skip node updates  [off]
+    --hc-int8-check                    EXL3 hc int8 check (graphs off)  [off]
+    --hc-step-check                    EXL3 hc step eager check  [off]
+    --inject-panic-steps <N>           test drill: inject a scheduler panic at decode step N  [unset]
+    --inject-stall <TEXT>              drill for the SSE keep-alive bound (one box, never on a server that serves users): ROUND:SECONDS makes the scheduler thread sleep SECONDS (1 to 600) once, at decode round ROUND counted from boot (velogb10_scheduler_steps_total + 1 is the next round). No decode round and no prefill chunk completes meanwhile, as with a hung scheduler; the HTTP layer keeps running. Expected: on a silent stream the keep-alive frames stop once the last completed work is 60 s old, and the stream continues when the sleep ends. REFUSED at startup together with --tp, --head or --node (the sleeping rank would stall the others, whose watchdogs would declare it dead). Read by the EXL3 and NVFP4 schedulers only: it does nothing on the DSV4 server, which has no scheduler round, and nothing before the first decode round (a prefill alone never reaches ROUND)  [unset] (per box)
+    --lane-pack-drill-skip-sparse <on|off>
+                                       test drill, one-sided (per box: it acts on the box whose command line carries it): under --lane-pack on this rank captures NO sparse-regime packed verify graphs, so its packed graph set differs from its peer's (a rank-local graph presence, the receipt of the CF-P1e TP=2 --max-batch 16 death). The TP boot agree (the packed graph set's count and digest are part of its hash) must REFUSE the boot with both hashes named; without it the first sparse pack would have one rank replaying a graph its peer does not hold. Diagnostics only  [off] (per box)
+    --layer-csum                       NVFP4 per-layer checksums  [off]
+    --layer-fullhash                   NVFP4 per-layer full hashes  [off]
+    --lmh-xcheck                       W3/LMH eager cross-check  [off]
+    --load-shard-trace                 load: shard trace  [off]
+    --loop-trace                       scheduler loop trace  [off]
+    --mem-trace                        1 Hz unified-memory timeline  [off] (per box)
+    --moe-fold-debug                   E12 fold debug prints  [off]
+    --mtp-cover <N>                    EXL3 MTP coverage probe layer count  [0]
+    --mtp-cover-out <PATH>             EXL3 MTP coverage probe CSV path  [/tmp/mtp_cover.csv]
+    --mtp-curve-file <PATH>            NVFP4 scheduler: MTP acceptance curve file  [unset]
+    --mtp-dispatch-trace               MTP dispatch trace  [off]
+    --mtp-draft-log <PATH>             NVFP4 scheduler: per-step MTP draft log file  [unset]
+    --mtp-dump <PATH>                  EXL3 MTP dump dir (graphs off)  [unset]
+    --mtp-garbage-draft                test drill: garbage drafts (losslessness negative control)  [off]
+    --mtp-lossless-audit               MTP losslessness audit  [off]
+    --mtp-reprobe-drill                TEST DRILL (identity and stress runs only; never for serving): shrink the auto-off round gates and the re-probe backoff to a few steps so a short run crosses many off/re-arm transitions; affects draft scheduling only — greedy output is byte-identical  [off]
+    --mxfp4-prefill-check              MXFP4 prefill A/B check  [off]
+    --mxfp4-xchain-capture             MXFP4 cross-chain capture hooks (the probes arm it)  [off]
+    --p1-time-all                      EXL3 bench: time every chunk size  [off]
+    --pack3-family                     PACK3: --probe-exl3-pack3 also captures + gates the R_pad {2..16} packed graph family with 1-GB-cap accounting  [off]
+    --pack3-graphs                     PACK3: --probe-exl3-packstate replays the packed verify through the R_pad CUDA-graph family (probe-only; default boot unchanged)  [off]
+    --parity                           bench protocol (--bench-mtp family): the credited SGLang parity recipe (chat template + thinking xhigh, temperature 1.0 / top-p 0.95 / top-k 20, long generations, the math domain only). Without it the bench runs its default recipe  [off] (per box)
+    --pf-dump                          NVFP4 prefill dump  [off]
+    --pf4-trace                        MXFP4 prefill trace  [off]
+    --pf8-check                        fp8 prefill check  [off]
+    --pf8-dump                         fp8 prefill dump  [off]
+    --pf8-trace                        fp8 prefill trace  [off]
+    --pfx1-headkv-poison               PFX1 head-KV poison drill  [off]
+    --ple-trace <TEXT>                 PLE trace  [unset]
+    --ple-xcheck                       PLE eager cross-check  [off]
+    --pq8-xcheck                       PQ8 eager cross-check  [off]
+    --prefill-reps <N>                 EXL3 prefill bench reps  [1]
+    --prefill-trace                    prefill trace (every family)  [off]
+    --prefill-warmup                   EXL3 prefill bench warmup  [off]
+    --prefillx-expect-sig <TEXT>       prefillx probe: expected signature  [unset]
+    --prefillx-qsa-keys                prefillx probe: dump QSA keys  [off]
+    --prefillx-rel [N]                 prefillx probe: rel-L2 report (2 = verbose)  [off]
+    --prefillx-tier                    prefillx probe: tier report  [off]
+    --prefillx-ulp <TEXT>              prefillx probe: ULP list  [unset]
+    --prefillx-widths <TEXT>           prefillx probe: widths list  [unset]
+    --psk-xcheck                       PSK eager cross-check  [off]
+    --qsa-dump                         NVFP4 QSA dumps  [off]
+    --qsa-dump-layer <N>               EXL3 QSA dump layer  [unset]
+    --qsa-rowdump-layer <N>            EXL3 QSA row dump layer  [unset]
+    --qsa-time                         QSA timing (syncs)  [off]
+    --regime-csv <PATH>                --probe-exl3-regime: per-step CSV (bit differences, max |dlogit|, rel-L2, KL, top-1 agreement, margin)  [unset] (per box)
+    --regime-joiner <PATH>             --probe-exl3-regime: the long (joiner) prompt, past the sparse-attention switch (2,051 tokens on Flash-Next)  [unset] (per box)
+    --regime-order <short-first|long-first>
+                                       --probe-exl3-regime: row order inside the mixed step (runner row first, or the joiner row first)  [short-first] (per box)
+    --regime-runner <PATH>             --probe-exl3-regime: the short (runner) prompt, raw text or a JSON token-id array  [unset] (per box)
+    --regime-steps <N>                 --probe-exl3-regime: teacher-forced decode steps  [1600] (per box)
+    --regime-time <N>                  --probe-exl3-regime: after the comparison loop, time N served 4-row mixed decode steps (three rows at/below the sparse switch + the joiner); with --regime-steps 0 this is all the probe does  [0] (per box)
+    --reprime-xcheck                   re-prime eager cross-check  [off]
+    --round-trace                      DFlash2 round trace; EXL3 server: each request's [mtp-stats] line also carries seed= and arms= (one entry per round: P = packed verify, S = lone speculative verify, c = control round, p = plain step, each followed by the tokens it produced; the first 48 rounds) and toks= (the ids of its first 8 generated tokens)  [off]
+    --spec-mode <drafter|oracle|miss|adapt|mixed|sampled|chi>
+                                       Naive --probe-naive-spec mode: drafter | oracle | miss | adapt | mixed | sampled | chi  [drafter] (per box)
+    --spec-pass-xcheck                 spec-pass eager cross-check  [off]
+    --step-topk-dir <PATH>             EXL3 step top-k dump dir  [unset]
+    --tool-trace <PATH>                server (TOOLEVAL): append one JSON line per tool-involved chat turn (the request offers tools, or its history carries a tool result) to this file: the tail of the rendered prompt, the model's raw output (thinking included), the text the tool parser was given, and the parsed verdict (content, tool_calls, finish) with the request class (stream, seed, sampling, thinking, tool count). Off by default; zero cost when off. The lines are prompt and model output: treat the file as user data  [off]
+    --tp-accept <N>                    TP bench_accept depth (set = run the accept branch)  [unset]
+    --tp-agree-drill <N>               test drill, NVFP4 packs, one-sided (per box: it acts on the box whose command line carries it): corrupt THIS rank's agree hash at scheduler step N, once per head session (a resident node supervisor started with this flag re-arms it for every head that connects; the corruption depends on the rank, so a drill armed on two ranks cannot cancel). Inert, with a boot line saying so, on EXL3 packs (use --tp-width-drill) and at TP=1  [unset] (per box)
+    --tp-batch-probe <N>               TP batch probe width  [unset]
+    --tp-binv-tp                       TP batch-invariance probe (also --probe-binv-tp)  [off]
+    --tp-boot-delay <TEXT>             test drill: <rank>:<seconds> sleep before the boot rendezvous  [unset]
+    --tp-capture <PATH>                TP debug capture path  [unset]
+    --tp-decode-ctx <N>                TP DecodeCtx probe context  [unset]
+    --tp-diag                          TP transport diagnostics  [off]
+    --tp-ep-deal-file <PATH>           --ep-deal freq: an alternative deal table  [committed table]
+    --tp-ep-hist <PATH>                EXL3 TP expert histogram dump  [unset]
+    --tp-head-proof                    NVFP4 TP head proof  [off]
+    --tp-head-proof-fault              test drill: NVFP4 TP head-proof fault on THIS rank (per box)  [off] (per box)
+    --tp-race-probe <N>                test drill (issue #10): world-2 race probe — rank 1 holds every epoch release by <ms> and watches the withheld slot; the head aligns its pre-verify exchange onto that slot (must CLOBBER-detect on the old hot-ring exchange transport, stay clean on the dedicated ctrl slots)  [off]
+    --tp-state-tp                      TP GDN state probe  [off]
+    --tp-step-probe <N>                TP step probe  [unset]
+    --tp-tail-drill                    test drill: TP transport tail drill  [off]
+    --tp-trace                         TP trace  [off]
+    --tp-width-drill <N>               test drill, EXL3 packs, one-sided (per box) and ONE-SHOT per head session (a resident node supervisor started with this flag re-arms it for every head that connects): THIS rank reports verify width N-1-rank (N-1 on the head) in the post-round lockstep word of the FIRST N-row round, then tells the truth; the forward is untouched. The lie depends on the rank, so a drill armed on two ranks is still caught. A boot line says the drill is armed, or why it is inert (NVFP4 pack, TP=1, N <= rank)  [unset] (per box)
+    --tpc-debug                        TP config debug print  [off]
+    --trace-dequant                    NVFP4 dequant trace  [off]
+    --trace-prefill                    NVFP4 prefill trace  [off]
+    --trace-wide                       NVFP4 wide trace  [off]
+    --v2-det                           NVFP4 v2 determinism check  [off]
+    --vision-fail-gemm                 Vision drill: fail the FIRST GPU-tower GEMM once (drives the CPU-tower fallback; the next request uses the GPU again)  [off] (per box)
+    --w4a4-check                       W4A4 check  [off]
+    --w4a4-trace                       W4A4 trace  [off]
+    --w4dense-xcheck                   W4/DENSE eager cross-check  [off]
+    --w4hc-xcheck                      W4/HC eager cross-check  [off]
+    --w4qsa-xcheck                     W4/QSA eager cross-check  [off]
+    --w4s-xcheck <TEXT>                W4/SMALL eager cross-check (1|all|<parts>)  [unset]
+    --wp01-xcheck                      WP01 tokenizer cache shadow check  [off]
+    --wp05-xcheck                      WP05 eager cross-check  [off]
+    --wp09-xcheck                      WP09 eager cross-check  [off]
+    --wp10-xcheck                      WP10 eager cross-check  [off]
+    --wp12-xcheck                      WP12 eager cross-check  [off]
+    --wp16-probe-tail <N>              WP16 probe tail  [unset]
+    --wp16-xcheck                      WP16 eager cross-check  [off]
+    --wp18-xcheck                      WP18 eager cross-check  [off]
+    --wp21-xcheck                      WP21 eager cross-check  [off]
+    --wp24-dump <PATH>                 WP24 sampler dump path  [unset]
+    --wp24-xcheck                      WP24 sampler cross-check  [off]
+    --xchain-ctx-dump <PATH>           NVFP4 cross-chain context dump path  [unset]
+    --xchain-ctx-layers <TEXT>         NVFP4 cross-chain context layers  [unset]
+    --xtp-floor-seeds <N>              xtp floor probe seeds  [6]
+    --zero-kv                          zero the KV cache at alloc  [off]
+
+  Set internally (not command-line options; shown by --print-config):
+
+  MODE / BENCH / PROBE FLAGS (hand-read by the mode dispatch; [day-to-day] ones are the launch set in --help)
+    --after
+    --arm <value>
+    --auto-disable-thinking-with-tools
+    --autotune
+    --autotune-report
+    --barriers
+    --batch <value>
+    --bench-accept
+    --bench-batch
+    --bench-decode-ctx
+    --bench-df2-matrix
+    --bench-df2-sample
+    --bench-df2-sample-realq
+    --bench-dspark
+    --bench-exl3-forward
+    --bench-exl3-gemm
+    --bench-exl3-ladder
+    --bench-exl3-mtp
+    --bench-exl3-wide
+    --bench-file <value>
+    --bench-lanes
+    --bench-mtp
+    --bench-mtp-sample
+    --bench-only
+    --bench-prefill
+    --bench-tau
+    --bench-tree
+    --bench-verify
+    --binv
+    --binv-trace
+    --blocks
+    --bundle <value>
+    --cached-models-list
+    --cached-models-remove
+    --cached-models-remove-all
+    --capture-layers
+    --chat
+    --check
+    --chunk-sizes <value>
+    --chunked
+    --classes <value>
+    --clear-model-blobs
+    --converted-load <value>
+    --cpu-affinity
+    --cq-hold
+    --cq-hold-us
+    --ctx <value>
+    --ctxs <value>
+    --default-frequency-penalty <value>
+    --default-presence-penalty <value>   [day-to-day]
+    --default-repetition-penalty <value>
+    --depth <value>
+    --dev <value>
+    --dev2 <value>
+    --df2-bake-fp8
+    --df2-bake-nvfp4
+    --df2-block <value>
+    --df2-carry <value>
+    --df2-k <value>
+    --df2-mask-override <value>
+    --df2-prose-lane <value>
+    --df2-quant-fidelity
+    --df2-round-shard <value>
+    --df2-step-dump <value>
+    --df2-trace
+    --dflash-dir <value>
+    --discover-wait <value>
+    --discovery-port <value>
+    --domains <value>
+    --draft-confidence
+    --draft-temperature
+    --draws <value>
+    --dry-run
+    --dspark
+    --dspark-depth <value>
+    --dspark-fp8-head <value>
+    --dsv4-bench-decode
+    --dsv4-bench-prefill
+    --dump-argmax
+    --dump-logits <value>
+    --dump-rank-weights
+    --dump-states
+    --dump-weights <value>
+    --embed <value>
+    --embed-from <value>
+    --exl3-bench-steps <value>
+    --exl3-grouped-e <value>
+    --exl3-iters <value>
+    --exl3-ks <value>
+    --exl3-l2-alias <value>
+    --exl3-ladder-out <value>
+    --exl3-ladder-skip-n <value>
+    --exl3-ladder-window <value>
+    --exl3-pack-manifest
+    --exl3-prime-batch <value>
+    --exl3-prime-batch-xcheck <value>
+    --exl3-slab-cols <value>
+    --exl3-wide-ms <value>
+    --exl3-wide-mts <value>
+    --exl3-widths <value>
+    --extract-dspark
+    --floats
+    --from <value>
+    --gemm-m <value>
+    --gen <value>
+    --gen-dflash2-synth <value>
+    --gen-dspark-synth <value>
+    --gid <value>
+    --golden <value>
+    --gpu
+    --gpu-only
+    --graph-precapture
+    --grid <value>
+    --gt-reprime
+    --head <value>
+    --help
+    --help-advanced
+    --help-diag
+    --ids <value>
+    --imatrix <value>
+    --in-x <value>
+    --inject-delay-us-max
+    --io <value>
+    --iters <value>
+    --job <value>
+    --jsonl <value>
+    --kvnll-accept
+    --kvnll-accept-ctx
+    --kvnll-csv <value>
+    --kvnll-dump-ref <value>
+    --kvnll-ids <value>
+    --kvnll-label <value>
+    --kvnll-needles <value>
+    --kvnll-ref <value>
+    --kvnll-text <value>
+    --kvnll-tf
+    --kvnll-windows <value>
+    --label <value>
+    --ladder-dir <value>
+    --ladder-layers <value>
+    --ladder-step <value>
+    --layer <value>
+    --layers <value>
+    --legacy-oracle
+    --limit <value>
+    --list-model-blobs
+    --lookahead
+    --loop-detect
+    --loop-min-reps
+    --loop-window
+    --ltrows-c <value>
+    --ltrows-shapes <value>
+    --main-core
+    --max-batch <value>   [day-to-day]
+    --max-n <value>
+    --max-new-tokens <value>
+    --max-tokens <value>   [day-to-day]
+    --mix
+    --mode <value>
+    --model <value>
+    --model-dir <value>   [day-to-day]
+    --model-dir-b <value>
+    --model-name <value>
+    --module <value>
+    --mtp-depth <value>
+    --net-test
+    --ngram <value>
+    --ngram-draft <value>
+    --nll
+    --nll-file <value>
+    --nll-out <value>
+    --nll-rows <value>
+    --nll-tokens <value>
+    --no-chat
+    --no-shard-mixers
+    --node   [day-to-day]
+    --nodes <value>
+    --offset <value>
+    --once
+    --oracle <value>
+    --oracle-dir <value>
+    --otel-endpoint
+    --otel-model-id
+    --otel-topology
+    --other
+    --out <value>
+    --out-dir <value>
+    --out-x <value>
+    --output-prompts
+    --payload-bytes
+    --peer <value>
+    --peer-ips <value>
+    --penalty-range
+    --pixels <value>
+    --plan-deals <value>
+    --plan-worlds <value>
+    --poison
+    --pool-census
+    --por
+    --port <value>   [day-to-day]
+    --positions
+    --pp-bench-prefill
+    --pp-chunk-list <value>
+    --pp-node
+    --ppl
+    --ppl-ref-windowz
+    --ppl-zzzz-qqqq
+    --prefill-chunk <value>
+    --prefix
+    --prefix-cache <value>   [day-to-day]
+    --prefix-ckpt-mem-gb
+    --print-config
+    --probe-bandwidth
+    --probe-bandwidth-sustained
+    --probe-binv
+    --probe-df2-draft
+    --probe-df2-graph
+    --probe-df2-lossless
+    --probe-df2-prime
+    --probe-df2-round <value>
+    --probe-df2-tapcap
+    --probe-dflash <value>
+    --probe-dflash-local
+    --probe-dflash2
+    --probe-dispatch
+    --probe-dspark
+    --probe-dspark-bind <value>
+    --probe-dspark-rollback
+    --probe-dspark-round <value>
+    --probe-dspark-synth <value>
+    --probe-dsv4
+    --probe-exl3
+    --probe-exl3-binv
+    --probe-exl3-flashpf
+    --probe-exl3-hcw4
+    --probe-exl3-kernel
+    --probe-exl3-kvnll
+    --probe-exl3-kvq
+    --probe-exl3-ltrows
+    --probe-exl3-moeglue
+    --probe-exl3-oracle
+    --probe-exl3-pack2
+    --probe-exl3-pack3
+    --probe-exl3-packstate
+    --probe-exl3-pfxtrace
+    --probe-exl3-prefillx
+    --probe-exl3-regime
+    --probe-exl3-routergemm
+    --probe-exl3-slice
+    --probe-exl3-sppin
+    --probe-exl3-tailgemm
+    --probe-exl3-tpspec
+    --probe-exl3-wide
+    --probe-exl3-wp16
+    --probe-exl3-xchain
+    --probe-exl3-xtp
+    --probe-fold-xchain-compare <value>
+    --probe-gemm
+    --probe-moe
+    --probe-moe-gemm
+    --probe-mxfp4
+    --probe-mxfp4-fused
+    --probe-mxfp4-xchain
+    --probe-mxfp4-xchain2 <value>
+    --probe-mxfp4-xchain2-compare <value>
+    --probe-naive-a1-ab
+    --probe-naive-attn-prefill
+    --probe-naive-chunkxcpu
+    --probe-naive-cpu
+    --probe-naive-dequant
+    --probe-naive-drafter
+    --probe-naive-full
+    --probe-naive-fuse
+    --probe-naive-gemm
+    --probe-naive-gemm-bench
+    --probe-naive-graph
+    --probe-naive-idx-prefill
+    --probe-naive-lanes
+    --probe-naive-loop
+    --probe-naive-oracle
+    --probe-naive-pack
+    --probe-naive-prefill
+    --probe-naive-sampler
+    --probe-naive-shard
+    --probe-naive-shard-dir
+    --probe-naive-slice
+    --probe-naive-slots
+    --probe-naive-spec
+    --probe-naive-topk
+    --probe-naive-tp
+    --probe-naive-tp-engine
+    --probe-penalties
+    --probe-ppsplit
+    --probe-q4
+    --probe-reject
+    --probe-sampler
+    --probe-serve-pinned
+    --probe-shard-plan
+    --probe-spec-sampling
+    --probe-splitk
+    --probe-state
+    --probe-tp-gemv
+    --probe-tq <value>
+    --probe-verify-m8
+    --probe-vision-tower
+    --profile-mtp
+    --prompt <value>
+    --prompt-file <value>
+    --prompt-ids <value>
+    --prompt-len <value>
+    --proxy-core
+    --proxy-core2
+    --quantize
+    --quick
+    --rank <value>
+    --real-taps <value>
+    --reasoning-effort <value>
+    --recipe <value>
+    --reduces
+    --remove-model-blob
+    --replay-df2-bisect
+    --replay-df2-round
+    --reps <value>
+    --requant-gdn
+    --requant-q2fake
+    --requant-sim
+    --rounds <value>
+    --rows-chunk <value>
+    --runs <value>
+    --scope <value>
+    --seconds <value>
+    --seed <value>
+    --seeds <value>
+    --seq-len <value>
+    --served-model-name <value>
+    --server   [day-to-day]
+    --server-dspark <value>
+    --server-port <value>
+    --sha256 <value>
+    --shapes <value>
+    --shard <value>
+    --shard-dir <value>
+    --shard-end <value>
+    --shard-rank <value>
+    --shard-start <value>
+    --shard-world <value>
+    --sizes-mb <value>
+    --slice-experts <value>
+    --spacing-us
+    --spec-block <value>
+    --spec-dds <value>
+    --spec-depths <value>
+    --spec-gen
+    --spec-ident <value>
+    --spec-mode <value>
+    --spec-prefix <value>
+    --spec-prompts <value>
+    --spec-reps
+    --spec-samp <value>
+    --spec-sampling
+    --spec-source <value>
+    --spec-trials
+    --split <value>
+    --sppin-c <value>
+    --sppin-world <value>
+    --stall-consumer-every
+    --stall-us
+    --step <value>
+    --steps <value>
+    --stq-bake
+    --streaming
+    --sweep-gemm
+    --taps <value>
+    --temp <value>
+    --temperature <value>
+    --thinking <value>   [day-to-day]
+    --thinking-on
+    --time-widths <value>
+    --tmp <value>
+    --tokenizer <value>
+    --tokens <value>
+    --tool-call-format <value>
+    --top-k <value>
+    --top-p <value>
+    --tp   [day-to-day]
+    --tp-barrier-bench
+    --tp-reduce-bench
+    --tp-sim
+    --tp-sim-full
+    --tp-sim-layer <value>
+    --tree-draft <value>
+    --trials <value>
+    --tripwire <value>
+    --tripwire-selftest
+    --tune-draft
+    --tune-profile
+    --tune-table
+    --verify
+    --vision-fail-gemm-x
+    --warmup
+    --with-trunk
+    --world <value>
+    --wp16-b-ids <value>
+    --wp16-split <value>
+    --x-in <value>
+    --xport
+    --xtp-gates <value>
+    --xtp-gen <value>
+    --xtp-ident-only
+    --xtp-out <value>
+    --xtp-pf-chunk <value>
+    --xtp-ref <value>
+    --xtp-sp-fault <value>
+    --xtp-time <value>
+    --y-out <value>
+
+  A value that really starts with "--" must be written --option=value; a value-taking option is never taken from the next --flag - no value-taking option, registry or hand-read, ever eats one (F7/F9).

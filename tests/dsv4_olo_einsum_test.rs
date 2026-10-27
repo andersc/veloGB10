@@ -223,7 +223,7 @@ fn comp_fast_pair_bitwise_vs_tc_pair() {
         return;
     }
     let dev = Arc::new(CudaDevice::new(0).unwrap());
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_comp.ptx", &[
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_COMP, "gpu_dsv4_comp", &[
         "dsv4_comp_gemm_tc_pair_b",
         "dsv4_comp_gemm_fast_pair_b",
         "dsv4_comp_pad16_b",
@@ -307,7 +307,7 @@ fn comp_fast_pair_bitwise_vs_tc_pair() {
 fn comp_fast_pair_bench() {
     let _g = gate();
     let dev = Arc::new(CudaDevice::new(0).unwrap());
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_comp.ptx", &[
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_COMP, "gpu_dsv4_comp", &[
         "dsv4_comp_gemm_tc_pair_b",
         "dsv4_comp_gemm_fast_pair_b",
     ]).expect("load comp kernels");

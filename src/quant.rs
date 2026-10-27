@@ -1370,6 +1370,81 @@ pub fn subset_rows_fp8(qw: &[u8], rs: &[f32], k: usize, rows: &[u32]) -> (Vec<u8
     (oq, os)
 }
 
+/// `--draft-vocab` (FR-Spec): how much of the vocabulary the MTP drafter may PROPOSE from. ON by
+/// default for the Qwen3.5/3.6/3.8 family (`default_for`). The verify always scores the full
+/// vocabulary, so the subset only trades acceptance (a token outside it is never drafted) against the
+/// draft chain's LM-head bytes; greedy output is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DraftVocab {
+    /// the full vocabulary: no reduced draft head is built (`--draft-vocab off`; the default outside
+    /// the Qwen3.5/3.6/3.8 family)
+    Off,
+    /// the `n` most frequent token ids (BPE id order), plus the special-token tail
+    Top(usize),
+    /// a fraction in (0, 1] of the vocabulary, same id order
+    Frac(f64),
+}
+
+/// Rows `--draft-vocab on` keeps. Measured on prose+code, the top 65536 ids of the Qwen BPE vocabulary
+/// (26%) cover 97.5% of emitted tokens.
+pub const DRAFT_VOCAB_ON_ROWS: usize = 65536;
+
+impl DraftVocab {
+    /// The command-line spellings: `off` (also 0/full/false/no), `on` (= DRAFT_VOCAB_ON_ROWS rows; also
+    /// true/yes), a row count `N`, a percentage `P%`, or a fraction `0.F`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let t = s.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "off" | "0" | "full" | "false" | "no" => return Ok(Self::Off),
+            "on" | "true" | "yes" => return Ok(Self::Top(DRAFT_VOCAB_ON_ROWS)),
+            _ => {}
+        }
+        let bad = || format!("--draft-vocab takes off|on|<rows>|<percent>%|<fraction> (got '{s}')");
+        if let Some(p) = t.strip_suffix('%') {
+            let p: f64 = p.trim().parse().map_err(|_| bad())?;
+            return if p > 0.0 && p <= 100.0 { Ok(Self::Frac(p / 100.0)) } else { Err(bad()) };
+        }
+        if t.contains('.') {
+            let f: f64 = t.parse().map_err(|_| bad())?;
+            return if f > 0.0 && f <= 1.0 { Ok(Self::Frac(f)) } else { Err(bad()) };
+        }
+        match t.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(Self::Top(n as usize)),
+            _ => Err(bad()),
+        }
+    }
+
+    /// The registry's stored spelling (validated at boot; the head ships it to TP nodes verbatim).
+    pub fn canonical_text(s: &str) -> Result<String, String> {
+        let t = s.trim().to_ascii_lowercase();
+        Ok(match Self::parse(&t)? {
+            Self::Off => "off".to_string(),
+            _ if matches!(t.as_str(), "on" | "true" | "yes") => "on".to_string(),
+            _ => t,
+        })
+    }
+
+    /// The setting when `--draft-vocab` is not given (owner 2026-10-27): ON for the Qwen3.5/3.6/3.8
+    /// family, where it was measured (+7..+22% sampled decode, 0.8B..27B, TP=1/TP=2); OFF elsewhere
+    /// (hy_v3 unverified; qwen4_exp never builds one). Non-Latin-script text is mostly outside the
+    /// id-order subset (Chinese ~15% of tokens proposable): `--draft-vocab off` for those workloads.
+    pub fn default_for(family: crate::qwen::Family) -> Self {
+        match family {
+            crate::qwen::Family::Qwen35 => Self::Top(DRAFT_VOCAB_ON_ROWS),
+            _ => Self::Off,
+        }
+    }
+
+    /// The most-frequent ids to keep for a vocabulary of `vocab` rows (0 = off).
+    pub fn top(self, vocab: usize) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Top(n) => n,
+            Self::Frac(f) => ((f * vocab as f64).round() as usize).max(1),
+        }
+    }
+}
+
 /// The rows a draft head should keep: the `top` most-frequent tokens, PLUS the tail of the vocabulary.
 ///
 /// The tail matters more than it looks. Special/added tokens (`<|im_end|>`, `<|endoftext|>`, the tool
@@ -1587,5 +1662,36 @@ mod q2_tests {
         eprintln!("got:  {:?}", got);
         let has_small = got.iter().any(|v| v.abs() < 1.0);
         assert!(has_small, "q2 collapsed everything to the extreme level: {:?}", got);
+    }
+
+    #[test]
+    fn draft_vocab_defaults_and_parses_every_spelling() {
+        // default (no flag): ON for the Qwen3.5/3.6/3.8 family only (owner 2026-10-27)
+        assert_eq!(DraftVocab::default_for(crate::qwen::Family::Qwen35), DraftVocab::Top(DRAFT_VOCAB_ON_ROWS));
+        for f in [crate::qwen::Family::HyV3, crate::qwen::Family::Qwen4Exp, crate::qwen::Family::Dsv4] {
+            assert_eq!(DraftVocab::default_for(f), DraftVocab::Off, "{f:?}");
+        }
+        for off in ["off", "0", "full", "OFF", " no "] {
+            assert_eq!(DraftVocab::parse(off), Ok(DraftVocab::Off), "{off}");
+            assert_eq!(DraftVocab::canonical_text(off).unwrap(), "off");
+        }
+        assert_eq!(DraftVocab::parse("on"), Ok(DraftVocab::Top(DRAFT_VOCAB_ON_ROWS)));
+        assert_eq!(DraftVocab::canonical_text("Yes").unwrap(), "on");
+        assert_eq!(DraftVocab::parse("40000"), Ok(DraftVocab::Top(40000)));
+        assert_eq!(DraftVocab::parse("27%"), Ok(DraftVocab::Frac(0.27)));
+        assert_eq!(DraftVocab::parse("0.5"), Ok(DraftVocab::Frac(0.5)));
+        assert_eq!(DraftVocab::canonical_text(" 30% ").unwrap(), "30%");
+        for bad in ["", "-5", "0%", "101%", "1.5", "0.0", "abc", "12k"] {
+            assert!(DraftVocab::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(DraftVocab::Off.top(248320), 0);
+        assert_eq!(DraftVocab::Top(65536).top(248320), 65536);
+        assert_eq!(DraftVocab::Frac(0.5).top(248320), 124160);
+        // the default `on` subset on the Qwen vocabulary: 16-row aligned, keeps <|endoftext|> (248044)
+        // and <|im_end|> (248046) proposable, and stays a strict subset of the head
+        let rows = draft_vocab_rows(DraftVocab::parse("on").unwrap().top(248320), 248320);
+        assert_eq!(rows.len() % MMA_M, 0);
+        assert!(rows.contains(&248044) && rows.contains(&248046));
+        assert!(rows.len() < 248320 / 2);
     }
 }

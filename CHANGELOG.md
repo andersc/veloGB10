@@ -3,9 +3,24 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
-## Unreleased (master since v0.7.5)
+## v0.7.5 — EXL3 everywhere + the Naive-N0.5-Flash family + DFlash2 drafts under TP everywhere + reduced draft vocabulary
 
-What has landed on master AFTER the v0.7.5 re-cut. Not part of any staged release tarball yet.
+_Released 2026-10-27 · tag `v0.7.5` · asset `velogb10-v0.7.5-gb10-sm121.tar.gz` (+ `SHA256SUMS.txt`, `PROVENANCE.txt`) · binary sha256 `430b2c240c5e4a0cb55b7b469cd17e6b9048247808a5953f7544b1181f7581d6`_
+
+Re-cut of the previously deleted v0.7.5: this build contains everything that cut contained (all
+five EXL3 packs serving everywhere, graceful `--max-batch`, the stable cut) plus everything since
+— the Naive-N0.5-Flash family, `--prefill-interleave` on by default, DFlash2 drafts under TP on
+every path, and the KV-spill hardening. Verified end-to-end before staging: a 12-cell serving
+matrix across four model families at TP=1/2/4 with the owner's exact launch flags (9 bootable
+cells green — boot, gates, streamed generation with per-cell decode tok/s and code-emission
+checks), the LANERES3-TP4 quick rung (TP=4 boot+serve, KV-spill capture/restore across all four
+ranks, lane reservation), and a 969/0 unit suite on the naive port before it merged.
+
+This is the **final v0.7.5 cut (2026-10-27)**: on top of all of the above it folds in the reduced
+draft vocabulary work that landed after the re-cut candidate (below), so one release carries the
+whole line.
+
+### Reduced draft vocabulary (`--draft-vocab`) — new in this final cut
 
 - **FR-Spec reduced MTP draft head + `--draft-vocab`**: the draft head can now be built over a
   reduced, id-order subset of the vocabulary (special-token tail) instead of the full vocab, for
@@ -26,17 +41,6 @@ What has landed on master AFTER the v0.7.5 re-cut. Not part of any staged releas
 - Verified so far: greedy-identical output with the flag on vs off across 12 configurations
   (TP1 on .11, TP2 on .11+.13); the default-on flip is owner-ordered (2026-10-27). Full sampled
   benchmarking of the reduced head is still pending.
-
-## v0.7.5 — EXL3 everywhere + the Naive-N0.5-Flash family + DFlash2 drafts under TP everywhere
-
-Re-cut of the previously deleted v0.7.5: this build contains everything that cut contained (all
-five EXL3 packs serving everywhere, graceful `--max-batch`, the stable cut) plus everything since
-— the Naive-N0.5-Flash family, `--prefill-interleave` on by default, DFlash2 drafts under TP on
-every path, and the KV-spill hardening. Verified end-to-end before staging: a 12-cell serving
-matrix across four model families at TP=1/2/4 with the owner's exact launch flags (9 bootable
-cells green — boot, gates, streamed generation with per-cell decode tok/s and code-emission
-checks), the LANERES3-TP4 quick rung (TP=4 boot+serve, KV-spill capture/restore across all four
-ranks, lane reservation), and a 969/0 unit suite on the naive port before it merged.
 
 ### What is in this build
 

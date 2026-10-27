@@ -865,6 +865,18 @@ fn sse_error_event(reason: &str) -> String {
 /// `<tool_calls:opensource>`, so one constant covers both families.
 const TOOL_OPEN: &str = "<tool_call";
 
+/// Does a generation start INSIDE a reasoning block? The RENDERED PROMPT decides: it ends in an open
+/// think tag. hy_v3 alone (`family_primed == false`, the `<think:opensource>` family) keeps the effort
+/// arm: its low|high template primes `…assistant<think:opensource>` even when the tail check cannot see
+/// it. The Qwen templates never open the block from `reasoning_effort` (Qwen3.8's only adds a system
+/// instruction), so on a Qwen no-think render (a CLOSED empty block) a low|high effort is a direct
+/// answer: Qwen3.5-0.8B/2B (template default: no think) under VeloBench's `reasoning_effort: "low"`
+/// streamed the whole answer as reasoning_content with content empty (ISSUES 149).
+fn stream_starts_in_reasoning(prompt: &str, think_open: &str, family_primed: bool, effort: Option<&str>) -> bool {
+    prompt.trim_end().ends_with(think_open)
+        || (!family_primed && matches!(effort, Some("low") | Some("high")))
+}
+
 /// Split a completed generation into (reasoning, answer). If the close marker is present, everything
 /// before it is reasoning (a leading think-open is stripped) and everything after (trimmed) is the
 /// answer. If the marker never appears, the whole text is returned as the answer content.
@@ -2253,14 +2265,13 @@ async fn chat_completions(
         // answer as reasoning_content forever (content stayed empty; the model card's non-thinking
         // mode is real and respected by the model — verified sync+bf16 2026-08-30). hy_v3 keeps
         // the effort arm: its low|high template primes `…assistant<think:opensource>` even when
-        // the tail check can't see it.
-        let (think_open, think_close, _) = tokenizer.think_tags();
+        // the tail check can't see it (see `stream_starts_in_reasoning`).
+        let (think_open, think_close, family_primed) = tokenizer.think_tags();
         // trim_end: the primed form is `<think>\n` — the trailing newline must not defeat the
         // tail check (a plain ends_with(think_open) sent thinking streams to content: exactly
         // the 35b4b15 follow-up bug). The no-think tail `<think>\n\n</think>\n\n` trims to
         // `</think>` and stays content.
-        let starts_in_reasoning = prompt.trim_end().ends_with(think_open)
-            || matches!(effort, Some("low") | Some("high"));
+        let starts_in_reasoning = stream_starts_in_reasoning(&prompt, think_open, family_primed, effort);
 
         // OTel generation telemetry (--otel-endpoint). Handle built ONCE per request; the hooks
         // below forward the SAME chunk strings the SSE path yields (single source of truth —
@@ -2359,12 +2370,11 @@ async fn chat_completions(
             }}))).into_response();
         }
         let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
-        let (think_open, think_close, _) = state.tokenizer.think_tags();
+        let (think_open, think_close, family_primed) = state.tokenizer.think_tags();
         // [gen] line (item 5b): did the request end inside the think block its prompt opened?
         // (the same rule as the streaming branch's `starts_in_reasoning`)
         let think_closed = text.contains(think_close);
-        let starts_in_reasoning = prompt.trim_end().ends_with(think_open)
-            || matches!(effort, Some("low") | Some("high"));
+        let starts_in_reasoning = stream_starts_in_reasoning(&prompt, think_open, family_primed, effort);
         let (reasoning, content) = split_think_in(&text, think_open, think_close, starts_in_reasoning);
         // SURFACE2 item 8: the generation ended inside the block (budget exhausted while reasoning,
         // or a stop string hit there) — the text is reasoning, as the streaming branch sends it.
@@ -3031,6 +3041,32 @@ mod prompt_token_id_tests {
             let e = prompt_token_ids(&[json!(1), bad.clone(), json!(2)], 100).unwrap_err();
             assert!(e.contains("[0, 100)") && e.contains(&bad.to_string()), "{bad}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_start_tests {
+    use super::{split_think_in, stream_starts_in_reasoning};
+
+    /// ISSUES 149: a Qwen no-think render (the 0.8B/2B template default) with reasoning_effort
+    /// low|high starts in CONTENT; only an open think tag (or hy_v3's effort arm) starts in reasoning.
+    #[test]
+    fn qwen_no_think_render_with_an_effort_is_content() {
+        let no_think = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let think = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        for effort in [None, Some("low"), Some("high"), Some("medium")] {
+            assert!(!stream_starts_in_reasoning(no_think, "<think>", true, effort), "{effort:?}");
+            assert!(stream_starts_in_reasoning(think, "<think>", true, effort), "{effort:?}");
+        }
+        // the reproduced answer (v0.7.5, streaming, effort low): a direct code block is content
+        let (r, c) = split_think_in("```c\nvoid f(void) {}\n```", "<think>", "</think>",
+                                    stream_starts_in_reasoning(no_think, "<think>", true, Some("low")));
+        assert_eq!((r, c.as_str()), (None, "```c\nvoid f(void) {}\n```"));
+        // hy_v3 keeps its effort arm, unchanged
+        let hy = "<|hy_User|>hi<|hy_Assistant|>";
+        assert!(stream_starts_in_reasoning(hy, "<think:opensource>", false, Some("low")));
+        assert!(stream_starts_in_reasoning(hy, "<think:opensource>", false, Some("high")));
+        assert!(!stream_starts_in_reasoning(hy, "<think:opensource>", false, None));
     }
 }
 

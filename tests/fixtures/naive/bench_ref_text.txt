@@ -1,0 +1,44 @@
+## Introduction
+
+Naive-N0.5-Flash is an open-weight **309B MoE model with 15.5B active parameters**, built for **coding and AI R&D**. It supports a **native 1M-token context window** through a hybrid of Sliding-Window Attention (SWA) and lightweight DeepSeek Sparse Attention (DSA), with no full-attention layers.
+
+### Key Features
+
+- **Native 1M context, without full attention.** Naive-N0.5-Flash combines Sliding-Window Attention (SWA) and lightweight DeepSeek Sparse Attention (DSA) with GQA4 at a predominantly 5:1 SWA–DSA layout. The entire network remains local or sparse, with no full-attention layers.
+- **AI-optimized inference up to 2,000 tokens/s.** NaiveRT, our inference system for Naive-N0.5-Flash, was built and optimized through AI-centered R&D. It combines mega-kernel fusion, Programmatic Dependent Launch (PDL), and speculative decoding, delivering 50 tokens/s per user in Standard mode and up to 2,000 tokens/s in Ultrafast mode. See the NaiveRT case study in the [technical blog][blog] for the implementation and optimization process.
+- **Open weights and API.** Model weights and inference code are released under the MIT license. API access will also be provided, with pricing set at $0.10 / $0.40 / $0.01 per million tokens for input, output, and cache reads, respectively.
+
+## Model Architecture
+
+| Property | Specification |
+| --- | --- |
+| Architecture | Mixture-of-Experts (MoE) |
+| Total parameters | 309B |
+| Active parameters | 15.5B |
+| Context length | Native 1M tokens |
+| Transformer layers | 48 |
+| Attention-layer composition | 39 SWA layers + 9 DSA layers |
+| Attention mechanism | Hybrid SWA–DSA |
+| SWA window | 128 tokens |
+| DSA token selection | Top 2,048 tokens for backbone attention |
+| DSA KV groups | 4 (GQA4) |
+| Indexer query heads | 16 |
+
+### Hybrid SWA–DSA Attention
+
+Naive-N0.5-Flash builds on the open-weight MiMo-V2.5 base model, which has a simple architecture with strong foundational capabilities in world knowledge and deep research. Most layers use Sliding-Window Attention (SWA), whose per-token decoding cost does not grow with context length, while a small number of global-attention layers preserve long-range information. At million-token context lengths, however, these global-attention layers account for much of the decoding overhead.
+
+Naive-N0.5-Flash replaces the global-attention layers with DeepSeek Sparse Attention (DSA). A lightweight indexer scores the full history, while the backbone computes attention only over a selected subset of tokens. Although the indexer still scans the full history and the full KV cache is retained, sparse attention substantially reduces attention computation and memory access. Adapting the model to this new attention structure was one objective of continued pretraining.
+
+![Hybrid SWA–DSA architecture showing the network stack and the DSA attention module, including the 16-head indexer and top-2,048 token selection.][architecture-figure]
+
+<p align="center"><em>Figure 1. The hybrid attention stack and DSA module.</em></p>
+
+The network consists of **eight six-layer modules**. A standard module contains five SWA layers followed by one DSA layer, with the first layer of the first module also replaced by DSA. SWA uses a **128-token window**, while DSA selects the **top 2,048 tokens** for backbone attention. Both attention types incorporate sink bias.
+
+Unlike the original MLA-based DSA implementation, Naive-N0.5-Flash replaces MLA with grouped-query attention (GQA) using **four KV groups**. For the architecture design process and indexer efficiency comparison, see model architecture in the [technical blog][blog].
+
+### Training Overview
+
+Following the architectural changes, Naive-N0.5-Flash completed 3.25T tokens of multi-stage training with a native 1M-token context window: 50B tokens of Indexer Warmup, 3T tokens of Sparse Attention Training, and 200B tokens of Learning Rate Decay. This process adapted the model to its new sparse attention architecture while substantially improving its AI R&D and coding capabilities. See the [technical blog][blog] for training details.
+

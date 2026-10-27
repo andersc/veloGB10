@@ -71,6 +71,18 @@ static DF2_MASK_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
 pub fn df2_round() { DF2_ROUNDS.fetch_add(1, Relaxed); }
 pub fn df2_mask_override(on: bool) { DF2_MASK_OVERRIDE.store(on as u64, Relaxed); }
+
+// --draft-vocab (FR-Spec, opt-in): the reduced draft head's size (0 = not built: the drafter reads the
+// full vocabulary) and the MTP draft tokens it picked. scripts/owner_check.py prints both.
+static DRAFT_VOCAB_ROWS: AtomicU64 = AtomicU64::new(0);
+static DRAFT_VOCAB_FULL: AtomicU64 = AtomicU64::new(0);
+static DRAFT_VOCAB_STEPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_draft_vocab(rows: usize, vocab: usize) {
+    DRAFT_VOCAB_ROWS.store(rows as u64, Relaxed);
+    DRAFT_VOCAB_FULL.store(vocab as u64, Relaxed);
+}
+pub fn draft_vocab_step() { DRAFT_VOCAB_STEPS.fetch_add(1, Relaxed); }
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH: AtomicU64 = AtomicU64::new(0);
 /// F2: the `--max-batch` the command line asked for, BEFORE the EXL3 server's 16-lane cap. A number
@@ -768,6 +780,12 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str(&format!("velogb10_df2_rounds_total {}\n", DF2_ROUNDS.load(Relaxed)));
     o.push_str("# HELP velogb10_df2_mask_row_override 1 if the draft's mask row measured DAMAGED at load and the artifact's BF16 copy override is engaged (0 otherwise).\n# TYPE velogb10_df2_mask_row_override gauge\n");
     o.push_str(&format!("velogb10_df2_mask_row_override {}\n", DF2_MASK_OVERRIDE.load(Relaxed)));
+    o.push_str("# HELP velogb10_draft_vocab_rows Token ids the MTP drafter may propose (--draft-vocab, FR-Spec); 0 = no reduced draft head, the drafter reads the full vocabulary.\n# TYPE velogb10_draft_vocab_rows gauge\n");
+    o.push_str(&format!("velogb10_draft_vocab_rows {}\n", DRAFT_VOCAB_ROWS.load(Relaxed)));
+    o.push_str("# HELP velogb10_draft_vocab_full_rows The model's full vocabulary (the denominator of velogb10_draft_vocab_rows; 0 when no reduced draft head was built).\n# TYPE velogb10_draft_vocab_full_rows gauge\n");
+    o.push_str(&format!("velogb10_draft_vocab_full_rows {}\n", DRAFT_VOCAB_FULL.load(Relaxed)));
+    o.push_str("# HELP velogb10_draft_vocab_steps_total MTP draft tokens picked from the reduced draft head (--draft-vocab engaged).\n# TYPE velogb10_draft_vocab_steps_total counter\n");
+    o.push_str(&format!("velogb10_draft_vocab_steps_total {}\n", DRAFT_VOCAB_STEPS.load(Relaxed)));
     let inflight = IN_FLIGHT.load(Relaxed);
     let cap = MAX_BATCH.load(Relaxed);
     let running = if cap > 0 { inflight.min(cap) } else { inflight };

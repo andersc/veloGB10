@@ -98,7 +98,7 @@ fn attn_rescale_bitexact_vs_cpu() {
     let _g = gate();
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_attn.ptx", &["dsv4_attn_rescale_b"]).expect("load");
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", &["dsv4_attn_rescale_b"]).expect("load");
 
     let (s, nh, hd) = (7usize, 64usize, 512usize);
     let rows = s * nh;
@@ -154,7 +154,7 @@ fn kv_sim_strided_bitexact_vs_cpu() {
     let _g = gate();
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_attn.ptx", &["dsv4_kv_sim_g64_strided"]).expect("load");
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", &["dsv4_kv_sim_g64_strided"]).expect("load");
 
     let (rows, hd, rd) = (17usize, 512usize, 64usize);
     let nope = hd - rd;
@@ -218,7 +218,7 @@ fn ring_write_matches_cpu() {
     let _g = gate();
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_attn.ptx", &["dsv4_ring_write_b"]).expect("load");
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", &["dsv4_ring_write_b"]).expect("load");
     let (win, hd) = (128usize, 512usize);
     let mut rng = XorShift(0x3A30_0003);
 
@@ -261,7 +261,7 @@ fn window_idxs_match_cpu() {
     let _g = gate();
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_attn.ptx", &["dsv4_window_idxs_b"]).expect("load");
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", &["dsv4_window_idxs_b"]).expect("load");
     let win = 128usize;
 
     // (s, start_pos): prefill wide/small, full-ring decode, early decode, the 127 boundary.
@@ -306,7 +306,7 @@ fn olo_proj_matches_cpu_and_binv() {
     let _g = gate();
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
-    let ks = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_attn.ptx", &["dsv4_olo_proj_b"]).expect("load");
+    let ks = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", &["dsv4_olo_proj_b"]).expect("load");
 
     let (s, nh, hd, g, r) = (16usize, 64usize, 512usize, 8usize, 1024usize);
     let gd = nh * hd / g; // 4096
@@ -536,7 +536,7 @@ fn window_idxs_strided_matches_cpu() {
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
     let ks = Dsv4Kernels::load_module(
-        &dev, "src/ptx/gpu_dsv4_attn.ptx",
+        &dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn",
         &["dsv4_window_idxs_strided_b"],
     ).expect("load");
     let win = 128usize;
@@ -577,7 +577,7 @@ fn compress_idxs_matches_cpu() {
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
     let ks = Dsv4Kernels::load_module(
-        &dev, "src/ptx/gpu_dsv4_attn.ptx",
+        &dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn",
         &["dsv4_compress_idxs_b"],
     ).expect("load");
     // HCA: ratio=128. Cases: prefill S=130 (1 completed block), S=260 (2), decode (start_pos>0).
@@ -632,7 +632,7 @@ fn idxs_place_strided() {
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
     let ks = Dsv4Kernels::load_module(
-        &dev, "src/ptx/gpu_dsv4_attn.ptx",
+        &dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn",
         &["dsv4_idxs_place_b"],
     ).expect("load");
     let (s, t_count, t_stride, col_off) = (8usize, 512usize, 640usize, 128usize);

@@ -226,7 +226,7 @@ mod tests {
     /// Fixtures from the pure-Python port of frac.cu (`scripts/naive/frac_ref.py fixtures`).
     #[test]
     fn matches_the_python_frac_reference() {
-        let path = concat!(".", "/tests/fixtures/naive/frac_tiles.json");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/naive/frac_tiles.json");
         let raw = std::fs::read_to_string(path).expect("fixture tests/fixtures/naive/frac_tiles.json");
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cases = v["cases"].as_array().unwrap();

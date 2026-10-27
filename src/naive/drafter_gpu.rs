@@ -597,7 +597,7 @@ pub fn probe_drafter(model_dir: &str, draft_dir: &str) -> Result<()> {
     let s = dev.fork_default_stream().context("fork stream")?;
 
     // ---- 1. the gate on the fixture ----
-    let fx = "tests/fixtures/naive/drafter";
+    let fx = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/naive/drafter");
     let npz = std::path::Path::new(fx).join("oracle.npz");
     ensure!(npz.is_file() && std::path::Path::new(fx).join("drafter.safetensors").is_file(),
             "fixture missing under {fx} (scripts/naive/drafter_oracle.py)");

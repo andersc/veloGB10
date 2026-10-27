@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn tiny_drafter_round_matches_the_hf_modules() {
-        let dir = "tests/fixtures/naive/drafter";
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/naive/drafter");
         // oracle.npz is committed; drafter.safetensors (7.9 MB, *.safetensors is gitignored) is generated on the box:
         //   python3 scripts/naive/drafter_oracle.py tests/fixtures/naive/drafter   (needs torch + safetensors)
         if !Path::new(dir).join("oracle.npz").is_file() || !Path::new(dir).join("drafter.safetensors").is_file() {

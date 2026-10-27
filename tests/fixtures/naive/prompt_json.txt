@@ -1,0 +1,13 @@
+<|im_start|>system
+Reasoning Effort: Max<|im_end|><|im_start|>system
+You are Naive-N0.5-Flash, a helpful AI assistant engineered by Naive AI.<|im_end|><|im_start|>user
+Output a JSON array of 6 objects, each with keys "name" and "age", for six fictional people. JSON only.<|im_end|><|im_start|>assistant
+<think></think>
+
+[
+  {"name": "Elena Voss", "age": 34},
+  {"name": "Marcus Chen", "age": 27},
+  {"name": "Sofia Delgado", "age": 41},
+  {"name": "James Okafor", "age": 19},
+  {"name": "Priya Nair", "age": 52},
+  {"name": "Liam Novak", "

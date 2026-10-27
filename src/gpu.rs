@@ -1126,11 +1126,12 @@ pub const PF_MIN: usize = 128;
 /// at slot 2 touches slots 2..=(2 + N - 2).
 pub const PROFILE_MAX_N: usize = 8;
 
-/// How many of the most-frequent token ids the DRAFT head keeps (FR-Spec). Measured on prose+code,
-/// the top 65536 ids of this BPE vocabulary (26%) cover 97.5% of emitted tokens -- and the tokens they
-/// miss are rare AND hard to predict, i.e. exactly the ones the drafter was already getting wrong.
-/// `--draft-vocab=0` turns it off.
-pub const DRAFT_VOCAB_TOP: usize = 65536;
+/// How many of the most-frequent token ids the DRAFT head keeps under `--draft-vocab on` (FR-Spec).
+/// Measured on prose+code, the top 65536 ids of this BPE vocabulary (26%) cover 97.5% of emitted
+/// tokens -- and the tokens they miss are rare AND hard to predict, i.e. exactly the ones the drafter
+/// was already getting wrong. Default ON for the Qwen3.5/3.6/3.8 family (quant::DraftVocab::default_for);
+/// `--draft-vocab off` builds no draft head.
+pub const DRAFT_VOCAB_TOP: usize = crate::quant::DRAFT_VOCAB_ON_ROWS;
 
 /// Depths the auto-policy calibrates and may choose between. Capped at PROFILE_MAX_N because the
 /// calibration probe runs a real verify at each of these widths against a `2 + PROFILE_MAX_N`-slot
@@ -3272,36 +3273,29 @@ impl GpuModel {
         // PyTorch reference tests anchor indexes the projections individually.
         // ---- FR-Spec: a smaller LM head, for picking DRAFT tokens only ----
         //
-        // Built by subsetting the rows of the real head, which is EXACT (rows do not interact in either
-        // codec). Done here, before the mma repack consumes the host bytes.
+        // Built by subsetting the rows of the real head, which is EXACT (rows do not interact in any
+        // codec). DEFAULT ON for the Qwen3.5/3.6/3.8 family (owner 2026-10-27; README documents the
+        // trade: non-Latin scripts are mostly outside the id-order subset, `--draft-vocab off` for
+        // those workloads); opt-in elsewhere (hy_v3 unverified; qwen4_exp never). `--draft-vocab off`
+        // = no draft head and no reserved host copy.
         //
-        // `--draft-vocab=0` disables it; a plain number is the number of most-frequent token
-        // ids to keep (plus the whole tail of the id range, where every special token lives -- a
-        // drafter that cannot propose <|im_end|> cannot draft the end of a chat turn). A FRACTION
-        // ("0.30") or PERCENT ("30%") is taken of the full vocab (E19's push: ~30% vs the 55%
-        // default). NOTE the ranking is BPE ID ORDER (earlier merges ≈ more frequent) — a proxy, not
+        // A row count is the number of most-frequent token ids to keep (plus the whole tail of the id
+        // range, where every special token lives -- a drafter that cannot propose <|im_end|> cannot
+        // draft the end of a chat turn). A FRACTION ("0.30") or PERCENT ("30%") is taken of the full
+        // vocab. NOTE the ranking is BPE ID ORDER (earlier merges ≈ more frequent) — a proxy, not
         // a measured ranking. `--draft-vocab-file=<path>` replaces the list with explicit
-        // newline-separated ids from a corpus-ranked artifact (the remaining OFFLINE step: no
-        // frequency corpus exists in-tree yet — until it does, the fraction knob is the A/B lever).
-        let draft_top: usize = crate::opts::var(crate::opt!("draft-vocab")).ok()
-            .map(|v| {
-                let s = v.trim();
-                if let Some(p) = s.strip_suffix('%') {
-                    (p.parse::<f64>().unwrap_or(0.0) / 100.0 * cfg.vocab_size as f64) as usize
-                } else if s.contains('.') {
-                    (s.parse::<f64>().unwrap_or(0.0) * cfg.vocab_size as f64) as usize
-                } else {
-                    s.parse().unwrap_or(DRAFT_VOCAB_TOP)
-                }
-            })
-            .unwrap_or(DRAFT_VOCAB_TOP);
+        // newline-separated ids from a corpus-ranked artifact.
+        let draft_top: usize = match crate::opts::var(crate::opt!("draft-vocab")).ok() {
+            // validated at boot (opts::canon)
+            Some(v) => crate::quant::DraftVocab::parse(&v).unwrap_or(crate::quant::DraftVocab::Off),
+            None => crate::quant::DraftVocab::default_for(cfg.family),
+        }.top(cfg.vocab_size);
         let head_name = if cfg.tie_word_embeddings { format!("{}.embed_tokens.weight", pref) }
                         else { "lm_head.weight".to_string() };
-        let t_draft0 = std::time::Instant::now();
         // FR-Spec draft head: the ROWS are precomputed here (data-independent); the subset build
-        // needs the LM-head's host bytes, which the streaming pipeline consumes — it is built
-        // AFTER the shard loop from the reserved `draft_parts_*` copies.
-        let draft_rows: Vec<u32> = if draft_top == 0 && crate::opts::var(crate::opt!("draft-vocab-file")).is_err() {
+        // needs the LM-head's bytes, which the streaming pipeline consumes — it is built AFTER the
+        // shard loop (section 3b) from the reserved `draft_parts_*` copies or the bf16 map.
+        let mut draft_rows: Vec<u32> = if draft_top == 0 && crate::opts::var(crate::opt!("draft-vocab-file")).is_err() {
             Vec::new()
         } else {
             match crate::opts::var(crate::opt!("draft-vocab-file")) {
@@ -3310,6 +3304,19 @@ impl GpuModel {
                 Err(_) => crate::quant::draft_vocab_rows(draft_top, cfg.vocab_size),
             }
         };
+        // Graceful fallbacks (AGENTS §1b-bis 8): one line, then the full-vocabulary drafter.
+        if !draft_rows.is_empty() && cfg.family == crate::qwen::Family::Qwen4Exp {
+            crate::rprintln!("--draft-vocab: not applied to this qwen4_exp (Flash-Next) model — its MTP drafter \
+                      keeps the full vocabulary (the reduced draft head is built for the Qwen3.5/3.6/3.8 \
+                      and hy_v3 families only)");
+            draft_rows.clear();
+        }
+        if !draft_rows.is_empty() && draft_rows.len() >= cfg.vocab_size {
+            crate::rprintln!("--draft-vocab: the requested subset ({} rows) covers the whole {}-token vocabulary — \
+                      no reduced draft head is built (it would only duplicate the LM head)",
+                     draft_rows.len(), cfg.vocab_size);
+            draft_rows.clear();
+        }
 
 
 
@@ -3836,89 +3843,6 @@ impl GpuModel {
         // hy_v3's MTP block is `model.layers.<num_layers>.*` (80): eh_proj (=fc), enorm/hnorm
         // (=pre_fc norms), final_layernorm (=mtp.norm), and a full decoder layer underneath —
         // one-to-one with GpuMtpLayer (P6).
-        let (draft_head, draft_ids) =
-            if draft_top == 0 && crate::opts::var(crate::opt!("draft-vocab-file")).is_err() {
-                (None, Vec::new())
-            } else {
-                let rows = draft_rows;
-
-                let w = if let Some((qw, sc, inv_gs, _m, k)) = draft_parts_q4.as_ref() {
-                    let (sq, ss) = crate::quant::subset_rows_nvfp4(qw, sc, *k, &rows);
-                    let (wt, st) = crate::quant::repack_nvfp4_mma(&sq, &ss, rows.len(), *k);
-                    let gsv = vec![*inv_gs; rows.len() / 16];
-                    if mxfp4_mode {
-                        // The draft head is part of the native chain: it needs the lossless OMMA
-                        // repack too (the pipeline does not see it — it is a row subset), and its W
-                        // must carry the OMMA layout as PRIMARY storage (the native prefill dequant
-                        // reads qweight/scales as OMMA). Small (170 MB), so no economy math.
-                        let (aimg, sfa) = crate::mxfp4::repack_nvfp4_omma(&wt, &st, rows.len(), *k);
-                        let qweight = dev.htod_sync_copy(&aimg).unwrap();
-                        let scales = dev.htod_sync_copy(&sfa).unwrap();
-                        omma_map.insert(
-                            *qweight.device_ptr() as u64,
-                            crate::mxfp4::OmmaEntry::Ptr(
-                                *qweight.device_ptr() as u64,
-                                *scales.device_ptr() as u64,
-                            ),
-                        );
-                        Some(W::Nvfp4 {
-                            qweight,
-                            scales,
-                            gs: dev.htod_sync_copy(&gsv).unwrap(),
-                            m: rows.len(),
-                            k: *k,
-                        })
-                    } else {
-                        Some(W::Nvfp4 {
-                            qweight: dev.htod_sync_copy(&wt).unwrap(),
-                            scales: dev.htod_sync_copy(&st).unwrap(),
-                            gs: dev.htod_sync_copy(&gsv).unwrap(),
-                            m: rows.len(),
-                            k: *k,
-                        })
-                    }
-                } else if let Some((qw, rs, _m, k)) = draft_parts_q8.as_ref() {
-                    let (sq, srs) = crate::quant::subset_rows_fp8(qw, rs, *k, &rows);
-                    let wt = crate::quant::repack_fp8_mma(&sq, rows.len(), *k);
-                    Some(W::Fp8 {
-                        data: dev.htod_sync_copy(&wt).unwrap(),
-                        row_scale: dev.htod_sync_copy(&srs).unwrap(),
-                        m: rows.len(),
-                        k: *k,
-                    })
-                } else if is_hy3 && gpu_bf16.contains_key(&head_name) {
-                    // hy_v3: the head is bf16 (recipe `-lmhead`) — subset its rows into a bf16 draft
-                    // head. One host round-trip at load (~1 GB) for a permanent halving of the draft
-                    // head's per-token read. Rows are independent, so the subset is exact.
-                    let host = dev
-                        .dtoh_sync_copy(gpu_bf16.get(&head_name).unwrap())
-                        .unwrap();
-                    let k = host.len() / cfg.vocab_size;
-                    let mut sub: Vec<half::bf16> = Vec::with_capacity(rows.len() * k);
-                    for &r in &rows {
-                        sub.extend_from_slice(&host[r as usize * k..(r as usize + 1) * k]);
-                    }
-                    Some(W::Bf16(dev.htod_sync_copy(&sub).unwrap()))
-                } else {
-                    None // bf16 model: not the serving path, skip FR-Spec rather than duplicate 15 GB
-                };
-                match w {
-                    Some(w) => {
-                        println!(
-                        "  draft head: {} of {} tokens ({:.0}% of the vocabulary) -- the draft \
-                              chain reads {:.0}% of the LM head's bytes",
-                        rows.len(),
-                        cfg.vocab_size,
-                             100.0 * rows.len() as f32 / cfg.vocab_size as f32,
-                        100.0 * rows.len() as f32 / cfg.vocab_size as f32
-                    );
-                        (Some(w), rows)
-                    }
-                    None => (None, Vec::new()),
-                }
-            };
-        let t_draft = t_draft0.elapsed();
-        mem_probe("post-draft");
         // 3) The pipeline: workers assemble host-side (fuse -> repack -> optional host shard) and
         //    hand host buffers to the ONE uploader thread. The handoff is bounded by a bytes gate
         //    (the working set is the peak host memory this adds) and a 2-deep output channel.
@@ -4440,9 +4364,10 @@ impl GpuModel {
                         1.0f32 / gs,           // kernel multiplies, so pre-invert once here
                         m, k));
                     // STREAMING LOAD: reserve the LM-head/embed parts for the FR-Spec draft
-                    // head BEFORE the head's own job consumes them from host_q4.
+                    // head BEFORE the head's own job consumes them from host_q4 (only when
+                    // --draft-vocab asked for one: the default load holds no extra copy).
                     let key = format!("{}.weight", stem);
-                    if key == head_name && draft_parts_q4.is_none() {
+                    if !draft_rows.is_empty() && key == head_name && draft_parts_q4.is_none() {
                         draft_parts_q4 = Some((pv.data().to_vec(), sv.data().to_vec(), 1.0f32 / gs, m, k));
                     }
                 }
@@ -4493,7 +4418,7 @@ impl GpuModel {
                     t_up_shard += t.elapsed();
                 } else {
                     host_q8.lock().unwrap().insert(wname.clone(), (wv.data().to_vec(), scales.clone(), m, k, nb_k));
-                    if wname == &head_name && nb_k == 0 && draft_parts_q8.is_none() {
+                    if !draft_rows.is_empty() && wname == &head_name && nb_k == 0 && draft_parts_q8.is_none() {
                         draft_parts_q8 = Some((wv.data().to_vec(), scales, m, k));
                     }
                 }
@@ -4617,7 +4542,7 @@ impl GpuModel {
                 jq.1.notify_all();
                 drop(tx);   // the uploader's recv ends once the workers' senders drop
                 let (res, omma_map_up, allow_up, t_up) = up.join().unwrap();
-                omma_map.extend(omma_map_up);   // merge: the draft head may already be in there
+                omma_map.extend(omma_map_up);
                 allow_bf16.extend(allow_up);
                 results = res;
                 t_up_post += t_up;
@@ -4628,6 +4553,104 @@ impl GpuModel {
                 Ok(())
             })?;
         }
+
+        // 3b) FR-Spec draft head (`--draft-vocab`, default on for Qwen3.5/3.6/3.8; `--draft-vocab-file`). Built HERE, after the
+        //     shard loop: the reserved `draft_parts_*` copies are filled only while the shards stream
+        //     through (the streaming load of 14c6d7b5 built the head BEFORE the loop, so every load from
+        //     v0.4.1 on silently got none), and a bf16 head is still in `gpu_bf16` until the real pass
+        //     below takes it. The subset comes from the FULL head on every TP rank (shard-at-load slices
+        //     the head's own job, never these copies), so the draft head is replicated: no gather.
+        let t_draft0 = std::time::Instant::now();
+        let (draft_head, draft_ids) = if draft_rows.is_empty() {
+            (None, Vec::new())
+        } else {
+            let rows = std::mem::take(&mut draft_rows);
+            let w = if let Some((qw, sc, inv_gs, _m, k)) = draft_parts_q4.take() {
+                let (sq, ss) = crate::quant::subset_rows_nvfp4(&qw, &sc, k, &rows);
+                let (wt, st) = crate::quant::repack_nvfp4_mma(&sq, &ss, rows.len(), k);
+                let gsv = vec![inv_gs; rows.len() / 16];
+                if mxfp4_mode {
+                    // The draft head is part of the native chain: it needs the lossless OMMA
+                    // repack too (the pipeline does not see it — it is a row subset), and its W
+                    // must carry the OMMA layout as PRIMARY storage (the native prefill dequant
+                    // reads qweight/scales as OMMA). Small (170 MB), so no economy math.
+                    let (aimg, sfa) = crate::mxfp4::repack_nvfp4_omma(&wt, &st, rows.len(), k);
+                    let qweight = dev.htod_sync_copy(&aimg).unwrap();
+                    let scales = dev.htod_sync_copy(&sfa).unwrap();
+                    omma_map.insert(
+                        *qweight.device_ptr() as u64,
+                        crate::mxfp4::OmmaEntry::Ptr(
+                            *qweight.device_ptr() as u64,
+                            *scales.device_ptr() as u64,
+                        ),
+                    );
+                    Some(W::Nvfp4 { qweight, scales, gs: dev.htod_sync_copy(&gsv).unwrap(), m: rows.len(), k })
+                } else {
+                    Some(W::Nvfp4 {
+                        qweight: dev.htod_sync_copy(&wt).unwrap(),
+                        scales: dev.htod_sync_copy(&st).unwrap(),
+                        gs: dev.htod_sync_copy(&gsv).unwrap(),
+                        m: rows.len(),
+                        k,
+                    })
+                }
+            } else if let Some((qw, rs, _m, k)) = draft_parts_q8.take() {
+                let (sq, srs) = crate::quant::subset_rows_fp8(&qw, &rs, k, &rows);
+                let wt = crate::quant::repack_fp8_mma(&sq, rows.len(), k);
+                Some(W::Fp8 {
+                    data: dev.htod_sync_copy(&wt).unwrap(),
+                    row_scale: dev.htod_sync_copy(&srs).unwrap(),
+                    m: rows.len(),
+                    k,
+                })
+            } else if let Some(full) = gpu_bf16.get(&head_name) {
+                // bf16 head (hy_v3 by recipe; a Qwen pack with a bf16 LM head; --dequant-at-load):
+                // copy the kept rows on the device, one D2D per contiguous run of ids (the default
+                // subset is two runs), on the compute stream. Rows are independent: the subset is exact.
+                let k = full.len() / cfg.vocab_size;
+                let sub = dev.alloc_zeros::<half::bf16>(rows.len() * k)?;   // every row is written below
+                let mut i = 0;
+                while i < rows.len() {
+                    let mut j = i + 1;
+                    while j < rows.len() && rows[j] == rows[j - 1] + 1 { j += 1; }
+                    unsafe {
+                        let r = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                            *sub.device_ptr() as u64 + (i * k * 2) as u64,
+                            *full.device_ptr() as u64 + (rows[i] as usize * k * 2) as u64,
+                            (j - i) * k * 2, stream.stream);
+                        assert!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                                "draft head bf16 row copy failed: {r:?}");
+                    }
+                    i = j;
+                }
+                dev.synchronize()?;
+                Some(W::Bf16(sub))
+            } else {
+                None
+            };
+            match w {
+                Some(w) => {
+                    println!(
+                        "  draft head: {} of {} tokens ({:.0}% of the vocabulary) -- the draft \
+                         chain reads {:.0}% of the LM head's bytes",
+                        rows.len(),
+                        cfg.vocab_size,
+                        100.0 * rows.len() as f32 / cfg.vocab_size as f32,
+                        100.0 * rows.len() as f32 / cfg.vocab_size as f32
+                    );
+                    crate::metrics::set_draft_vocab(rows.len(), cfg.vocab_size);
+                    (Some(w), rows)
+                }
+                None => {
+                    crate::rprintln!("--draft-vocab: this model's LM head ({head_name}) is in a format the reduced \
+                              draft head cannot subset (block-scaled FP8) — the MTP drafter keeps the full \
+                              vocabulary");
+                    (None, Vec::new())
+                }
+            }
+        };
+        let t_draft = t_draft0.elapsed();
+        mem_probe("post-draft");
         // 4) REAL pass: the same assembly, gwn now a lookup over the pipeline results (identical
         //    dispatch to the old serial gwn: hy3 inline bands -> assembled q4/q8 -> bf16 map).
         record_pass.set(false);
@@ -15445,6 +15468,7 @@ impl GpuModel {
         let hidden = mixed.as_ref().unwrap_or(hidden);
         let r = self.argmax_hidden_inner(pool, hidden);
         if let Some(m) = mixed { pool.release_bf16(m, self.cfg.hidden_size); }
+        if self.draft_head.is_some() { crate::metrics::draft_vocab_step(); }
         r
     }
     fn argmax_hidden_inner(&self, pool: &mut Pool, hidden: &B) -> u32 {

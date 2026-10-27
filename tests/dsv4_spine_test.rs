@@ -740,7 +740,7 @@ fn rescale_rope_sim_fused_bitwise_match_separate() {
     let dev = dev();
     let stream = dsv4_gpu::blocking_compute_stream(&dev);
     let ks = Dsv4Kernels::load(&dev, &["dsv4_rope_pair_b"]).expect("load spine");
-    let ka_mod = Dsv4Kernels::load_module(&dev, "src/ptx/gpu_dsv4_attn.ptx", &[
+    let ka_mod = Dsv4Kernels::load_module(&dev, gb10_inference::ptx_embed::GPU_DSV4_ATTN, "gpu_dsv4_attn", &[
         "dsv4_attn_rescale_b", "dsv4_kv_sim_g64_strided", "dsv4_rescale_rope_sim_b",
     ]).expect("load attn");
 

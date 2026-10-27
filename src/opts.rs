@@ -247,6 +247,9 @@ fn canon(o: &Opt, v: Option<&str>) -> Result<Option<String>, String> {
             let v = need(v)?;
             v.trim().parse::<f64>().map(|_| Some(v.clone())).map_err(|_| format!("--{f} takes a number (got '{v}')"))
         }
+        // --draft-vocab is free-form (off|on|N|P%|0.F) but the loader reads it long after the boot:
+        // a bad spelling is refused HERE, never silently read as "off" at load time.
+        Ty::Text if f == "draft-vocab" => crate::quant::DraftVocab::canonical_text(&need(v)?).map(Some),
         Ty::Text | Ty::Path => Ok(Some(need(v)?)),
         Ty::Choice(list) => {
             let v = need(v)?;
@@ -1256,7 +1259,7 @@ mod tests {
         // each distinct name exactly once
         assert_eq!(unknown_warnings(&a(&["bin", "--max-bach", "--max-bach"])).len(), 1);
         // argv[0] (the program path) is never judged
-        assert!(unknown_warnings(&a(&["/models/x/--weird-path"])).is_empty());
+        assert!(unknown_warnings(&a(&["/home/x/--weird-path"])).is_empty());
     }
 
     #[test]
@@ -1833,11 +1836,11 @@ mod tests {
         format!("--{flag} needs a value, but it is the last argument; to give a value that starts with \"--\" write --{flag}=<value>")
     }
 
-    /// Every Text/Path row (39 Text + 27 Path = 66): the four cases of the addendum.
+    /// Every Text/Path row (40 Text + 28 Path = 68): the four cases of the addendum.
     #[test]
     fn f7_text_path_rows_never_eat_a_flag_shaped_token() {
         let rows: Vec<&Opt> = REG.iter().filter(|o| matches!(o.ty, Ty::Text | Ty::Path)).collect();
-        assert_eq!(rows.len(), 67, "39 Text + 28 Path");
+        assert_eq!(rows.len(), 68, "40 Text + 28 Path");
         let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         for o in rows {
             let id = lookup(o.flag).unwrap();
@@ -1846,6 +1849,18 @@ mod tests {
             assert_eq!(e, f7_msg(o.flag, "--tp"), "{f}");
             let e = parse_cli(&args(&[&f, "--mtp", "off"])).unwrap_err();
             assert_eq!(e, f7_msg(o.flag, "--mtp"), "{f}");
+            assert_eq!(parse_cli(&args(&[&f])).unwrap_err(), f7_last(o.flag), "{f}");
+            if o.flag == "draft-vocab" {
+                // the one CHECKED Text row: a value outside off|on|N|P%|0.F is refused at boot
+                // (a flag-shaped one included), a valid one is stored canonical
+                let e = parse_cli(&args(&[&f, "-x"])).unwrap_err();
+                assert!(e.starts_with("--draft-vocab takes"), "{e}");
+                assert!(parse_cli(&args(&[&format!("{f}=--tp")])).is_err(), "{f}");
+                assert!(parse_cli(&args(&[&f, "ON", "--tp", "2"])).is_ok(), "{f}");
+                assert_eq!(crate::opts::var(id).as_deref(), Ok("on"), "{f}");
+                crate::opts::test_set(id, None);
+                continue;
+            }
             assert!(parse_cli(&args(&[&f, "-x"])).is_ok(), "{f}");
             crate::opts::test_set(id, None);
             assert!(parse_cli(&args(&[&f, "v", "--tp", "2"])).is_ok(), "{f}");
