@@ -20,9 +20,9 @@ What has landed on master AFTER the v0.7.5 re-cut. Not part of any staged releas
   reduced draft head; each setting keeps its own calibration file (default file name and stamp
   unchanged).
 - **Streaming fix (ISSUES 149)**: a Qwen no-think render with `reasoning_effort low|high` no
-  longer streams the reasoning label as visible content.
+  longer streams the reasoning label as visible content (the streaming symptom reported in issue #18).
 - **`--quantize --help` now documents the recipe syntax** and the three documented recipes
-  (`all`; `all,gdn:fp8` - the default; `all:fp8`).
+  (`all`; `all,gdn:fp8` - the default; `all:fp8`). Answers the question in issue #3.
 - Verified so far: greedy-identical output with the flag on vs off across 12 configurations
   (TP1 on .11, TP2 on .11+.13); the default-on flip is owner-ordered (2026-10-27). Full sampled
   benchmarking of the reduced head is still pending.
@@ -50,7 +50,7 @@ ranks, lane reservation), and a 969/0 unit suite on the naive port before it mer
   speculation, expert-parallel MoE, lane reservation, prefix reuse, TP levers.
 - **`--prefill-interleave` defaults to 1** — a joining stream no longer stalls the running
   streams (9.1 s to 1.7 s join at TP=2); `--prefill-interleave 0` restores the old behavior;
-  engagement counters on `/metrics` and in `scripts/owner_check.py`.
+  engagement counters on `/metrics` and in `scripts/owner_check.py`. Answers community PR #23, which proposed the same feature.
 - **DFlash2 drafts are head-authoritative under TP on every path** — sampled drafts carry their
   drawn weights and the 16-candidate table per position, greedy drafts too; the drafter ships
   through the EXL3 TP sync and the boot agreement hashes the DF2 outcome; `--df2-k` caps verify
@@ -69,6 +69,13 @@ ranks, lane reservation), and a 969/0 unit suite on the naive port before it mer
   tap fix (hyper-connection mean; band-attention smem bounded by the window).
 - Four static-review fixes in the DFlash2 ring/verify paths (one measured re-alignment was
   rejected and backed out — it cost sampled acceptance).
+
+- **Community items this release answers**: PR #23 (`--prefill-interleave` - proposed upstream,
+  shipped natively); issues #9 and #10 (EXL3 pack loads and the TP draft-hash instability, both
+  closed during bring-up and re-verified by this release's matrix); issues #1 and #2 (the
+  OOM-at-boot class - the graceful `--max-batch` boot - and the 35B-A3B NVFP4 class, verified
+  serving in the matrix). Server-surface items #7/#8 and vision items #20/#24 were closed before
+  this cut.
 
 ### What this build does NOT do (plain words)
 
