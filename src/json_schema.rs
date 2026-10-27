@@ -835,6 +835,11 @@ struct Vocab {
 const STR_RUN_CLOSES: u16 = 0x8000;
 const STR_RUN_BAD: u16 = 0xFFFF;
 
+/// 1 while a started escape or UTF-8 sequence has not produced its character yet.
+fn pending_char(st: &StrState) -> u64 {
+    u64::from(!st.is_closed_interior())
+}
+
 /// [`Vocab::str_run`] entry for one piece.
 fn str_run_of(bytes: &[u8]) -> u16 {
     let mut st = StrState::new();
@@ -845,7 +850,7 @@ fn str_run_of(bytes: &[u8]) -> u16 {
             Step::Bad => return STR_RUN_BAD,
         }
     }
-    st.cp.min(0x7FFE) as u16
+    ((st.cp as u64 + pending_char(&st)).min(0x7FFE)) as u16
 }
 
 impl Vocab {
@@ -1389,7 +1394,10 @@ impl SchemaMask {
     fn str_value_ok(&self, si: u32, st: &StrState, closing: bool) -> bool {
         let s = &self.schemas[si as usize];
         if let Some(mx) = s.max_len.filter(|_| !st.free_len) {
-            if st.cp as u64 > mx {
+            // A started escape or UTF-8 sequence already commits one more character: counting it
+            // only once complete let a string at maxLength begin one, after which no byte could
+            // finish it (a dead end that ends the reply mid-document).
+            if st.cp as u64 + pending_char(st) > mx {
                 return false;
             }
         }
@@ -2564,6 +2572,20 @@ mod tests {
     }
 
     #[test]
+    fn no_dead_end_at_max_length() {
+        // At maxLength a started escape or UTF-8 sequence could never be finished.
+        no_dead_ends(r#"{"type":"object","properties":{"t":{"type":"string","maxLength":3}},"required":["t"]}"#, 400, 80);
+        no_dead_ends(r#"{"type":"array","items":{"type":"string","minLength":1,"maxLength":1},"minItems":2,"maxItems":2}"#, 400, 80);
+        let m = mask(r#"{"type":"object","properties":{"t":{"type":"string","maxLength":2}}}"#);
+        assert!(walk(&m, r#"{"t":"a\u00"#).is_some(), "an escape may start while there is room for its character");
+        assert!(walk(&m, r#"{"t":"ab\"#).is_none(), "no escape at maxLength");
+        let at_max = walk(&m, r#"{"t":"ab"#).unwrap();
+        assert!(m.step(at_max, 0xC3).is_none(), "no UTF-8 lead byte at maxLength");
+        let closed = m.step(at_max, b'"' as u32).unwrap();
+        assert!(m.step(closed, b'}' as u32).is_some());
+    }
+
+    #[test]
     fn no_dead_end_enum_with_escapes_and_spaces() {
         no_dead_ends(r#"{"type":"object","properties":{"color":{"type":"string","enum":["red","green","light blue","naïve","𝄞 clef"]}},"required":["color"]}"#, 400, 200);
     }
@@ -2670,9 +2692,9 @@ mod tests {
         assert_eq!(str_run_of(b"ab\"}"), 2 | STR_RUN_CLOSES);
         assert_eq!(str_run_of(b"\\n"), 1);
         assert_eq!(str_run_of(b"\\u00e9x"), 2);
-        assert_eq!(str_run_of(b"\\u00"), 0); // escape still open: no character yet
+        assert_eq!(str_run_of(b"\\u00"), 1); // escape still open: its character is committed
         assert_eq!(str_run_of("\u{e9}\u{e9}".as_bytes()), 2);
-        assert_eq!(str_run_of(&[0xC3]), 0); // UTF-8 sequence still open
+        assert_eq!(str_run_of(&[0xC3]), 1); // UTF-8 sequence still open: same
         assert_eq!(str_run_of(&[0x01]), STR_RUN_BAD);
     }
 
