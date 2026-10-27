@@ -1357,10 +1357,25 @@ fn warn_unenforced_schema_once(why: &str) {
     }
 }
 
-/// Marks a served response whose `response_format` was not enforced (see above).
-fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool) {
-    if !unenforced { return; }
-    if let Ok(v) = HeaderValue::from_str("none") {
+/// W2-EXL3: the vocabulary table every constrained request shares (built once per process from
+/// the tokenizer's output-byte tables; the server serves one tokenizer).
+fn schema_vocab_table(tok: &crate::tokenizer::QwenTokenizer) -> crate::json_schema::VocabTable {
+    static T: std::sync::OnceLock<crate::json_schema::VocabTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let t0 = std::time::Instant::now();
+        let t = crate::json_schema::VocabTable::build(tok.vocab_pieces());
+        crate::reprintln!("[schema] vocabulary table built: {} ids ({:.0} ms, once per process)",
+                          t.len(), t0.elapsed().as_secs_f64() * 1e3);
+        t
+    }).clone()
+}
+
+/// Marks a served response whose `response_format` was not enforced (see above) with
+/// `x-json-schema-enforced: none`, and (W2-EXL3, `--json-schema-enforce on`) one whose schema
+/// WAS armed as a token mask with `x-json-schema-enforced: full`. No header without a schema.
+fn attach_schema_unenforced_header(resp: &mut Response, unenforced: bool, enforced: bool) {
+    let val = if unenforced { "none" } else if enforced { "full" } else { return };
+    if let Ok(v) = HeaderValue::from_str(val) {
         resp.headers_mut().insert("x-json-schema-enforced", v);
     }
 }
@@ -1932,16 +1947,19 @@ async fn chat_completions(
     // Flip JSON_SCHEMA_ENFORCEMENT_ENABLED to true only when the emission path is proven
     // end-to-end: `cargo test --lib json_schema::tests` green AND the W2 probe 6/6 enforced
     // across temperature × TP × spec source. Until then, serving + advertising beats refusing.
-    const JSON_SCHEMA_ENFORCEMENT_ENABLED: bool = false;
-    let mut schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = None;
+    // W2-EXL3: the constant became the opt-in `--json-schema-enforce on`; the EXL3 serve
+    // path now arms the mask too (exl3_serve.rs), so the flag is meaningful on every server.
+    let json_schema_enforcement_enabled = crate::opts::on(crate::opt!("json-schema-enforce"));
+    // The mask is finalised (think deferral) after the prompt is rendered, below.
+    let mut schema_pending: Option<crate::json_schema::SchemaMask> = None;
     let mut schema_unenforced: Option<String> = None;
     if let Some(rf) = req.response_format.as_ref() {
         match crate::json_schema::compile_response_format(rf) {
             Ok(None) => {}
-            Ok(Some(mut m)) if JSON_SCHEMA_ENFORCEMENT_ENABLED => {
-                m.set_vocab(state.tokenizer.vocab_pieces());
+            Ok(Some(mut m)) if json_schema_enforcement_enabled => {
+                m.set_vocab_table(&schema_vocab_table(&state.tokenizer));
                 crate::reprintln!("[req] response_format: constrained decoding armed ({})", m.summary());
-                schema_mask = Some(std::sync::Arc::new(m));
+                schema_pending = Some(m);
             }
             Ok(Some(m)) => {
                 schema_unenforced = Some(format!(
@@ -2161,6 +2179,19 @@ async fn chat_completions(
     // Sampling: explicit request values win; anything left out takes the server's default for
     // THIS request's mode (the rendered prompt opens a <think> block or it does not).
     let thinking_on = prompt.trim_end().ends_with(state.tokenizer.think_tags().0);
+    // W2-EXL3: a prompt that opens a think block reasons first; the schema applies to the answer
+    // after the think-close token (a single token in the supported tokenizers; if it is not, the
+    // constraint starts at the first token, the previous behaviour).
+    let schema_mask: Option<std::sync::Arc<crate::json_schema::SchemaMask>> = schema_pending.take().map(|mut m| {
+        if thinking_on {
+            let close = state.tokenizer.think_tags().1;
+            match state.tokenizer.encode(close, false).as_deref() {
+                Ok([id]) => m.set_defer_until(Some(*id)),
+                _ => crate::reprintln!("[req] response_format: think-close tag {close:?} is not one token; constraint starts at the first token"),
+            }
+        }
+        std::sync::Arc::new(m)
+    });
     let (d_temp, d_top_p, d_top_k) = if thinking_on { state.sampling_defaults.think }
                                      else { state.sampling_defaults.no_think };
     let temperature = req.temperature.unwrap_or(d_temp);
@@ -2324,7 +2355,7 @@ async fn chat_completions(
             move |t| dec.push(t)
         });
         let mut resp = sse_with_keepalive(stream, sse_keepalive(), ka_frame);
-        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some(), schema_mask.is_some());
         resp
     } else {
         crate::reprintln!("[req] sync   prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
@@ -2496,7 +2527,7 @@ async fn chat_completions(
             session_id: otel_session,
         };
         let mut resp = Json(response).into_response();
-        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some());
+        attach_schema_unenforced_header(&mut resp, schema_unenforced.is_some(), schema_mask.is_some());
         resp
     }
 }

@@ -426,6 +426,9 @@ enum Esc {
 struct StrState {
     esc: Esc,
     dec: Vec<u8>,
+    /// The raw bytes consumed inside the string (kept with `dec`): enum values and declared keys
+    /// are matched in their canonical spelling (see [`canon_match`]).
+    raw: Vec<u8>,
     cp: u32,
     /// Trailing bytes of a not-yet-complete UTF-8 sequence (a token can split a code point).
     pend: Vec<u8>,
@@ -433,7 +436,7 @@ struct StrState {
 
 impl StrState {
     fn new() -> StrState {
-        StrState { esc: Esc::None, dec: Vec::new(), cp: 0, pend: Vec::new() }
+        StrState { esc: Esc::None, dec: Vec::new(), raw: Vec::new(), cp: 0, pend: Vec::new() }
     }
     fn is_closed_interior(&self) -> bool {
         self.esc == Esc::None && self.pend.is_empty()
@@ -493,7 +496,13 @@ fn push_raw(st: &mut StrState, b: u8, keep: bool) -> bool {
 
 /// Advance one byte inside a string. `keep` mirrors the caller's prefix-constraint need.
 fn str_advance(st: &mut StrState, b: u8, keep: bool) -> Step {
+    if keep && !(st.esc == Esc::None && b == b'"') {
+        st.raw.push(b);
+    }
     match st.esc {
+        // An ASCII byte (including `"` and `\`) while a multi-byte UTF-8 sequence is still
+        // incomplete would make the string invalid UTF-8.
+        Esc::None if !st.pend.is_empty() && b < 0x80 => Step::Bad,
         Esc::None => match b {
             b'"' => Step::Closed,
             b'\\' => {
@@ -693,7 +702,16 @@ enum Frame {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 struct Machine {
     stack: Vec<Frame>,
+    /// Consecutive STRUCTURAL whitespace bytes just consumed (whitespace between tokens of the
+    /// document, never string content). Capped at [`MAX_WS_RUN`]: without a cap, whitespace is
+    /// legal in every structural position, so a model that does not want to start the document
+    /// can emit blank space until max_tokens and the reply never parses.
+    ws: u8,
 }
+
+/// Longest run of structural whitespace the machine accepts (enough for pretty-printing a deeply
+/// nested document: a newline plus indentation).
+const MAX_WS_RUN: u8 = 24;
 
 impl Machine {
     fn is_dead(&self) -> bool {
@@ -703,6 +721,52 @@ impl Machine {
     fn at_doc_end(&self) -> bool {
         self.stack.len() == 1 && matches!(self.stack[0], Frame::DocEnd)
     }
+    /// True while the next byte is string CONTENT (a value string or an object key).
+    fn in_string(&self) -> bool {
+        matches!(self.stack.last(), Some(Frame::Str { .. }) | Some(Frame::Obj { phase: ObjPhase::Key(_), .. }))
+    }
+}
+
+/// The canonical JSON encoding (serde_json's: `"` `\\` and the short control escapes, other
+/// control characters as lowercase `\u00XX`, everything else as raw UTF-8) of string `v`,
+/// without the quotes, compared against `raw` (the bytes emitted so far inside the string).
+/// Returns (`raw` is a prefix of the encoding, `raw` is the whole encoding).
+///
+/// Enum values and declared property names are matched in this ONE canonical spelling. Matching
+/// the decoded value instead admits every escaped spelling (`"\u0074"` for `t`), and a model
+/// under the mask then wanders into long escape sequences (or into escapes and partial UTF-8
+/// sequences that no candidate completes) instead of writing the value.
+fn canon_match(v: &str, raw: &[u8]) -> (bool, bool) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0usize;
+    let mut buf = [0u8; 6];
+    for c in v.chars() {
+        let enc: &[u8] = match c {
+            '"' => b"\\\"",
+            '\\' => b"\\\\",
+            '\u{08}' => b"\\b",
+            '\u{0C}' => b"\\f",
+            '\n' => b"\\n",
+            '\r' => b"\\r",
+            '\t' => b"\\t",
+            c if (c as u32) < 0x20 => {
+                buf = [b'\\', b'u', b'0', b'0', HEX[(c as usize) >> 4], HEX[(c as usize) & 15]];
+                &buf[..]
+            }
+            c => c.encode_utf8(&mut buf).as_bytes(),
+        };
+        for &e in enc {
+            if i == raw.len() {
+                return (true, false);
+            }
+            if raw[i] != e {
+                return (false, false);
+            }
+            i += 1;
+        }
+    }
+    // the encoding is exhausted: `raw` matches only if it is exhausted too
+    (i == raw.len(), i == raw.len())
 }
 
 /// Undo log for a single byte, used by the trie walk to roll a shared machine back instead of
@@ -818,9 +882,43 @@ pub struct SchemaMask {
     /// `state -> allowed bitset`. Computed on demand; states are interned so identical machine
     /// snapshots share one entry.
     cache: Mutex<HashMap<u32, Arc<Vec<u32>>>>,
-    vocab: Vocab,
+    /// Shared, immutable byte trie of the model vocabulary (see [`VocabTable`]): built once per
+    /// process and handed to every request's mask, instead of rebuilding a 248K-entry trie per
+    /// request.
+    vocab: Arc<Vocab>,
     vocab_size: usize,
     words: usize,
+    /// When `Some(tok)`, the mask is NOT applied until the lane has emitted `tok` (the model's
+    /// think-close token): a request whose prompt opens a reasoning block reasons freely, and
+    /// only the answer after the block is constrained. `None` = constrained from the first token.
+    defer_until: Option<u32>,
+}
+
+/// A model vocabulary prepared for constrained decoding: token id -> raw output bytes plus the
+/// byte trie `allowed()` walks. Immutable after `build`; share it with `Arc` across requests and
+/// attach it with [`SchemaMask::set_vocab_table`].
+#[derive(Debug, Clone)]
+pub struct VocabTable {
+    vocab: Arc<Vocab>,
+    size: usize,
+}
+
+impl VocabTable {
+    /// `pieces` = (token id, the exact bytes that token adds to the output text). Special /
+    /// control tokens must be left out (or given empty bytes): they are never allowed.
+    pub fn build(pieces: Vec<(u32, Vec<u8>)>) -> Self {
+        let (v, size) = Vocab::build(pieces);
+        VocabTable { vocab: Arc::new(v), size }
+    }
+
+    /// Number of token ids covered (max id + 1).
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
 }
 
 impl SchemaMask {
@@ -887,11 +985,25 @@ impl SchemaMask {
     /// before `allowed()`; also fixes `vocab_size`/`words`. Cached bitsets are dropped because they
     /// were computed against the previous vocabulary.
     pub fn set_vocab(&mut self, pieces: Vec<(u32, Vec<u8>)>) {
-        let (v, size) = Vocab::build(pieces);
-        self.vocab = v;
-        self.vocab_size = size;
-        self.words = vocab_words(size);
+        self.set_vocab_table(&VocabTable::build(pieces));
+    }
+
+    /// `set_vocab` with a prebuilt, shared table (no per-request trie build).
+    pub fn set_vocab_table(&mut self, table: &VocabTable) {
+        self.vocab = table.vocab.clone();
+        self.vocab_size = table.size;
+        self.words = vocab_words(table.size);
         lock(&self.cache).clear();
+    }
+
+    /// Defer the constraint until the lane emits `tok` (see the `defer_until` field).
+    pub fn set_defer_until(&mut self, tok: Option<u32>) {
+        self.defer_until = tok;
+    }
+
+    /// The token that arms the constraint, if the constraint is deferred.
+    pub fn defer_until(&self) -> Option<u32> {
+        self.defer_until
     }
 
     /// A bitset with every token disallowed EXCEPT the model's end-of-generation tokens: when the
@@ -980,12 +1092,15 @@ impl SchemaMask {
     /// One machine is reused and rolled back per byte (see [`Roll`]) — no per-node clones and no
     /// full-vocab rescan.
     fn trie_walk(&self, m: &mut Machine, node: usize, out: &mut Vec<u32>) {
-        let children = self.vocab.nodes[node].children.clone();
-        for (b, child) in children {
+        // Iterate the shared trie by reference: cloning the child list at every node cost one
+        // allocation per visited node (~1M on a 248K vocabulary inside a free string).
+        let vocab = &*self.vocab;
+        for &(b, child) in &vocab.nodes[node].children {
             let mut roll = Roll::new(m.stack.len());
+            let ws0 = m.ws; // not covered by the Roll undo log (it records frames only)
             let alive = self.feed(m, b, Some(&mut roll));
             if alive {
-                if let Some(tok) = self.vocab.nodes[child].token {
+                if let Some(tok) = vocab.nodes[child].token {
                     let t = tok as usize;
                     if t < self.vocab_size {
                         out[t >> 5] |= 1u32 << (t & 31);
@@ -994,6 +1109,7 @@ impl SchemaMask {
                 self.trie_walk(m, child, out);
             }
             roll.restore(m);
+            m.ws = ws0;
         }
     }
 
@@ -1144,12 +1260,10 @@ impl SchemaMask {
                     return false;
                 }
             }
-            if !s.enum_str.is_empty() && !s.enum_str.iter().any(|e| e.as_bytes() == st.dec.as_slice()) {
+            if !s.enum_str.is_empty() && !s.enum_str.iter().any(|e| canon_match(e, &st.raw).1) {
                 return false;
             }
-        } else if !s.enum_str.is_empty()
-            && !s.enum_str.iter().any(|e| e.as_bytes().starts_with(&st.dec))
-        {
+        } else if !s.enum_str.is_empty() && !s.enum_str.iter().any(|e| canon_match(e, &st.raw).0) {
             // enum prefix rule: only bytes that keep us on the way to an allowed value.
             return false;
         }
@@ -1255,9 +1369,19 @@ impl SchemaMask {
         true
     }
 
-    fn key_prefix_ok(&self, si: u32, dec: &[u8]) -> bool {
+    /// Can the key being parsed still become a key this object accepts? Declared keys already
+    /// present (`seen`) are excluded: a duplicate is refused when the key closes, so letting it
+    /// through here led into a state with no allowed continuation.
+    fn key_prefix_ok(&self, si: u32, st: &StrState, seen: &[u32]) -> bool {
         let s = &self.schemas[si as usize];
-        s.additional || s.props.iter().any(|(n, _)| n.as_bytes().starts_with(dec))
+        s.additional
+            || s.props.iter().enumerate().any(|(i, (n, _))| !seen.contains(&(i as u32)) && canon_match(n, &st.raw).0)
+    }
+
+    /// May another key start in this object (`"` after `{`, `,` after a member)?
+    fn can_add_key(&self, si: u32, seen: &[u32]) -> bool {
+        let s = &self.schemas[si as usize];
+        s.additional || (0..s.props.len() as u32).any(|i| !seen.contains(&i))
     }
 
     /// Feed ONE byte. Returns true when the byte was consumed by a live machine; false when the
@@ -1265,7 +1389,23 @@ impl SchemaMask {
     ///
     /// Frames are mutated only after being popped, which is what makes the [`Roll`] undo log and
     /// the "pop, then let the parent reprocess the same byte" loop sound.
-    fn feed(&self, m: &mut Machine, b: u8, mut roll: Option<&mut Roll>) -> bool {
+    fn feed(&self, m: &mut Machine, b: u8, roll: Option<&mut Roll>) -> bool {
+        // Trailing whitespace after a complete document (top = DocEnd) is not counted: the
+        // completed state stays one interned state, and the scheduler ends the turn there anyway.
+        let structural_ws = is_ws(b) && !m.in_string() && !matches!(m.stack.last(), Some(Frame::DocEnd));
+        if structural_ws && m.ws >= MAX_WS_RUN {
+            // Refused without touching the stack: both callers discard the machine (step) or
+            // roll it back (trie_walk) on `false`.
+            return false;
+        }
+        let alive = self.feed_inner(m, b, roll);
+        if alive {
+            m.ws = if structural_ws { m.ws + 1 } else { 0 };
+        }
+        alive
+    }
+
+    fn feed_inner(&self, m: &mut Machine, b: u8, mut roll: Option<&mut Roll>) -> bool {
         loop {
             if m.stack.is_empty() {
                 m.stack.push(Frame::Dead);
@@ -1313,7 +1453,7 @@ impl SchemaMask {
                             m.stack.push(Frame::Dead);
                             return false;
                         }
-                        if b == b'"' {
+                        if b == b'"' && self.can_add_key(si, &seen) {
                             m.stack.push(Frame::Obj {
                                 si,
                                 phase: ObjPhase::Key(StrState::new()),
@@ -1328,7 +1468,7 @@ impl SchemaMask {
                     ObjPhase::Key(mut st) => {
                         match str_advance(&mut st, b, true) {
                             Step::Open => {
-                                if !self.key_prefix_ok(si, &st.dec) {
+                                if !self.key_prefix_ok(si, &st, &seen) {
                                     m.stack.push(Frame::Dead);
                                     return false;
                                 }
@@ -1415,7 +1555,7 @@ impl SchemaMask {
                             m.stack.push(Frame::Obj { si, phase: ObjPhase::AfterValue, seen, extra });
                             return true;
                         }
-                        if b == b',' {
+                        if b == b',' && self.can_add_key(si, &seen) {
                             m.stack.push(Frame::Obj { si, phase: ObjPhase::KeyReq, seen, extra });
                             return true;
                         }
@@ -1464,7 +1604,9 @@ impl SchemaMask {
                             m.stack.push(Frame::Arr { si, n, phase: ArrPhase::AfterItem });
                             return true;
                         }
-                        if b == b',' {
+                        // A `,` must leave room for one more item (maxItems), or the array can only
+                        // dead-end.
+                        if b == b',' && self.schemas[si as usize].max_items.map_or(true, |mx| n < mx) {
                             m.stack.push(Frame::Arr { si, n, phase: ArrPhase::ItemReq });
                             return true;
                         }
@@ -1661,11 +1803,12 @@ fn build_mask(schema: &Value, depth: usize, via: &str) -> Result<SchemaMask, Str
         start: 0,
         interner: Mutex::new(Interner::default()),
         cache: Mutex::new(HashMap::new()),
-        vocab: Vocab::default(),
+        vocab: Arc::new(Vocab::default()),
         vocab_size: 0,
         words: 0,
+        defer_until: None,
     };
-    let start = m.intern(Machine { stack: vec![Frame::DocEnd, Frame::Value { si: root }] });
+    let start = m.intern(Machine { stack: vec![Frame::DocEnd, Frame::Value { si: root }], ws: 0 });
     m.start = start;
     Ok(m)
 }
@@ -2053,7 +2196,9 @@ mod tests {
         assert_eq!(m.step(after_colon, 4), None, "1 is not a string");
 
         let after_value = m.step(after_colon, 5).unwrap();
-        assert_eq!(m.allowed(after_value).as_slice(), bits(&[3, 7, 11], words).as_slice());
+        // No `,` (7): the only declared key is present and additional properties are off, so a
+        // comma could only lead to a key slot that nothing can fill.
+        assert_eq!(m.allowed(after_value).as_slice(), bits(&[3, 11], words).as_slice());
 
         let done = m.step(after_value, 3).unwrap();
         assert!(m.is_complete(done));
@@ -2244,5 +2389,81 @@ mod tests {
         assert!(!ok(&mask(r#"{"type":"boolean"}"#), "truex"));
         assert!(ok(&mask(r#"{"type":"null"}"#), "null"));
         assert!(!ok(&mask(r#"{"type":"null"}"#), "nul"));
+    }
+
+    // ---- dead-end freedom: every reachable state allows a token or is complete -----------------
+
+    /// Random walks over the allowed sets (single-byte vocabulary). A state that accepts no byte
+    /// and is not a complete document is a dead end: under the token mask the sampler would have
+    /// nothing to pick. Every allowed byte must also step.
+    fn no_dead_ends(schema: &str, walks: usize, max_len: usize) {
+        let m = mask(schema);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for w in 0..walks {
+            let mut st = m.start_state();
+            let mut doc = Vec::new();
+            for _ in 0..max_len {
+                if m.is_complete(st) { break; }
+                let bits = m.allowed(st);
+                let ids: Vec<u32> = (0..256u32).filter(|&t| bits[(t >> 5) as usize] >> (t & 31) & 1 == 1).collect();
+                assert!(!ids.is_empty(), "walk {w}: dead end after {:?}", String::from_utf8_lossy(&doc));
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let t = ids[((rng >> 33) as usize) % ids.len()];
+                st = m.step(st, t).unwrap_or_else(|| panic!("walk {w}: allowed byte {t} refused by step"));
+                doc.push(t as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn no_dead_end_enum_with_escapes_and_spaces() {
+        no_dead_ends(r#"{"type":"object","properties":{"color":{"type":"string","enum":["red","green","light blue","naïve","𝄞 clef"]}},"required":["color"]}"#, 400, 200);
+    }
+
+    #[test]
+    fn no_dead_end_object_keys_and_arrays() {
+        no_dead_ends(r#"{"type":"object","properties":{"a":{"type":"integer","minimum":0,"maximum":9},"ab":{"type":"boolean"},"list":{"type":"array","items":{"type":"string","enum":["x","y"]},"maxItems":2}},"required":["a"]}"#, 400, 200);
+    }
+
+    #[test]
+    fn enum_values_and_keys_use_the_canonical_spelling() {
+        let m = mask(r#"{"type":"string","enum":["no","not x","𝄞","say \"hi\"\n"]}"#);
+        assert!(ok(&m, r#""not x""#));
+        assert!(ok(&m, r#""𝄞""#), "non-ASCII is written raw");
+        assert!(ok(&m, r#""say \"hi\"\n""#), "quote and newline use their short escapes");
+        assert!(walk(&m, r#""no\u0074"#).is_none(), "an escaped spelling of a plain character is refused");
+        assert!(walk(&m, r#""\ud834"#).is_none(), "so is a surrogate escape of a raw-written character");
+        assert!(walk(&m, "\"no\u{e9}").is_none(), "a raw multi-byte char no candidate continues with");
+        assert!(walk(&m, r#""no\"#).is_none(), "a backslash no candidate needs");
+        let k = mask(r#"{"type":"object","properties":{"ab":{"type":"integer"}},"required":["ab"]}"#);
+        assert!(ok(&k, r#"{"ab":1}"#));
+        assert!(walk(&k, r#"{"\u0061"#).is_none(), "declared keys too");
+        assert_eq!(canon_match("a\u{1}b", b"a\\u0001b"), (true, true));
+        assert_eq!(canon_match("ab", b"a"), (true, false));
+        assert_eq!(canon_match("ab", b"abc"), (false, false));
+    }
+
+    #[test]
+    fn structural_whitespace_is_capped() {
+        let m = mask(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#);
+        let lead = " ".repeat(MAX_WS_RUN as usize);
+        assert!(ok(&m, &format!("{lead}{{\"a\":\"x\"}}")), "a run up to the cap is fine");
+        assert!(walk(&m, &format!("{lead} ")).is_none(), "one more is refused");
+        assert!(ok(&m, &format!("{{\"a\":\"{}\"}}", " ".repeat(100))), "string content is not structural");
+        assert!(ok(&m, &format!("{{{lead}\"a\"{lead}:{lead}\"x\"{lead}}}")), "the run resets at every token");
+    }
+
+    #[test]
+    fn no_key_or_item_slot_that_cannot_be_filled() {
+        let m = mask(r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#);
+        assert!(walk(&m, r#"{"a":1,"a"#).is_none(), "a duplicate declared key cannot start");
+        assert!(ok(&m, r#"{"a":1,"b":2}"#));
+        assert!(walk(&m, r#"{"a":1,"b":2,"#).is_none(), "no key left: the comma is refused");
+        let arr = mask(r#"{"type":"array","items":{"type":"integer"},"maxItems":2}"#);
+        assert!(ok(&arr, "[1,2]"));
+        assert!(walk(&arr, "[1,2,").is_none(), "maxItems reached: the comma is refused");
+        let none = mask(r#"{"type":"object","properties":{},"additionalProperties":false}"#);
+        assert!(ok(&none, "{}"));
+        assert!(walk(&none, "{\"").is_none(), "no key can ever be accepted");
     }
 }
