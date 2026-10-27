@@ -7,6 +7,44 @@ generic language where they aren't individually notable.
 
 _Released 2026-10-27 · tag `v0.7.5` · asset `velogb10-v0.7.5-gb10-sm121.tar.gz` (+ `SHA256SUMS.txt`, `PROVENANCE.txt`) · binary sha256 `7ff7ef98e8909ed408589623b018324c509b5c22d6b9ccd8636800ec512038f4`_
 
+### Delta vs v0.7.4 — the full release delta list (2026-10-12 → 2026-10-27; 8 release commits, 155 files changed)
+
+#### New model / serving support
+1. **All five EXL3 quantization packs serve end-to-end** — dense 27B @ 3.05 & 3.5 bpw, dense 9B @ 3.5, 35B-A3B MoE @ 3.5, 27B Flash-Next @ 3.05. TP=2 on all five; TP=4 on 9B / 35B-A3B / 27B-3.05 / 27B-3.5 (losslessness ×5 each, both test machines). *(answers issues #9, #10)*
+2. **Naive-N0.5-Flash family** (new architecture): TP=2/TP=4 serving, DSpark-drafter speculation, expert-parallel MoE, lane reservation, prefix reuse, TP levers.
+3. **Flash-Next 1.5 / 2.0 bpw packs** (KFIX1 GEMM pipeline + draft-round CUDA graph).
+
+#### New features
+4. **Reduced MTP draft vocabulary — `--draft-vocab`** (FR-Spec): draft head built over an id-order vocab subset for all Qwen NVFP4/FP8/bf16 heads. **Default ON for Qwen3.5/3.6/3.8** (owner decision 2026-10-27), off elsewhere; known trade: non-Latin scripts mostly outside the subset (documented in README).
+5. **DFlash2 drafts head-authoritative under TP on every path** — sampled drafts carry their drawn weights + per-position 16-candidate table; drafter ships through the EXL3 TP sync; boot agreement hashes the DF2 outcome; `--df2-k`, `--df2-mask-override`; bake inventories follow artifact geometry.
+6. **KV-spill hardened** (TP=4 context hand-off; still off by default): capture vote accepts its own frames, failed vote stops admission with a real message, whole-plane snapshots, payloads carry only used rows, single-strip restore (every capture was rejected before), restore resends reasoning+content, peer-miss names its reason. TP=4 verified: capture→restore across 4 ranks, 959 prompt tokens restored with no re-prefill.
+7. **Lane reservation** — one scoped admit per TP iteration with apply-time requeue; never refuse.
+8. **Unsent sampler fields resolve from the pack's `generation_config.json`** on both servers, with one boot line naming the resolved values.
+
+#### Performance / responsiveness
+9. **`--prefill-interleave` defaults to 1** — a joining stream no longer stalls running streams (9.1 s → 1.7 s join at TP=2); `0` restores old behavior; engagement counters on `/metrics` + `owner_check.py`. *(answers community PR #23, which proposed the same)*
+10. **Large prompts tokenize off the single request thread**; the debug generation log no longer re-tokenizes every reply.
+
+#### Fixes
+11. **Graceful `--max-batch` boot** — the server starts on the most lanes that fit, never truncates context, prints one line saying what it serves and why, counts what it queued on `/metrics`. *(the OOM-at-boot class, issue #1)*
+12. **Streaming fix** (ISSUES 149 / issue #18): Qwen no-think render with `reasoning_effort low|high` no longer streams the reasoning label as visible content.
+13. **EXL3 DF2 tap fix** — hyper-connection mean capture; band-attention smem bounded by the window (drafter conditioning correctness).
+14. **Four static-review fixes** in the DFlash2 ring/verify paths (a measured re-alignment was rejected and backed out — it cost sampled acceptance).
+15. **MTP calibration cache keyed on `--draft-vocab`** — a full-vocab calibration overpriced the reduced head; each setting keeps its own calibration file.
+16. **`--quantize --help` documents the recipe syntax** and the three recipes (`all`; `all,gdn:fp8` — default; `all:fp8`). *(issue #3)*
+17. Issue #2 (35B-A3B NVFP4 serving) verified in the matrix; #7/#8 (server surface) and #20/#24 (vision) were closed just before the cut and are cross-referenced.
+
+#### Packaging / release format
+18. **EMB1 one-binary release** — kernels embedded in the binary, tarball ships no external PTX (this is the first release cut on that contract).
+
+#### Known limitations stated in this release (plain words)
+- Serving-matrix numbers are **single-rep smokes**, not benchmarks; the README's measured tables remain the reference.
+- **Naive-N0.5-Flash @TP=2 and 35B-A3B @TP=2 deterministically emit no visible answer** for a pure-code prompt at an 8192-token budget (thinking-dominated; prompt-seeded sampler reproduces the stream) — TP=1/TP=4 are fine; a higher budget completes.
+- Some Flash-Next / 27B-exl3 cells hit the 8192 budget mid-answer (truncated code).
+- **TP=2 head's over-cap counter is still not wired** (TP=1 counts every over-cap arrival; TP=2 serves correctly but never increments).
+- `--kv-spill` off by default; TP=4 verified by the quick rung only — the full LANERES3 ladder (concurrency cells + churn ×2) was descoped.
+- Reduced draft head: full **sampled** benchmarking still pending; non-Latin workloads don't benefit (falls back to full-vocab behavior).
+
 Re-cut of the previously deleted v0.7.5: this build contains everything that cut contained (all
 five EXL3 packs serving everywhere, graceful `--max-batch`, the stable cut) plus everything since
 — the Naive-N0.5-Flash family, `--prefill-interleave` on by default, DFlash2 drafts under TP on
