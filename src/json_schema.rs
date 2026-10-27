@@ -432,11 +432,14 @@ struct StrState {
     cp: u32,
     /// Trailing bytes of a not-yet-complete UTF-8 sequence (a token can split a code point).
     pend: Vec<u8>,
+    /// Skip this string's minLength / maxLength checks. Only set on the machine used to build a
+    /// length-free base mask (see [`SchemaMask::allowed_len_bounded`]); never on a live state.
+    free_len: bool,
 }
 
 impl StrState {
     fn new() -> StrState {
-        StrState { esc: Esc::None, dec: Vec::new(), raw: Vec::new(), cp: 0, pend: Vec::new() }
+        StrState { esc: Esc::None, dec: Vec::new(), raw: Vec::new(), cp: 0, pend: Vec::new(), free_len: false }
     }
     fn is_closed_interior(&self) -> bool {
         self.esc == Esc::None && self.pend.is_empty()
@@ -822,6 +825,27 @@ struct Vocab {
     by_id: HashMap<u32, Vec<u8>>,
     /// Longest piece in bytes: an upper bound on the characters one token adds to a string.
     max_piece: usize,
+    /// Per token id, fed from the interior of a value string (no pending escape or UTF-8
+    /// sequence): the characters it adds before the string closes or the piece ends, with
+    /// [`STR_RUN_CLOSES`] set when it closes the string. [`STR_RUN_BAD`] when the bytes are not
+    /// valid string content (such a token is never in a base mask, so it is never consulted).
+    str_run: Vec<u16>,
+}
+
+const STR_RUN_CLOSES: u16 = 0x8000;
+const STR_RUN_BAD: u16 = 0xFFFF;
+
+/// [`Vocab::str_run`] entry for one piece.
+fn str_run_of(bytes: &[u8]) -> u16 {
+    let mut st = StrState::new();
+    for &b in bytes {
+        match str_advance(&mut st, b, false) {
+            Step::Open => {}
+            Step::Closed => return (st.cp.min(0x7FFE) as u16) | STR_RUN_CLOSES,
+            Step::Bad => return STR_RUN_BAD,
+        }
+    }
+    st.cp.min(0x7FFE) as u16
 }
 
 impl Vocab {
@@ -852,6 +876,10 @@ impl Vocab {
                 cur = nxt;
             }
             v.nodes[cur].token = Some(id); // duplicate piece: last id wins
+        }
+        v.str_run = vec![STR_RUN_BAD; vocab_size];
+        for (&id, bytes) in &v.by_id {
+            v.str_run[id as usize] = str_run_of(bytes);
         }
         (v, vocab_size)
     }
@@ -943,18 +971,79 @@ impl SchemaMask {
         if let Some(hit) = lock(&self.cache).get(&state).cloned() {
             return hit;
         }
-        let key = self.machine(state).map(|m| self.mask_key(&m));
-        let hit = key.as_ref().and_then(|k| lock(&self.mask_cache).get(k).cloned());
-        let arc = match hit {
-            Some(a) => a,
-            None => {
-                let a = Arc::new(self.compute_allowed(state));
-                if let Some(k) = key { lock(&self.mask_cache).insert(k, a.clone()); }
-                a
-            }
+        let arc = match self.machine(state) {
+            Some(m) => self.allowed_for(&m),
+            None => Arc::new(vec![0u32; self.words]),
         };
         lock(&self.cache).insert(state, arc.clone());
         arc
+    }
+
+    /// Allowed set of a machine snapshot, shared through `mask_cache` by [`SchemaMask::mask_key`].
+    fn allowed_for(&self, m: &Machine) -> Arc<Vec<u32>> {
+        let key = self.mask_key(m);
+        if let Some(hit) = lock(&self.mask_cache).get(&key).cloned() {
+            return hit;
+        }
+        let a = Arc::new(match self.allowed_len_bounded(m) {
+            Some(bits) => bits,
+            None => self.compute_allowed_machine(m),
+        });
+        lock(&self.mask_cache).insert(key, a.clone());
+        a
+    }
+
+    /// Inside a value string whose minLength / maxLength can refuse the next token, derive the
+    /// allowed set from the length-free set of the same position instead of walking the trie.
+    ///
+    /// The string's character count only gates acceptance: it never changes what the bytes
+    /// parse to. It only grows while a token is fed, and a token is refused by it exactly when
+    /// the count after its last in-string byte exceeds maxLength, or the string closes below
+    /// minLength. From an interior state (no pending escape or UTF-8 sequence) the characters a
+    /// token adds depend only on its bytes ([`Vocab::str_run`]), so
+    ///
+    /// `allowed = base ∩ { t : added(t) <= room  and  (closes(t) ⇒ added(t) >= to_min) }`
+    ///
+    /// where `base` ignores this string's bounds. `base` is one cached mask per position, so the
+    /// last characters before maxLength (and the first before minLength) cost a bitset pass each
+    /// instead of a full trie walk. `None` when the shortcut does not apply.
+    fn allowed_len_bounded(&self, m: &Machine) -> Option<Vec<u32>> {
+        let Some(Frame::Str { si, st }) = m.stack.last() else { return None };
+        let s = &self.schemas[*si as usize];
+        if !s.enum_str.is_empty() || st.free_len || !st.is_closed_interior() || self.vocab.str_run.is_empty() {
+            return None;
+        }
+        if s.min_len.is_none() && s.max_len.is_none() {
+            return None;
+        }
+        let cp = st.cp as u64;
+        let to_min = s.min_len.map_or(0, |lo| lo.saturating_sub(cp));
+        let room = s.max_len.map_or(u64::MAX, |hi| hi.saturating_sub(cp));
+        let mut free = m.clone();
+        if let Some(Frame::Str { st, .. }) = free.stack.last_mut() {
+            st.free_len = true;
+            st.cp = 0;
+        }
+        let base = self.allowed_for(&free);
+        let run = &self.vocab.str_run;
+        let mut bits = vec![0u32; base.len()];
+        for (w, &word) in base.iter().enumerate() {
+            let mut rest = word;
+            while rest != 0 {
+                let b = rest.trailing_zeros();
+                rest &= rest - 1;
+                let t = (w << 5) | b as usize;
+                let r = run.get(t).copied().unwrap_or(STR_RUN_BAD);
+                if r == STR_RUN_BAD {
+                    continue;
+                }
+                let added = (r & !STR_RUN_CLOSES) as u64;
+                if added <= room && (r & STR_RUN_CLOSES == 0 || added >= to_min) {
+                    bits[w] |= 1u32 << b;
+                }
+            }
+        }
+        Some(bits)
     }
 
     /// The machine with every value string's character count replaced by what the next token
@@ -968,7 +1057,7 @@ impl SchemaMask {
         for f in k.stack.iter_mut() {
             if let Frame::Str { si, st } = f {
                 let s = &self.schemas[*si as usize];
-                if !s.enum_str.is_empty() {
+                if !s.enum_str.is_empty() || st.free_len {
                     continue;
                 }
                 let cp = st.cp as u64;
@@ -1119,12 +1208,26 @@ impl SchemaMask {
             return bits;
         }
         let Some(stored) = self.machine(state) else { return bits };
-        if stored.is_dead() {
+        self.walk_into(&stored, &mut bits);
+        bits
+    }
+
+    /// [`SchemaMask::compute_allowed`] for a machine snapshot that need not be interned.
+    fn compute_allowed_machine(&self, m: &Machine) -> Vec<u32> {
+        let mut bits = vec![0u32; self.words];
+        if self.words == 0 || self.vocab.nodes.is_empty() {
             return bits;
         }
-        let mut m = (*stored).clone();
-        self.trie_walk(&mut m, 0, &mut bits);
+        self.walk_into(m, &mut bits);
         bits
+    }
+
+    fn walk_into(&self, stored: &Machine, bits: &mut Vec<u32>) {
+        if stored.is_dead() {
+            return;
+        }
+        let mut m = stored.clone();
+        self.trie_walk(&mut m, 0, bits);
     }
 
     /// DFS the vocabulary trie from `node`, pruning the moment the machine refuses a byte.
@@ -1285,7 +1388,7 @@ impl SchemaMask {
     /// Value-string constraint check. `closing` = the terminating quote was consumed.
     fn str_value_ok(&self, si: u32, st: &StrState, closing: bool) -> bool {
         let s = &self.schemas[si as usize];
-        if let Some(mx) = s.max_len {
+        if let Some(mx) = s.max_len.filter(|_| !st.free_len) {
             if st.cp as u64 > mx {
                 return false;
             }
@@ -1294,7 +1397,7 @@ impl SchemaMask {
             if !st.is_closed_interior() {
                 return false;
             }
-            if let Some(mn) = s.min_len {
+            if let Some(mn) = s.min_len.filter(|_| !st.free_len) {
                 if (st.cp as u64) < mn {
                     return false;
                 }
@@ -2515,6 +2618,62 @@ mod tests {
                 assert_eq!(*m.allowed(st), m.compute_allowed(st), "{schema}: {len} chars");
             }
         }
+    }
+
+    /// Multi-byte pieces with escapes, UTF-8, closing quotes and structure after the close.
+    fn mixed_vocab() -> Vec<(u32, Vec<u8>)> {
+        let mut pieces = byte_vocab();
+        let n = pieces.len() as u32;
+        let extra: [&[u8]; 14] = [b"ab", b"abc", b"abcd\"", b"\"}", b"xyz", b"\\n", b"q\\t",
+            "\u{e9}".as_bytes(), "a\u{e9}b\"".as_bytes(), b"\\u00e9", b"\\u00", b"e9\"}",
+            b"\", \"", &[0xC3]];
+        for (i, p) in extra.iter().enumerate() {
+            pieces.push((n + i as u32, p.to_vec()));
+        }
+        pieces
+    }
+
+    #[test]
+    fn length_bounded_masks_match_full_walk() {
+        // Every state reached by a random walk over multi-byte pieces: the derived mask near the
+        // length bounds must equal a full trie walk (including mid-escape / mid-UTF-8 states,
+        // which take the full walk).
+        for schema in [r#"{"type":"object","properties":{"t":{"type":"string","minLength":3,"maxLength":7}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","maxLength":4},"u":{"type":"string","maxLength":2}}}"#,
+                       r#"{"type":"object","properties":{"t":{"type":"string","minLength":5}}}"#,
+                       r#"{"type":"array","items":{"type":"string","maxLength":3},"maxItems":4}"#] {
+            let mut m = mask(schema);
+            m.set_vocab(mixed_vocab());
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut checked = 0;
+            for _ in 0..200 {
+                let mut st = m.start_state();
+                for _ in 0..24 {
+                    if m.is_complete(st) { break; }
+                    let bits = m.allowed(st);
+                    assert_eq!(*bits, m.compute_allowed(st), "{schema}");
+                    checked += 1;
+                    let ids: Vec<u32> = (0..m.vocab_size as u32)
+                        .filter(|&t| bits[(t >> 5) as usize] >> (t & 31) & 1 == 1).collect();
+                    if ids.is_empty() { break; }
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    st = m.step(st, ids[((rng >> 33) as usize) % ids.len()]).expect("allowed token refused");
+                }
+            }
+            assert!(checked > 200, "{schema}: only {checked} states checked");
+        }
+    }
+
+    #[test]
+    fn str_run_counts_characters_not_bytes() {
+        assert_eq!(str_run_of(b"abc"), 3);
+        assert_eq!(str_run_of(b"ab\"}"), 2 | STR_RUN_CLOSES);
+        assert_eq!(str_run_of(b"\\n"), 1);
+        assert_eq!(str_run_of(b"\\u00e9x"), 2);
+        assert_eq!(str_run_of(b"\\u00"), 0); // escape still open: no character yet
+        assert_eq!(str_run_of("\u{e9}\u{e9}".as_bytes()), 2);
+        assert_eq!(str_run_of(&[0xC3]), 0); // UTF-8 sequence still open
+        assert_eq!(str_run_of(&[0x01]), STR_RUN_BAD);
     }
 
     #[test]
