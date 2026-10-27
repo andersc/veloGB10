@@ -3656,15 +3656,6 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
         Ok(())
     }
 
-    /// S-B9-REL-SMALLFIXES item 5(a): the lane in slot `s` is finishing on the stop token `tok`,
-    /// the choice of logits row `row` of the step that just ran. Reads that ONE row back and sends
-    /// the token's probability and rank ahead of the Finish (`stop_p` / `stop_rank` of the HTTP
-    /// side's `[gen]` line). Cost: one host readback of vocab f16 values plus one host pass over
-    /// them, on a request's FINISHING step and only when it ends on a stop token; no step of a
-    /// running request pays anything. TP=1 only: under TP the greedy head is vocab-parallel and no
-    /// rank holds a full logits row (the line says `na`). A greedy row checks itself — its token
-    /// must be the row's top logit (`stop_info_checked`); if it is not, the row read is not the row
-    /// that chose the token, nothing is sent and one line per boot says so.
     /// The log probability of `tok` (the choice of the plain step's logits row `row` in
     /// `self.sc`) and the `n` most likely alternatives, sent as a `TokEvent::Logprob` just before
     /// the token itself. A failed readback sends nothing (the handler then has no entry for that
@@ -3679,6 +3670,16 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
         }
     }
 
+
+    /// S-B9-REL-SMALLFIXES item 5(a): the lane in slot `s` is finishing on the stop token `tok`,
+    /// the choice of logits row `row` of the step that just ran. Reads that ONE row back and sends
+    /// the token's probability and rank ahead of the Finish (`stop_p` / `stop_rank` of the HTTP
+    /// side's `[gen]` line). Cost: one host readback of vocab f16 values plus one host pass over
+    /// them, on a request's FINISHING step and only when it ends on a stop token; no step of a
+    /// running request pays anything. TP=1 only: under TP the greedy head is vocab-parallel and no
+    /// rank holds a full logits row (the line says `na`). A greedy row checks itself — its token
+    /// must be the row's top logit (`stop_info_checked`); if it is not, the row read is not the row
+    /// that chose the token, nothing is sent and one line per boot says so.
     fn send_stop_info(&self, s: usize, row: usize, tok: u32, packed: bool) {
         if self.tp.is_some() { return; }
         let Some(lane) = self.lanes[s].as_ref() else { return };
@@ -8729,7 +8730,16 @@ mod stop_info_tests {
             assert!(line.contains("reason == \"stop\""), "a call not guarded by the stop reason: `{}`", line.trim());
         }
         let rb = format!(".logits_{}(", "row");
-        assert_eq!(src.matches(rb.as_str()).count(), 1, "one readback site in the scheduler (send_stop_info)");
+        assert_eq!(src.matches(rb.as_str()).count(), 2, "two readback sites in the scheduler (send_stop_info, send_logprob)");
+        // send_logprob runs only for a request that asked for log probabilities, and never under TP
+        let lp = format!("self.send_{}(", "logprob");
+        assert_eq!(src.matches(lp.as_str()).count(), 2, "the plain step and the prefill's first token");
+        for (i, _) in src.match_indices(lp.as_str()) {
+            let before = &src[src[..i].rfind("\n        ").unwrap_or(0)..i];
+            let ctx = &src[i.saturating_sub(400)..i];
+            assert!(ctx.contains("logprobs") && (ctx.contains("!tp_on") || ctx.contains("self.tp.is_none()")),
+                    "a send_logprob call not gated on the request's logprobs and TP=1: `{}`", before.trim());
+        }
         let f = &src[src.find(format!("fn send_{}(&self", "stop_info").as_str()).expect("send_stop_info")..];
         assert!(f.find("if self.tp.is_some() { return; }").unwrap() < f.find(rb.as_str()).unwrap(), "no readback under TP");
     }
