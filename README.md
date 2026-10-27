@@ -38,7 +38,8 @@ serving stack is required.
 [Benchmarks](#benchmarks)): Qwen3.8 27B at **~40 tok/s on one GB10 and ~56 tok/s on two** (and
 **~85 tok/s on four** with DFlash 2) · Qwen3.6 27B at **~42 tok/s** on one GB10 and **~53 tok/s on two** ·
 Qwen3.6 35B MoE at **~111 tok/s** on one GB10 and **~130 tok/s on two** · Qwen3.5 122B MoE at **~39 tok/s** on one GB10 and **~57
-tok/s on two**.
+tok/s on two** · Naive-N0.5-Flash (EXL3 3.5 bpw) at **~82 tok/s on four GB10s** (TP=4, sampled
+pure-code decode).
 
 Prebuilt binaries for GB10 systems are on the [**Releases** page](https://github.com/sf-stav/veloGB10/releases) — each release includes the
 inference binary, the required PTX kernels, SHA-256 checksums, and build provenance notes. If you
@@ -318,6 +319,46 @@ a vLLM / SGLang / ExLlamaV3 recipe has, to my knowledge.
 - Streaming, cancel mid-decode and mid-prefill, penalties with the reference engine's windowing,
   loop detection.
 - Every option is a command-line flag, plus `--print-config`.
+
+---
+
+## Naive N0.5 Flash (EXL3)
+
+**veloGB10 serves Naive-N0.5-Flash from EXL3 packs at the model's full 256K context, with the S8
+block-7 FP8 drafter for speculative decoding, at TP=4 and TP=2.**
+
+Two packs, either one works:
+[doth4580/Naive-N0.5-Flash-EXL3-3.5bpw](https://huggingface.co/doth4580/Naive-N0.5-Flash-EXL3-3.5bpw)
+(~110.8 GB of artifacts; the measured numbers below) and
+[doth4580/Naive-N0.5-Flash-EXL3-4bpw](https://huggingface.co/doth4580/Naive-N0.5-Flash-EXL3-4bpw).
+The head ships each node its own rank's shard through the TP blob cache — you never copy weights
+to the node machines. Full step-by-step guide with launch commands, expected log lines and cache
+behaviour: **[NAIVE_N0.5_FLASH_SETUP.md](NAIVE_N0.5_FLASH_SETUP.md)**.
+
+### Naive N0.5 Flash performance
+
+Single-stream decode, VeloBenchmark 0.3.0, production sampling (no sampler fields sent; the
+pack's generation defaults), pure-code regime (ANSI C sorting), reasoning effort low:
+
+| | TP=4 | TP=2 |
+|---|---:|---:|
+| Decode median | **82.4 tok/s** | 51.9 tok/s |
+| Decode p50 / p90 / p99 | 82.4 / 90.0 / 91.6 | 51.9 / 72.8 / 79.6 |
+| TTFT (short prompt) | 0.52 s | 0.58 s |
+| Spec acceptance / depth | 77 % / 4.9 | 38 % / 3.3 |
+| Stability (sustain / peak) | 98 % | 84 % |
+
+The TP=4 cell is a full 3,726-token pure-code session (91 steps, 27 speculation rounds at 2.00
+accepted tokens per round); the TP=2 cell is a short cancelled probe (439 tokens in 9 s) and
+under-reports the topology — treat it as indicative.
+
+### Boot times (EXL3 3.5 bpw, to `/health = 200`)
+
+| | TP=4 | TP=2 |
+|---|---:|---:|
+| First-ever boot (ships the weights) | **~20.5 min** | ~15 min |
+| Staged-cold (weights cached, decode cache cold) | ~6.5 min | ~7 min |
+| Warm (all caches present) | **~1.8 min** | ~3.5 min |
 
 ---
 
