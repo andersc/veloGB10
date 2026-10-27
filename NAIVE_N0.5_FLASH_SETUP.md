@@ -171,6 +171,15 @@ workers:
 | 2 concurrent — avg TTFT | 0.87 s | 1.47 s |
 | 2 concurrent — tokens in cell | 4,425 (71 s) | 11,077 (3 m 57 s) |
 
+**Prefill scaling** (separate calls, one request at a time; decode-rate and speculation columns
+from the same requests are in the report above):
+
+| Input length | TP=4 prefill | TP=4 TTFT | TP=2 prefill | TP=2 TTFT |
+|---|---:|---:|---:|---:|
+| ~1K tokens | 631 tok/s | 1.69 s | 405 tok/s | 2.63 s |
+| ~4K tokens | 726 tok/s | 5.70 s | 490 tok/s | 8.44 s |
+| ~8K tokens | 739 tok/s | 11.14 s | 501 tok/s | 16.44 s |
+
 Live decode-rate traces, one per topology (VeloBenchmark):
 
 ![Naive N0.5 Flash — TP=4 decode trace](assets/naive_tp4.png)
