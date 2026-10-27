@@ -391,6 +391,25 @@ fn compile_schema(v: &Value, depth: usize, via: &str, table: &mut Vec<Schema>) -
                 "keyword 'enum' values do not match {ty_label} (V1 supports string and integer enum values only)"
             )));
         }
+        // Only values the schema's other keywords also accept are candidates: an enum value
+        // outside minLength/maxLength or the numeric bounds would let decoding start a prefix
+        // with no valid completion.
+        let (min_len, max_len) = (s.min_len, s.max_len);
+        s.enum_str.retain(|e| {
+            let n = e.chars().count() as u64;
+            min_len.map_or(true, |m| n >= m) && max_len.map_or(true, |m| n <= m)
+        });
+        let in_bounds = |v: f64| {
+            s.minimum.map_or(true, |m| v >= m) && s.excl_min.map_or(true, |m| v > m)
+                && s.maximum.map_or(true, |m| v <= m) && s.excl_max.map_or(true, |m| v < m)
+        };
+        let ints: Vec<i64> = s.enum_int.iter().copied().filter(|&e| in_bounds(e as f64)).collect();
+        s.enum_int = ints;
+        if s.enum_str.is_empty() && s.enum_int.is_empty() {
+            return Err(err_msg(
+                "keyword 'enum': no value satisfies the schema's other constraints".to_string(),
+            ));
+        }
         s.has_enum = true;
     }
 
@@ -549,6 +568,11 @@ fn str_advance(st: &mut StrState, b: u8, keep: bool) -> Step {
             let Some(d) = hex_val(b) else { return Step::Bad };
             let acc = acc * 16 + d as u32;
             if n + 1 < 4 {
+                // `\uDC`..`\uDF` can only become a lone low surrogate: refuse it now, while
+                // another byte can still follow, instead of at the fourth digit
+                if n + 1 == 2 && (0xDC..=0xDF).contains(&acc) {
+                    return Step::Bad;
+                }
                 st.esc = Esc::Hex { n: n + 1, acc };
                 return Step::Open;
             }
@@ -585,6 +609,11 @@ fn str_advance(st: &mut StrState, b: u8, keep: bool) -> Step {
             let Some(d) = hex_val(b) else { return Step::Bad };
             let acc = acc * 16 + d as u32;
             if n + 1 < 4 {
+                // the second half of a pair must be `\uDC00`..`\uDFFF`: refuse a prefix that
+                // cannot become one
+                if (n + 1 == 1 && acc != 0xD) || (n + 1 == 2 && !(0xDC..=0xDF).contains(&acc)) {
+                    return Step::Bad;
+                }
                 st.esc = Esc::LowHex { n: n + 1, acc, hi };
                 return Step::Open;
             }
@@ -1337,6 +1366,10 @@ impl SchemaMask {
                 if has_enum && !any_int && (b == b'-' || b.is_ascii_digit()) {
                     return false;
                 }
+                // enum values are strings and integers only: an object or array never matches
+                if has_enum && (b == b'{' || b == b'[') {
+                    return false;
+                }
                 match b {
                     b'{' => {
                         push_obj(m, si);
@@ -1430,14 +1463,9 @@ impl SchemaMask {
         if s.ty == Ty::Integer && !matches!(st, NumState::Zero | NumState::Int) {
             return false; // integer forbids fraction/exponent
         }
-        if s.has_enum {
-            if s.enum_str.is_empty() {
-                if !s.enum_int.iter().any(|&e| e as f64 == v) {
-                    return false;
-                }
-            } else {
-                return false; // string enum on a numeric schema cannot match
-            }
+        // a number matches only the enum's integer values (an untyped enum may list strings too)
+        if s.has_enum && !s.enum_int.iter().any(|&e| e as f64 == v) {
+            return false;
         }
         if let Some(m) = s.minimum {
             if v < m {
@@ -1462,49 +1490,85 @@ impl SchemaMask {
         true
     }
 
-    /// Can a number whose bytes so far are `buf` (grammar position `st`) still END UP in range?
+    /// Can a number whose bytes so far are `buf` (grammar position `st`) still END UP valid?
     ///
     /// `num_ok` runs only when the number TERMINATES, so without this check the allowed set let the
-    /// model run an unbounded digit sequence after a value that had already passed the bound — the
-    /// escape the 0.8B probe produced on 2026-09-14 (`{"n":-1000…`, 258 chars, `finish=length`).
+    /// model run an unbounded digit sequence after a prefix that could no longer complete.
     ///
-    /// The rule is deliberately narrow: it returns false only when the prefix is PROVABLY
-    /// unsatisfiable, so it can prune the mask but can never reject a document that `num_ok` would
-    /// accept. That is why it applies to `Ty::Integer` only — for a float, `.`/`e` can still move
-    /// any digit prefix back into range (`70e-1 == 7`), and for `Ty::Any` a fraction is allowed too.
+    /// The rule may prune the mask (refuse a prefix) only when no valid completion exists, or
+    /// when it narrows the spelling of a value that is still reachable another way:
+    ///   - an integer enum: the canonical spelling of a listed value only (as for string enums);
+    ///   - `integer`: no fraction or exponent (`num_ok` refuses them), and the digits must still
+    ///     reach an integer inside the bounds (the values `p*10^k ..= p*10^k + 10^k - 1`);
+    ///   - `number`: a sign the bounds exclude (a nonzero negative with no negative value allowed,
+    ///     a nonzero positive with no positive value allowed). Any other float prefix can still
+    ///     be moved into range by `.`/`e` (`70e-1 == 7`).
     fn num_prefix_viable(&self, si: u32, buf: &[u8], st: NumState) -> bool {
         let s = &self.schemas[si as usize];
-        if s.ty != Ty::Integer {
-            return true;
-        }
-        if !matches!(st, NumState::NegStart | NumState::Zero | NumState::Int) {
-            return true;
+        if !s.enum_int.is_empty() {
+            return s.enum_int.iter().any(|e| e.to_string().as_bytes().starts_with(buf));
         }
         let negative = buf.first() == Some(&b'-');
         let digits = if negative { &buf[1..] } else { buf };
-        if digits.is_empty() {
-            // A bare `-`: viable iff some negative integer could be in range.
-            return !(s.minimum.is_some_and(|mn| mn > 0.0)
-                || s.excl_min.is_some_and(|mn| mn >= 0.0));
+        let lead = digits.first().copied();
+        match s.ty {
+            Ty::Integer => {}
+            Ty::Number => {
+                let neg_ok = s.minimum.map_or(true, |m| m < 0.0) && s.excl_min.map_or(true, |m| m < 0.0);
+                let pos_ok = s.maximum.map_or(true, |m| m > 0.0) && s.excl_max.map_or(true, |m| m > 0.0);
+                let zero_ok = s.minimum.map_or(true, |m| m <= 0.0) && s.excl_min.map_or(true, |m| m < 0.0)
+                    && s.maximum.map_or(true, |m| m >= 0.0) && s.excl_max.map_or(true, |m| m > 0.0);
+                let lower = s.minimum.unwrap_or(f64::NEG_INFINITY).max(s.excl_min.unwrap_or(f64::NEG_INFINITY));
+                let upper = s.maximum.unwrap_or(f64::INFINITY).min(s.excl_max.unwrap_or(f64::INFINITY));
+                return match lead {
+                    None => neg_ok || zero_ok, // a bare `-`: `-0` or a negative
+                    // `0`, `0.x`: a value in [0, 1); `-0`, `-0.x`: a value in (-1, 0]
+                    Some(b'0') if negative => zero_ok || (neg_ok && upper > -1.0),
+                    Some(b'0') => zero_ok || (pos_ok && lower < 1.0),
+                    Some(_) if negative => neg_ok,
+                    Some(_) => pos_ok,
+                };
+            }
+            _ => return true,
         }
-        let Ok(text) = std::str::from_utf8(buf) else { return true };
-        let Ok(v) = text.parse::<f64>() else { return true };
-        // An integer's value is monotone in its digits: appending a digit moves it AWAY from zero,
-        // so a positive prefix above the upper bound can never come back down, and a negative
-        // prefix below the lower bound can never come back up.
-        if negative {
-            if s.minimum.is_some_and(|mn| v < mn) || s.excl_min.is_some_and(|mn| v < mn) {
+        if !matches!(st, NumState::NegStart | NumState::Zero | NumState::Int) {
+            return false;
+        }
+        // the integer bounds
+        let lo = s.minimum.map_or(f64::NEG_INFINITY, f64::ceil)
+            .max(s.excl_min.map_or(f64::NEG_INFINITY, |m| m.floor() + 1.0));
+        let hi = s.maximum.map_or(f64::INFINITY, f64::floor)
+            .min(s.excl_max.map_or(f64::INFINITY, |m| m.ceil() - 1.0));
+        if lo > hi {
+            return false;
+        }
+        if digits.is_empty() {
+            // a bare `-`: `-0` (= 0) or a negative integer
+            return lo <= hi.min(0.0);
+        }
+        // `0` / `-0` cannot be extended by another digit (leading zeros are illegal JSON)
+        if st == NumState::Zero {
+            return self.num_ok(si, buf, st);
+        }
+        let Ok(text) = std::str::from_utf8(digits) else { return true };
+        let Ok(p) = text.parse::<f64>() else { return true };
+        // the magnitudes this prefix can still become: [p*10^k, p*10^k + 10^k - 1], k = 0, 1, ...
+        let mut scale = 1.0f64;
+        loop {
+            let (a, b) = (p * scale, p * scale + scale - 1.0);
+            let (vlo, vhi) = if negative { (-b, -a) } else { (a, b) };
+            if vlo <= hi && vhi >= lo {
+                return true;
+            }
+            // every longer number lies further from zero, so past the bound means never
+            if (!negative && a > hi) || (negative && -a < lo) {
                 return false;
             }
-        } else if s.maximum.is_some_and(|mx| v > mx) || s.excl_max.is_some_and(|mx| v > mx) {
-            return false;
+            if scale > 1e19 {
+                return true; // beyond the integer range checked exactly here; `num_ok` decides
+            }
+            scale *= 10.0;
         }
-        // `0` / `-0` cannot be extended by another digit (leading zeros are illegal JSON), so this
-        // prefix is already final and must be in range on its own.
-        if st == NumState::Zero && !self.num_ok(si, buf, st) {
-            return false;
-        }
-        true
     }
 
     /// Pop a terminal pending number frame (used by `is_complete`); false = it was not valid.
@@ -2583,6 +2647,72 @@ mod tests {
         assert!(m.step(at_max, 0xC3).is_none(), "no UTF-8 lead byte at maxLength");
         let closed = m.step(at_max, b'"' as u32).unwrap();
         assert!(m.step(closed, b'}' as u32).is_some());
+    }
+
+    #[test]
+    fn enum_candidates_respect_length_bounds() {
+        let m = mask(r#"{"type":"string","enum":["a","bbb"],"minLength":3}"#);
+        assert!(walk(&m, r#""a"#).is_none(), "a value shorter than minLength is not a candidate");
+        assert!(ok(&m, r#""bbb""#));
+        let m = mask(r#"{"type":"string","enum":["abc","de"],"maxLength":2}"#);
+        assert!(walk(&m, r#""a"#).is_none(), "a value longer than maxLength is not a candidate");
+        assert!(ok(&m, r#""de""#));
+        assert!(compile_err(r#"{"type":"string","enum":["a"],"minLength":2}"#).contains("enum"));
+        let m = mask(r#"{"type":"integer","enum":[1,20],"maximum":10}"#);
+        assert!(walk(&m, "2").is_none(), "an integer outside the bounds is not a candidate");
+        assert!(ok(&m, "1"));
+    }
+
+    #[test]
+    fn integer_prefixes_must_reach_a_valid_value() {
+        let m = mask(r#"{"type":"integer"}"#);
+        assert!(walk(&m, "1.").is_none(), "no fraction for an integer");
+        assert!(walk(&m, "1e").is_none(), "no exponent for an integer");
+        assert!(ok(&m, "-12"));
+        let m = mask(r#"{"type":"integer","minimum":5,"maximum":10}"#);
+        assert!(walk(&m, "2").is_none(), "2, 20.. are all outside 5..10");
+        assert!(walk(&m, "1").is_some(), "1 can still become 10");
+        assert!(walk(&m, "11").is_none());
+        assert!(walk(&m, "-").is_none());
+        assert!(ok(&m, "5") && ok(&m, "10") && !ok(&m, "1"));
+        let m = mask(r#"{"type":"integer","minimum":-10,"maximum":-5}"#);
+        assert!(walk(&m, "-1").is_some() && walk(&m, "-2").is_none() && walk(&m, "0").is_none());
+        assert!(ok(&m, "-5") && ok(&m, "-10"));
+        let m = mask(r#"{"type":"integer","exclusiveMinimum":4.5,"exclusiveMaximum":7}"#);
+        assert!(walk(&m, "4").is_none() && walk(&m, "7").is_none());
+        assert!(ok(&m, "5") && ok(&m, "6"));
+        let m = mask(r#"{"type":"integer","enum":[1,2]}"#);
+        assert!(walk(&m, "3").is_none() && walk(&m, "10").is_none() && walk(&m, "1.").is_none());
+        assert!(ok(&m, "1") && ok(&m, "2"));
+        let m = mask(r#"{"type":"number","minimum":0}"#);
+        assert!(walk(&m, "-1").is_none(), "no negative number when none is allowed");
+        assert!(ok(&m, "-0") && ok(&m, "2.5"));
+        let m = mask(r#"{"type":"number","maximum":-1}"#);
+        assert!(walk(&m, "5").is_none() && walk(&m, "0").is_none() && walk(&m, "-0").is_none());
+        assert!(ok(&m, "-1.5"));
+        no_dead_ends(r#"{"type":"object","properties":{"a":{"type":"integer","minimum":5,"maximum":10},"b":{"type":"integer","enum":[1,2,30]}},"required":["a","b"]}"#, 400, 80);
+    }
+
+    #[test]
+    fn untyped_enum_admits_only_its_values() {
+        let m = mask(r#"{"enum":["alpha","beta"]}"#);
+        assert!(walk(&m, "{").is_none() && walk(&m, "[").is_none());
+        assert!(ok(&m, r#""alpha""#));
+        let m = mask(r#"{"type":"object","properties":{"k":{"enum":["x",3]}},"required":["k"]}"#);
+        assert!(walk(&m, r#"{"k":{"#).is_none() && walk(&m, r#"{"k":["#).is_none());
+        assert!(ok(&m, r#"{"k":"x"}"#) && ok(&m, r#"{"k":3}"#));
+        assert!(walk(&m, r#"{"k":4"#).is_none());
+    }
+
+    #[test]
+    fn no_lone_surrogate_escape_prefix() {
+        let m = mask(r#"{"type":"string"}"#);
+        assert!(walk(&m, r#""\udc"#).is_none(), "a low surrogate cannot start a pair");
+        assert!(walk(&m, r#""\ud834\u"#).is_some());
+        assert!(walk(&m, r#""\ud834\ue"#).is_none(), "a pair needs a low surrogate second");
+        assert!(walk(&m, r#""\ud834\ud8"#).is_none());
+        assert!(ok(&m, r#""\ud834\udd1e""#));
+        no_dead_ends(r#"{"type":"object","properties":{"t":{"type":"string"}},"required":["t"]}"#, 2000, 60);
     }
 
     #[test]
