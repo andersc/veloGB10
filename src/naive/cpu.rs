@@ -525,7 +525,7 @@ mod tests {
     use std::path::Path;
 
     fn fixture() -> Option<String> {
-        let d = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/naive/tiny");
+        let d = concat!(".", "/tests/fixtures/naive/tiny");
         // oracle.npz is committed; model.safetensors (12.5 MB, *.safetensors is gitignored) is generated on the box:
         //   python3 scripts/naive/tiny_replica.py build tests/fixtures/naive/tiny   (needs torch + safetensors)
         if Path::new(d).join("oracle.npz").is_file() && Path::new(d).join("model.safetensors").is_file() { Some(d.to_string()) }

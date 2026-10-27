@@ -5,7 +5,7 @@ generic language where they aren't individually notable.
 
 ## v0.7.5 — EXL3 everywhere + the Naive-N0.5-Flash family + DFlash2 drafts under TP everywhere + reduced draft vocabulary
 
-_Released 2026-10-27 · tag `v0.7.5` · asset `velogb10-v0.7.5-gb10-sm121.tar.gz` (+ `SHA256SUMS.txt`, `PROVENANCE.txt`) · binary sha256 `430b2c240c5e4a0cb55b7b469cd17e6b9048247808a5953f7544b1181f7581d6`_
+_Released 2026-10-27 · tag `v0.7.5` · asset `velogb10-v0.7.5-gb10-sm121.tar.gz` (+ `SHA256SUMS.txt`, `PROVENANCE.txt`) · binary sha256 `7ff7ef98e8909ed408589623b018324c509b5c22d6b9ccd8636800ec512038f4`_
 
 Re-cut of the previously deleted v0.7.5: this build contains everything that cut contained (all
 five EXL3 packs serving everywhere, graceful `--max-batch`, the stable cut) plus everything since
