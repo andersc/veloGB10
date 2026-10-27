@@ -557,6 +557,64 @@ recipe is ~76 GB.
 
 ---
 
+## Reduced draft vocabulary (`--draft-vocab`, on by default)
+
+*New after v0.7.5.* On the NVFP4 server, the MTP drafter proposes its draft tokens from a reduced
+vocabulary: the 65,536 most frequent token ids plus the special-token tail (end-of-turn, think and
+tool-call markers) — about 27% of the Qwen vocabulary. Each draft step then reads about a quarter of
+the LM head instead of all of it. The verify step still scores the **full** vocabulary, so greedy
+output is byte-for-byte the same and sampled output keeps exactly the same distribution; only the
+draft cost and the acceptance rate change.
+
+It is **on by default for the Qwen3.5 / 3.6 / 3.8 models** (dense and MoE, NVFP4 / FP8 / bf16 LM
+heads; tested on a single node and at TP=2). The boot log prints `draft head: 66048 of 248320 tokens`, and `/metrics`
+reports `velogb10_draft_vocab_rows` and `velogb10_draft_vocab_steps_total`. It does not apply to the
+Qwen3.8-Flash-Next or EXL3 packs.
+
+Measured on a GB10 (median decode, one request at a time, requests with the server's default sampling,
+thinking on and off, English prompts):
+
+| Model | Topology | Speed-up |
+|---|---|---|
+| Qwen3.5 0.8B | single node / TP=2 | +21.5% / +15.4% |
+| Qwen3.5 2B | single node | +10.9% |
+| Qwen3.5 4B | single node | +17.8% |
+| Qwen3.5 9B | single node / TP=2 | +20.2% / +6.6% |
+| Qwen3.6 35B A3B | single node | +10.0% |
+| Qwen3.8 27B | single node | +7.2% |
+
+Individual prompts ranged from −8% to +33%.
+
+**Turn it off for non-Latin-script workloads.** The kept ids are the most frequent ones in the
+tokenizer's order, which favours code, English and other Latin-script languages. A token outside the
+subset can never be drafted, so for languages whose tokens mostly fall outside it the drafter rarely
+lands a draft and speculation stops paying. Share of tokens the reduced drafter can propose:
+
+| Text | Share |
+|---|---|
+| Code, tool-call JSON | 100% |
+| English | 94% |
+| German | 77% |
+| Russian | 50% |
+| Japanese / Arabic / Korean | 31% / 27% / 26% |
+| Chinese | 15% |
+| Hindi / Thai | 8% / 4% |
+
+If your users mostly write in Chinese, Japanese, Korean, Arabic, Hindi, Thai or similar, start the
+server with `--draft-vocab off`:
+
+```bash
+./gb10_inference --server --model-dir=/path/to/model --port=9000 \
+  --max-seq-len=32768 --max-batch=1 --prefix-cache=on --mtp=auto --draft-vocab off
+```
+
+Other values: `on` (the default), a row count (`--draft-vocab 40000`), a percentage
+(`--draft-vocab 30%`) or a fraction (`--draft-vocab 0.3`) of the vocabulary;
+`--draft-vocab-file <path>` takes an explicit list of token ids (the special-token tail is always
+added).
+
+---
+
 ## Security: tool-secret scrub (opt-in)
 
 Agentic traffic can carry credentials inside tool results, and a model will sometimes echo one
