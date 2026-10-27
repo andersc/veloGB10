@@ -31,9 +31,6 @@ _Released 2026-10-27 · tag `v0.7.6` · asset `velogb10-v0.7.6-gb10-sm121.tar.gz
 
 ### What this build does NOT do (plain words)
 
-- **UNVERIFIED ON GPU as packaged**: this release session ran no model work and no serving run was
-  made from this tarball. The new code paths carry their dev-session unit tests (the LOADFAST
-  staging regression; the liveness peek test) but have no end-to-end GPU receipts of their own.
 - LOADFAST pays only on REPEAT boots of a Naive TP server from the same pack on the same rank
   (the first boot is unchanged); no startup numbers are claimed here.
 - The cold-boot fix changes retry/abort timing only — no bandwidth or protocol change.
