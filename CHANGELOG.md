@@ -3,6 +3,30 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## Unreleased (master since v0.7.5)
+
+What has landed on master AFTER the v0.7.5 re-cut. Not part of any staged release tarball yet.
+
+- **FR-Spec reduced MTP draft head + `--draft-vocab`**: the draft head can now be built over a
+  reduced, id-order subset of the vocabulary (special-token tail) instead of the full vocab, for
+  all Qwen NVFP4/FP8/bf16 heads (ISSUES 148). Started opt-in; since 2026-10-27 (owner decision)
+  **`--draft-vocab` is ON by default for the Qwen3.5/3.6/3.8 family**; off elsewhere (hy_v3
+  unverified, qwen4_exp never). `--draft-vocab off` disables it; an explicit setting keeps its
+  own MTP calibration file.
+- **The known trade, in plain words**: the reduced draft head covers an id-order subset, so
+  non-Latin scripts are mostly OUTSIDE it — drafting for such text does not benefit and falls
+  back to full-vocab behavior. Documented in the README.
+- **MTP calibration cache is keyed on `--draft-vocab`**: a full-vocab calibration overprices the
+  reduced draft head; each setting keeps its own calibration file (default file name and stamp
+  unchanged).
+- **Streaming fix (ISSUES 149)**: a Qwen no-think render with `reasoning_effort low|high` no
+  longer streams the reasoning label as visible content.
+- **`--quantize --help` now documents the recipe syntax** and the three documented recipes
+  (`all`; `all,gdn:fp8` - the default; `all:fp8`).
+- Verified so far: greedy-identical output with the flag on vs off across 12 configurations
+  (TP1 on .11, TP2 on .11+.13); the default-on flip is owner-ordered (2026-10-27). Full sampled
+  benchmarking of the reduced head is still pending.
+
 ## v0.7.5 — EXL3 everywhere + the Naive-N0.5-Flash family + DFlash2 drafts under TP everywhere
 
 Re-cut of the previously deleted v0.7.5: this build contains everything that cut contained (all
