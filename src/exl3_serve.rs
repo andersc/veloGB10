@@ -382,8 +382,8 @@ enum SchemaStep {
     Continue,
     /// the JSON document is complete: the turn ends here ("stop")
     Complete,
-    /// the token is not valid in the machine's state (cannot happen with the mask armed);
-    /// the turn ends ("stop") and the event is logged
+    /// the token is not valid in the machine's state, or leaves no valid continuation: the
+    /// turn ends with an error finish (`SCHEMA_DEAD_END`) and the event is logged
     Invalid,
 }
 
