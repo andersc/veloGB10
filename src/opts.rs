@@ -622,9 +622,16 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("once", false, Vis::Adv),
     ("oracle", true, Vis::Adv),
     ("oracle-dir", true, Vis::Adv),
-    ("otel-endpoint", false, Vis::Adv),
-    ("otel-model-id", false, Vis::Adv),
-    ("otel-topology", false, Vis::Adv),
+    // MTPAGREE1 (public v0.7.6 report, Q3): the six --otel-* options are read by otel::config_from_args
+    // through a closure, never as "--otel-…" literals in the scanned files, so three of them were
+    // missing here and F7b printed "unknown option --otel-include-tokens: ignored" for a value the
+    // server DID apply (v0.7.4 and v0.7.6 alike). All six take a value.
+    ("otel-batch-interval-ms", true, Vis::Adv),
+    ("otel-batch-size", true, Vis::Adv),
+    ("otel-endpoint", true, Vis::Adv),
+    ("otel-include-tokens", true, Vis::Adv),
+    ("otel-model-id", true, Vis::Adv),
+    ("otel-topology", true, Vis::Adv),
     ("other", false, Vis::Adv),
     ("out", true, Vis::Adv),
     ("out-dir", true, Vis::Adv),
@@ -1260,6 +1267,19 @@ mod tests {
         assert_eq!(unknown_warnings(&a(&["bin", "--max-bach", "--max-bach"])).len(), 1);
         // argv[0] (the program path) is never judged
         assert!(unknown_warnings(&a(&["/home/x/--weird-path"])).is_empty());
+    }
+
+    /// MTPAGREE1 (public v0.7.6 report, Q3): the --otel-* options are read through a closure in
+    /// otel::config_from_args, so the literal scan above never saw three of them and the guard printed
+    /// "unknown option --otel-include-tokens: ignored" for a value the server applied. All six are
+    /// known and value-taking (the value slot after each is not judged).
+    #[test]
+    fn f7b_otel_options_are_known_and_take_a_value() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let w = unknown_warnings(&a(&["bin", "--server", "--otel-endpoint", "http://127.0.0.1:4318",
+                                       "--otel-include-tokens", "on", "--otel-batch-size", "256",
+                                       "--otel-batch-interval-ms", "50", "--otel-model-id", "m", "--otel-topology", "tp2"]));
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]

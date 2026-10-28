@@ -6256,7 +6256,7 @@ fn wp21_check_slabs(l: &Launcher, q: &Quad, xh: &CudaSlice<u16>, yraw: &mut Cuda
     let (xh_p, yr_p) = (*xh.device_ptr() as u64, *yraw.device_ptr() as u64);
     for (r0, ms) in wp22r1_slabs(m) {
         xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                 (&q.tr, xh_p + (r0 * k * 2) as u64, ws, ms as i32, q.k, q.n, q.bits))?;
+                 (&q.tr, xh_p + (r0 * k * 2) as u64, ws, ms as i32, q.k, q.n, q.k2))?;
         xqlaunch!(l, "exl3_ks_combine", (((ms * n) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                  (ws, yr_p + (r0 * n * 2) as u64, ms as i32, q.n, q.ks as i32))?;
     }
@@ -6574,7 +6574,7 @@ fn psk_xcheck_pair(l: &Launcher, q0: &Quad, q1: &Quad, xh0: &CudaSlice<u16>, xh1
     let t0 = l.dev.alloc_zeros::<f32>(need)?;
     let t1 = l.dev.alloc_zeros::<f32>(need)?;
     xqlaunch!(l, "exl3_hmma_gemm_ks_x2", ((q0.n as u32) / 128, q0.ks, 2), (256, 1, 1), 0,
-             (&q0.tr, &q1.tr, xh0, xh1, &t0, &t1, m as i32, q0.k, q0.n, q0.bits))?;
+             (&q0.tr, &q1.tr, xh0, xh1, &t0, &t1, m as i32, q0.k, q0.n, q0.k2))?;
     l.dev.synchronize()?;
     let (mut n0, mut n1) = (vec![0f32; need], vec![0f32; need]);
     l.dev.dtoh_sync_copy_into(&ws0.slice(0..need), &mut n0)?;
@@ -6707,7 +6707,7 @@ fn exl3_chain_pair(l: &Launcher, q0: &Quad, q1: &Quad, x: &CudaSlice<u16>,
         }
     } else {
         xqlaunch!(l, "exl3_hmma_gemm_ks_x2", ((n as u32) / 128, q0.ks, 2), (256, 1, 1), 0,
-                 (&q0.tr, &q1.tr, &*xh0, &*xh1, ws0, ws1, m as i32, k, n, q0.bits))?;
+                 (&q0.tr, &q1.tr, &*xh0, &*xh1, ws0, ws1, m as i32, k, n, q0.k2))?;
         let mn = (m * n as usize) as u32;
         xqlaunch!(l, "exl3_ks_combine_x2", ((mn + 255) / 256, 1, 2), (256, 1, 1), 0,
                  (ws0, ws1, &mut *yraw0, &mut *yraw1, m as i32, n, q0.ks as i32))?;
@@ -13382,6 +13382,27 @@ impl FwdModel {
         out.push(fnv(&mut rs.iter().map(|x| x.to_bits())));
         let tk = self.dev.dtoh_sync_copy(&sc.taps_keep)?;
         out.push(fnv(&mut tk.iter().map(|x| x.to_bits())));
+        // MTPAGREE1 (diagnostic): the MTP head's own state next to the trunk's — its collapsed hidden
+        // (sc.x, the lm-head input of the last draft pass), the DHEAD-rotated copy (sc.chain_xh) and
+        // the head's KV rows of slot 0, positions 0..512 of every K|V plane (where the head attends).
+        // Labels in exl3_serve::tp_round: m = resid, m+1 = taps, m+2 = x, m+3 = chain_xh, m+4 = head_kv.
+        let xs = self.dev.dtoh_sync_copy(&sc.x)?;
+        out.push(fnv(&mut xs.iter().map(|&x| x as u32)));
+        let cx = self.dev.dtoh_sync_copy(&sc.chain_xh)?;
+        out.push(fnv(&mut cx.iter().map(|&x| x as u32)));
+        if let Some(head) = self.mtp.as_ref() {
+            let nkv = self.cfg.num_kv_heads;
+            let rb = kv_rowbytes(self.kv_fmt, self.cfg.head_dim);
+            let npos = self.max_pos.min(512);
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for plane in 0..2 * nkv {
+                let start = (plane * self.max_pos) * rb; // slot 0
+                let mut bytes = vec![0u8; npos * rb];
+                self.dev.dtoh_sync_copy_into(&head.kv.slice(start..start + npos * rb), &mut bytes)?;
+                for b in bytes { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01b3); }
+            }
+            out.push(h);
+        } else { out.push(0); }
         Ok(out)
     }
 
@@ -22039,9 +22060,15 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
             let y_p = *y.device_ptr() as u64;
             wp21_occupancy_once(l);
             for (r0, ms) in wp22r1_slabs(m) {
+                // MTPAGREE1 (public v0.7.6 TP=2 report): the fused kernel's switch is keyed on k2 (W3, 2026-10-18),
+                // and this site — the MTP head's fc_hidden / fc_embed prime + re-prime, the one wp22r1_chain
+                // caller — kept passing `bits`. For the 5-bit head quads (bits 5, k2 10) no case matched and the
+                // kernel returned without computing: sc.hf / sc.yd kept whatever the buffer held, per rank, so the
+                // replicated head's hidden and its re-primed KV rows drifted apart across TP ranks (confidences by
+                // 1-2 fp16 ulps per round, sampled drafts diverging) while every trunk digest stayed identical.
                 xqlaunch!(l, "exl3_hmma_gemm_ks_fx", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
                          (&q.tr, xh_p + (r0 * k * 2) as u64, ws, &q.svh, y_p + (r0 * n * 2) as u64, &q.cnt,
-                          ms as i32, q.k, q.n, q.bits))?;
+                          ms as i32, q.k, q.n, q.k2))?;
             }
             if wp21_xcheck() { wp21_check_slabs(l, q, xh, yraw, y, m, ws)?; }
             return Ok(());
@@ -22054,7 +22081,7 @@ its packed graph set will differ from its peer's — the TP boot agree must refu
                 if psk_xcheck() { psk_xcheck_single(l, q, xs, ws, ms, g)?; }
             } else {
             xqlaunch!(l, "exl3_hmma_gemm_ks", ((q.n as u32) / 128, q.ks, 1), (256, 1, 1), 0,
-                     (&q.tr, xs, ws, ms as i32, q.k, q.n, q.bits))?;
+                     (&q.tr, xs, ws, ms as i32, q.k, q.n, q.k2))?;
             }
             let mn = (ms * n) as u32;
             xqlaunch!(l, "exl3_ks_combine", ((mn + 255) / 256, 1, 1), (256, 1, 1), 0,

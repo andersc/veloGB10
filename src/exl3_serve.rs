@@ -2353,6 +2353,14 @@ impl Exl3Scheduler {
                 crate::deprintln!("[tp-ident] FIRST MISMATCH at {what} (lockstep step {step}, width {m}): {bad} of {} digests differ \
                            (logits rows 0..{m}, resid, taps)", digests.len());
             }
+            // MTPAGREE1: name WHICH digests differ (index < m: logits row / vp key; m: resid; m+1: taps), every time,
+            // at --log-level debug, so the first divergent round says trunk vs head.
+            if bad > 0 {
+                let which: Vec<String> = (0..digests.len()).filter(|&i| mine[7 + 2 * i] != peer[7 + 2 * i] || mine[8 + 2 * i] != peer[8 + 2 * i])
+                    .map(|i| format!("{}:{:08x}{:08x}/{:08x}{:08x}", if i < m { format!("logits{i}") } else { ["resid", "taps", "x", "chain_xh", "head_kv"].get(i - m).map(|s| s.to_string()).unwrap_or_else(|| format!("d{i}")) },
+                                     mine[8 + 2 * i], mine[7 + 2 * i], peer[8 + 2 * i], peer[7 + 2 * i])).collect();
+                crate::deprintln!("[tp-ident] {what} step {step} width {m}: differing digests (mine/peer) {}", which.join(" "));
+            }
         }
         if rank == 0 {
             Ok((ms, plain_ms, captured))
@@ -3338,6 +3346,14 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
         // TP-C: lockstep — agree on (step, accept, verify width, emitted + drafts + confidences) and
         // take the HEAD's ms / plain ms / capture flag (identity at TP=1: no TP state).
         let captured_local = self.model.graph_count() != g0;
+        // MTPAGREE1: --round-trace prints every speculative round's view on EVERY rank (and at TP=1), so two
+        // runs or two ranks can be diffed field by field: tokens vs the per-position confidences (the f32
+        // bits the TP mtp-round digest also hashes).
+        if round_trace_on() {
+            let r = self.tp.as_ref().map_or(0, |t| t.rank);
+            eprintln!("[round-trace] rank={r} s={s} p={p} plain={plain_step} k_eff={k_eff} a={} drafts={:?} emitted={:?} confs_bits={:?}",
+                      out.a, out.drafts, out.emitted, confs.iter().map(|c| format!("{:08x}", c.to_bits())).collect::<Vec<_>>());
+        }
         let (ms, plain_ms, captured) = if self.tp.is_some() {
             let mut w: Vec<u32> = out.emitted.iter().map(|&x| x as u32).collect();
             w.extend(out.drafts.iter().map(|&x| x as u32));
@@ -3350,6 +3366,16 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
                     // logs to see whether the chain diverges at draft[0] (input/ring) or mid-chain.
                     eprintln!("[df2-tp2] p={:?} plain={} accept={} drafts={:?} emitted={:?} confs={:?}",
                               p, plain_step, out.a, out.drafts, out.emitted, confs);
+                    // MTPAGREE1 (public v0.7.6 TP=2 report): the lane's sampler state next to the round
+                    // view, so a rank diff names the subsystem (seed/counters = RNG stream; pen = the
+                    // penalty rows; history tail = the committed stream the two ranks hold).
+                    if let Some(lane) = self.lanes[s].as_ref() {
+                        let ht: Vec<u32> = lane.history.iter().rev().take(8).copied().collect();
+                        eprintln!("[df2-tp2] lane s={s} seed={} ctr={} dctr={} temp={} top_p={} top_k={} min_p={} pen={:?} \
+                                   spec_ratio={} k_eff={} tap_row={} b={} pos={} generated={} history_tail(rev)={:?}",
+                                  lane.seed, lane.ctr, lane.dctr, lane.temperature, lane.top_p, lane.top_k,
+                                  lane.min_p, lane.pen, self.spec_ratio, k_eff, tap_row, b, lane.pos, lane.generated, ht);
+                    }
                     return Err(e);
                 }
             }
@@ -8244,6 +8270,7 @@ mod s1_eq_aware_arg_tests {
     const FLAGS: &[&str] = &[
         "--lane-order", "--lane-quantum", "--model-name", "--served-model-name",
         "--otel-endpoint", "--otel-model-id", "--otel-topology",
+        "--otel-include-tokens", "--otel-batch-size", "--otel-batch-interval-ms",
         "--port", "--max-seq-len", "--max-batch", "--prefix-cache", "--prefill-chunk", "--prefill-interleave",
         "--kv-cache", "--ple-ram", "--reasoning-effort", "--thinking", "--cpu-affinity",
         "--tune-table", "--tune-draft", "--tune-profile", "--draft-confidence",

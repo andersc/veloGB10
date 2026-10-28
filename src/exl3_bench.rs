@@ -2357,6 +2357,10 @@ fn probe_moe_epi_k4(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
     Ok(())
 }
 
+// MTPAGREE1 (2026-10-28): the reference launches below drive k2-keyed kernels (exl3_hmma_gemm, _ks, _ks_x2, _ks_fx —
+// their switch takes 2*K since W3, 2026-10-18); they kept passing `bits`, so on a 4-bit module the reference ran the
+// K=2.0 body and on a 6-bit module the K=3 body, and --probe-exl3-binv reported false kernel-equivalence FAILs. The
+// grouped / wide kernels stay bits-keyed and keep `bits`.
 // ---------------------------------------------------------------------------
 // S-A3-n F3: the grouped expert kernel's A-once body must be BITWISE equal to the
 // barrier body (exl3_hmma_gemm) on the same trellis + activations, every row,
@@ -2379,7 +2383,7 @@ fn probe_grouped_a1(dev: &std::sync::Arc<CudaDevice>, d_tr: &CudaSlice<u16>, k: 
         let mut y_grp = dev.htod_sync_copy(&vec![0u16; m * n])?;
         let cfg = |sm: u32| LaunchConfig { grid_dim: ((n / 128) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: sm };
         unsafe {
-            f_old.clone().launch(cfg(0), (d_tr, &d_xh, &mut y_old, m as i32, k as i32, n as i32, bits as i32))?;
+            f_old.clone().launch(cfg(0), (d_tr, &d_xh, &mut y_old, m as i32, k as i32, n as i32, (2 * bits) as i32))?;
             f_grp.clone().launch(cfg(smem as u32), (d_tr, &d_offs, &d_xh, &mut y_grp, m as i32, k as i32, n as i32, bits as i32, &d_esel))?;
         }
         dev.synchronize()?;
@@ -2440,7 +2444,7 @@ fn probe_lmh(dev: &std::sync::Arc<CudaDevice>, d_tr: &CudaSlice<u16>, d_svh: &Cu
         unsafe {
             f_old.clone().launch_on_stream(&stream,
                 LaunchConfig { grid_dim: ((n / 128) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                (d_tr, &d_xh, &mut yr_old, m as i32, k as i32, n as i32, bits as i32))?;
+                (d_tr, &d_xh, &mut yr_old, m as i32, k as i32, n as i32, (2 * bits) as i32))?;
             f_svh.clone().launch_on_stream(&stream,
                 LaunchConfig { grid_dim: ((m * n / 128) as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
                 (&yr_old, d_svh, &mut y_old, n as i32))?;
@@ -2566,9 +2570,9 @@ fn probe_ks_p(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
             let old_cfg = |z: u32| LaunchConfig { grid_dim: (tiles, ks, z), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
             let new_cfg = |g: u32| LaunchConfig { grid_dim: (g, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
             unsafe {
-                f_old.clone().launch(old_cfg(1), (&d_tr0, &d_x0, &mut r0, m as i32, k as i32, n as i32, bits as i32))?;
+                f_old.clone().launch(old_cfg(1), (&d_tr0, &d_x0, &mut r0, m as i32, k as i32, n as i32, (2 * bits) as i32))?;
                 f_old2.clone().launch(old_cfg(2), (&d_tr0, &d_tr1, &d_x0, &d_x1, &mut p0, &mut p1,
-                                                   m as i32, k as i32, n as i32, bits as i32))?;
+                                                   m as i32, k as i32, n as i32, (2 * bits) as i32))?;
             }
             dev.synchronize()?;
             let ref0 = dev.dtoh_sync_copy(&r0)?;
@@ -2733,7 +2737,7 @@ fn probe_wp21(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
                 dev.htod_sync_copy_into(&vec![0xFFFFu16; m * n], &mut y0)?;
                 unsafe {
                     f_fx.clone().launch_on_stream(&st, cfg((tiles as u32, ks as u32, 1), 256),
-                        (&a.tr, &xh0, &mut ws0, &a.svh, &mut y0, &cnt0, m as i32, k as i32, n as i32, bits as i32))?;
+                        (&a.tr, &xh0, &mut ws0, &a.svh, &mut y0, &cnt0, m as i32, k as i32, n as i32, (2 * bits) as i32))?;
                 }
                 dev.synchronize()?;
                 launches += 1;
@@ -2762,7 +2766,7 @@ fn probe_wp21(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
                     *ws0.device_ptr(), *ws1.device_ptr(), *a.svh.device_ptr(), *b.svh.device_ptr(),
                     *y0.device_ptr(), *y1.device_ptr(), *cnt0.device_ptr(), *cnt1.device_ptr(),
                 ];
-                crate::exl3_forward::wp21_fx_x2_raw(st.stream, pp, m, k as i32, n as i32, bits as i32, ks as u32)?;
+                crate::exl3_forward::wp21_fx_x2_raw(st.stream, pp, m, k as i32, n as i32, (2 * bits) as i32, ks as u32)?; // k2, as the served caller passes
                 dev.synchronize()?;
                 launches += 1;
                 let (p0, p1) = (dev.dtoh_sync_copy(&ws0)?, dev.dtoh_sync_copy(&ws1)?);
@@ -2790,7 +2794,7 @@ fn probe_wp21(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
                 gf("exl3_had_suh")?.launch_on_stream(&st, cfg(((m * k / 128) as u32, 1, 1), 32), (&x, &a.suh, &mut xh, k as i32))?;
                 for &(r0, ms) in &slabs {
                     gf("exl3_hmma_gemm_ks")?.launch_on_stream(&st, cfg((tiles as u32, ks as u32, 1), 256),
-                        (&a.tr, xh_p + (r0 * k * 2) as u64, &mut ws, ms as i32, k as i32, n as i32, bits as i32))?;
+                        (&a.tr, xh_p + (r0 * k * 2) as u64, &mut ws, ms as i32, k as i32, n as i32, (2 * bits) as i32))?;
                     gf("exl3_ks_combine")?.launch_on_stream(&st, cfg((((ms * n + 255) / 256) as u32, 1, 1), 256),
                         (&ws, yr_p + (r0 * n * 2) as u64, ms as i32, n as i32, ks as i32))?;
                 }
@@ -2809,7 +2813,7 @@ fn probe_wp21(dev: &std::sync::Arc<CudaDevice>, pack: &Exl3Pack) -> Result<()> {
                     unsafe {
                         f_fx.clone().launch_on_stream(&st, cfg((tiles as u32, ks as u32, 1), 256),
                             (&a.tr, xh_p + (r0 * k * 2) as u64, &mut ws, &a.svh, yf_p + (r0 * n * 2) as u64, &cnt0,
-                             ms as i32, k as i32, n as i32, bits as i32))?;
+                             ms as i32, k as i32, n as i32, (2 * bits) as i32))?;
                     }
                     launches += 1;
                 }
@@ -2885,7 +2889,7 @@ fn dense_ref(dev: &std::sync::Arc<CudaDevice>, st: &CudaStream, md: &DenseMod, x
         let xr = xin.as_ref().unwrap_or(x);
         gf("exl3_had_suh")?.launch_on_stream(st, cfg(((m * k / 128) as u32, 1, 1), 32), (xr, &md.suh, &mut xh, k as i32))?;
         gf("exl3_hmma_gemm_ks")?.launch_on_stream(st, cfg(((n / 128) as u32, ks as u32, 1), 256),
-                                                  (&md.tr, &xh, &mut ws, m as i32, k as i32, n as i32, md.bits as i32))?;
+                                                  (&md.tr, &xh, &mut ws, m as i32, k as i32, n as i32, (2 * md.bits) as i32))?;
         gf("exl3_ks_combine")?.launch_on_stream(st, cfg((((m * n + 255) / 256) as u32, 1, 1), 256),
                                                 (&ws, &mut yr, m as i32, n as i32, ks as i32))?;
         gf("exl3_had_svh")?.launch_on_stream(st, cfg(((m * n / 128) as u32, 1, 1), 32), (&yr, &md.svh, &mut y, n as i32))?;
@@ -2920,7 +2924,7 @@ fn dense_pair_fallback(dev: &std::sync::Arc<CudaDevice>, st: &CudaStream, a: &De
                                                 (x, &a.suh, &b.suh, &mut xh0, &mut xh1, k as i32))?;
         gf("exl3_hmma_gemm_ks_x2")?.launch_on_stream(st, cfg(((n / 128) as u32, ks as u32, 2), 256),
                                                      (&a.tr, &b.tr, &xh0, &xh1, &mut ws0, &mut ws1,
-                                                      m as i32, k as i32, n as i32, a.bits as i32))?;
+                                                      m as i32, k as i32, n as i32, (2 * a.bits) as i32))?;
         gf("exl3_ks_combine_x2")?.launch_on_stream(st, cfg((((m * n + 255) / 256) as u32, 1, 2), 256),
                                                    (&ws0, &ws1, &mut yr0, &mut yr1, m as i32, n as i32, ks as i32))?;
         gf("exl3_had_svh_x2")?.launch_on_stream(st, cfg(((m * n / 128) as u32, 1, 2), 32),
@@ -5983,7 +5987,7 @@ fn bench_lmh(dev: &std::sync::Arc<CudaDevice>, d_tr: &CudaSlice<u16>, d_svh: &Cu
             if *nst == 0 {
                 unsafe {
                     f_old.clone().launch_on_stream(&stream, cfg_g,
-                        (d_tr, &d_xh, &mut d_yr, m as i32, k as i32, n as i32, bits as i32))?;
+                        (d_tr, &d_xh, &mut d_yr, m as i32, k as i32, n as i32, (2 * bits) as i32))?;
                     if *flag {
                         f_svh.clone().launch_on_stream(&stream, cfg_o, (&d_yr, d_svh, &mut d_y, n as i32))?;
                     }
@@ -6040,7 +6044,7 @@ fn bench_launch(
     unsafe {
         f_gemm
             .clone()
-            .launch_on_stream(stream, cfg_g, (&c.d_tr, &c.d_xh, &mut c.d_yraw, w as i32, k as i32, n as i32, c.bits as i32))
+            .launch_on_stream(stream, cfg_g, (&c.d_tr, &c.d_xh, &mut c.d_yraw, w as i32, k as i32, n as i32, (2 * c.bits) as i32))
             .unwrap();
     }
     if full_chain {

@@ -1,7 +1,36 @@
-# Changelog
+## v0.7.7 — fix: TP=2 MTP lockstep crash on first generation (the `--mtp` blocker)
 
-High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
-generic language where they aren't individually notable.
+Fixes the v0.7.5/v0.7.6 crash reported on the issue tracker: with MTP enabled at TP=2, the first
+generation dies with `TP pre-verify FAILED` / `TP agree() FAILED at mtp-round` and exit 70.
+`--mtp off` worked around it; v0.7.4 was unaffected.
+
+**Root cause:** the fractional-K kernel work re-keyed the EXL3 decode GEMM kernels by `k2` (= 2K)
+instead of `bits`, but five launch sites still passed `q.bits`. Those launches silently dispatched
+to nothing, so the MTP head's prime / re-prime GEMMs computed nothing on affected packs, and the
+ranks diverged at the next mtp-round digest check. The fix passes `q.k2` at the five sites — one
+token per site, no kernel change, and no behaviour change for any launch that was already
+computing.
+
+Also in this release, all from the same investigation:
+- the `--otel-*` option set is allowlisted; the previous `unknown option --otel-include-tokens`
+  warning was a false positive — the value **was** applied, and the flag can stay in your launch
+  files;
+- the probe suite itself was repaired (several EXL3 probe launch sites carried the same stale-key
+  bug and had been reporting false kernel-equivalence FAILs);
+- on an `mtp-round` agree failure the server now dumps per-rank sampler state alongside the
+  watchdog dump;
+- `Cargo.lock` now records the crate version in lockstep with `Cargo.toml`.
+
+**What this build does NOT do:** no performance work is included (every verification number in the
+investigation is a correctness receipt); lane packing is unchanged (requests carrying a sampler
+penalty still never pack — the v0.7.4 rule); TP=4 was verified only at the reported posture
+(12 requests per cell); no long soak and no long-context cell was run. On packs whose MTP head
+uses a 5-bit key, the head's prime / re-prime now computes correctly, which can only raise
+speculative acceptance.
+
+Verified: unit suite (26 k2/WP21/PSK/chain/quad/option-guard tests), losslessness x5, the
+`--probe-exl3-binv` suite, TP=2 end-to-end at the reported flags (16/16 clean, speculation
+engaged), TP=4 12/12 on two packs.
 
 ## v0.7.6 — LOADFAST staged loader for Naive TP + TP cold-boot bring-up fix
 
