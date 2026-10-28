@@ -119,6 +119,11 @@ def report(m, where, window):
     if done == 0 and toks == 0:
         L.append("  Nothing was served in this period, so there is nothing to judge. Send your requests, then run this again.")
         return L
+    tk = val(m, "velogb10_top_k_capped_total")
+    if tk:
+        L.append(f"  top_k capped: {n(tk)} sampled request(s) asked for no top-k truncation (top_k 0 or negative) or more than 64 "
+                 f"candidates; this model family's GPU sampler keeps at most 64, so they were served with top_k 64 "
+                 f"(the EXL3 server and --cpu-sample apply no such limit)")
     dc, ds = val(m, "velogb10_decode_tokens_per_second_count"), val(m, "velogb10_decode_tokens_per_second_sum")
     if dc > 0:
         L.append(f"  average decode speed of a request: {ds / dc:.1f} tok/s over {n(dc)} requests "

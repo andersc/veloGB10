@@ -14116,7 +14116,7 @@ impl GpuModel {
         for j in 0..n {
             pf[j] = temp;
             pf[MAX_VERIFY + j] = top_p;
-            ki[MAX_VERIFY + j] = top_k as i32;
+            ki[MAX_VERIFY + j] = crate::sampler::gpu_top_k(top_k);   // TOPKM1: 0 / >64 -> the kernels' 64-candidate law, not argmax
         }
         for j in 0..n - 1 {
             pf[2 * MAX_VERIFY + j] = draft_qprobs[j];
@@ -14252,7 +14252,7 @@ impl GpuModel {
         for j in 0..n {
             pf[j] = temp;
             pf[MAX_VERIFY + j] = top_p;
-            ki[MAX_VERIFY + j] = top_k as i32;
+            ki[MAX_VERIFY + j] = crate::sampler::gpu_top_k(top_k);   // TOPKM1: 0 / >64 -> the kernels' 64-candidate law, not argmax
         }
         for j in 0..n - 1 {
             ki[j] = draft_tokens[j] as i32;
@@ -15948,7 +15948,7 @@ impl GpuModel {
         let mut k_dev = self.dev.alloc_zeros::<i32>(1).unwrap();   // [1] i32
         let mut p_dev = pool.get(1);     // [1] f32
         let mut sd_dev = self.dev.alloc_zeros::<u32>(1).unwrap();  // [1] u32
-        let t = [temp]; let k = [top_k as i32]; let p = [top_p]; let sd = [seed];
+        let t = [temp]; let k = [crate::sampler::gpu_top_k(top_k)]; let p = [top_p]; let sd = [seed];
         self.dev.htod_sync_copy_into(&t, &mut t_dev).unwrap();
         self.dev.htod_sync_copy_into(&k, &mut k_dev).unwrap();
         self.dev.htod_sync_copy_into(&p, &mut p_dev).unwrap();

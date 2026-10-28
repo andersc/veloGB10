@@ -102,6 +102,15 @@ pub fn set_max_batch_requested(n: usize) {
 static OVER_CAP_QUEUED: AtomicU64 = AtomicU64::new(0);
 /// MAXBATCH1: over-cap arrivals refused by the `--max-waiting` gate (503 `server_busy`).
 static OVER_CAP_REJECTED: AtomicU64 = AtomicU64::new(0);
+/// TOPKM1: sampled requests on the batched GPU samplers (NVFP4/bf16 family) that asked for no
+/// top-k truncation (0, or a negative value the server maps to 0) or a top_k above the kernels'
+/// 64-candidate limit; served with top_k 64 (`crate::sampler::gpu_top_k`).
+static TOP_K_CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// TOPKM1: count one request whose top_k the batched GPU samplers capped at 64 (owner_check prints it).
+pub fn top_k_capped() {
+    TOP_K_CAPPED.fetch_add(1, Relaxed);
+}
 
 /// MAXBATCH1: count one over-cap arrival that waits in the queue (owner_check prints it in words).
 pub fn over_cap_queued() {
@@ -801,6 +810,9 @@ pub fn render(engine_alive: bool) -> String {
     o.push_str("# HELP velogb10_over_cap_arrivals_total Requests that arrived beyond what the lane cap can run at once (a busy server, or a burst the queue must absorb): queued = waited for a lane, then served; rejected = waiting limit, 503 server_busy.\n# TYPE velogb10_over_cap_arrivals_total counter\n");
     o.push_str(&format!("velogb10_over_cap_arrivals_total{{disposition=\"queued\"}} {}\n", OVER_CAP_QUEUED.load(Relaxed)));
     o.push_str(&format!("velogb10_over_cap_arrivals_total{{disposition=\"rejected\"}} {}\n", OVER_CAP_REJECTED.load(Relaxed)));
+    // TOPKM1: the batched GPU samplers' top_k cap (0 / negative / > 64 -> 64). scripts/owner_check.py prints it.
+    o.push_str("# HELP velogb10_top_k_capped_total Sampled requests that asked for no top-k truncation (top_k 0 or negative) or more than 64 candidates on a model family whose GPU sampler keeps at most 64; served with top_k 64 (the EXL3 server and --cpu-sample apply no such limit).\n# TYPE velogb10_top_k_capped_total counter\n");
+    o.push_str(&format!("velogb10_top_k_capped_total {}\n", TOP_K_CAPPED.load(Relaxed)));
     // CLIPRUNE1: rendered since it was set (F7b) but never shown — scripts/owner_check.py
     // already reads it and tolerates absence; keep that guard working.
     o.push_str("# HELP velogb10_unknown_options Unknown '--' options seen at startup (warned and ignored; F7b).\n# TYPE velogb10_unknown_options gauge\n");

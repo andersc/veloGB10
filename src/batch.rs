@@ -2328,6 +2328,23 @@ impl BatchScheduler {
         let temperature = req.temperature;
         let top_p = req.top_p;
         let top_k = req.top_k;
+        // TOPKM1 (PR #29 follow-up): on the batched GPU samplers a request's top_k 0 ("no top-k
+        // truncation", also what the server maps a negative top_k to) and any top_k above their
+        // candidate limit are served as top-64 (crate::sampler::gpu_top_k). Count it and say so once
+        // per boot, so a client that asked for the full law can see what it got. The CPU sampler
+        // (--cpu-sample) applies no limit; greedy and top_k 1 never reach a sampler.
+        if self.gpu_sample && !greedy && top_k != 1 && crate::sampler::gpu_top_k_capped(top_k) {
+            crate::metrics::top_k_capped();
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::reprintln!("[req] top_k {} requested ({}): this model family's GPU sampler keeps the {} most likely tokens \
+                                   per step (its candidate limit), so this request and every later one like it is served with \
+                                   top_k {}; the CPU sampler (--cpu-sample) applies no limit. Counted in \
+                                   velogb10_top_k_capped_total; this line prints once per boot.",
+                                  top_k, if top_k == 0 { "no top-k truncation" } else { "above the limit" },
+                                  crate::sampler::GPU_SAMPLE_K_MAX, crate::sampler::GPU_SAMPLE_K_MAX);
+            }
+        }
         let domain = req.domain;
         let tx = req.tx;
         let plen = req.prompt.len();
@@ -6299,7 +6316,7 @@ impl BatchScheduler {
                         .map(|&i| self.lanes[i].as_ref().unwrap().temperature).collect();
                     t.resize(mb, 1.0);
                     let mut ki: Vec<i32> = batch_idx.iter()
-                        .map(|&i| self.lanes[i].as_ref().unwrap().top_k as i32).collect();
+                        .map(|&i| crate::sampler::gpu_top_k(self.lanes[i].as_ref().unwrap().top_k)).collect();
                     ki.resize(mb, 1);
                     let mut p: Vec<f32> = batch_idx.iter()
                         .map(|&i| self.lanes[i].as_ref().unwrap().top_p).collect();

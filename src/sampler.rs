@@ -31,6 +31,29 @@ impl Sampler {
     }
 }
 
+/// The batched GPU samplers of the NVFP4/bf16 family (`sample_b`, `sample_f32_b`, `sample_prob_b`
+/// and `spec_verify_b` in kernels/gpu_batch.cu) rank at most this many candidates per row (their
+/// `SAMPLE_K_MAX`) and clamp a `top_k` below 1 to 1, i.e. to the argmax.
+pub const GPU_SAMPLE_K_MAX: usize = 64;
+
+/// `top_k` as the batched GPU samplers must receive it (TOPKM1, the PR #29 follow-up). A request's
+/// 0 — "no top-k truncation", sent as 0 or as a negative value the server maps to 0 — and any value
+/// above the kernels' candidate limit both become that limit, the widest law the kernels can draw
+/// from. Before, 0 reached the kernels' own `topk < 1 -> 1` clamp and "no truncation" was served
+/// as greedy. The CPU sampler (`sample`) takes the request's value unchanged: it handles 0 and
+/// k >= vocabulary exactly. Callers count and say once per boot when the cap applies
+/// (`velogb10_top_k_capped_total`).
+pub fn gpu_top_k(top_k: usize) -> i32 {
+    if top_k == 0 || top_k > GPU_SAMPLE_K_MAX { GPU_SAMPLE_K_MAX as i32 } else { top_k as i32 }
+}
+
+/// Whether `gpu_top_k` changes the request's value (the cap applies): a sampled request (the
+/// caller excludes greedy and top_k 1, which never reach the sampler) asking for 0 or more than
+/// the kernels' limit.
+pub fn gpu_top_k_capped(top_k: usize) -> bool {
+    top_k == 0 || top_k > GPU_SAMPLE_K_MAX
+}
+
 /// Greedy argmax.
 pub fn argmax(logits: &[f32]) -> u32 {
     logits.iter().enumerate()
@@ -85,4 +108,38 @@ pub fn sample(logits: &[f32], temperature: f32, top_k: usize, top_p: f32) -> u32
         if r < acc { return idx as u32; }
     }
     nucleus[nucleus.len() - 1].0 as u32
+}
+
+#[cfg(test)]
+mod gpu_top_k_tests {
+    use super::*;
+
+    #[test]
+    fn zero_and_negative_mapped_zero_become_the_kernel_limit_not_argmax() {
+        assert_eq!(gpu_top_k(0), GPU_SAMPLE_K_MAX as i32);
+        assert!(gpu_top_k_capped(0));
+    }
+
+    #[test]
+    fn values_inside_the_limit_pass_unchanged() {
+        for k in [1usize, 2, 20, 63, 64] {
+            assert_eq!(gpu_top_k(k), k as i32, "top_k {k}");
+            assert!(!gpu_top_k_capped(k), "top_k {k}");
+        }
+    }
+
+    #[test]
+    fn values_above_the_limit_are_capped_at_it() {
+        for k in [65usize, 248320, 248321, u32::MAX as usize, usize::MAX] {
+            assert_eq!(gpu_top_k(k), GPU_SAMPLE_K_MAX as i32, "top_k {k}");
+            assert!(gpu_top_k_capped(k), "top_k {k}");
+        }
+    }
+
+    #[test]
+    fn the_kernel_limit_matches_gpu_batch_cu() {
+        let cu = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/gpu_batch.cu")).unwrap();
+        let line = cu.lines().find(|l| l.starts_with("#define SAMPLE_K_MAX ")).expect("SAMPLE_K_MAX in gpu_batch.cu");
+        assert_eq!(line.trim_end(), format!("#define SAMPLE_K_MAX {GPU_SAMPLE_K_MAX}"));
+    }
 }
