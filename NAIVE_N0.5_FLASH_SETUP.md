@@ -150,10 +150,10 @@ Reading the table:
 
 ## 5. Performance
 
-Measured with **VeloBenchmark 0.3.0** against the served model, reasoning effort low, pure-code
-regime (ANSI C sorting), sampled defaults (no sampler fields sent).
-
-**Single request** (one at a time):
+Measured with **VeloBenchmark 0.3.0** against the served model, pure-code regime (ANSI C
+sorting), sampled defaults (no sampler fields sent), reasoning effort low. The first block is
+one request at a time; the **2 concurrent** rows are the same regime with two simultaneous
+workers:
 
 | | TP=4 | TP=2 |
 |---|---:|---:|
@@ -163,28 +163,22 @@ regime (ANSI C sorting), sampled defaults (no sampler fields sent).
 | TTFT (short prompt) | 0.58 s | 0.58 s |
 | Spec acceptance / depth | 77 % / 4.9 | 38 % / 3.3 |
 | Stability (sustain / peak) | 98 % | 84 % |
-| Output tokens in cell | 3,726 (90 % code, 10 % reasoning) | 439 (cancelled early — indicative only) |
+| Output tokens in cell | 3,726 (90 % code, 10 % reasoning) | 439 (cancelled probe — indicative) |
+| **2 concurrent — aggregate sustained** | **68.2 tok/s** | **51.0 tok/s** |
+| 2 concurrent — end-to-end (sum / wall) | 62.5 tok/s | 46.7 tok/s |
+| 2 concurrent — mean per-request decode | 34.1 tok/s | 25.5 tok/s |
+| 2 concurrent — per-request min / max | 31.2 / 37.0 | 21.1 / 29.9 |
+| 2 concurrent — avg TTFT | 0.87 s | 1.47 s |
+| 2 concurrent — tokens in cell | 4,425 (71 s) | 11,077 (3 m 57 s) |
 
-The TP=4 number reproduced across two independent runs (82.4 and 81.2 tok/s median) — a full
-~50 s pure-code session each time (91 steps, 27 speculation rounds at 2.00 accepted tokens per
-round). The TP=2 single-request cell is a short cancelled probe and under-reports the topology;
-the concurrency cells below are the better TP=2 reference.
+**Prefill scaling** (separate calls, one request at a time; decode-rate and speculation columns
+from the same requests are in the report above):
 
-**Two concurrent requests** (2 workers, pure code, same regime):
-
-| | TP=4 | TP=2 |
-|---|---:|---:|
-| Aggregate sustained | **68.2 tok/s** | **51.0 tok/s** |
-| End-to-end (sum / wall) | 62.5 tok/s | 46.7 tok/s |
-| Mean per-request decode | 34.1 tok/s | 25.5 tok/s |
-| Per-request min / max | 31.2 / 37.0 | 21.1 / 29.9 |
-| Avg TTFT | 0.87 s | 1.47 s |
-| Tokens in cell | 4,425 (71 s) | 11,077 (3 m 57 s) |
-
-TP=2 holds an aggregate 51 tok/s across two long concurrent generations (11K tokens); TP=4
-sustains 68 tok/s on the same workload. Note the single→concurrent trade on TP=4 (81 → 68
-aggregate): with two lanes live, per-request decode settles at ~34 tok/s — speculation and
-batching trade off as lanes fill the step.
+| Input length | TP=4 prefill | TP=4 TTFT | TP=2 prefill | TP=2 TTFT |
+|---|---:|---:|---:|---:|
+| ~1K tokens | 631 tok/s | 1.69 s | 405 tok/s | 2.63 s |
+| ~4K tokens | 726 tok/s | 5.70 s | 490 tok/s | 8.44 s |
+| ~8K tokens | 739 tok/s | 11.14 s | 501 tok/s | 16.44 s |
 
 Live decode-rate traces, one per topology (VeloBenchmark):
 

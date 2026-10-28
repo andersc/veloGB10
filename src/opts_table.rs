@@ -9,6 +9,8 @@ pub const REG: &[Opt] = &[
           help: "NVFP4 attention-E path debug prints" },
     Opt { flag: "attn-flash", env: "GB10_ATTN_FLASH", ty: Ty::Bool, def: "on", cat: Cat::Exl3, scope: Scope::Spmd, vis: Vis::Adv,
           help: "EXL3 flash attention path (off = the pre-flash kernels)" },
+    Opt { flag: "attn-tc", env: "GB10_ATTN_TC", ty: Ty::Bool, def: "off", cat: Cat::Exl3, scope: Scope::Spmd, vis: Vis::Adv,
+          help: "EXL3 tensor-core causal prefill attention for hd=256 (opt-in; f16 mma, not bitwise vs flash256c)" },
     Opt { flag: "attn-p3", env: "GB10_ATTN_P3", ty: Ty::Flag, def: "off", cat: Cat::Nvfp4, scope: Scope::Spmd, vis: Vis::Adv,
           help: "NVFP4 P3 attention variant (opt-in)" },
     Opt { flag: "a-ctrl", env: "GB10_A_CTRL", ty: Ty::Choice(&["new", "fixed128", "old", "off"]), def: "new", cat: Cat::Exl3, scope: Scope::Spmd, vis: Vis::Adv,

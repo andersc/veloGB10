@@ -140,6 +140,7 @@ ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
     --a-seam <new|headprime|old>       WP-A escape: prime seam (headprime / old)  [new]
     --a-taps <lane|shared>             WP-A escape: shared = one tap buffer for every lane (the pre-WP03 clobber)  [lane]
     --attn-flash <on|off>              EXL3 flash attention path (off = the pre-flash kernels)  [on]
+    --attn-tc <on|off>                 EXL3 tensor-core causal prefill attention for hd=256 (opt-in; f16 mma, not bitwise vs flash256c)  [off]
     --exl3-a1b3 <on|off>               A-once 3-bit expert entry (tunable moe.a1b3 override)  [on]
     --exl3-chain-pair <on|off>         paired same-input chains (tunable override)  [on]
     --exl3-conv-serial                 prefill conv serial (tunable pf.conv_par=0)  [off]
