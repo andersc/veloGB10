@@ -433,7 +433,7 @@ mod h5_direct_print_baseline_tests {
         // (eprintln, matching the existing sibling site in finish()/xcheck drain).
         // S-B9-REL-SMALLFIXES item 1: 87 -> 86, the two MTP boot-banner println! became one
         // (the line is built by the testable mtp_banner()).
-        ("src/exl3_serve.rs", 103), // EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
+        ("src/exl3_serve.rs", 106), // MTPAGREE1 (v0.7.7): 103 -> 106, the [df2-tp2] lane dump on the lockstep-failure arm, the [round-trace] line behind --round-trace and the [tp-ident] differing-digest line (failure / diagnostic paths; TOPKM1 hygiene, conscious update). Earlier: EXL27C: 88 -> 97 (--df2-trace gated dispatch/round prints; conscious update). +1 AGREE16: the width drill's line (test drill; one-shot since AGREE16B, right before a link abort)
             ("src/exl3_tune.rs", 7),
             ("src/exl3_wp27.rs", 8),
             ("src/gptq.rs", 42),
@@ -505,8 +505,8 @@ mod h5_direct_print_baseline_tests {
             // help lines above); re-pinned to the count of the MERGED tree (1547 + 33 + 15 = 1595, counted with this
             // module's counter on the merged main.rs before the build). The row below is OPERATIVE (find() takes the
             // first); naive-n05's original row is kept verbatim after it for the port's line-identity check.
-            ("src/main.rs", 1595), // OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree
-            ("src/main.rs", 1580), // NAIVE: +33, the --probe-naive-* dispatches' NAIVE_*_FAIL exit-path lines, their usage expect()s' siblings, and the head/node Naive TP boot lines (probe/boot classes)
+            ("src/main.rs", 1603), // TOPKM1 hygiene (2026-10-28): 1595 -> 1603, the --quantize recipe help text (b612145e: +9/-1 println! in the usage printer; conscious update). Earlier: OPERATIVE at the port merge: 1547 + 33 (naive) + 15 (master) = 1595 on the merged tree. (A second, stale `src/main.rs` row of 1580 sat below this one; `find` takes the first row, so it never applied — removed.)
+            // NAIVE history of src/main.rs: +33, the --probe-naive-* dispatches' NAIVE_*_FAIL exit-path lines, their usage expect()s' siblings, and the head/node Naive TP boot lines (probe/boot classes)
             // Conscious updates, not conversion misses.
         ("src/tp.rs", 12),
             ("src/tp_bench.rs", 75),
@@ -522,10 +522,11 @@ mod h5_direct_print_baseline_tests {
             ("src/naive/drafter_gpu.rs", 12),
             ("src/naive/frac.rs", 2),
             ("src/naive/gpu.rs", 23),
-            ("src/naive/model.rs", 34),
+            ("src/naive/model.rs", 33), // LOADFAST (f2571038): the per-layer routed up_proj scale println! removed, the layer-loaded line is a dprintln! (34 -> 33; TOPKM1 hygiene, conscious update)
             ("src/naive/pack.rs", 11),
             ("src/naive/serve.rs", 68),
             ("src/naive/shard.rs", 3),
+            ("src/naive/stage.rs", 10), // LOADFAST (f2571038): the staged-layer loader's cache/stage progress + warning lines, shipped in v0.7.6 without a baseline row (TOPKM1 hygiene; conscious update)
             ("src/naive/tp.rs", 7),
         ];
         let mut files = Vec::new();
