@@ -5,6 +5,9 @@ a request with `top_k: -1` — the vLLM/llama.cpp/TGI convention for "no top-k t
 rejected with HTTP 400 (`top_k must be non-negative`), and `--cpu-sample` panicked outright on
 `top_k: 0` or `top_k` ≥ vocabulary.
 
+**Thanks to [@andersc](https://github.com/andersc)** for the original pull request
+[#29](https://github.com/sf-stav/veloGB10/pull/29).
+
 What changed:
 
 - `top_k` below 0 is accepted on `/v1/chat/completions` and `/v1/completions` and means **no top-k
