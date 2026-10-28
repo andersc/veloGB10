@@ -45,6 +45,9 @@ ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
     --gid-idx <N>                      RoCE GID index for the TP data plane (integer N, or omit for auto-detect). Auto-detect picks the first IPv4-mapped RoCE v2 GID from sysfs (logged at bring-up with the sysfs evidence); fallback if none found: the static default 3. An explicit N binds EXACTLY index N on EVERY rail (the second rail and the single-stage context use the same resolved index); a wrong N fails loudly at bind — it is never re-scanned  [auto] (per box)
     --naive-lane-ctx <on|off>          Naive --naive-lanes > 1 with speculation (2026-10-21): on (default) = every lane keeps its own drafter context (each shared step feeds every lane's row, ~0.7 ms per extra lane at TP4), so any request left alone speculates; off = one context, fed only by the request admitted into an idle engine (the only one that can speculate)  [on]
     --naive-lanes <N>                  Naive TP=2/TP=4 concurrent requests (G1): 0 (default) = follow --max-batch (owner 2026-10-21), capped at 4; N >= 1 overrides it (1 = one request at a time). Up to N requests share each step (one row each, N KV slots); shared steps do not speculate, a request left alone does  [0]
+    --naive-load-cache <on|auto|off>   Naive loader (LOADFAST): on/auto (default) = keep a per-rank staged-layer cache under the tp-cache root; warm boots load the post-slice image from local disk instead of re-reading the pack (the head stops reading the model disk after the first boot). A bad entry falls back to staging that layer cold; off = never read or write it  [on]
+    --naive-load-verify <on|off>       Naive loader (LOADFAST): on (default) = sha256 every staged-cache file as it is read and refuse a mismatched one (falls back to staging that layer cold); off = trust sizes only  [on]
+    --naive-load-workers <N>           Naive loader (LOADFAST): parallel staging threads (1..16; default 4). Layers are staged out of order and uploaded in order, so staging of layer l+k overlaps the upload of layer l; 1 = the old strictly serial load  [4]
     --naive-moe-shard <auto|ep|tp>     Naive TP=2/TP=4 experts: auto (default, owner 2026-10-21) = tp at TP=4, ep at TP=2; ep = each rank holds whole experts (e % world); tp = every rank holds 1/world of EVERY expert (gate/up columns, down rows), so no rank waits for the one that drew the most experts. tp sums the MoE partials over K slices (a different fp32 order: tolerance class, not bitwise vs ep); the nodes' shards ship under their own cache id  [auto]
     --naive-tp-k1 <multi|single>       Naive TP=4 single-stage reduce (lever 1c): the K1 that copies a rank's partial into the RDMA send ring. multi (default) = several blocks with 16 B stores; single = the one-block K1 (~14 us per reduce on GB10). Same bytes and publication order either way (bitwise)  [multi]
     --naive-tp-prefill-xport <pipe|serial>
@@ -713,9 +716,12 @@ ALL OPTIONS (the complete accepted set; the day-to-day launch subset: --help)
     --once
     --oracle <value>
     --oracle-dir <value>
-    --otel-endpoint
-    --otel-model-id
-    --otel-topology
+    --otel-batch-interval-ms <value>
+    --otel-batch-size <value>
+    --otel-endpoint <value>
+    --otel-include-tokens <value>
+    --otel-model-id <value>
+    --otel-topology <value>
     --other
     --out <value>
     --out-dir <value>
