@@ -10,6 +10,7 @@ We would like to thank the following people for their contributions to this proj
 - [@seanlinmt](https://github.com/seanlinmt) — pull requests [#15](https://github.com/sf-stav/veloGB10/pull/15) (TP network bring-up: RoCEv2 GID auto-detect, explicit CUDA device, clearer allocation errors), [#16](https://github.com/sf-stav/veloGB10/pull/16) (vision tower error handling and recovery) and [#17](https://github.com/sf-stav/veloGB10/pull/17) (TP image payload ordering, PLE headroom). Ported; shipped in v0.7.4.
 - [@ccgauvin94](https://github.com/ccgauvin94) — pull request [#21](https://github.com/sf-stav/veloGB10/pull/21) (device-memory fix for windows past the trained length; ported, shipped in v0.7.4) and pull request [#22](https://github.com/sf-stav/veloGB10/pull/22) (YaRN; porting planned).
 - [@adriangrassi](https://github.com/adriangrassi) — pull request [#23](https://github.com/sf-stav/veloGB10/pull/23) (`--prefill-interleave`). Ported; shipped in v0.7.4.
+- [@andersc](https://github.com/andersc) — pull request [#29](https://github.com/sf-stav/veloGB10/pull/29) (top_k client compatibility: negative values accepted as "no top-k truncation" on both endpoints, CPU-sampler edge cases fixed). Ported; shipped in v0.7.8.
 
 ## Reports, requests and benchmarks
 

@@ -1,3 +1,32 @@
+## v0.7.8 — fix: `top_k` client compatibility (PR #29 by @andersc) + the NVFP4 sampler cap made explicit
+
+Fixes the client-compatibility blocker reported in [#29](https://github.com/sf-stav/veloGB10/pull/29):
+a request with `top_k: -1` — the vLLM/llama.cpp/TGI convention for "no top-k truncation" — was
+rejected with HTTP 400 (`top_k must be non-negative`), and `--cpu-sample` panicked outright on
+`top_k: 0` or `top_k` ≥ vocabulary.
+
+What changed:
+
+- `top_k` below 0 is accepted on `/v1/chat/completions` and `/v1/completions` and means **no top-k
+  truncation**; the full unsigned range is parsed.
+- The CPU sampler (`--cpu-sample`) treats `top_k` 0 as no truncation and no longer panics on
+  `top_k` ≥ vocabulary.
+- The NVFP4-family GPU samplers now serve `top_k` 0 / > 64 as **top-64** instead of silently
+  falling back to argmax. The cap is announced once per boot and counted in
+  `velogb10_top_k_capped_total` (shown by `scripts/owner_check.py`). The EXL3 server and
+  `--cpu-sample` apply no such limit.
+- Test hygiene: the `--help` snapshot fixtures (stale since v0.7.6/v0.7.7) were refreshed and the
+  direct-print baseline rows updated, so a clean checkout passes the test suite again.
+
+Receipts (merge gates, dev report §9): unit suite 986 passed (the one failure is the pre-existing
+environment-dependent case, unchanged). Flash-Next TP=1 at the default posture: all 12 recorded
+greedy hashes reproduced byte-identically, `top_k` -1 / 0 / u64::MAX return 200 on both endpoints;
+on the 4B NVFP4 pack the GPU cap verified (`top_k` 1 = greedy, 0 / > 64 = top-64, counter 0 → 3,
+one boot line); `--cpu-sample --mtp=off`: every cell 200, no panic. Non-negative `top_k` values are
+byte-identical to v0.7.7 on the served EXL3 path. Not re-run at TP=2 / TP=4.
+
+---
+
 ## v0.7.7 — fix: TP=2 MTP lockstep crash on first generation (the `--mtp` blocker)
 
 Fixes the v0.7.5/v0.7.6 crash reported on the issue tracker: with MTP enabled at TP=2, the first
