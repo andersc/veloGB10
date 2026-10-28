@@ -15604,9 +15604,39 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         let hpk = if nkv > 0 { nh_a / nkv } else { 0 };
         if causal && attn_tc() && hd == 256 && t >= 64 && hpk > 0 && hpk % 6 == 0 {
             const TC_SMEM: u32 = 6 * 16 * 264 * 2 + 2 * 32 * 264 * 2;
-            return xqlaunch_raw!(l, "xq_attn_prefill_tc256", ((((t as u32) + 15) / 16), (nkv * (hpk / 6)) as u32, 1), (192, 1, 1), TC_SMEM,
+            // --pq8-xcheck=1 (eager): flash256c first as the reference, then the tensor-core kernel; print the
+            // error of the new kernel (it is not bitwise equal by design).
+            let chk = pq8_xcheck() && !self.stream_capturing();
+            let n16 = t * nh_a * hd;
+            let mut want: Vec<u16> = Vec::new();
+            if chk {
+                xqlaunch!(l, "xq_attn_prefill_flash256c", (((t as u32) + 7) / 8, nh_a as u32, 1), (256, 1, 1), 0,
+                          (&mut psc.normed, &psc.qg, kc_p, &a.qnkn, &psc.cos, (nkv as i32) | ((nh_a as i32) << 16),
+                           (hd as i32) | ((rdim as i32) << 16), self.mpf(), slot_pos0, t as i32, cfg.rms_eps))?;
+                self.dev.synchronize()?;
+                want = self.dev.dtoh_sync_copy(&psc.normed)?;
+                want.truncate(n16);
+                xqlaunch!(l, "xq_memset_u16", ((((n16 as i64) + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                          (*psc.normed.device_ptr() as u64, n16 as i64, 0xFFFFi32))?;
+            }
+            xqlaunch_raw!(l, "xq_attn_prefill_tc256", ((((t as u32) + 15) / 16), (nkv * (hpk / 6)) as u32, 1), (192, 1, 1), TC_SMEM,
                       (&mut psc.normed, &psc.qg, kc_p, &a.qnkn, &psc.cos, (nkv as i32) | ((nh_a as i32) << 16),
-                       (hd as i32) | ((rdim as i32) << 16), self.mpf(), slot_pos0, t as i32, cfg.rms_eps));
+                       (hd as i32) | ((rdim as i32) << 16), self.mpf(), slot_pos0, t as i32, cfg.rms_eps))?;
+            if chk {
+                self.dev.synchronize()?;
+                let got = self.dev.dtoh_sync_copy(&psc.normed)?;
+                let (mut se, mut sr, mut mx, mut mr, mut bad) = (0f64, 0f64, 0f32, 0f32, 0usize);
+                for (x, y) in want.iter().zip(&got[..n16]) {
+                    let (x, y) = (f16::from_bits(*x).to_f32(), f16::from_bits(*y).to_f32());
+                    if !y.is_finite() { bad += 1; continue; }
+                    let d = (x - y).abs();
+                    se += (d as f64) * (d as f64); sr += (x as f64) * (x as f64);
+                    mx = mx.max(d); mr = mr.max(x.abs());
+                }
+                crate::dprintln!("ATTN_TC_CHECK layer {att_i} pos0 {} rows {t} fmt {}: rel_rms {:.3e} max_abs {:.4} max_ref {:.3} ref_rms {:.4} nonfinite {bad}",
+                         ((slot_pos0 as u32) >> 12), kv_fmt_name(self.kv_fmt), (se / (sr + 1e-30)).sqrt(), mx, mr, (sr / n16 as f64).sqrt());
+            }
+            return Ok(());
         }
         let twin = if causal { "xq_attn_prefill_flash256c" } else { "xq_attn_prefill_flash256v" };
         let pair = ["xq_attn_prefill_flash256", twin];
