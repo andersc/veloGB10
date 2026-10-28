@@ -9858,6 +9858,226 @@ extern "C" __global__ void xq_attn_prefill_flash256c(__half* __restrict__ attn,
                                            nh_nkv, hd_rdim, max_pos, slot_pos0, C, eps);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tensor-core causal prefill attention, hd = 256, GB10 (sm_121) only. Opt-in: --pq8-flash=tc.
+// Same inputs / outputs / causal semantics as xq_attn_prefill_flash256c; the QK^T and P*V products
+// run on mma.sync.m16n8k16 (f16 inputs, f32 accumulate) with an online softmax, instead of one warp
+// per q row doing scalar fp32 FMAs. NOT bitwise equal to flash256c (f16 rounding of q / k / v / p).
+//
+// Block = 6 warps = 6 heads of ONE kv head (heads per kv head % 6 == 0) x a 16-token q tile, so a
+// K/V tile is dequantised and staged once for 6 heads. Warp w owns head (hsub*6 + w) and all 256
+// output dims (128 accumulator registers). Per 32-key tile: S = Q K^T (16 k-steps x 4 n-tiles),
+// online softmax in registers, O += P V (2 k-steps x 32 n-tiles). Q / K / V live in padded shared
+// memory (row stride 264 halves = 528 B: ldmatrix rows hit 8 distinct bank groups) and are read
+// with ldmatrix (V with .trans).
+// Dynamic shared memory: 6*16*264*2 (Q) + 2*32*264*2 (K, V) = 84480 B (<= 99 KB per block on 12.x).
+// ---------------------------------------------------------------------------------------------
+#define XQ_TC_WPB 6
+#define XQ_TC_BM 16
+#define XQ_TC_BKV 32
+#define XQ_TC_QP 264
+#define XQ_TC_SMEM (XQ_TC_WPB * XQ_TC_BM * XQ_TC_QP * 2 + 2 * XQ_TC_BKV * XQ_TC_QP * 2)
+
+__device__ __forceinline__ void xq_ldsm_x4(unsigned (&r)[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void xq_ldsm_x4_t(unsigned (&r)[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void xq_mma16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned xq_pack_h2(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&h);
+}
+__device__ __forceinline__ float xq_ex2(float x) {
+    float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y;
+}
+
+extern "C" __global__ void __launch_bounds__(XQ_TC_WPB * 32, 1)
+xq_attn_prefill_tc256(__half* __restrict__ attn, const __half* __restrict__ qg,
+                      const float* __restrict__ kcvc, const __half* __restrict__ qnkn,
+                      const float* __restrict__ cossin, int nh_nkv, int hd_rdim, int max_pos,
+                      int slot_pos0, int C, float eps) {
+    XQ_PDL_ENTRY();
+    constexpr int HD = 256, BM = XQ_TC_BM, BKV = XQ_TC_BKV, QP = XQ_TC_QP, WPB = XQ_TC_WPB;
+    extern __shared__ __align__(16) unsigned char tc_smem[];
+    __half* Qs = reinterpret_cast<__half*>(tc_smem);                 // [WPB][BM][QP]
+    __half* Ks = Qs + WPB * BM * QP;                                 // [BKV][QP]
+    __half* Vs = Ks + BKV * QP;                                      // [BKV][QP]
+    const int nkv = nh_nkv & 0xFFFF, nh = ((unsigned)nh_nkv) >> 16;
+    const int rdim = ((unsigned)hd_rdim) >> 16;
+    const int slot = slot_pos0 & 0xFFF, pos0 = ((unsigned)slot_pos0) >> 12;
+    const int hpk = nh / nkv, hgroups = hpk / WPB;
+    const int kvh = blockIdx.y / hgroups, hsub = blockIdx.y % hgroups;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, tg = lane & 3;
+    const int head = kvh * hpk + hsub * WPB + warp;
+    const int t0 = (gridDim.x - 1 - blockIdx.x) * BM;              // heaviest (latest) tiles first
+    const int pbase = pos0 + t0;
+    const int kmax = pos0 + min(t0 + BM, C) - 1;                     // last key any live row of the tile reads
+    const XqKv kc = xq_kv_make(kcvc, max_pos, HD, nkv, slot, kvh);
+    __half* Qw = Qs + warp * BM * QP;
+
+    // ---- prologue: normalise + rope + (q8) rotate each of the 16 q rows of this head -> f16 Qw.
+    // The fp32 scratch row aliases the K tile (dead until the first stage, after a __syncthreads).
+    float* R = reinterpret_cast<float*>(Ks) + warp * HD;
+    for (int rr = 0; rr < BM; rr++) {
+        const int t = t0 + rr;
+        if (t >= C) {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) Qw[rr * QP + lane + 32 * i] = __float2half_rn(0.0f);
+            continue;
+        }
+        const long long qrow = (long long)t * nh * HD * 2 + (long long)head * HD * 2;
+        float qv[8], ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { qv[i] = xq_h2f(qg[qrow + lane + 32 * i]); ss += qv[i] * qv[i]; }
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
+        ss = __shfl_sync(0xffffffff, ss, 0);
+        const float inv = rsqrtf(ss / (float)HD + eps);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) R[lane + 32 * i] = qv[i] * inv * (1.0f + xq_h2f(qnkn[lane + 32 * i]));
+        __syncwarp();
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int d = lane + 32 * i;
+            if (d < rdim / 2) {
+                const float x1 = R[d], x2 = R[d + rdim / 2];
+                const float* c = cossin + (long long)t * 2 * rdim;
+                const float* s = c + rdim;
+                R[d] = x1 * c[d] - x2 * s[d];
+                R[d + rdim / 2] = x2 * c[d] + x1 * s[d];
+            }
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float v = R[lane + 32 * i];
+            if (kc.fmt >= XQ_KV_Q8) v = xq_h32r(v, lane);
+            Qw[rr * QP + lane + 32 * i] = __float2half_rn(v);
+        }
+        __syncwarp();
+    }
+
+    float o[32][4];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) { o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f; }
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    const float sc = rsqrtf((float)HD) * 1.4426950408889634f;       // 1/sqrt(hd) * log2(e)
+    const int posA = pbase + g, posB = pbase + g + 8;                // causal limits of this thread's rows
+
+    for (int jt = 0; jt <= kmax; jt += BKV) {
+        __syncthreads();                                             // previous tile fully consumed
+        for (int it = tid; it < BKV * 2 * 32; it += WPB * 32) {      // stage K / V: 8 dims per item
+            const int grp = it & 31, jj = (it >> 5) & (BKV - 1), isv = it >> 10;
+            const int key = jt + jj;
+            float x[8];
+            if (key <= kmax) xq_kv_ld8(x, (isv ? kc.v : kc.k) + (long long)key * kc.rb, kc.fmt, HD, grp * 8);
+            else { x[0]=x[1]=x[2]=x[3]=x[4]=x[5]=x[6]=x[7]=0.0f; }
+            uint4 u = make_uint4(xq_pack_h2(x[0], x[1]), xq_pack_h2(x[2], x[3]),
+                                 xq_pack_h2(x[4], x[5]), xq_pack_h2(x[6], x[7]));
+            *reinterpret_cast<uint4*>((isv ? Vs : Ks) + jj * QP + grp * 8) = u;
+        }
+        __syncthreads();
+
+        // ---- S = Q K^T  (16 rows x 32 keys)
+        float s[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f; }
+        #pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++) {
+            unsigned a[4];
+            xq_ldsm_x4(a, Qw + ((lane & 7) + ((lane >> 3) & 1) * 8) * QP + ks * 16 + (lane >> 4) * 8);
+            #pragma unroll
+            for (int np = 0; np < 2; np++) {
+                unsigned b[4];
+                xq_ldsm_x4(b, Ks + (np * 16 + (lane & 7) + (lane >> 4) * 8) * QP + ks * 16 + ((lane >> 3) & 1) * 8);
+                xq_mma16816(s[2 * np], a, b[0], b[1]);
+                xq_mma16816(s[2 * np + 1], a, b[2], b[3]);
+            }
+        }
+        // ---- scale, causal mask, online softmax (rows g and g+8; a row's 32 keys sit in the 4 lanes of a quad)
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int key = jt + nt * 8 + 2 * tg + (e & 1);
+                const int lim = (e >> 1) ? posB : posA;
+                const float v = (key > lim) ? -INFINITY : s[nt][e] * sc;
+                s[nt][e] = v;
+                if (e >> 1) mx1 = fmaxf(mx1, v); else mx0 = fmaxf(mx0, v);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float f0 = (mn0 == -INFINITY) ? 1.0f : xq_ex2(m0 - mn0);   // a still-empty row keeps acc = l = 0
+        const float f1 = (mn1 == -INFINITY) ? 1.0f : xq_ex2(m1 - mn1);
+        m0 = mn0; m1 = mn1;
+        const float ms0 = (mn0 == -INFINITY) ? 0.0f : mn0, ms1 = (mn1 == -INFINITY) ? 0.0f : mn1;
+        float ps0 = 0.0f, ps1 = 0.0f;
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            s[nt][0] = xq_ex2(s[nt][0] - ms0); s[nt][1] = xq_ex2(s[nt][1] - ms0);
+            s[nt][2] = xq_ex2(s[nt][2] - ms1); s[nt][3] = xq_ex2(s[nt][3] - ms1);
+            ps0 += s[nt][0] + s[nt][1]; ps1 += s[nt][2] + s[nt][3];
+        }
+        l0 = l0 * f0 + ps0; l1 = l1 * f1 + ps1;                          // thread-partial; quad-reduced at the end
+        #pragma unroll
+        for (int nt = 0; nt < 32; nt++) { o[nt][0] *= f0; o[nt][1] *= f0; o[nt][2] *= f1; o[nt][3] *= f1; }
+        // ---- O += P V  (two k16 steps over the 32 keys)
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            unsigned pa[4] = { xq_pack_h2(s[2 * j][0], s[2 * j][1]), xq_pack_h2(s[2 * j][2], s[2 * j][3]),
+                               xq_pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]), xq_pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]) };
+            #pragma unroll
+            for (int dp = 0; dp < HD / 16; dp++) {
+                unsigned b[4];
+                xq_ldsm_x4_t(b, Vs + (j * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * QP + dp * 16 + (lane >> 4) * 8);
+                xq_mma16816(o[2 * dp], pa, b[0], b[1]);
+                xq_mma16816(o[2 * dp + 1], pa, b[2], b[3]);
+            }
+        }
+    }
+    // ---- epilogue: o / l -> fp32 smem (reusing this warp's Q region), per-row q8 rotate-back + sigmoid gate.
+    l0 += __shfl_xor_sync(0xffffffff, l0, 1); l0 += __shfl_xor_sync(0xffffffff, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffff, l1, 1); l1 += __shfl_xor_sync(0xffffffff, l1, 2);
+    float* Os = reinterpret_cast<float*>(Qw);                        // [16][132] fp32 = 8448 B = the Q region
+    #pragma unroll
+    for (int half_ = 0; half_ < 2; half_++) {
+        __syncwarp();
+        #pragma unroll
+        for (int nt = 0; nt < 16; nt++) {
+            const int c = nt * 8 + 2 * tg;
+            const float* v = o[half_ * 16 + nt];
+            Os[g * 132 + c] = v[0] / l0;       Os[g * 132 + c + 1] = v[1] / l0;
+            Os[(g + 8) * 132 + c] = v[2] / l1; Os[(g + 8) * 132 + c + 1] = v[3] / l1;
+        }
+        __syncwarp();
+        for (int rr = 0; rr < BM; rr++) {
+            const int t = t0 + rr;
+            if (t >= C) continue;
+            const long long qrow = (long long)t * nh * HD * 2 + (long long)head * HD * 2;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int e = half_ * 128 + lane + 32 * i;
+                const float gt = xq_h2f(qg[qrow + HD + e]);
+                const float ov = xq_kv_rot(Os[rr * 132 + lane + 32 * i], kc.fmt, lane);
+                attn[(long long)t * nh * HD + (long long)head * HD + e] = xq_f2h(ov * xq_sig(gt));
+            }
+        }
+    }
+}
+
 // w5/PFIX OPT-IN (the SAME GB10_PQ8_FLASH=causal switch; output-changing): the hd=128 causal twin.
 // xq_attn_prefill_flash (the hd=128 shape: BT=16 / BKV=32, blockDim 512) has flash256's diagonal-tile
 // defect under a different owner map: blockDim (512) != hd (128), so its scalar stager hands tile
