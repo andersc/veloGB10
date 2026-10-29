@@ -694,6 +694,83 @@ fn ple_xcheck_on() -> bool {
     *ON.get_or_init(|| crate::opts::var(crate::opt!("ple-xcheck")).is_ok() || crate::opts::var(crate::opt!("wp05-xcheck")).is_ok())
 }
 
+/// --ple-timing: per prefill chunk, how long the host spends building the PLE n-gram rows and
+/// how long the GPU sits between layer 0 finishing and the row upload landing (the part of the
+/// host row build the GPU actually waits for). Diagnostic only: events are recorded on the
+/// compute stream and read back without synchronizing (a later chunk drains the ready ones).
+fn ple_timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::opts::on(crate::opt!("ple-timing")))
+}
+
+/// --ple-threads: cap on the prefill PLE row-decode threads (default 8, the previous constant).
+fn ple_threads_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("ple-threads")).ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).max(1))
+}
+
+struct PleTimingRec {
+    es: cudarc::driver::sys::CUevent,
+    ea: cudarc::driver::sys::CUevent,
+    eb: cudarc::driver::sys::CUevent,
+    rows: usize,
+    l0_enq_ms: f64,
+    hist_ms: f64,
+    rows_ms: f64,
+}
+// Raw CUevent handles are only touched under the mutex.
+unsafe impl Send for PleTimingRec {}
+
+struct PleTimingState {
+    es: Option<(cudarc::driver::sys::CUevent, std::time::Instant)>,
+    pending: Vec<PleTimingRec>,
+}
+unsafe impl Send for PleTimingState {}
+
+static PLE_TIMING: std::sync::Mutex<PleTimingState> =
+    std::sync::Mutex::new(PleTimingState { es: None, pending: Vec::new() });
+
+fn ple_ev(stream: cudarc::driver::sys::CUstream) -> Option<cudarc::driver::sys::CUevent> {
+    use cudarc::driver::sys;
+    let mut e: sys::CUevent = std::ptr::null_mut();
+    unsafe {
+        if sys::cuEventCreate(&mut e, 0) != sys::CUresult::CUDA_SUCCESS { return None; }
+        if sys::cuEventRecord(e, stream) != sys::CUresult::CUDA_SUCCESS { sys::cuEventDestroy_v2(e); return None; }
+    }
+    Some(e)
+}
+
+/// Mark the start of a prefill chunk's layer 0 (only when --ple-timing is on).
+fn ple_timing_mark_l0(stream: cudarc::driver::sys::CUstream) {
+    if !ple_timing_on() { return; }
+    if let Some(e) = ple_ev(stream) {
+        let mut g = PLE_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((old, _)) = g.es.replace((e, std::time::Instant::now())) {
+            unsafe { cudarc::driver::sys::cuEventDestroy_v2(old); }
+        }
+        ple_timing_drain(&mut g);
+    }
+}
+
+/// Print and free every pending record whose last event has completed (never blocks).
+fn ple_timing_drain(g: &mut PleTimingState) {
+    use cudarc::driver::sys;
+    let mut keep = Vec::with_capacity(g.pending.len());
+    for r in g.pending.drain(..) {
+        let ready = unsafe { sys::cuEventQuery(r.eb) } == sys::CUresult::CUDA_SUCCESS;
+        if !ready { keep.push(r); continue; }
+        let (mut l0, mut gap) = (0f32, 0f32);
+        unsafe {
+            sys::cuEventElapsedTime(&mut l0, r.es, r.ea);
+            sys::cuEventElapsedTime(&mut gap, r.ea, r.eb);
+            sys::cuEventDestroy_v2(r.es); sys::cuEventDestroy_v2(r.ea); sys::cuEventDestroy_v2(r.eb);
+        }
+        eprintln!("PLE_TIMING rows {} l0_enq_ms {:.3} hist_ms {:.3} rows_ms {:.3} gpu_l0_ms {:.3} gpu_gap_ms {:.3}",
+                  r.rows, r.l0_enq_ms, r.hist_ms, r.rows_ms, l0, gap);
+    }
+    g.pending = keep;
+}
+
 /// First-mismatch report for the WP05 XCHECK lines: (count, first index, new, old).
 fn wp05_diff_u16(new: &[u16], old: &[u16]) -> (usize, Option<(usize, u16, u16)>) {
     let mut n = 0usize;
@@ -2196,7 +2273,7 @@ impl PleDev {
             }
             Ok(())
         };
-        let nt = if reference { 1 } else { (n / 32).clamp(1, 8) };
+        let nt = if reference { 1 } else { (n / 32).clamp(1, ple_threads_cap()) };
         if nt <= 1 {
             return run(h3s, &mut out[..n * 2560]);
         }
@@ -14603,6 +14680,8 @@ impl FwdModel {
             // into the pinned buffer and enqueue ONE async NULL-stream copy into the persistent
             // psc.ple_emb. No htod_sync_copy: the host never drains the device mid-chunk (layer 0
             // is still executing while the rows are built), and no per-chunk allocation.
+            let timing = ple_timing_on();
+            let t_hist = std::time::Instant::now();
             let h3s: Vec<[i32; 3]> = {
                 let mut hist = self.ple_hist.lock().unwrap();
                 let mut v = Vec::with_capacity(c);
@@ -14617,7 +14696,11 @@ impl FwdModel {
             if st.inflight_ple { self.dev.synchronize()?; st.inflight_ple = false; } // only after an error path
             let off = st.off_ple();
             let rows = st.pin.u16s(off, c * 2560);
+            let hist_ms = t_hist.elapsed().as_secs_f64() * 1e3;
+            let ea = if timing { ple_ev(l.stream.stream) } else { None };
+            let t_rows = std::time::Instant::now();
             ple.rows_par(&h3s, rows, false)?;
+            let rows_ms = t_rows.elapsed().as_secs_f64() * 1e3;
             if ple_xcheck_on() {
                 let mut refr = vec![0u16; c * 2560];
                 ple.rows_par(&h3s, &mut refr, true)?;
@@ -14627,6 +14710,22 @@ impl FwdModel {
             }
             st.pin.htod(off, *psc.ple_emb.device_ptr() as u64, c * 2560 * 2)?;
             st.inflight_ple = true;
+            if let Some(ea) = ea {
+                let mut g = PLE_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+                match (g.es.take(), ple_ev(l.stream.stream)) {
+                    (Some((es, t0)), Some(eb)) => {
+                        let l0_enq_ms = t0.elapsed().as_secs_f64() * 1e3 - hist_ms - rows_ms;
+                        g.pending.push(PleTimingRec { es, ea, eb, rows: c, l0_enq_ms, hist_ms, rows_ms });
+                    }
+                    (es, eb) => unsafe {
+                        use cudarc::driver::sys::cuEventDestroy_v2;
+                        cuEventDestroy_v2(ea);
+                        if let Some((e, _)) = es { cuEventDestroy_v2(e); }
+                        if let Some(e) = eb { cuEventDestroy_v2(e); }
+                    },
+                }
+                ple_timing_drain(&mut g);
+            }
         } else {
             let mut hist = self.ple_hist.lock().unwrap();
             // S-A3-f-d night FIX: this buffer is sized c*2560 while ple_build_embed
@@ -15782,6 +15881,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         let sp = self.sp_rows_for(psc, c);
         let sp_from = if ple_live { 1 } else { 0 };
         let spl = |li: usize| if li >= sp_from { sp } else { None };
+        if ple_live { ple_timing_mark_l0(l.stream.stream); }
         for (li, layer) in self.layers.iter().enumerate() {
             // S-A3-f-b FIX: PLE injects at the LAYER-1 boundary (decode injects
             // inside the layer loop before block 1's hc_pre) - the pre-loop call
