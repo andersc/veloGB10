@@ -368,6 +368,14 @@ struct Lane {
     // `TokEvent::Logprob` with the n most likely alternatives before each `Tok`. Such a lane
     // never speculates (mtp = None), so every token comes from a plain step's logits row.
     logprobs: Option<u8>,
+    // W2-EXL3: the request's compiled JSON-schema FSM (None = unconstrained), its current
+    // state, and whether the constraint is live yet (false while the lane is still inside the
+    // think block its prompt opened: the mask arms on the think-close token). A schema lane
+    // never speculates (mtp = None for its whole life), so every token it emits comes from a
+    // masked plain step.
+    schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
+    schema_state: u32,
+    schema_armed: bool,
     tx: crate::server::TokTx,
 }
 
@@ -412,6 +420,46 @@ fn token_logprobs(row: &[u16], tok: u32, n: usize) -> Option<(f32, Vec<(u32, f32
         top = cand.into_iter().map(|(i, x)| (i, lp(x))).collect();
     }
     Some((lp(xt), top))
+}
+
+/// W2-EXL3: what one emitted token does to a schema lane.
+#[derive(Debug, PartialEq, Eq)]
+enum SchemaStep {
+    /// keep decoding (constraint not armed yet, or the document is still open)
+    Continue,
+    /// the JSON document is complete: the turn ends here ("stop")
+    Complete,
+    /// the token is not valid in the machine's state, or leaves no valid continuation: the
+    /// turn ends with an error finish (`SCHEMA_DEAD_END`) and the event is logged
+    Invalid,
+}
+
+/// The finish reason of a schema turn that reached a state no token can continue (or emitted a
+/// token the state refuses): an error, so the client never reads the partial document as a
+/// completed one.
+const SCHEMA_DEAD_END: &str = "error: json-schema constrained decoding reached a state with no valid continuation";
+
+/// W2-EXL3: advance a schema lane's FSM by one emitted token (pure; unit-tested).
+fn schema_feed(sm: &crate::json_schema::SchemaMask, state: &mut u32, armed: &mut bool, tok: u32) -> SchemaStep {
+    if !*armed {
+        if sm.defer_until() == Some(tok) { *armed = true; }
+        return SchemaStep::Continue;
+    }
+    match sm.step(*state, tok) {
+        None => SchemaStep::Invalid,
+        Some(ns) => {
+            *state = ns;
+            if sm.is_complete(ns) {
+                SchemaStep::Complete
+            } else if sm.allowed(ns).iter().all(|&w| w == 0) {
+                // a state no token can continue (the machine should never reach one): end the
+                // turn instead of letting a fully masked row pick id 0
+                SchemaStep::Invalid
+            } else {
+                SchemaStep::Continue
+            }
+        }
+    }
 }
 
 /// S-B9-CF-PACK4: host-side anatomy of the packed rounds since boot: wall ms of the three stages
@@ -3844,6 +3892,19 @@ the [gen] line says stop_p=na", stats));
             .map(|&s| self.lanes[s].as_ref().unwrap().pen)
             .collect();
         self.model.set_penalties(&mut self.sc, &pens)?;
+        // W2-EXL3: per-row schema masks for the armed schema lanes (nothing staged — and no
+        // mask node in the step's graph — when no lane in this step carries a live constraint).
+        {
+            let masks: Vec<Option<std::sync::Arc<Vec<u32>>>> = slots.iter().map(|&s| {
+                let l = self.lanes[s].as_ref().unwrap();
+                match (&l.schema, l.schema_armed) {
+                    (Some(sm), true) => Some(sm.allowed(l.schema_state)),
+                    _ => None,
+                }
+            }).collect();
+            let rows: Vec<Option<&[u32]>> = masks.iter().map(|m| m.as_deref().map(|v| &v[..])).collect();
+            self.model.set_vmask(&mut self.sc, &rows)?;
+        }
         let ids = self.model.forward_step(&mut self.sc, &toks, &poss, slots, None)?;
         // S-B9: one agreed ms for the step (the HEAD's under TP — a rank-local clock must
         // never drive a decision), reused by the shared estimate and the off-lane sampler.
@@ -3934,8 +3995,25 @@ the [gen] line says stop_p=na", stats));
                     (true, "length")
                 } else if self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new {
                     (true, "stop")
+                } else if let Some(sm) = lane.schema.clone().filter(|_| lane.schema_armed) {
+                    // W2-EXL3: a schema turn ends at the end of its JSON document. The loop
+                    // detector does not run on an armed lane: the mask bounds the output, and a
+                    // valid document may legitimately repeat (a long array of equal values).
+                    match schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t) {
+                        SchemaStep::Continue => (false, ""),
+                        SchemaStep::Complete => (true, "stop"),
+                        SchemaStep::Invalid => {
+                            crate::reprintln!("[schema] slot {s}: token {t} leaves no valid continuation \
+                                               — ending the turn with an error");
+                            (true, SCHEMA_DEAD_END)
+                        }
+                    }
                 } else if lane.loop_feed(t) {
                     (true, "loop_detected") // WP08
+                } else if let Some(sm) = lane.schema.clone() {
+                    // not armed yet (reasoning): this token may be the one that arms it
+                    schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t);
+                    (false, "")
                 } else {
                     (false, "")
                 }
@@ -4479,9 +4557,11 @@ the [gen] line says stop_p=na", stats));
                 }
             }
         }
-        if req.schema.is_some() {
+        if req.schema.is_some() && self.tp.is_some() {
+            // W2-EXL3: the masked plain step is wired at TP=1 only (the head refuses it in
+            // exl3_reject before an Admit ships; this is the structural backstop)
             let _ = req.tx.send(TokEvent::Finish {
-                reason: "error: json-schema constraint not supported on the exl3 serve path yet".into(),
+                reason: "error: json-schema constraint not supported on the exl3 TP serve path yet".into(),
             });
             return;
         }
@@ -4576,6 +4656,21 @@ the [gen] line says stop_p=na", stats));
             if self.tp.is_some() { self.fatal = Some(format!("{e:#}")); } // TP-D: never a one-rank skip
             return;
         }
+        // W2-EXL3: the seam step emits the request's FIRST token — mask it when the constraint
+        // is live from the start (no think block to wait for).
+        let mut schema_state = req.schema.as_ref().map_or(0, |sm| sm.start_state());
+        let mut schema_armed = req.schema.as_ref().map_or(false, |sm| sm.defer_until().is_none());
+        let vstaged = match req.schema.as_ref().filter(|_| schema_armed) {
+            Some(sm) => {
+                let bits = sm.allowed(schema_state);
+                self.model.set_vmask(&mut self.sc, &[Some(&bits[..])])
+            }
+            None => self.model.set_vmask(&mut self.sc, &[None]),
+        };
+        if let Err(e) = vstaged {
+            let _ = req.tx.send(TokEvent::Finish { reason: format!("error: schema mask staging failed: {e}") });
+            return;
+        }
         let last = match self.model.forward_step(
             &mut self.sc,
             &[*req.prompt.last().unwrap() as i32],
@@ -4640,15 +4735,30 @@ the [gen] line says stop_p=na", stats));
             let _ = req.tx.send(TokEvent::Finish { reason: "stop".into() });
             return;
         }
+        if let Some(sm) = req.schema.as_ref() {
+            match schema_feed(sm, &mut schema_state, &mut schema_armed, last) {
+                SchemaStep::Continue => {}
+                SchemaStep::Complete => {
+                    let _ = req.tx.send(TokEvent::Finish { reason: "stop".into() });
+                    return;
+                }
+                SchemaStep::Invalid => {
+                    crate::reprintln!("[schema] slot {free}: first token {last} leaves no valid continuation \
+                                       — ending the turn with an error");
+                    let _ = req.tx.send(TokEvent::Finish { reason: SCHEMA_DEAD_END.into() });
+                    return;
+                }
+            }
+        }
         // S-A3-f-d: greedy lanes on an M1 pack speculate by default (AGENTS 1b).
         // Prime the head once: snapshot the tap that predicted `last` (now the
         // seam decode step's sc.resid — exact, same composition as the bench-mtp
         // prime and every round's re-prime), then feed the head the last prompt
         // token with that tap (round 1's draft-extend reuses tap_row 0).
-        // A lane that reports log probabilities never speculates: each token's logits row is
-        // then the plain step's row for that token.
+        // A lane that reports log probabilities, or a schema lane (its verify rows are not masked),
+        // never speculates: every token comes from a plain step's logits row.
         let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt()
-            && req.logprobs.is_none() {
+            && req.logprobs.is_none() && req.schema.is_none() {
             match self.mtp_prime(free, *req.prompt.last().unwrap(), plen) {
                 Ok(()) => {
                     if crate::exl3_forward::a_xcheck_on() {
@@ -4716,6 +4826,9 @@ the [gen] line says stop_p=na", stats));
             fcfs_credit: 0,
             img: is_img,
             logprobs: req.logprobs,
+            schema: req.schema.clone(),
+            schema_state,
+            schema_armed,
             tx: req.tx,
         });
     }
@@ -6715,6 +6828,8 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         // exl3 snapshots at the prompt end: no ckpt_at render needed — except C1 tail checkpoints,
         // which take one at the message boundary (ckpt_at) of every prompt
         prefix_cache: prefix_on && tail_ckpt_boot,
+        // the EXL3 scheduler arms a schema after the think-close token (schema_feed)
+        schema_defer: true,
         vision_tower,
         vision_gpu,
         vision_cpu: false,
