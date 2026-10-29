@@ -709,6 +709,21 @@ fn ple_threads_cap() -> usize {
     *V.get_or_init(|| crate::opts::var(crate::opt!("ple-threads")).ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).max(1))
 }
 
+/// --ple-prefetch: (chunk, admit) parts enabled. Advisory page-cache reads only — the bytes the
+/// row build reads are unchanged, so no output bit can change.
+fn ple_prefetch_mode() -> (bool, bool) {
+    static V: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match crate::opts::var(crate::opt!("ple-prefetch")).unwrap_or_default().as_str() {
+        "chunk" => (true, false),
+        "admit" => (false, true),
+        "on" => (true, true),
+        _ => (false, false),
+    })
+}
+
+/// --ple-prefetch admit|on (read by the serving loop at lane admission).
+pub(crate) fn ple_prefetch_admit() -> bool { ple_prefetch_mode().1 }
+
 struct PleTimingRec {
     es: cudarc::driver::sys::CUevent,
     ea: cudarc::driver::sys::CUevent,
@@ -2240,6 +2255,15 @@ impl PleDev {
         if self.ram.get().is_some() { return; }
         let uids: Vec<i64> = h3s.iter().flat_map(|h| self.ngram_uids(h)).collect();
         self.prefetch_rows(&uids);
+    }
+
+    /// `prefetch_h3s` split over up to `nt` scoped threads (the advise calls are independent).
+    fn prefetch_h3s_par(&self, h3s: &[[i32; 3]], nt: usize) {
+        if self.ram.get().is_some() || h3s.is_empty() { return; }
+        let nt = nt.min(h3s.len().div_ceil(64)).max(1);
+        if nt <= 1 { return self.prefetch_h3s(h3s); }
+        let per = h3s.len().div_ceil(nt);
+        std::thread::scope(|s| { for c in h3s.chunks(per) { s.spawn(move || self.prefetch_h3s(c)); } });
     }
 
     /// One 102-byte trellis row (RAM table or pread) — the pre-WP05 fetch, unchanged.
@@ -14664,6 +14688,23 @@ impl FwdModel {
         })
     }
 
+    /// --ple-prefetch admit: queue the page reads of every PLE row this prompt's prefill will read,
+    /// from a fresh slot's n-gram history (the EOS pair). Run off the scheduler thread while the
+    /// request waits for its prefill turn. Advisory only (no bytes read, no state touched); a prefix
+    /// hit or a different ring only makes a few advised rows unused.
+    pub(crate) fn ple_prefetch_prompt(&self, prompt: &[u32]) {
+        let Some(ple) = self.ple.as_ref() else { return };
+        if ple.ram.get().is_some() || prompt.is_empty() { return; }
+        let (mut a, mut b) = (ple.eos, ple.eos);
+        let h3s: Vec<[i32; 3]> = prompt.iter().map(|&t| {
+            let t = t as i32;
+            let h = [a, b, t];
+            a = b; b = t;
+            h
+        }).collect();
+        ple.prefetch_h3s_par(&h3s, ple_threads_cap());
+    }
+
     fn ple_forward_chunk(&self, l: &Launcher, psc: &mut PrefillScratch, toks: &[i32], slot: usize) -> Result<()> {
         let ple = match self.ple.as_ref() {
             Some(p) => p,
@@ -14699,6 +14740,7 @@ impl FwdModel {
             let hist_ms = t_hist.elapsed().as_secs_f64() * 1e3;
             let ea = if timing { ple_ev(l.stream.stream) } else { None };
             let t_rows = std::time::Instant::now();
+            if ple_prefetch_mode().0 { ple.prefetch_h3s_par(&h3s, ple_threads_cap()); }
             ple.rows_par(&h3s, rows, false)?;
             let rows_ms = t_rows.elapsed().as_secs_f64() * 1e3;
             if ple_xcheck_on() {

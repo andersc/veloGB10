@@ -466,10 +466,6 @@ pub const REG: &[Opt] = &[
           help: "PLE SSD row cache capacity" },
     Opt { flag: "ple-ssd-threads", env: "GB10_PLE_SSD_THREADS", ty: Ty::Int, def: "32", cat: Cat::Load, scope: Scope::Spmd, vis: Vis::Adv,
           help: "PLE SSD reader threads" },
-    Opt { flag: "ple-threads", env: "GB10_PLE_THREADS", ty: Ty::Int, def: "8", cat: Cat::Exl3, scope: Scope::Spmd, vis: Vis::Adv,
-          help: "PLE prefill row-decode thread cap" },
-    Opt { flag: "ple-timing", env: "GB10_PLE_TIMING", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
-          help: "PLE prefill host/GPU overlap timing (stderr, one line per chunk)" },
     Opt { flag: "ple-trace", env: "GB10_PLE_TRACE", ty: Ty::Text, def: "unset", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
           help: "PLE trace" },
     Opt { flag: "ple-xcheck", env: "GB10_PLE_XCHECK", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
@@ -1085,6 +1081,12 @@ pub const REG: &[Opt] = &[
           help: "C4PRIMEA: batch the shared plain step's per-lane head-row prime writes into one xq_gather_tap_rows + ONE re-prime pass + xq_attn_kv_prefill_pairs (off = the per-lane loop)" },
     Opt { flag: "exl3-prime-batch-xcheck", env: "", ty: Ty::Bool, def: "on", cat: Cat::Exl3, scope: Scope::Head, vis: Vis::Adv,
           help: "C4PRIMEA: on the FIRST batched prime of a boot, bit-compare the legacy per-lane head-KV rows against the batched ones (one-time GPU identity gate on the real path)" },
+    Opt { flag: "ple-prefetch", env: "", ty: Ty::Choice(&["off", "chunk", "admit", "on"]), def: "off", cat: Cat::Exl3, scope: Scope::Spmd, vis: Vis::Adv,
+          help: "PLE prefill page-cache prefetch of SSD rows (chunk = before the row build, admit = at lane admission, on = both)" },
+    Opt { flag: "ple-threads", env: "", ty: Ty::Int, def: "8", cat: Cat::Exl3, scope: Scope::Spmd, vis: Vis::Adv,
+          help: "PLE prefill row-decode thread cap" },
+    Opt { flag: "ple-timing", env: "", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
+          help: "PLE prefill host/GPU overlap timing (stderr, one line per chunk)" },
 ];
 
 /// Environment variables that were read once and are gone (merged into an existing flag, or dead):

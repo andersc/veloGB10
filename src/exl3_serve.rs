@@ -4491,6 +4491,11 @@ the [gen] line says stop_p=na", stats));
     }
 
     fn admit_req(&mut self, req: BatchRequest, scoped: Option<(&[usize], crate::lane_reserve::Kind)>) {
+        if crate::exl3_forward::ple_prefetch_admit() {
+            let m = self.model.clone();
+            let p = req.prompt.clone();
+            std::thread::spawn(move || m.ple_prefetch_prompt(&p));
+        }
         let t_admit = std::time::Instant::now();
         // prefix cache: prefer the free lane whose snapshot is the longest prefix of this prompt,
         // then a lane with no snapshot, then any free lane.
