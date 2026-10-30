@@ -2166,13 +2166,20 @@ impl PleDev {
     }
 
     /// `prefetch_h3s` split over up to `nt` scoped threads (each advise call is independent; at most one
-    /// thread per 64 histories so short chunks stay on the calling thread).
+    /// thread per 64 histories so short chunks stay on the calling thread). Workers re-pin to the worker
+    /// CPU mask, as in `rows_par`.
     fn prefetch_h3s_par(&self, h3s: &[[i32; 3]], nt: usize) {
         if self.ram.get().is_some() || h3s.is_empty() { return; }
         let nt = nt.min(h3s.len().div_ceil(64)).max(1);
         if nt <= 1 { return self.prefetch_h3s(h3s); }
         let per = h3s.len().div_ceil(nt);
-        std::thread::scope(|s| { for c in h3s.chunks(per) { s.spawn(move || self.prefetch_h3s(c)); } });
+        // Re-pin to the worker mask like rows_par: a pinned scheduler thread (TP serve) would otherwise
+        // confine every spawned prefetch thread to its own core.
+        std::thread::scope(|s| {
+            for c in h3s.chunks(per) {
+                s.spawn(move || { crate::cpu_affinity::pin_worker(); self.prefetch_h3s(c) });
+            }
+        });
     }
 
     /// One 102-byte trellis row (RAM table or pread) — the pre-WP05 fetch, unchanged.
