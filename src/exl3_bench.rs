@@ -149,6 +149,8 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     "xq_attn_prefill_flash256v",
     // PQ8-v2 opt-in (--pq8-flash=causal): flash256v with causal (block-wide) K/V staging
     "xq_attn_prefill_flash256c",
+    // tensor-core causal prefill attention, hd=256 (opt-in --attn-tc=on; mma.sync f16, not bitwise)
+    "xq_attn_prefill_tc256",
     // w5/PFIX opt-in (same --pq8-flash=causal): the hd=128 causal-staging twin
     "xq_attn_prefill_flash128c",
     "xq_ple_conv_chunk",
