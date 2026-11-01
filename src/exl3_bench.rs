@@ -1251,15 +1251,24 @@ fn probe_hc_upmix(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
         dev.synchronize()?;
         let u = dev.dtoh_sync_copy(&d_u)?;
         let mut hist = [0usize; 4];
+        let mut worst = (0f64, 0usize, 0usize, 0f64, 0f64, 0f64);
+        let mut over = 0usize;
         let rows: Vec<usize> = if c > 64 { (0..c).step_by(c / 37 + 1).chain([c - 1]).collect() } else { (0..c).collect() };
         for &r in &rows {
             for col in 0..n {
-                let mut s = 0f64;
-                for k in 0..lr { s += h2f(dd[r * lr + k]) as f64 * h2f(up[col * lr + k]) as f64; }
+                let (mut s, mut sa) = (0f64, 0f64);
+                for k in 0..lr { let t = h2f(dd[r * lr + k]) as f64 * h2f(up[col * lr + k]) as f64; s += t; sa += t.abs(); }
                 let refh = half::f16::from_f64(s).to_bits() as i32;
                 let got = u[r * n + col] as i32;
                 let d = ((refh - got).abs() as usize).min(3);
                 hist[d] += 1;
+                // error bound: f16 output rounding (half an ulp of |s|, min subnormal step) + f32 accumulation (lr * 2^-24 * sum|t|)
+                let gv = half::f16::from_bits(got as u16).to_f64();
+                let ulp = (s.abs().max(6.1e-5)).log2().floor().exp2() * 2f64.powi(-10);
+                let bound = ulp + lr as f64 * 2f64.powi(-24) * sa;
+                let ratio = (gv - s).abs() / bound;
+                if ratio > worst.0 { worst = (ratio, r, col, s, gv, sa); }
+                if ratio > 1.0 { over += 1; }
             }
         }
         let nan_u = u[..c * n].iter().filter(|&&v| v == 0x7E00).count();
@@ -1272,7 +1281,9 @@ fn probe_hc_upmix(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
         let tail_x = xb[c * h..].iter().filter(|&&v| v != 0x7E00).count();
         println!("HC-UPMIX upmix c={c}: u vs f64 ref ulp hist [0, 1, 2, >=3] = {hist:?} over {} rows; u unwritten {nan_u}; \
                   x vs pf_mix(u_dbg) differ {bad_x}; rows past c written {tail_x}", rows.len());
-        anyhow::ensure!(nan_u == 0 && bad_x == 0 && tail_x == 0 && hist[2] + hist[3] == 0, "HC-UPMIX upmix FAIL");
+        println!("HC-UPMIX upmix c={c}: worst err/bound {:.3} at row {} col {} (ref {:.6e} got {:.6e} sum|t| {:.3e}); over bound {over}",
+                 worst.0, worst.1, worst.2, worst.3, worst.4, worst.5);
+        anyhow::ensure!(nan_u == 0 && bad_x == 0 && tail_x == 0 && over == 0, "HC-UPMIX upmix FAIL");
     }
     // ---- timing at c = 5830
     let c = cmax; let ci = c as i32;
