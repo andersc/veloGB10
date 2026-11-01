@@ -3664,6 +3664,12 @@ fn hc_upmix_on() -> bool {
     *ON.get_or_init(|| { let on = std::env::var("VELO_HC_UPMIX").map_or(false, |v| v == "1");
         if on { crate::rprintln!("[hc-upmix] fused hc up-GEMM + mix ON (prefill, h 2560 hc 4 lr 320)"); } on })
 }
+/// HC-UPMIX row gate: the fused up-GEMM loses to cuBLAS on small passes (one 1,240-row prompt:
+/// +3.4% pass time) and wins on packed ones (6,300 rows: -2.3%). VELO_HC_UPMIX_MIN, default 4096.
+fn hc_upmix_min_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VELO_HC_UPMIX_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+}
 fn stream_capturing(l: &Launcher) -> bool {
     use cudarc::driver::sys;
     let mut st = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
@@ -16993,7 +16999,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         // (bitwise the old mix's), cuBLAS down + silu_div as before, then ONE fused up-GEMM + mix
         // kernel (uu never written). Only the plain replicated prefill shape (h 2560, hc 4, lr 320).
         if hc_upmix_on() && !normed && fnorm && fmix && h == 2560 && hcn == 4 && lr == 320
-            && recon_min_rows() > 0 && c >= recon_min_rows() {
+            && recon_min_rows() > 0 && c >= recon_min_rows() && c >= hc_upmix_min_rows() {
             let winj = hc.winj.as_ref().map_or(0u64, |w| *w.device_ptr() as u64);
             xqlaunch!(l, "xq_pf_hc_inj_norm_rowinj", (c as u32, 1, 1), (512, 1, 1), 0,
                      (&mut psc.hn, &mut psc.resid, pend.unwrap_or(0u64), &mut psc.inj, &hc.norm, winj,
