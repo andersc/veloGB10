@@ -1655,6 +1655,18 @@ fn main() {
     //   --prefillx-widths=2048,256 (served widths), --prefillx-qsa-keys=1.
     //   TP-4X1: a width entry g<C> / g<C>a (e.g. g2048,g4095a) runs this prompt's SERVED chunk grid
     //   (plan_grid, tail checkpoint at n-14; trailing 'a' = the removed --prefill-absorb-tail) and prints its rows.
+    // PACK-PF: packed multi-prompt prefill vs per-prompt prefill (state equality + time).
+    if args.iter().any(|a| a == "--probe-exl3-packpf") {
+        let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-packpf requires --model-dir <DIR>");
+        let a = gb10_inference::exl3_forward::FwdArgs {
+            dir: dir.to_string(), prompt: None, ids_file: None, max_new: 16, width: 1,
+            ladder_dir: None, ladder_layers: Vec::new(), ladder_step: None,
+            max_pos: gb10_inference::opt_or_arg(&args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192),
+            bench_steps: 0, widths: Vec::new(), prefill_chunk: None,
+        };
+        gb10_inference::exl3_forward::probe_pack_pf(&a).unwrap_or_else(|e| { eprintln!("PROBE_PACKPF_FAIL: {e:#}"); std::process::exit(1); });
+        return;
+    }
     if args.iter().any(|a| a == "--probe-exl3-prefillx") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-exl3-prefillx requires --model-dir <DIR>");
         let a = gb10_inference::exl3_forward::FwdArgs {

@@ -690,6 +690,7 @@ pub const HAND_FLAGS: &[(&str, bool, Vis)] = &[
     ("probe-exl3-moeglue", false, Vis::Adv),
     ("probe-exl3-oracle", false, Vis::Adv),
     ("probe-exl3-pack2", false, Vis::Adv),
+    ("probe-exl3-packpf", false, Vis::Adv),
     ("probe-exl3-pack3", false, Vis::Adv),
     ("probe-exl3-packstate", false, Vis::Adv),
     ("probe-exl3-pfxtrace", false, Vis::Adv),
