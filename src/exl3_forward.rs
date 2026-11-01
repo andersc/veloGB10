@@ -6925,6 +6925,24 @@ pub(crate) fn moe_pf_pick(kind: char, mt: usize, mask: i32, bits: usize) -> (&'s
     }
     (moe_pf_fn(kind, mt), moe_pf_smem_bytes(mt, nw), (nw * 32) as u32)
 }
+/// MOE-AFUSE (VELO_MOE_AFUSE=1, default off): the gate|up fold forms its A operand in the prologue
+/// (x[row_tok] * suh -> exl3_had128 -> f16 RN into smem) instead of reading xh_e written by
+/// xq_had_suh_rows_live; drops that pass and the xh_e write + read (~R*K*4 bytes per layer). Bitwise.
+pub(crate) fn moe_afuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| { let on = std::env::var("VELO_MOE_AFUSE").map_or(false, |v| v == "1");
+        if on { crate::rprintln!("[moe-afuse] gate|up A operand rotated in the expert kernel prologue ON (prefill fold, no EP)"); } on })
+}
+/// Mirror of XqPfAfSmem<MT>::halves * 2 (kernels/exl3_bench.cu).
+pub(crate) fn moe_pf_af_smem_bytes(mt: usize) -> u32 {
+    let rows = mt * 16;
+    let a = 2 * rows * (8 * 16 + 8);
+    let t = 2 * rows.min(64) * 136;
+    (a.max(t) * 2) as u32
+}
+pub(crate) fn moe_pf_af_fn(mt: usize) -> &'static str {
+    match mt { 1 => "xq_moe_pf_gf1", 2 => "xq_moe_pf_gf2", 4 => "xq_moe_pf_gf4", _ => "xq_moe_pf_gf8" }
+}
 /// Mirror of XqPfSmem<MT, NW>::halves * 2 (kernels/exl3_bench.cu; EXL3-MOE-PF checks the mirror).
 pub(crate) fn moe_pf_smem_bytes(mt: usize, nw: usize) -> u32 {
     let rows = mt * 16;
@@ -15172,7 +15190,10 @@ would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200
                 xqlaunch!(l, "xq_moe_pf_ep_fill", (r.div_ceil(256).min(1024) as u32, 1, 1), (256, 1, 1), 0,
                          (&psc.offs_row, ne as i32, r as i32, &mut psc.row_tok, &mut psc.row_eidx))?;
             }
-            if ep.is_some() {
+            // MOE-AFUSE: the fold's gate|up kernel rotates A itself (no EP: the live-row bound is not needed).
+            let afuse = fold && ep.is_none() && moe_afuse_on();
+            if afuse {
+            } else if ep.is_some() {
                 // TP-4M1: only rows [0, offs_row[ne_l]) are ever read (the rest hold the ep_fill dummy mapping); the live-row
                 // twin skips the dead ones and moves 8 B per lane. Same per-element arithmetic (bitwise equal on live rows).
                 let live_end = *psc.offs_row.device_ptr() as u64 + (ne * 4) as u64;
@@ -15194,7 +15215,15 @@ would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200
             let (svh_gu, suh_d, svh_d) = (*moe.svh_gu.device_ptr() as u64, *moe.suh_d.device_ptr() as u64,
                                           *moe.svh_d.device_ptr() as u64);
             for &(gmt, tp, np, cap) in &groups {
-                if fold {
+                if afuse {
+                    let (f, sm) = (moe_pf_af_fn(gmt), moe_pf_af_smem_bytes(gmt));
+                    xqlaunch_raw!(l, f, ((mi as u32) * 2 / 256, cap, 1), (512, 1, 1), sm,
+                             (*moe.gu_tr.device_ptr() as u64, *psc.pf_offs_gu.device_ptr() as u64,
+                              *psc.x.device_ptr() as u64, *psc.xhd.device_ptr() as u64, tp, np,
+                              *psc.offs_row.device_ptr() as u64, *psc.cnt.device_ptr() as u64, kn_gu, moe.bits as i32,
+                              svh_gu, suh_d, *moe.suh_gu.device_ptr() as u64, *psc.row_tok.device_ptr() as u64,
+                              *psc.row_eidx.device_ptr() as u64, *psc.pf_ident.device_ptr() as u64))?;
+                } else if fold {
                     let (f, sm, nt) = moe_pf_pick('g', gmt, pf2, moe.bits);
                     xqlaunch!(l, f, ((mi as u32) * 2 / 256, cap, 1), (nt, 1, 1), sm,
                              (&moe.gu_tr, &psc.pf_offs_gu, &psc.xh_e, &mut psc.xhd, tp, np,
@@ -24513,6 +24542,20 @@ pub fn probe_pack_pf(a: &FwdArgs) -> Result<()> {
     let (_, ca) = run_a(&mut psc)?; let sa = snap(ca)?; let la = seam(&mut dsc)?;
     let (_, cb) = run_b(&mut psc)?; let sb = snap(cb)?; let lb = seam(&mut dsc)?;
     let (_, _) = run_a(&mut psc)?; let la2 = seam(&mut dsc)?;
+    {
+        // cross-binary / cross-env bitwise check: FNV-1a over every state byte + the seam logprobs
+        fn eat(hsh: &mut u64, bs: &[u8]) { for &x in bs { *hsh ^= x as u64; *hsh = hsh.wrapping_mul(0x100000001b3); } }
+        for (tag, sn, lp) in [("A", &sa, &la), ("B", &sb, &lb)] {
+            let mut hsh = 0xcbf29ce484222325u64;
+            let mut eat = |bs: &[u8]| eat(&mut hsh, bs);
+            for v in &sn.0 { for x in v { eat(&x.to_bits().to_le_bytes()); } }
+            for v in &sn.1 { eat(v); }
+            for v in &sn.2 { for x in v { eat(&x.to_le_bytes()); } }
+            for x in &lp.0 { eat(&x.to_bits().to_le_bytes()); }
+            drop(eat);
+            crate::rprintln!("[packpf] DIGEST {tag} {hsh:016x}");
+        }
+    }
     cmp_lp("A-vs-A2 (repeat)", &la, &la2);
     cmp_lp("A-vs-C (2-chunk)", &la, &lc);
     cmp_lp("A-vs-B (packed) ", &la, &lb);

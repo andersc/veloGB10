@@ -1001,6 +1001,11 @@ impl SchemaMask {
     ///
     /// Returns an all-zero bitset if `set_vocab` was never called (`fail closed`: nothing is
     /// emitted rather than unconstrained text).
+    /// The cached allowed set of `state`, without computing it on a miss.
+    pub fn allowed_cached(&self, state: u32) -> Option<Arc<Vec<u32>>> {
+        lock(&self.cache).get(&state).cloned()
+    }
+
     pub fn allowed(&self, state: u32) -> Arc<Vec<u32>> {
         if let Some(hit) = lock(&self.cache).get(&state).cloned() {
             return hit;

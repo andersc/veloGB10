@@ -10580,14 +10580,20 @@ __device__ __forceinline__ void xq_pf_prof_put(long long w, long long c, long lo
 }
 #define XQ_PF_CLK(v) do { if constexpr (PROF > 0) (v) = clock64(); } while (0)
 
-template <int BITS, int MT, int NW, int EPI, int PROF>
+// MOE-AFUSE (AF = 1, gate|up only): the A operand is formed IN the prologue instead of read from xh_e:
+// a warp owns whole rows of the stage's 128-column block, loads x[row_tok] and the expert's suh as one
+// 8-byte uint2 per lane, and runs xq_had_suh_rows_live_body's per-element arithmetic (f32 product,
+// exl3_had128, ONE f16 RN store) into the smem tile. KS = 8 (stage = one 128-block) for every MT.
+// The global loads are issued before the stage's MMA loop and the rotate + store runs after it.
+template <int BITS, int MT, int NW, int EPI, int PROF, int AF = 0>
 __device__ __forceinline__ void xq_moe_pf_body(
         const uint16_t* __restrict__ trellis, const __half* __restrict__ xh,
         __half* __restrict__ y, int M, int K, int N, int cta_tile, int m_sup,
         __half* __restrict__ smem, const __half* __restrict__ svh_e,
-        const __half* __restrict__ suh_de) {
+        const __half* __restrict__ suh_de, const __half* __restrict__ xa = nullptr,
+        const int* __restrict__ rtok = nullptr, const __half* __restrict__ suh_a = nullptr) {
     static_assert(BITS <= 4, "the one-load-per-lane ring decode needs 8*BITS <= 32");
-    constexpr int KS = XqPfKs<MT>::v;
+    constexpr int KS = AF ? 8 : XqPfKs<MT>::v;
     constexpr int ROWS = MT * 16;
     constexpr int LD = KS * 16 + 8;
     constexpr int C8 = KS * 2;                 // 16-B chunks per staged row
@@ -10667,7 +10673,50 @@ __device__ __forceinline__ void xq_moe_pf_body(
         } \
     } while (0)
 
-    XQ_PF_STAGE(0, buf0);
+    // ---- MOE-AFUSE staging (AF = 1) ----
+    constexpr int RPW = (ROWS + NW - 1) / NW;   // rows per warp (ROWS % NW == 0 for the served shapes)
+    static_assert(!AF || (ROWS % NW) == 0, "AF: whole rows per warp");
+    uint2 fxa[AF ? RPW : 1];
+    uint2 fsa;
+    int ftok[AF ? RPW : 1];
+    if constexpr (AF) {
+        #pragma unroll
+        for (int u = 0; u < RPW; ++u) {
+            const int gr = row_base + u * NW + warp;
+            ftok[u] = gr < M ? rtok[gr] : -1;
+        }
+    }
+    #define XQ_PF_FLOAD(J) do { \
+        const int col_ = (J) * 128 + lane * 4; \
+        fsa = *reinterpret_cast<const uint2*>(suh_a + col_); \
+        _Pragma("unroll") \
+        for (int u_ = 0; u_ < RPW; ++u_) \
+            fxa[u_] = ftok[u_] >= 0 ? *reinterpret_cast<const uint2*>(xa + (size_t)ftok[u_] * K + col_) \
+                                    : make_uint2(0u, 0u); \
+    } while (0)
+    #define XQ_PF_FSTORE(DST) do { \
+        const float2 sa_ = __half22float2(*reinterpret_cast<const __half2*>(&fsa.x)); \
+        const float2 sb_ = __half22float2(*reinterpret_cast<const __half2*>(&fsa.y)); \
+        _Pragma("unroll") \
+        for (int u_ = 0; u_ < RPW; ++u_) { \
+            uint2 ov_ = make_uint2(0u, 0u); \
+            if (ftok[u_] >= 0) { \
+                const float2 xa_ = __half22float2(*reinterpret_cast<const __half2*>(&fxa[u_].x)); \
+                const float2 xb_ = __half22float2(*reinterpret_cast<const __half2*>(&fxa[u_].y)); \
+                float v_[4]; \
+                v_[0] = xa_.x * sa_.x; v_[1] = xa_.y * sa_.y; v_[2] = xb_.x * sb_.x; v_[3] = xb_.y * sb_.y; \
+                exl3_had128(v_, lane); \
+                const __half2 o01_ = __floats2half2_rn(v_[0], v_[1]); \
+                const __half2 o23_ = __floats2half2_rn(v_[2], v_[3]); \
+                ov_.x = *reinterpret_cast<const unsigned*>(&o01_); \
+                ov_.y = *reinterpret_cast<const unsigned*>(&o23_); \
+            } \
+            *reinterpret_cast<uint2*>((DST) + (u_ * NW + warp) * LD + lane * 4) = ov_; \
+        } \
+    } while (0)
+
+    if constexpr (AF) { XQ_PF_FLOAD(0); XQ_PF_FSTORE(buf0); }
+    else { XQ_PF_STAGE(0, buf0); }
     XQ_PF_LOADW(0);
     const int gid = lane >> 2, tig = lane & 3;
     for (int j = 0; j < NS; ++j) {
@@ -10680,7 +10729,8 @@ __device__ __forceinline__ void xq_moe_pf_body(
         XQ_PF_CLK(ptb);
         const __half* cur = (j & 1) ? buf1 : buf0;
         if (j + 1 < NS) {
-            XQ_PF_STAGE(j + 1, (j & 1) ? buf0 : buf1);
+            if constexpr (AF) { XQ_PF_FLOAD(j + 1); }
+            else { XQ_PF_STAGE(j + 1, (j & 1) ? buf0 : buf1); }
             XQ_PF_LOADW(j + 1);
         }
         #pragma unroll
@@ -10727,10 +10777,13 @@ __device__ __forceinline__ void xq_moe_pf_body(
                 }
             }
         }
+        if constexpr (AF) { if (j + 1 < NS) XQ_PF_FSTORE((j & 1) ? buf0 : buf1); }
         if constexpr (PROF > 0) { const long long ptc = clock64(); pw += ptb - pta; pc += ptc - ptb; }
     }
     #undef XQ_PF_STAGE
     #undef XQ_PF_LOADW
+    #undef XQ_PF_FLOAD
+    #undef XQ_PF_FSTORE
     XQ_PF_CLK(pta);
 
     if constexpr (EPI == 0) {
@@ -10985,6 +11038,51 @@ __device__ __forceinline__ void xq_moe_pf_entry(const uint16_t* __restrict__ bas
         if (bits == 3) xq_moe_pf2_body<3, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
         else if (bits == 4) xq_moe_pf2_body<4, MT, NW, EPI, KS2, P2, PROF>(tr, xe, ye, ce, K, N, cta_tile, m_sup, xq_pf_dsm, svh_e, suh_de);
     }
+}
+
+// MOE-AFUSE entries (VELO_MOE_AFUSE=1): the gate|up fold (EPI 2, 16 warps, V 0) with the A operand
+// rotated in the prologue from x / row_tok / suh_gu (no xq_had_suh_rows_live pass, no xh_e round trip).
+// Dynamic smem = XqPfAfSmem<MT>::halves * 2 (host mirror moe_pf_af_smem_bytes; > 48 KB for MT 8 -> opt-in).
+template <int MT>
+struct XqPfAfSmem {
+    static constexpr int ROWS = MT * 16;
+    static constexpr int A = 2 * ROWS * (8 * 16 + 8);
+    static constexpr int T = 2 * (ROWS < 64 ? ROWS : 64) * 136;
+    static constexpr int halves = A > T ? A : T;
+};
+#define XQ_PFAF_ENTRY(NAME, MT) \
+extern "C" __global__ void __launch_bounds__(512, 1) NAME( \
+        const uint16_t* __restrict__ base, const uint64_t* __restrict__ offs, \
+        const __half* __restrict__ x, __half* __restrict__ y, const int* __restrict__ tiles, \
+        const int* __restrict__ ntiles, const int* __restrict__ offs_row, const int* __restrict__ cnt, \
+        int kn, int bits, const __half* __restrict__ svh_all, const __half* __restrict__ suh_d_all, \
+        const __half* __restrict__ suh_gu_all, const int* __restrict__ row_tok, \
+        const int* __restrict__ row_eidx, const int* __restrict__ idxmap) { \
+    XQ_PDL_ENTRY(); \
+    extern __shared__ __align__(16) __half xq_pf_dsm[]; \
+    const int tile = blockIdx.y; \
+    if (tile >= *ntiles) return; \
+    const int K = kn & 0xFFFF, N = kn >> 16; \
+    const int e = tiles[2 * tile], m_sup = tiles[2 * tile + 1]; \
+    const int ce = cnt[e]; \
+    const int row0 = offs_row[e]; \
+    const uint16_t* tr = base + (size_t)offs[e]; \
+    __half* ye = y + (size_t)row0 * (N >> 1); \
+    const __half* svh_e = svh_all + (size_t)e * N; \
+    const __half* suh_de = suh_d_all + (size_t)e * (N >> 1); \
+    const __half* suh_a = suh_gu_all + (size_t)idxmap[row_eidx[row0]] * K; \
+    const int* rtok = row_tok + row0; \
+    if (bits == 3) xq_moe_pf_body<3, MT, 16, 2, 0, 1>(tr, nullptr, ye, ce, K, N, (int)blockIdx.x, m_sup, xq_pf_dsm, svh_e, suh_de, x, rtok, suh_a); \
+    else if (bits == 4) xq_moe_pf_body<4, MT, 16, 2, 0, 1>(tr, nullptr, ye, ce, K, N, (int)blockIdx.x, m_sup, xq_pf_dsm, svh_e, suh_de, x, rtok, suh_a); \
+}
+XQ_PFAF_ENTRY(xq_moe_pf_gf1, 1)
+XQ_PFAF_ENTRY(xq_moe_pf_gf2, 2)
+XQ_PFAF_ENTRY(xq_moe_pf_gf4, 4)
+XQ_PFAF_ENTRY(xq_moe_pf_gf8, 8)
+#undef XQ_PFAF_ENTRY
+extern "C" __global__ void xq_moe_pf_af_smem_query(int* out) {
+    out[0] = XqPfAfSmem<1>::halves * 2; out[1] = XqPfAfSmem<2>::halves * 2;
+    out[2] = XqPfAfSmem<4>::halves * 2; out[3] = XqPfAfSmem<8>::halves * 2;
 }
 
 #define XQ_PFV_ENTRY(NAME, MT, NW, EPI, MINB, V, KS2, P2, PROF) \

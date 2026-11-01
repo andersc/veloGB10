@@ -439,6 +439,13 @@ enum SchemaStep {
 /// completed one.
 const SCHEMA_DEAD_END: &str = "error: json-schema constrained decoding reached a state with no valid continuation";
 
+/// SCHEMA-PAR (VELO_SCHEMA_PAR, default on; 0 = serial): build the plain step's schema-mask cache
+/// misses on scoped threads.
+fn schema_par_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELO_SCHEMA_PAR").map_or(true, |v| v != "0"))
+}
+
 /// W2-EXL3: advance a schema lane's FSM by one emitted token (pure; unit-tested).
 fn schema_feed(sm: &crate::json_schema::SchemaMask, state: &mut u32, armed: &mut bool, tok: u32) -> SchemaStep {
     if !*armed {
@@ -3946,13 +3953,31 @@ the [gen] line says stop_p=na", stats));
         // W2-EXL3: per-row schema masks for the armed schema lanes (nothing staged — and no
         // mask node in the step's graph — when no lane in this step carries a live constraint).
         {
-            let masks: Vec<Option<std::sync::Arc<Vec<u32>>>> = slots.iter().map(|&s| {
+            // SCHEMA-PAR: the GPU idles while the masks are built (the step needs them), and a cache
+            // miss walks the vocab trie (~ms). Misses of different lanes are independent: with 2+
+            // misses they run on scoped threads (the same pure function -> the same bits).
+            let mut masks: Vec<Option<std::sync::Arc<Vec<u32>>>> = Vec::with_capacity(slots.len());
+            let mut miss: Vec<(usize, std::sync::Arc<crate::json_schema::SchemaMask>, u32)> = Vec::new();
+            for (i, &s) in slots.iter().enumerate() {
                 let l = self.lanes[s].as_ref().unwrap();
-                match (&l.schema, l.schema_armed) {
-                    (Some(sm), true) => Some(sm.allowed(l.schema_state)),
+                masks.push(match (&l.schema, l.schema_armed) {
+                    (Some(sm), true) => match sm.allowed_cached(l.schema_state) {
+                        Some(hit) => Some(hit),
+                        None => { miss.push((i, sm.clone(), l.schema_state)); None }
+                    },
                     _ => None,
-                }
-            }).collect();
+                });
+            }
+            if miss.len() >= 2 && schema_par_on() {
+                let got: Vec<std::sync::Arc<Vec<u32>>> = std::thread::scope(|sc| {
+                    let hs: Vec<_> = miss[1..].iter().map(|(_, sm, st)| sc.spawn(move || sm.allowed(*st))).collect();
+                    let first = miss[0].1.allowed(miss[0].2);
+                    std::iter::once(first).chain(hs.into_iter().map(|h| h.join().expect("schema mask thread"))).collect()
+                });
+                for ((i, _, _), a) in miss.iter().zip(got) { masks[*i] = Some(a); }
+            } else {
+                for (i, sm, st) in &miss { masks[*i] = Some(sm.allowed(*st)); }
+            }
             let rows: Vec<Option<&[u32]>> = masks.iter().map(|m| m.as_deref().map(|v| &v[..])).collect();
             self.model.set_vmask(&mut self.sc, &rows)?;
         }
@@ -4025,6 +4050,26 @@ the [gen] line says stop_p=na", stats));
             }
         }
 
+        // SCHEMA-PAR: schema_feed's dead-end check builds the NEXT state's mask (a trie walk on a
+        // miss) lane by lane while the GPU waits. Warm those misses on scoped threads first; the
+        // serial loop below then runs unchanged and hits the cache (pure function: same bits).
+        if schema_par_on() {
+            let mut warm: Vec<(std::sync::Arc<crate::json_schema::SchemaMask>, u32)> = Vec::new();
+            for (j, &s) in slots.iter().enumerate() {
+                let l = self.lanes[s].as_ref().unwrap();
+                if let (Some(sm), true) = (&l.schema, l.schema_armed) {
+                    if let Some(ns) = sm.step(l.schema_state, ids[j] as u32) {
+                        if !sm.is_complete(ns) && sm.allowed_cached(ns).is_none() { warm.push((sm.clone(), ns)); }
+                    }
+                }
+            }
+            if warm.len() >= 2 {
+                std::thread::scope(|sc| {
+                    for (sm, ns) in &warm[1..] { sc.spawn(move || { sm.allowed(*ns); }); }
+                    warm[0].0.allowed(warm[0].1);
+                });
+            }
+        }
         for (j, &s) in slots.iter().enumerate() {
             let t = {
                 let lane = self.lanes[s].as_mut().unwrap();

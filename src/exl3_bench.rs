@@ -179,6 +179,7 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     "xq_moe_pf_t1", "xq_moe_pf_t2", "xq_moe_pf_t4", "xq_moe_pf_t8",
     "xq_moe_pf_s1", "xq_moe_pf_s2", "xq_moe_pf_s4", "xq_moe_pf_s8",
     "xq_moe_pf_g1", "xq_moe_pf_g2", "xq_moe_pf_g4", "xq_moe_pf_g8",
+    "xq_moe_pf_gf1", "xq_moe_pf_gf2", "xq_moe_pf_gf4", "xq_moe_pf_gf8", "xq_moe_pf_af_smem_query",
     "xq_moe_pf_count4", "xq_moe_pf_smem_query",
     // A5-L2: smem trellis-ring twins (prefill.moe_pf2) + the `_prof` clock64 twins (harness)
     "xq_moe_pf2_t1", "xq_moe_pf2_t2", "xq_moe_pf2_t4", "xq_moe_pf2_t8",
