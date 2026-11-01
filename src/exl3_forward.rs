@@ -4504,8 +4504,23 @@ static LT_FAMILIES: std::sync::Mutex<Option<(Vec<(usize, usize, bool, usize, usi
 /// ld=K, opB=N (row offset applied by the caller via pointer); C row-major
 /// [m,N] → col-major [N,m], ld=N. Heuristics per (k,n,m), cached process-wide
 /// (the brief's "heuristics first"; the winning algo is pinned by the cache).
+/// PACK-PF: --exl3-lt-canon N — inside a prefill pass (LT_CANON_ACTIVE) every cuBLASLt GEMM at
+/// m >= 17 runs the algo cuBLASLt picks for m = N, pinned on the m-row layouts (the TP-SP pin
+/// mechanism), so a row's bytes do not depend on how many rows share the chunk (chunk grid, packed
+/// prompts). 0 = off (the per-m heuristic).
+fn lt_canon_m() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("exl3-lt-canon")).ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+static LT_CANON_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn exl3_lt_matmul(l: &Launcher, a: u64, b: u64, c: u64,
                   k: usize, n: usize, m: usize, ta: bool, ltws: u64, ltws_len: usize) -> Result<()> {
+    let pm = lt_canon_m();
+    if pm > 0 && m != pm && m >= 17 && LT_CANON_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        && lt_pin_plan_ensure(k, n, m, pm, ta, ltws_len).is_ok() {
+        return exl3_lt_matmul_pinned(l, a, b, c, k, n, m, pm, ta, ltws, ltws_len);
+    }
     if LT_REC_ON.load(std::sync::atomic::Ordering::Relaxed) {
         let mut rec = LT_REC.lock().unwrap();
         if !rec.contains(&(k, n, m, ta, ltws_len)) { rec.push((k, n, m, ta, ltws_len)); }
@@ -14333,6 +14348,13 @@ impl Wp18Scratch {
 /// C-row scratch for the chunked prefill sweep (separate from the decode
 /// `Scratch`, which is width-scaled for serving lanes; the compact MoE row
 /// lists make the per-expert buffers O(C*topk), not O(E*C)).
+/// PACK-PF: one prompt segment of a packed prefill pass — rows [r0, r0+n) of the chunk are
+/// positions [pos0, pos0+n) of `slot`.
+#[derive(Clone, Copy, Debug)]
+pub struct PfSeg { pub r0: usize, pub n: usize, pub pos0: usize, pub slot: usize }
+/// PACK-PF: the most prompts one packed pass carries.
+pub const PACK_PF_MAX: usize = 16;
+
 pub struct PrefillScratch {
     pub c: usize,
     sids: CudaSlice<i32>,
@@ -14351,6 +14373,8 @@ pub struct PrefillScratch {
     hfill_a: CudaSlice<u16>,
     hfill_b: CudaSlice<u16>,
     hfill_carry: CudaSlice<f32>,
+    /// PACK-PF: segment k's head-fill carry (its last prompt row's streams) at row k.
+    pub hfill_carry_segs: CudaSlice<f32>,
     // S-A3-u D: device-side MoE routing — tile list [(expert, super-row)] + its length, the
     // identity expert map, per-expert trellis offsets, and the identity row map (down side).
     pf_tiles: CudaSlice<i32>,
@@ -14496,6 +14520,7 @@ impl FwdModel {
             hfill_a: dev.alloc_zeros::<u16>(hf)?,
             hfill_b: dev.alloc_zeros::<u16>(hf)?,
             hfill_carry: dev.alloc_zeros::<f32>(if self.mtp.is_some() { rw } else { 1 })?,
+            hfill_carry_segs: dev.alloc_zeros::<f32>(if self.mtp.is_some() { PACK_PF_MAX * rw } else { 1 })?,
             sids: dev.htod_sync_copy(&vec![0i32, 0i32])?,
             qsa_qk: dev.alloc_zeros::<u16>(c * if qsa_on { (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim } else { 0 })?,
             qsa_qkb: dev.alloc_zeros::<u16>(c * if qsa_on { (cfg.indexer_n_heads + 1) * cfg.indexer_head_dim } else { 0 })?,
@@ -14597,7 +14622,8 @@ impl FwdModel {
         })
     }
 
-    fn ple_forward_chunk(&self, l: &Launcher, psc: &mut PrefillScratch, toks: &[i32], slot: usize) -> Result<()> {
+    fn ple_forward_segs(&self, l: &Launcher, psc: &mut PrefillScratch, toks: &[i32], segs: &[PfSeg]) -> Result<()> {
+        let slot = segs[0].slot;
         let ple = match self.ple.as_ref() {
             Some(p) => p,
             None => return Ok(()),
@@ -14616,10 +14642,13 @@ impl FwdModel {
             let h3s: Vec<[i32; 3]> = {
                 let mut hist = self.ple_hist.lock().unwrap();
                 let mut v = Vec::with_capacity(c);
-                for q in 0..c {
-                    v.push([hist[slot * 2], hist[slot * 2 + 1], toks[q]]);
-                    hist[slot * 2] = hist[slot * 2 + 1];
-                    hist[slot * 2 + 1] = toks[q];
+                for sg in segs {
+                    let slot = sg.slot;
+                    for q in sg.r0..sg.r0 + sg.n {
+                        v.push([hist[slot * 2], hist[slot * 2 + 1], toks[q]]);
+                        hist[slot * 2] = hist[slot * 2 + 1];
+                        hist[slot * 2 + 1] = toks[q];
+                    }
                 }
                 v
             };
@@ -14649,6 +14678,7 @@ impl FwdModel {
             // as the PLE pack was driven through a 1-row, width-1 prefill scratch
             // (probe_scratch(1)) or a last chunk of 1 row (§2.2 class). The decode
             // path never hits this because it passes a width-sized buffer.
+            anyhow::ensure!(segs.len() == 1, "PACK-PF: the host PLE fallback is single-segment");
             let mut emb_buf = vec![0u16; c * 2560];
             for q in 0..c {
                 let h3 = [hist[slot * 2], hist[slot * 2 + 1], toks[q]];
@@ -14684,8 +14714,18 @@ impl FwdModel {
                  (&psc.ple_qn, &psc.ple_kn, &psc.ple_val, &mut psc.ple_gated, scale))?;
         xqlaunch!(l, "xq_ple_norm_hh", (c as u32 * 4, 1, 1), (256, 1, 1), 0,
                  (&psc.ple_gated, &ple.norm_conv_w, &mut psc.ple_normed, eps))?;
+        if segs.len() == 1 {
         xqlaunch!(l, "xq_ple_conv_chunk", ((10240u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                  (&mut psc.resid, &psc.ple_gated, &psc.ple_normed, &self.ple_state, &ple.conv_w, slot as i32, c as i32))?;
+        } else {
+            let (rp, gp, np) = (*psc.resid.device_ptr() as u64, *psc.ple_gated.device_ptr() as u64,
+                                *psc.ple_normed.device_ptr() as u64);
+            for sg in segs {
+                let (o32, o16) = ((sg.r0 * 10240 * 4) as u64, (sg.r0 * 10240 * 2) as u64);
+                xqlaunch!(l, "xq_ple_conv_chunk", ((10240u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
+                         (rp + o32, gp + o16, np + o16, &self.ple_state, &ple.conv_w, sg.slot as i32, sg.n as i32))?;
+            }
+        }
         Ok(())
     }
 
@@ -15683,7 +15723,41 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
 
     pub fn prefill_chunk(&self, psc: &mut PrefillScratch, toks: &[i32], pos0: usize,
                          slot: usize, want_logits: bool, ld: Option<&LadderCtx>) -> Result<()> {
+        let segs = [PfSeg { r0: 0, n: toks.len(), pos0, slot }];
+        self.prefill_segs(psc, toks, &segs, want_logits, ld)
+    }
+
+    /// PACK-PF: one prefill pass over several prompt segments packed back to back in the chunk
+    /// rows (`toks` = the concatenation, `segs` in row order). Every row-independent launch
+    /// (chains, MoE, hc glue, norms) runs once over all rows, so the per-pass weight streaming is
+    /// shared; the sequence-dependent ones (PLE history/conv, GDN conv + scan, the K/V writes,
+    /// attention, QSA pooling, the head fill) loop over the segments with row-offset pointers.
+    /// A single segment is exactly the old prefill_chunk (all offsets 0).
+    pub fn prefill_segs(&self, psc: &mut PrefillScratch, toks: &[i32], segs: &[PfSeg],
+                        want_logits: bool, ld: Option<&LadderCtx>) -> Result<()> {
+        LT_CANON_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = self.prefill_segs_inner(psc, toks, segs, want_logits, ld);
+        LT_CANON_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+
+    fn prefill_segs_inner(&self, psc: &mut PrefillScratch, toks: &[i32], segs: &[PfSeg],
+                          want_logits: bool, ld: Option<&LadderCtx>) -> Result<()> {
         let c = toks.len();
+        anyhow::ensure!(!segs.is_empty(), "prefill_segs: no segments");
+        let multi = segs.len() > 1;
+        let (pos0, slot) = (segs[0].pos0, segs[0].slot);
+        if multi {
+            let mut r = 0usize;
+            for sg in segs {
+                anyhow::ensure!(sg.r0 == r && sg.n > 0, "prefill_segs: segments must tile the rows in order");
+                anyhow::ensure!(sg.pos0 + sg.n <= self.max_pos, "prefill_segs: segment past max_pos");
+                r += sg.n;
+            }
+            anyhow::ensure!(r == c && segs.len() <= PACK_PF_MAX, "prefill_segs: rows {r} != {c} or too many segments");
+            anyhow::ensure!(ld.is_none() && self.tp.is_none() && psc.vis_img.is_none() && !want_logits && psc.ppl.is_none(),
+                            "prefill_segs: packed pass needs no trace/TP/vision/logits/ppl");
+        }
         // TP-A rung 3: the chunked prefill MoE (moe_prefill) has no EP filter/reduce site yet —
         // refuse loudly instead of silently mixing a rank's partial into its residual.
         // TP-B: prefill is TP-wired (EP experts + head-sharded mixers + row-parallel reduces).
@@ -15719,11 +15793,19 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             if st.inflight_tab { self.dev.synchronize()?; st.inflight_tab = false; } // only after an error path
             let cc = st.c;
             st.pin.i32s(0, c).copy_from_slice(toks);
-            for (i, x) in st.pin.i32s(4 * cc, c).iter_mut().enumerate() { *x = (pos0 + i) as i32; }
-            st.pin.i32s(8 * cc, c).fill(slot as i32);
+            {
+                let pr = st.pin.i32s(4 * cc, c);
+                for sg in segs { for i in 0..sg.n { pr[sg.r0 + i] = (sg.pos0 + i) as i32; } }
+            }
+            {
+                let sr = st.pin.i32s(8 * cc, c);
+                for sg in segs { sr[sg.r0..sg.r0 + sg.n].fill(sg.slot as i32); }
+            }
             {
                 let sp = st.pin.i32s(12 * cc, 2 * c);
-                for i in 0..c { sp[2 * i] = slot as i32; sp[2 * i + 1] = (pos0 + i) as i32; }
+                for sg in segs {
+                    for i in 0..sg.n { sp[2 * (sg.r0 + i)] = sg.slot as i32; sp[2 * (sg.r0 + i) + 1] = (sg.pos0 + i) as i32; }
+                }
             }
             st.pin.i32s(20 * cc, 1)[0] = (c * cfg.num_experts_per_tok) as i32;
             st.pin.htod(0, *psc.toks.device_ptr() as u64, c * 4)?;
@@ -15744,6 +15826,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                 crate::dprintln!("PLE_XCHECK prefill-rope pos0 {pos0} rows {c}: {nd} mismatching f32 of {}", want.len());
             }
         } else {
+        anyhow::ensure!(!multi, "prefill_segs: a packed pass needs the WP05 prologue");
         psc.toks = self.dev.htod_sync_copy(toks)?;
         // S-A3-u D: the MoE row count is a per-chunk constant (c * topk) — one upload per chunk.
         self.dev.htod_copy_into(vec![(c * cfg.num_experts_per_tok) as i32], &mut psc.moerows)?;
@@ -15804,7 +15887,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
             if li == 1 && ple_live {
                 // (layer 0's MoE reduce takes no hook when the PLE follows, so `normed` is false here)
                 if let Some(y) = pend.take() { self.hc_post_rows(&l, psc, y, c)?; } // A5-P2: PLE reads resid
-                self.ple_forward_chunk(&l, psc, toks, slot)?;
+                self.ple_forward_segs(&l, psc, toks, segs)?;
             }
             match spl(li) {
                 Some(s) => self.hc_pre_rows_sp(&l, psc, &layer.hc_attn, s, pend.take(), std::mem::take(&mut normed), true)?,
@@ -15835,27 +15918,41 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     }
                     self.tr_u16(ld, true, li, &psc.a_out, &format!("g{li}_a"), c * nh)?;
                     self.tr_u16(ld, true, li, &psc.b_out, &format!("g{li}_b"), c * nh)?;
+                    // PACK-PF: the parallel conv's output stays in chain_xh and the scan reads it there
+                    // (the copy back into qkv is skipped: chain_xh is dead until the out_proj chain).
+                    let mut qkv_p = *psc.qkv.device_ptr() as u64;
+                    let conv_nocopy = ld.is_none() && crate::opts::var(crate::opt!("exl3-gdn-xcheck")).is_err();
                     if ck <= 8 && tune::get_cur(&T_PF_CONV_PAR) != 0 {
                         // A5 D17: parallel (token, channel) conv into chain_xh (dead between chains),
                         // ring advance from the intact inputs, then copy back — bit-identical to the
                         // serial per-channel loop (4.1 s of a 128K prefill). --exl3-conv-serial = old.
                         let st_p = (*self.conv_state[gdn_i].device_ptr()) as u64;
                         let n = (c * conv_dim) as i64;
-                        xqlaunch!(l, "xq_conv1d_chunk_par", (((n + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
-                                  (&mut psc.chain_xh, &psc.qkv, st_p, &g.conv_w,
-                                   conv_dim as i32, ck as i32, c as i32, slot as i32, conv_dim as i32))?;
-                        xqlaunch!(l, "xq_conv1d_state_upd", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
-                                  (st_p, &psc.qkv, conv_dim as i32, ck as i32, c as i32, slot as i32, conv_dim as i32))?;
+                        let (xo, xi) = (*psc.chain_xh.device_ptr() as u64, *psc.qkv.device_ptr() as u64);
+                        for sg in segs {
+                            let off = (sg.r0 * conv_dim * 2) as u64;
+                            let ns = (sg.n * conv_dim) as i64;
+                            xqlaunch!(l, "xq_conv1d_chunk_par", (((ns + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                                      (xo + off, xi + off, st_p, &g.conv_w,
+                                       conv_dim as i32, ck as i32, sg.n as i32, sg.slot as i32, conv_dim as i32))?;
+                            xqlaunch!(l, "xq_conv1d_state_upd", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
+                                      (st_p, xi + off, conv_dim as i32, ck as i32, sg.n as i32, sg.slot as i32, conv_dim as i32))?;
+                        }
+                        if conv_nocopy {
+                            qkv_p = xo;
+                        } else {
                         xqlaunch!(l, "xq_copy_u16", (((n + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
                                   (&mut psc.qkv, &psc.chain_xh, n, 0i64, 0i64))?;
+                        }
                     } else {
+                    anyhow::ensure!(!multi, "PACK-PF: the serial conv path is single-segment");
                     xqlaunch!(l, "xq_conv1d_chunk", ((conv_dim as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                              (&mut psc.qkv, (*self.conv_state[gdn_i].device_ptr()) as u64, &g.conv_w,
                               conv_dim as i32, ck as i32, c as i32, slot as i32, conv_dim as i32))?;
                     }
                     self.tr_u16(ld, true, li, &psc.qkv, &format!("g{li}_conv"), c * conv_dim)?;
                     let tc_min = gdn_tc_min_rows();
-                    let tc = if tc_min > 0 && c >= tc_min && kd == 128 && vd == 128 {
+                    let tc = if tc_min > 0 && segs.iter().all(|sg| sg.n >= tc_min) && kd == 128 && vd == 128 {
                         // A5-L1 prefill.gdn_scan: the re-scheduled bitwise twin xq_gdn_chunk_tc2
                         let v2 = tune::get(&T_PF_GDN_SCAN, &l.cx()) != 0;
                         static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -15867,7 +15964,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     } else { None };
                     // S-A3-v --exl3-gdn-xcheck: the sequential scan on a copy of this slot's state
                     // (twin core rows), diffed against the chunkwise scan below — per-layer error.
-                    let gx = if tc.is_some() && crate::opts::var(crate::opt!("exl3-gdn-xcheck")).is_ok() {
+                    let gx = if !multi && tc.is_some() && crate::opts::var(crate::opt!("exl3-gdn-xcheck")).is_ok() {
                         let ns = nh * kd * vd;
                         let mut st2 = self.dev.alloc_zeros::<f32>(ns)?;
                         let mut core2 = self.dev.alloc_zeros::<u16>(c * nh * vd)?;
@@ -15882,16 +15979,17 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     } else { None };
                     if let Some(f) = tc {
                         // S-A3-v: chunkwise-parallel scan (tensor cores; f32 state master in registers).
-                        let mut a_core = *psc.core.device_ptr() as u64;
-                        let mut a_qkv = *psc.qkv.device_ptr() as u64;
+                        for sg in segs {
+                        let mut a_core = *psc.core.device_ptr() as u64 + (sg.r0 * nh * vd * 2) as u64;
+                        let mut a_qkv = qkv_p + (sg.r0 * conv_dim * 2) as u64;
                         let mut a_st = *self.s_state[gdn_i].device_ptr() as u64;
-                        let mut a_b = *psc.b_out.device_ptr() as u64;
-                        let mut a_a = *psc.a_out.device_ptr() as u64;
+                        let mut a_b = *psc.b_out.device_ptr() as u64 + (sg.r0 * nh * 2) as u64;
+                        let mut a_a = *psc.a_out.device_ptr() as u64 + (sg.r0 * nh * 2) as u64;
                         let mut a_alog = *g.a_log.device_ptr() as u64;
                         let mut a_dtb = *g.dt_bias.device_ptr() as u64;
                         let mut a_nhnk = (nh | (nk << 16)) as i32;
-                        let mut a_slot = slot as i32;
-                        let mut a_n = c as i32;
+                        let mut a_slot = sg.slot as i32;
+                        let mut a_n = sg.n as i32;
                         let mut args: [*mut std::ffi::c_void; 10] = [
                             &mut a_core as *mut u64 as *mut _, &mut a_qkv as *mut u64 as *mut _,
                             &mut a_st as *mut u64 as *mut _, &mut a_b as *mut u64 as *mut _,
@@ -15905,6 +16003,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                         };
                         anyhow::ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
                                         "xq_gdn_chunk_tc launch failed ({r:?})");
+                        }
                         if let Some((st2, core2)) = gx.as_ref() {
                             self.dev.synchronize()?;
                             let ns = nh * kd * vd;
@@ -15926,11 +16025,17 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     let nchunk = vd / 32;
                     let smem = (kd * 33 + kd + 32 * 3 + kd * 2) * 4;
                     // 12-arg cap: slot_C = slot | C<<12
-                    let slot_c: i32 = (slot as i32) | ((c as i32) << 12);
+                    for sg in segs {
+                    let slot_c: i32 = (sg.slot as i32) | ((sg.n as i32) << 12);
                     xqlaunch!(l, "xq_gdn_step_chunk", ((nh * nchunk) as u32, 1, 1), (kd as u32, 1, 1), smem as u32,
-                             (&mut psc.core, &psc.qkv, (*self.s_state[gdn_i].device_ptr()) as u64,
-                              &psc.b_out, &psc.a_out, (nh | (nk << 16)) as i32, kd as i32, vd as i32,
+                             (*psc.core.device_ptr() as u64 + (sg.r0 * nh * vd * 2) as u64,
+                              qkv_p + (sg.r0 * conv_dim * 2) as u64,
+                              (*self.s_state[gdn_i].device_ptr()) as u64,
+                              *psc.b_out.device_ptr() as u64 + (sg.r0 * nh * 2) as u64,
+                              *psc.a_out.device_ptr() as u64 + (sg.r0 * nh * 2) as u64,
+                              (nh | (nk << 16)) as i32, kd as i32, vd as i32,
                               &g.a_log, &g.dt_bias, slot_c, 0u64))?;
+                    }
                     }
                     self.tr_u16(ld, true, li, &psc.core, &format!("g{li}_core"), c * vd)?;
                     if cfg.gdn_gate_sigmoid {
@@ -15956,8 +16061,27 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     // 12-arg cap packing (see kernel headers)
                     let slot_pos0: i32 = (slot as i32) | ((pos0 as i32) << 12);
                     // PQ8 item 1: row-parallel K/V append (bit-identical; --pq8-kvw=0 = serial)
+                    if multi {
+                        for sg in segs {
+                            self.kv_prefill_write_off(&l, psc, &self.k_cache[att_i], &a.qnkn, *sg)?;
+                        }
+                    } else {
                     self.kv_prefill_write(&l, psc, &self.k_cache[att_i], &a.qnkn, slot, pos0, c,
                                           &format!("layer {att_i}"))?;
+                    }
+                    if multi {
+                        // PACK-PF: every segment fully dense (below the QSA limit), hd = 256 flash rows.
+                        for sg in segs {
+                            anyhow::ensure!(!(a.idx.is_some() && self.qsa_live(sg.pos0 + sg.n - 1)) && hd == 256 && sg.n >= 16,
+                                            "PACK-PF: segment needs the dense hd=256 flash path");
+                            let sp0: i32 = (sg.slot as i32) | ((sg.pos0 as i32) << 12);
+                            self.flash256_launch_off(&l, psc, a, att_i, sp0, sg.n, sg.r0)?;
+                        }
+                        self.qsa_keys_append_dense_segs(&l, psc, a, att_i, segs, c)?;
+                        let hk = self.pf_hook(psc, &layer.hc_mlp, *psc.mixer_out.device_ptr() as u64, ov_rows);
+                        normed = self.chain_o_rb(&l, &a.o_proj, &psc.normed, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.mixer_out, c, &psc.chain_ws, &rb, hk, spl(li))?;
+                        att_i += 1;
+                    } else {
                     // S-A3-i: QSA straddle. Rows whose visible position exceeds
                     // qsa_limit() ride the selection path (the model spec past the
                     // threshold — the seam contract needs prefill and decode to agree);
@@ -16023,6 +16147,7 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                     let hk = self.pf_hook(psc, &layer.hc_mlp, *psc.mixer_out.device_ptr() as u64, ov_rows);
                     normed = self.chain_o_rb(&l, &a.o_proj, &psc.normed, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.mixer_out, c, &psc.chain_ws, &rb, hk, spl(li))?; // TP-B: row-parallel -> all-reduce (TP-SP: reduce-scatter)
                     att_i += 1;
+                    }
                 }
             }
             let yatt_p = *psc.mixer_out.device_ptr() as u64;
@@ -16140,7 +16265,9 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                 // and the carry it leaves (WP16 checkpoints it; the seam prime reads it) — digested only
                 // in the redesigned gate's runs (ld.sp), so the replicated G-T1-b is unchanged
                 if ld.map_or(false, |x| x.sp.is_some()) { self.tr_f32(ld, false, 0, &psc.resid, "streams", c)?; }
+                if multi { self.head_fill_segs(&l, psc, head, segs, c)?; } else {
                 self.head_fill_rows(&l, psc, head, slot, pos0, c)?;
+                }
                 if ld.map_or(false, |x| x.sp.is_some()) { self.tr_f32(ld, false, 0, &psc.hfill_carry, "hcarry", 1)?; }
             }
         }
@@ -16159,6 +16286,137 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
     /// nothing downstream (no attention, MoE or logits). All wide-M launches, no per-token loop.
     /// Runs after the trunk's final mixer: it overwrites psc.resid/hn/x (nothing reads them after
     /// a chunk returns). The serve's single last-position prime (head_prime) is unchanged.
+    /// PACK-PF: kv_prefill_write's row-parallel append for segment `sg` (rows sg.r0.. of kp/vp/cos).
+    /// PACK-PF: make segment k's head-fill carry the live psc carry (the seam prime and the
+    /// prefix snapshot of that segment's slot read psc.hfill_carry).
+    /// PACK-PF: the most rows one packed pass can carry on this scratch.
+    pub fn pf_rows_cap(&self, psc: &PrefillScratch) -> usize { psc.toks.len().min(psc.pos_rows.len()) }
+
+    pub fn pf_use_carry(&self, psc: &mut PrefillScratch, k: usize) -> Result<()> {
+        if self.mtp.is_none() { return Ok(()); }
+        let rw = self.cfg.hidden_size * self.cfg.hc_count.max(1);
+        anyhow::ensure!(psc.hfill_carry_segs.len() >= (k + 1) * rw && psc.hfill_carry.len() >= rw, "PACK-PF: carry {k} out of range");
+        let l = Launcher { dev: &self.dev, stream: &self.stream };
+        xqlaunch!(l, "xq_copy_f32", ((((rw as i64) + 255) / 256) as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut psc.hfill_carry, &psc.hfill_carry_segs, rw as i64, 0i64, (k * rw) as i64))?;
+        Ok(())
+    }
+
+    fn kv_prefill_write_off(&self, l: &Launcher, psc: &mut PrefillScratch, cache: &CudaSlice<u8>,
+                            qnkn: &CudaSlice<u16>, sg: PfSeg) -> Result<()> {
+        let cfg = if self.mtp.as_ref().map_or(false, |hh| std::ptr::eq(cache, &hh.kv)) { &self.cfg } else { &self.tc };
+        let (nkv, hd, rdim) = (cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
+        anyhow::ensure!(pq8_item(0), "PACK-PF: needs the row-parallel K/V append (--pq8-kvw)");
+        let cache_p = *cache.device_ptr() as u64;
+        let nkv_hd = (nkv as i32) | ((hd as i32) << 16);
+        let rdim_mp = (rdim as i32) | ((self.max_pos as i32) << 8) | ((self.kv_fmt as i32) << 28);
+        let slot_pos0: i32 = (sg.slot as i32) | ((sg.pos0 as i32) << 12);
+        let ok = (sg.r0 * nkv * hd * 2) as u64;
+        let oc = (sg.r0 * 2 * rdim * 4) as u64;
+        xqlaunch!(l, "xq_attn_kv_prefill_rows", ((sg.n * nkv) as u32, 1, 1), (hd as u32, 1, 1), 0,
+                  (*psc.kp.device_ptr() as u64 + ok, *psc.vp.device_ptr() as u64 + ok, cache_p, qnkn,
+                   *psc.cos.device_ptr() as u64 + oc, nkv_hd, rdim_mp, slot_pos0, sg.n as i32, cfg.rms_eps))?;
+        Ok(())
+    }
+
+    /// PACK-PF: flash256_launch for `t` rows starting at chunk row `r0` (offset q / out / RoPE rows).
+    #[allow(clippy::too_many_arguments)]
+    fn flash256_launch_off(&self, l: &Launcher, psc: &mut PrefillScratch, a: &AttnLayer, att_i: usize,
+                           slot_pos0: i32, t: usize, r0: usize) -> Result<()> {
+        let cfg = self.acfg_i(att_i);
+        let (nh_a, nkv, hd, rdim) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
+        let kc_p = *self.k_cache[att_i].device_ptr() as u64;
+        let v = pq8_item(1);
+        let causal = v && pq8_flash_causal();
+        let po = *psc.normed.device_ptr() as u64 + (r0 * nh_a * hd * 2) as u64;
+        let pq = *psc.qg.device_ptr() as u64 + (r0 * nh_a * hd * 2 * 2) as u64;
+        let pc = *psc.cos.device_ptr() as u64 + (r0 * 2 * rdim * 4) as u64;
+        let hpk = if nkv > 0 { nh_a / nkv } else { 0 };
+        if causal && attn_tc() && hd == 256 && t >= 64 && hpk > 0 && hpk % 6 == 0 {
+            const TC_SMEM: u32 = 6 * 16 * 264 * 2 + 2 * 32 * 264 * 2;
+            xqlaunch_raw!(l, "xq_attn_prefill_tc256", ((((t as u32) + 15) / 16), (nkv * (hpk / 6)) as u32, 1), (192, 1, 1), TC_SMEM,
+                      (po, pq, kc_p, *a.qnkn.device_ptr() as u64, pc, (nkv as i32) | ((nh_a as i32) << 16),
+                       (hd as i32) | ((rdim as i32) << 16), self.mpf(), slot_pos0, t as i32, cfg.rms_eps))?;
+            return Ok(());
+        }
+        let kname = if !v { "xq_attn_prefill_flash256" } else if causal { "xq_attn_prefill_flash256c" } else { "xq_attn_prefill_flash256v" };
+        xqlaunch!(l, kname, (((t as u32) + 7) / 8, nh_a as u32, 1), (256, 1, 1), 0,
+                  (po, pq, kc_p, &a.qnkn, pc, (nkv as i32) | ((nh_a as i32) << 16),
+                   (hd as i32) | ((rdim as i32) << 16), self.mpf(), slot_pos0, t as i32, cfg.rms_eps))?;
+        Ok(())
+    }
+
+    /// PACK-PF: qsa_keys_append_dense_rows over a packed chunk — the indexer chain and the key
+    /// write run once over all rows (per-row slot/pos tables), the pooled-block refresh per segment.
+    fn qsa_keys_append_dense_segs(&self, l: &Launcher, psc: &mut PrefillScratch, a: &AttnLayer,
+                                  att_i: usize, segs: &[PfSeg], c: usize) -> Result<()> {
+        let Some(ix) = a.idx.as_ref() else { return Ok(()); };
+        if !self.cfg.has_indexer() || qsa_disabled() { return Ok(()); }
+        let Some(keys_p) = self.qsa_keys_p(att_i) else { return Ok(()); };
+        let cfg = &self.cfg;
+        let (hdx, heads) = (cfg.indexer_head_dim, cfg.indexer_n_heads);
+        let qk_dim = (heads + 1) * hdx;
+        if psc.qsa_qk.len() < c * qk_dim || psc.qsa_qkb.len() < c * qk_dim || psc.pos_rows.len() < c { return Ok(()); }
+        anyhow::ensure!(psc.slot_rows.len() >= c, "PACK-PF: per-row slot table missing");
+        pf_chain_check_n(&ix.qk, c, &psc.chain_xh, &psc.chain_yraw)?;
+        exl3_chain(l, &ix.qk, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.qsa_qk, c, &psc.chain_ws)?;
+        let ncnv = (c * qk_dim) as i64;
+        xqlaunch!(l, "xq_qsa_h2b", ((((ncnv + 255) / 256).max(1)) as u32, 1, 1), (256, 1, 1), 0,
+                  (&mut psc.qsa_qkb, &psc.qsa_qk, ncnv))?;
+        gblaunch!(l, "qsa_key_write_b", ((c * hdx) as u32, 1, 1), (256, 1, 1), 0,
+                  (keys_p, &psc.qsa_qkb, &psc.pos_rows, &psc.slot_rows, self.max_pos as i32, 0i32,
+                   qk_dim as i32, (heads * hdx) as i32, hdx as i32, c as i32))?;
+        for sg in segs { self.qsa_pool_range(l, a, att_i, keys_p, sg.slot, sg.pos0, sg.n)?; }
+        Ok(())
+    }
+
+    /// PACK-PF: head_fill_rows over a packed chunk of FRESH prompts (every pos0 = 0): row r0 of
+    /// each segment pairs with the zero carry, rows r0+1.. with the streams after the previous row
+    /// of the same segment; segment k's carry (its last row) lands in psc.hfill_carry_segs[k].
+    fn head_fill_segs(&self, l: &Launcher, psc: &mut PrefillScratch, head: &DraftHead,
+                      segs: &[PfSeg], c: usize) -> Result<()> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let hcn = cfg.hc_count.max(1);
+        let rw = h * hcn;
+        if psc.hfill_s.len() < c * rw { return Ok(()); }
+        anyhow::ensure!(segs.iter().all(|sg| sg.pos0 == 0), "PACK-PF: head fill packs fresh prompts only");
+        anyhow::ensure!(psc.hfill_carry_segs.len() >= segs.len() * rw, "PACK-PF: carry buffer too small");
+        let rb = self.recon_bufs(psc);
+        let g = |n: usize| (((n as u32) + 255) / 256, 1u32, 1u32);
+        if c > 1 {
+            xqlaunch!(l, "xq_copy_f32", g((c - 1) * rw), (256, 1, 1), 0,
+                      (&mut psc.hfill_s, &psc.resid, ((c - 1) * rw) as i64, rw as i64, 0i64))?;
+        }
+        for (k, sg) in segs.iter().enumerate() {
+            xqlaunch!(l, "xq_memset_f32", g(rw), (256, 1, 1), 0, (&psc.hfill_s, (sg.r0 * rw) as i64, rw as i64))?;
+            xqlaunch!(l, "xq_copy_f32", g(rw), (256, 1, 1), 0,
+                      (&mut psc.hfill_carry_segs, &psc.resid, rw as i64, (k * rw) as i64, ((sg.r0 + sg.n - 1) * rw) as i64))?;
+        }
+        let last = segs[segs.len() - 1];
+        xqlaunch!(l, "xq_copy_f32", g(rw), (256, 1, 1), 0,
+                  (&mut psc.hfill_carry, &psc.resid, rw as i64, 0i64, ((last.r0 + last.n - 1) * rw) as i64))?;
+        xqlaunch!(l, "xq_hc_norm", ((hcn * c) as u32, 1, 1), (1024, 1, 1), 4096,
+                  (&mut psc.hn, &psc.hfill_s, &head.pre_fc_norm_hidden, h as i32, hcn as i32, c as i32, cfg.rms_eps))?;
+        exl3_chain_rb(l, &head.fc_hidden, &psc.hn, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.hfill_a,
+                      c * hcn, &psc.chain_ws, &rb)?;
+        xqlaunch!(l, "xq_embed_resid", (((rw * c) as u32) / 256 + 1, 1, 1), (256, 1, 1), 0,
+                  (&mut psc.hfill_s, &self.embed, &psc.toks, h as i32, hcn as i32, c as i32))?;
+        xqlaunch!(l, "xq_hc_norm", ((hcn * c) as u32, 1, 1), (1024, 1, 1), 4096,
+                  (&mut psc.hn, &psc.hfill_s, &head.pre_fc_norm_embedding, h as i32, hcn as i32, c as i32, cfg.rms_eps))?;
+        exl3_chain_rb(l, &head.fc_embed, &psc.hn, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.hfill_b,
+                      c * hcn, &psc.chain_ws, &rb)?;
+        xqlaunch!(l, "xq_add_f16_f32", (((rw * c) as u32) / 256 + 1, 1, 1), (256, 1, 1), 0,
+                  (&mut psc.resid, &psc.hfill_a, &psc.hfill_b, (rw * c) as i64))?;
+        self.hc_pre_rows(l, psc, &head.hc_attn, c)?;
+        let a = &head.attn;
+        self.qsa_keys_append_dense_segs(l, psc, a, HEAD_ATT, segs, c)?;
+        exl3_chain_rb(l, &a.k_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.kp, c, &psc.chain_ws, &rb)?;
+        exl3_chain_rb(l, &a.v_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.vp, c, &psc.chain_ws, &rb)?;
+        for sg in segs { self.kv_prefill_write_off(l, psc, &head.kv, &a.qnkn, *sg)?; }
+        Ok(())
+    }
+
     fn head_fill_rows(&self, l: &Launcher, psc: &mut PrefillScratch, head: &DraftHead,
                       slot: usize, pos0: usize, c: usize) -> Result<()> {
         let cfg = &self.cfg;
@@ -23874,4 +24132,155 @@ mod spill_region_tests {
         // the whole-lane case reproduces the version-2 region (one segment, every row)
         assert_eq!(spill_row_regions(0x0, 400, 4, 1, 100, 1, 100).unwrap(), vec![(100, 100)]);
     }
+}
+
+// ==================== PACK-PF probe ====================
+/// PACK-PF: `--probe-exl3-packpf --model-dir <pack>` — K fresh prompts prefilled (A) one
+/// prefill_chunk per prompt, (B) one packed prefill_segs pass. Compares every per-slot state the
+/// prefill writes (GDN conv + scan state, trunk K/V, PLE conv state, head K/V, QSA keys, the
+/// head-fill carries) and times both arms. GB10_PACKPF_K (3), GB10_PACKPF_LEN (1200), GB10_PACKPF_REPS (3).
+pub fn probe_pack_pf(a: &FwdArgs) -> Result<()> {
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let k = env("PACKPF_K", 3).clamp(1, PACK_PF_MAX);
+    let len = env("PACKPF_LEN", 1200);
+    let reps = env("PACKPF_REPS", 3).max(1);
+    let model = FwdModel::load(&a.dir, k, a.max_pos)?;
+    let rows = env("PACKPF_ROWS", (k * len).min(4095));
+    let mut psc = model.prefill_scratch(rows)?;
+    let vocab = model.cfg.vocab_size as u64;
+    let mut seed = 0x9E3779B97F4A7C15u64;
+    let prompts: Vec<Vec<i32>> = (0..k).map(|j| {
+        let n = len - (j * 37) % 200;
+        (0..n).map(|_| {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            (1000 + seed % (vocab.min(150000) - 1000)) as i32
+        }).collect()
+    }).collect();
+    let total: usize = prompts.iter().map(|p| p.len()).sum();
+    anyhow::ensure!(total <= rows, "PACK-PF probe: {total} rows > scratch {rows}");
+    crate::rprintln!("[packpf] K={k} prompts, rows {:?} (total {total})", prompts.iter().map(|p| p.len()).collect::<Vec<_>>());
+    let rw = model.cfg.hidden_size * model.cfg.hc_count.max(1);
+    let reset = || -> Result<()> { for j in 0..k { model.reset_slot_for_prefill(j)?; } model.dev.synchronize()?; Ok(()) };
+    type Snap = (Vec<Vec<f32>>, Vec<Vec<u8>>, Vec<Vec<u16>>, Vec<f32>);
+    let snap = |carries: Vec<f32>| -> Result<Snap> {
+        let mut f = Vec::new();
+        for x in model.conv_state.iter().chain(model.s_state.iter()) { f.push(model.dev.dtoh_sync_copy(x)?); }
+        let mut b = Vec::new();
+        for x in model.k_cache.iter() { b.push(model.dev.dtoh_sync_copy(x)?); }
+        if let Some(hd) = model.mtp.as_ref() { b.push(model.dev.dtoh_sync_copy(&hd.kv)?); }
+        let mut h = vec![model.dev.dtoh_sync_copy(&model.ple_state)?];
+        for x in model.qsa_keys.iter() { h.push(model.dev.dtoh_sync_copy(x)?); }
+        if let Some(x) = model.mtp.as_ref().and_then(|hd| hd.qsa_keys.as_ref()) { h.push(model.dev.dtoh_sync_copy(x)?); }
+        Ok((f, b, h, carries))
+    };
+    let run_a = |psc: &mut PrefillScratch| -> Result<(f64, Vec<f32>)> {
+        reset()?;
+        let mut carries = vec![0f32; k * rw];
+        let t0 = std::time::Instant::now();
+        let mut busy = 0f64;
+        for (j, p) in prompts.iter().enumerate() {
+            let t1 = std::time::Instant::now();
+            model.prefill_chunk(psc, p, 0, j, false, None)?;
+            busy += t1.elapsed().as_secs_f64();
+            if model.mtp.is_some() {
+                let c = model.dev.dtoh_sync_copy(&psc.hfill_carry)?;
+                carries[j * rw..(j + 1) * rw].copy_from_slice(&c[..rw]);
+            }
+        }
+        let _ = t0;
+        Ok((busy * 1e3, carries))
+    };
+    let run_b = |psc: &mut PrefillScratch| -> Result<(f64, Vec<f32>)> {
+        reset()?;
+        let mut toks = Vec::with_capacity(total);
+        let mut segs = Vec::with_capacity(k);
+        for (j, p) in prompts.iter().enumerate() {
+            segs.push(PfSeg { r0: toks.len(), n: p.len(), pos0: 0, slot: j });
+            toks.extend_from_slice(p);
+        }
+        let t0 = std::time::Instant::now();
+        model.prefill_segs(psc, &toks, &segs, false, None)?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let carries = if model.mtp.is_some() {
+            let c = model.dev.dtoh_sync_copy(&psc.hfill_carry_segs)?; c[..k * rw].to_vec()
+        } else { vec![0f32; k * rw] };
+        Ok((ms, carries))
+    };
+    // the seam step: every slot's last prompt token in ONE forward_step (m = K) -> logits per prompt
+    let mut dsc = Scratch::new(&model.dev, &model.cfg, k, model.cfg.rotary_dim, model.max_pos)?;
+    let vsz = model.cfg.vocab_size;
+    let mut seam = |dsc: &mut Scratch| -> Result<(Vec<f32>, Vec<i32>)> {
+        let toks: Vec<i32> = prompts.iter().map(|p| p[p.len() - 1]).collect();
+        let pos: Vec<usize> = prompts.iter().map(|p| p.len() - 1).collect();
+        let slots: Vec<usize> = (0..k).collect();
+        model.forward_step(dsc, &toks, &pos, &slots, None)?;
+        model.dev.synchronize()?;
+        let lg = model.dev.dtoh_sync_copy(&dsc.logits)?;
+        let am = model.dev.dtoh_sync_copy(&dsc.argmax)?;
+        let mut out = Vec::with_capacity(k * vsz);
+        for j in 0..k {
+            let row: Vec<f32> = lg[j * vsz..(j + 1) * vsz].iter().map(|x| half::f16::from_bits(*x).to_f32()).collect();
+            let mx = row.iter().cloned().fold(f32::MIN, f32::max);
+            let lse = mx + row.iter().map(|x| (x - mx).exp()).sum::<f32>().ln();
+            out.extend(row.iter().map(|x| x - lse));
+        }
+        Ok((out, am[..k].to_vec()))
+    };
+    // C: the calibration arm — each prompt in TWO sequential chunks (a served chunk-grid variation)
+    let run_c = |psc: &mut PrefillScratch| -> Result<()> {
+        reset()?;
+        for (j, p) in prompts.iter().enumerate() {
+            let h = p.len() / 2;
+            model.prefill_chunk(psc, &p[..h], 0, j, false, None)?;
+            model.prefill_chunk(psc, &p[h..], h, j, false, None)?;
+        }
+        Ok(())
+    };
+    let cmp_lp = |tag: &str, a: &(Vec<f32>, Vec<i32>), b: &(Vec<f32>, Vec<i32>)| {
+        for j in 0..k {
+            let (x, y) = (&a.0[j * vsz..(j + 1) * vsz], &b.0[j * vsz..(j + 1) * vsz]);
+            let mut idx: Vec<usize> = (0..vsz).collect();
+            idx.sort_by(|&p, &q| x[q].partial_cmp(&x[p]).unwrap());
+            let top: Vec<usize> = idx[..20].to_vec();
+            let md = top.iter().map(|&i| (x[i] - y[i]).abs()).fold(0f32, f32::max);
+            let p1 = (x[top[0]].exp(), y[top[0]].exp());
+            crate::rprintln!("[packpf] {tag} prompt {j}: argmax {} vs {} {}  top20 max |dlogp| {md:.4}  p(top1) {:.4} vs {:.4}",
+                     a.1[j], b.1[j], if a.1[j] == b.1[j] { "same" } else { "DIFF" }, p1.0, p1.1);
+        }
+    };
+    // warm-up both (cold PLE pages, autotune)
+    run_a(&mut psc)?; run_b(&mut psc)?;
+    run_c(&mut psc)?; let lc = seam(&mut dsc)?;
+    let (_, ca) = run_a(&mut psc)?; let sa = snap(ca)?; let la = seam(&mut dsc)?;
+    let (_, cb) = run_b(&mut psc)?; let sb = snap(cb)?; let lb = seam(&mut dsc)?;
+    let (_, _) = run_a(&mut psc)?; let la2 = seam(&mut dsc)?;
+    cmp_lp("A-vs-A2 (repeat)", &la, &la2);
+    cmp_lp("A-vs-C (2-chunk)", &la, &lc);
+    cmp_lp("A-vs-B (packed) ", &la, &lb);
+    let rel = |x: &[f32], y: &[f32]| -> (usize, f64, f32) {
+        let (mut d2, mut r2, mut mx, mut nd) = (0f64, 0f64, 0f32, 0usize);
+        for (p, q) in x.iter().zip(y) {
+            if p.to_bits() != q.to_bits() { nd += 1; }
+            let d = p - q; d2 += (d as f64) * (d as f64); r2 += (*p as f64) * (*p as f64); mx = mx.max(d.abs());
+        }
+        (nd, (d2 / r2.max(1e-30)).sqrt(), mx)
+    };
+    let nconv = model.conv_state.len();
+    for (i, (x, y)) in sa.0.iter().zip(&sb.0).enumerate() {
+        let (nd, r, mx) = rel(x, y);
+        let tag = if i < nconv { format!("conv{i}") } else { format!("gdnS{}", i - nconv) };
+        if nd > 0 || i == 0 || i == nconv { crate::rprintln!("[packpf] {tag:8} differ {nd:>9} of {:>9}  relL2 {r:.3e} max {mx:.3e}", x.len()); }
+    }
+    let fd: usize = sa.0.iter().zip(&sb.0).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+    let bd: Vec<usize> = sa.1.iter().zip(&sb.1).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p != q).count()).collect();
+    let hd: Vec<usize> = sa.2.iter().zip(&sb.2).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p != q).count()).collect();
+    let (cn, cr, cm) = rel(&sa.3, &sb.3);
+    crate::rprintln!("[packpf] states: f32 conv/gdn differ {fd}; kv bytes differ per layer {bd:?}; ple/qsa u16 differ {hd:?}; carries differ {cn} relL2 {cr:.3e} max {cm:.3e}");
+    let mut ta = Vec::new(); let mut tb = Vec::new();
+    for _ in 0..reps { ta.push(run_a(&mut psc)?.0); tb.push(run_b(&mut psc)?.0); }
+    ta.sort_by(|x, y| x.partial_cmp(y).unwrap()); tb.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let (ma, mb) = (ta[ta.len() / 2], tb[tb.len() / 2]);
+    crate::rprintln!("[packpf] TIME sequential {ma:.1} ms ({:.0} tok/s)  packed {mb:.1} ms ({:.0} tok/s)  speedup {:.3}x  all A {ta:.1?} B {tb:.1?}",
+             total as f64 / ma * 1e3, total as f64 / mb * 1e3, ma / mb);
+    Ok(())
 }
