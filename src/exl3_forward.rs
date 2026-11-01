@@ -3658,6 +3658,12 @@ fn wp11_capacity(dev: &Arc<CudaDevice>, name: &str) -> u32 {
 
 /// WP11: true while the launcher's stream is recording a graph (or the query fails) — the
 /// eager-only diagnostics must not synchronize inside a capture.
+/// HC-UPMIX (experimental): VELO_HC_UPMIX=1 fuses the prefill hc up GEMM with the mix (see kernels).
+fn hc_upmix_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| { let on = std::env::var("VELO_HC_UPMIX").map_or(false, |v| v == "1");
+        if on { crate::rprintln!("[hc-upmix] fused hc up-GEMM + mix ON (prefill, h 2560 hc 4 lr 320)"); } on })
+}
 fn stream_capturing(l: &Launcher) -> bool {
     use cudarc::driver::sys;
     let mut st = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
@@ -7022,6 +7028,20 @@ fn exl3_chain_impl(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlic
             return Ok(());
         }
     }
+    // EXP-RC2: VELO_RECON_RESIDENT=2 — the whole wide chain (suh + reconstruct + GEMM + svh) folded
+    // into ONE resident fp16 matrix W_full = D_su Hb W Hb D_sv, so prefill runs a single GEMM.
+    if m > 16 {
+        if let Some(r) = rb {
+            let rmin = recon_min_rows();
+            if rmin > 0 && m >= rmin && wide_trellis_supports_bits(q.bits as usize) {
+                if let Some(wf) = recon_folded_get(l, q, r)? {
+                    exl3_lt_matmul(l, wf, *x.device_ptr() as u64, *y.device_ptr() as u64,
+                                   q.k as usize, q.n as usize, m, false, r.ltws, r.ltws_len)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
     xqlaunch!(l, "exl3_had_suh", (m as u32 * (q.k as u32 / 128), 1, 1), (32, 1, 1), 0, (x, &q.suh, &mut *xh, q.k))?;
     // W3/LMH: true when the persistent lm_head GEMM already applied the output Hadamard.
     let mut svh_done = false;
@@ -7096,6 +7116,96 @@ fn chain_wide_raw(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlice
     chain_wide_gemm(l, q, xh, yraw, m, rb)
 }
 
+/// EXP-RC: resident reconstructed dense weights (prefill only). Keyed by the module's trellis
+/// device pointer; filled on first use with the normal reconstruct kernel into a dedicated buffer.
+struct ReconResident { map: std::collections::HashMap<u64, CudaSlice<u16>>, bytes: usize, full: bool }
+static RECON_RESIDENT: std::sync::Mutex<Option<ReconResident>> = std::sync::Mutex::new(None);
+fn recon_resident_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELO_RECON_RESIDENT").map_or(false, |v| v == "1"))
+}
+fn recon_folded_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELO_RECON_RESIDENT").map_or(false, |v| v == "2"))
+}
+/// EXP-RC2: build (first use) and return the folded matrix for q. Computed by pushing identity
+/// rows through the module's own chain: row i of W_full = chain(e_i).
+fn recon_folded_get(l: &Launcher, q: &Quad, r: &ReconBufs) -> Result<Option<u64>> {
+    if !recon_folded_on() || stream_capturing(l) { return Ok(None); }
+    let key = *q.tr.device_ptr() as u64;
+    let mut g = RECON_RESIDENT.lock().unwrap();
+    let st = g.get_or_insert_with(|| ReconResident { map: Default::default(), bytes: 0, full: false });
+    if let Some(b) = st.map.get(&key) { return Ok(Some(*b.device_ptr() as u64)); }
+    if st.full { return Ok(None); }
+    let (k, n) = (q.k as usize, q.n as usize);
+    if st.bytes + 2 * k * n > recon_resident_cap() {
+        st.full = true;
+        crate::rprintln!("[exp-rc2] resident cap reached at {} modules / {:.2} GiB", st.map.len(), st.bytes as f64 / (1u64 << 30) as f64);
+        return Ok(None);
+    }
+    anyhow::ensure!(k * n <= r.ws_len, "exp-rc2: recon staging too small");
+    let wf: CudaSlice<u16> = match unsafe { l.dev.alloc::<u16>(k * n) } { Ok(b) => b, Err(_) => { st.full = true; return Ok(None); } };
+    // W' into the staging buffer, then identity blocks through suh -> GEMM -> svh.
+    exl3_reconstruct(l, key, r.rc, r.ws, q.k, q.n, q.k2)?;
+    let blk = 512usize.min(k);
+    let one = f16::from_f32(1.0).to_bits();
+    let mut id = vec![0u16; blk * k];
+    let mut xi: CudaSlice<u16> = l.dev.alloc_zeros::<u16>(blk * k)?;
+    let mut xh: CudaSlice<u16> = l.dev.alloc_zeros::<u16>(blk * k)?;
+    let mut yr: CudaSlice<u16> = l.dev.alloc_zeros::<u16>(blk * n)?;
+    let mut i0 = 0usize;
+    while i0 < k {
+        let b = blk.min(k - i0);
+        for v in id.iter_mut() { *v = 0; }
+        for j in 0..b { id[j * k + i0 + j] = one; }
+        l.dev.synchronize()?;
+        l.dev.htod_sync_copy_into(&id, &mut xi)?;
+        xqlaunch!(l, "exl3_had_suh", (b as u32 * (q.k as u32 / 128), 1, 1), (32, 1, 1), 0, (&xi, &q.suh, &mut xh, q.k))?;
+        exl3_lt_matmul(l, r.ws, *xh.device_ptr() as u64, *yr.device_ptr() as u64, k, n, b, false, r.ltws, r.ltws_len)?;
+        let out = *wf.device_ptr() as u64 + (i0 * n * 2) as u64;
+        xqlaunch!(l, "exl3_had_svh", (b as u32 * (q.n as u32 / 128), 1, 1), (32, 1, 1), 0, (&yr, &q.svh, out, q.n))?;
+        i0 += b;
+    }
+    l.dev.synchronize()?;
+    st.bytes += 2 * k * n;
+    if st.map.len() % 32 == 31 || st.map.len() < 2 {
+        crate::rprintln!("[exp-rc2] {} modules folded, {:.2} GiB", st.map.len() + 1, st.bytes as f64 / (1u64 << 30) as f64);
+    }
+    let p = *wf.device_ptr() as u64;
+    st.map.insert(key, wf);
+    Ok(Some(p))
+}
+fn recon_resident_cap() -> usize {
+    std::env::var("VELO_RECON_RESIDENT_GB").ok().and_then(|v| v.parse::<f64>().ok())
+        .map_or(12usize << 30, |g| (g * (1u64 << 30) as f64) as usize)
+}
+fn recon_resident_get(l: &Launcher, q: &Quad) -> Result<Option<u64>> {
+    if !recon_resident_on() || stream_capturing(l) { return Ok(None); }
+    let key = *q.tr.device_ptr() as u64;
+    let mut g = RECON_RESIDENT.lock().unwrap();
+    let st = g.get_or_insert_with(|| ReconResident { map: Default::default(), bytes: 0, full: false });
+    if let Some(b) = st.map.get(&key) { return Ok(Some(*b.device_ptr() as u64)); }
+    if st.full { return Ok(None); }
+    let n = (q.k as usize) * (q.n as usize);
+    if st.bytes + 2 * n > recon_resident_cap() {
+        st.full = true;
+        crate::rprintln!("[exp-rc] resident cap reached at {} modules / {:.2} GiB", st.map.len(), st.bytes as f64 / (1u64 << 30) as f64);
+        return Ok(None);
+    }
+    let buf: CudaSlice<u16> = match unsafe { l.dev.alloc::<u16>(n) } { Ok(b) => b, Err(_) => { st.full = true; return Ok(None); } };
+    let rc = RC_LUT_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    anyhow::ensure!(rc != 0, "exp-rc: rc LUT not registered");
+    exl3_reconstruct(l, key, rc, *buf.device_ptr() as u64, q.k, q.n, q.k2)?;
+    st.bytes += 2 * n;
+    if st.map.len() % 32 == 31 {
+        crate::rprintln!("[exp-rc] {} modules resident, {:.2} GiB", st.map.len() + 1, st.bytes as f64 / (1u64 << 30) as f64);
+    }
+    let p = *buf.device_ptr() as u64;
+    st.map.insert(key, buf);
+    Ok(Some(p))
+}
+static RC_LUT_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// F3: the once-per-boot note for a module the wide arm cannot serve (forced to the reconstruct arm).
 static WIDE_FALLBACK_NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
@@ -7129,8 +7239,17 @@ cannot decode (K 3, 4, 5 only); those modules serve through the reconstruct + cu
             let need = (q.k as usize) * (q.n as usize);
             anyhow::ensure!(need <= r.ws_len,
                 "recon staging too small: need {need} have {}", r.ws_len);
-            exl3_reconstruct(l, *q.tr.device_ptr() as u64, r.rc, r.ws, q.k, q.n, q.k2)?;
-            exl3_lt_matmul(l, r.ws, *xh.device_ptr() as u64, *yraw.device_ptr() as u64,
+            // EXP-RC: --exl3-recon-resident (env VELO_RECON_RESIDENT=1): keep each module's
+            // reconstructed fp16 W_dec resident after its first prefill use, so later passes skip
+            // exl3_decode_dump8 entirely (same bytes as the per-pass reconstruct).
+            let wptr = match recon_resident_get(l, q)? {
+                Some(p) => p,
+                None => {
+                    exl3_reconstruct(l, *q.tr.device_ptr() as u64, r.rc, r.ws, q.k, q.n, q.k2)?;
+                    r.ws
+                }
+            };
+            exl3_lt_matmul(l, wptr, *xh.device_ptr() as u64, *yraw.device_ptr() as u64,
                            q.k as usize, q.n as usize, m, false, r.ltws, r.ltws_len)?;
         } else {
             // S-B9-REL-INTEG D1: no 6-bit (or 1-, 2-, 7-, 8-bit) arm exists here: refuse, never launch a kernel
@@ -14167,7 +14286,7 @@ impl FwdModel {
         ReconBufs {
             ws: *psc.recon_ws.device_ptr() as u64,
             ws_len: psc.recon_ws.len(),
-            rc: *self.rc_lut.device_ptr() as u64,
+            rc: { let p = *self.rc_lut.device_ptr() as u64; RC_LUT_PTR.store(p, std::sync::atomic::Ordering::Relaxed); p },
             ltws: *psc.lt_ws.device_ptr() as u64,
             ltws_len: psc.lt_ws.len(),
         }
@@ -16870,6 +16989,26 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         let lr = self.cfg.hc_lowrank;
         let rw = h * hcn;
         let (fnorm, fmix) = self.pf_hc_fuse(l);
+        // HC-UPMIX (experimental, VELO_HC_UPMIX=1): per-row inj_norm that also writes the inj gates
+        // (bitwise the old mix's), cuBLAS down + silu_div as before, then ONE fused up-GEMM + mix
+        // kernel (uu never written). Only the plain replicated prefill shape (h 2560, hc 4, lr 320).
+        if hc_upmix_on() && !normed && fnorm && fmix && h == 2560 && hcn == 4 && lr == 320
+            && recon_min_rows() > 0 && c >= recon_min_rows() {
+            let winj = hc.winj.as_ref().map_or(0u64, |w| *w.device_ptr() as u64);
+            xqlaunch!(l, "xq_pf_hc_inj_norm_rowinj", (c as u32, 1, 1), (512, 1, 1), 0,
+                     (&mut psc.hn, &mut psc.resid, pend.unwrap_or(0u64), &mut psc.inj, &hc.norm, winj,
+                      c as i32, self.cfg.rms_eps))?;
+            let rb = self.recon_bufs(psc);
+            exl3_lt_matmul(l, *hc.down.device_ptr() as u64, *psc.hn.device_ptr() as u64,
+                           *psc.dd.device_ptr() as u64, rw, lr as usize, c, true,
+                           rb.ltws, rb.ltws_len)?;
+            xqlaunch!(l, "xq_silu_div", (((lr * c) as u32) / 256 + 1, 1, 1), (256, 1, 1), 0,
+                     (&mut psc.dd, hcn as f32, (lr * c) as i32))?;
+            const HCU_SMEM: u32 = 64 * 328 * 2 + 3 * 128 * 72 * 2;
+            xqlaunch_raw!(l, "xq_hc_upmix_2560x4", (c.div_ceil(64) as u32, 1, 1), (256, 1, 1), HCU_SMEM,
+                         (&mut psc.x, &psc.hn, &psc.dd, &hc.up, 0u64, c as i32))?;
+            return Ok(());
+        }
         if normed {
             anyhow::ensure!(fnorm && pend.is_some(), "prefill overlap: a hooked norm without the fused inj_norm path");
         } else if fnorm {

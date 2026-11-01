@@ -19580,3 +19580,269 @@ extern "C" __global__ void __launch_bounds__(128, 12) xq_dh_screen_k1(
     }
     xtp_k1_last(c, arrive, part, nbytes);
 }
+
+// =============================================================================
+// HC-UPMIX (experimental, VELO_HC_UPMIX=1; optimization/REWRITE-PLAN.md "fused hc up + mix"):
+// the prefill hc_pre tail  uu = up(dd) [cuBLASLt, c x 10240 f16 written to DRAM]  +  xq_pf_hc_mix_2560x4
+// (reads uu + hn) becomes ONE kernel: the up GEMM (K = 320) runs on mma.sync with the u tile kept
+// in registers, and the mix epilogue (x[i] = f16((sum_s sig(f16(u[s*H+i])) * hn[s*H+i]) / HC))
+// consumes it on chip, so uu never touches DRAM. The inj gates (the winj dot products, a full-row
+// reduction) move into xq_pf_hc_inj_norm_rowinj, which owns the whole hn row (one CTA per row) and
+// replays xq_pf_hc_mix's exact leaf chains / tree, so inj is BITWISE the old value. x differs from
+// the cuBLAS path only where the f16 rounding of u differs (different fp32 accumulation order).
+// Fixed shape: h 2560, hc 4, lowrank 320. Up weight [10240][320] row-major (w[n][k]), dd [c][320].
+// CTA: 64 rows x all 10240 u columns, looping over 80 groups of 128 columns (32 i x 4 streams);
+// 8 warps = 2 (m, 32 rows) x 4 (n, 8 i x 4 streams: n8 tile t == stream s, so the s-sum is in-thread).
+// smem: A 64 x 328 halves (41,984 B) + 3-stage B ring of 128 x 72 halves k-chunks (55,296 B).
+// =============================================================================
+#define HCU_LR 320
+#define HCU_H 2560
+#define HCU_N 10240
+#define HCU_MT 64
+#define HCU_AP 328
+#define HCU_KC 64
+#define HCU_BP 72
+#define HCU_NST 3
+#define HCU_SMEM (HCU_MT * HCU_AP * 2 + HCU_NST * 128 * HCU_BP * 2)
+
+__device__ __forceinline__ void hcu_cp16(unsigned dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src) : "memory");
+}
+__device__ __forceinline__ void hcu_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void hcu_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
+
+// chunk q: group g = q / 5 (i0 = 32 g), k-chunk kc = q % 5. B local row lr = wn*32 + s*8 + j <-> up row
+// n = s*2560 + i0 + 8*wn + j. 128 rows x 64 halves = 1024 16-B pieces, 4 per thread.
+__device__ __forceinline__ void hcu_issue_b(unsigned bs_u, const __half* __restrict__ up, int q, int tid) {
+    const int g = q / 5, kc = q - g * 5;
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int piece = tid + 256 * p;          // 0..1023
+        const int lr = piece >> 3, c16 = piece & 7;
+        const int wn = lr >> 5, s = (lr >> 3) & 3, j = lr & 7;
+        const int n = s * HCU_H + g * 32 + 8 * wn + j;
+        const __half* src = up + (long long)n * HCU_LR + kc * HCU_KC + c16 * 8;
+        hcu_cp16(bs_u + (unsigned)((lr * HCU_BP + c16 * 8) * 2), src);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+xq_hc_upmix_2560x4(__half* __restrict__ x, const __half* __restrict__ hn, const __half* __restrict__ dd,
+                   const __half* __restrict__ up, __half* __restrict__ u_dbg, int c) {
+    XQ_PDL_ENTRY();
+    extern __shared__ __align__(16) unsigned char hcu_sm[];
+    __half* As = reinterpret_cast<__half*>(hcu_sm);
+    __half* Bs = As + HCU_MT * HCU_AP;
+    const unsigned bs_u0 = (unsigned)__cvta_generic_to_shared(Bs);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp >> 2, wn = warp & 3;
+    const int r0 = blockIdx.x * HCU_MT;
+    // ---- A: 64 rows x 320 (zero rows past c); 64 * 40 = 2560 16-B pieces, 10 per thread
+    #pragma unroll
+    for (int p = 0; p < 10; ++p) {
+        const int piece = tid + 256 * p;
+        const int r = piece / 40, c16 = piece - r * 40;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (r0 + r < c) v = *reinterpret_cast<const uint4*>(dd + (long long)(r0 + r) * HCU_LR + c16 * 8);
+        *reinterpret_cast<uint4*>(As + r * HCU_AP + c16 * 8) = v;
+    }
+    constexpr int NQ = 80 * 5;
+    hcu_issue_b(bs_u0, up, 0, tid); hcu_commit();
+    hcu_issue_b(bs_u0 + 128 * HCU_BP * 2, up, 1, tid); hcu_commit();
+    float acc[2][4][4];
+    __half2 hv[2][2][4];
+    // per-thread epilogue geometry
+    const int rr = lane >> 2, cc = 2 * (lane & 3);
+    for (int q = 0; q < NQ; ++q) {
+        hcu_wait<1>();
+        __syncthreads();
+        if (q + 2 < NQ) hcu_issue_b(bs_u0 + (unsigned)(((q + 2) % HCU_NST) * 128 * HCU_BP * 2), up, q + 2, tid);
+        hcu_commit();
+        const int g = q / 5, kc = q - g * 5;
+        const int i = g * 32 + 8 * wn + cc;
+        if (kc == 0) {
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                #pragma unroll
+                for (int s = 0; s < 4; ++s)
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[mt][s][e] = 0.0f;
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                #pragma unroll
+                for (int hr = 0; hr < 2; ++hr) {
+                    const int row = r0 + wm * 32 + mt * 16 + rr + hr * 8;
+                    #pragma unroll
+                    for (int s = 0; s < 4; ++s)
+                        hv[mt][hr][s] = (row < c) ? *reinterpret_cast<const __half2*>(hn + (long long)row * HCU_N + s * HCU_H + i)
+                                                  : __floats2half2_rn(0.0f, 0.0f);
+                }
+        }
+        const __half* Bq = Bs + (q % HCU_NST) * 128 * HCU_BP;
+        #pragma unroll
+        for (int ks = 0; ks < HCU_KC / 16; ++ks) {
+            const int kA = kc * HCU_KC + ks * 16;
+            unsigned a[2][4];
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                xq_ldsm_x4(a[mt], As + (wm * 32 + mt * 16 + (lane & 15)) * HCU_AP + kA + (lane >> 4) * 8);
+            unsigned b[4][2];
+            #pragma unroll
+            for (int sp = 0; sp < 2; ++sp) {        // n8 tiles (s = 2 sp, 2 sp + 1)
+                unsigned r4[4];
+                const int lr = wn * 32 + sp * 16 + (lane & 7) + ((lane >> 4) << 3);
+                xq_ldsm_x4(r4, Bq + lr * HCU_BP + ks * 16 + ((lane >> 3) & 1) * 8);
+                b[2 * sp][0] = r4[0]; b[2 * sp][1] = r4[1]; b[2 * sp + 1][0] = r4[2]; b[2 * sp + 1][1] = r4[3];
+            }
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) xq_mma16816(acc[mt][s], a[mt], b[s][0], b[s][1]);
+        }
+        if (kc == 4) {
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                #pragma unroll
+                for (int hr = 0; hr < 2; ++hr) {
+                    const int row = r0 + wm * 32 + mt * 16 + rr + hr * 8;
+                    if (row < c) {
+                        float o[2];
+                        __half uh[4][2];
+                        #pragma unroll
+                        for (int e = 0; e < 2; ++e) {
+                            float ax = 0.0f;
+                            #pragma unroll
+                            for (int s = 0; s < 4; ++s) {
+                                const __half uv = xq_f2h(acc[mt][s][hr * 2 + e]);
+                                uh[s][e] = uv;
+                                const float hf = xq_h2f(e == 0 ? __low2half(hv[mt][hr][s]) : __high2half(hv[mt][hr][s]));
+                                ax += xq_sig(xq_h2f(uv)) * hf;
+                            }
+                            o[e] = ax / 4.0f;
+                        }
+                        *reinterpret_cast<__half2*>(x + (long long)row * HCU_H + i) = __floats2half2_rn(o[0], o[1]);
+                        if (u_dbg != nullptr) {
+                            #pragma unroll
+                            for (int s = 0; s < 4; ++s)
+                                *reinterpret_cast<__half2*>(u_dbg + (long long)row * HCU_N + s * HCU_H + i) = __halves2half2(uh[s][0], uh[s][1]);
+                        }
+                    }
+                }
+        }
+    }
+    hcu_wait<0>();
+}
+
+// xq_pf_hc_inj_norm (inject + norm, per (row, stream)) as ONE CTA per row (512 threads = 4 groups of
+// 128; group s == the old CTA blk = b*hc + s, same per-element code), plus — when winj != null — the
+// inj gates xq_pf_hc_mix_2560x4 computed from the f16 hn: the old mix thread T's leaf chains run over
+// k = 0..19 (element 512k + 4T + e = stream k/5, i = 512(k%5) + 4T + e), i.e. group s holds links
+// k = 5s..5s+4; the chains are handed group to group through smem in ascending s (the same fma
+// sequence), then the same level-512 add and xq_pf_tree512. inj is written after every group has read
+// the old gates (barriers in between). Requires h == 2560, hc == 4.
+extern "C" __global__ void __launch_bounds__(512)
+xq_pf_hc_inj_norm_rowinj(__half* __restrict__ out, float* __restrict__ x, const __half* __restrict__ y,
+                         float* __restrict__ inj, const __half* __restrict__ w, const __half* __restrict__ winj,
+                         int B, float eps) {
+    XQ_PDL_ENTRY();
+    constexpr int h = 2560, hc = 4, nk = 5, N = h * hc;
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    const int s = threadIdx.x >> 7, T = threadIdx.x & 127;
+    __shared__ float sm[4][512];
+    __shared__ float s_inv[4];
+    __shared__ float chain[2][4][4][128];     // [pa|pb][t][e][T]
+    const int blk = b * hc + s;
+    float* xs = x + (long long)blk * h;
+    const bool doinj = (y != nullptr);
+    const __half* yr = doinj ? y + (long long)b * h : y;
+    const float g = doinj ? inj[b * hc + s] : 0.0f;
+    float v[nk][4];
+    float pa[4] = {0.0f, 0.0f, 0.0f, 0.0f}, pb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+    for (int k = 0; k < nk; ++k) {
+        const int i = 512 * k + 4 * T;
+        float4 t4 = *reinterpret_cast<const float4*>(xs + i);
+        float t[4] = {t4.x, t4.y, t4.z, t4.w};
+        if (doinj) {
+            float yf[4];
+            xq_pf_unpack4(*reinterpret_cast<const uint2*>(yr + i), yf);
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) t[e] += g * yf[e];
+            *reinterpret_cast<float4*>(xs + i) = make_float4(t[0], t[1], t[2], t[3]);
+        }
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            v[k][e] = t[e];
+            if (k & 1) pb[e] += t[e] * t[e]; else pa[e] += t[e] * t[e];
+        }
+    }
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) sm[s][4 * T + e] = pa[e] + pb[e];
+    __syncthreads();
+    if (T < 32) {
+        const float r = xq_pf_tree512(sm[s], T);
+        if (T == 0) s_inv[s] = rsqrtf(r / (float)h + eps);
+    }
+    __syncthreads();
+    const float inv = s_inv[s];
+    const __half* ws = w + (long long)s * h;
+    __half* os = out + (long long)blk * h;
+    float hf[nk][4];
+    #pragma unroll
+    for (int k = 0; k < nk; ++k) {
+        const int i = 512 * k + 4 * T;
+        float wf[4], o[4];
+        xq_pf_unpack4(*reinterpret_cast<const uint2*>(ws + i), wf);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) o[e] = v[k][e] * inv * (1.0f + wf[e]);
+        const uint2 pk = xq_pf_pack4(o);
+        *reinterpret_cast<uint2*>(os + i) = pk;
+        xq_pf_unpack4(pk, hf[k]);
+    }
+    if (winj == nullptr) return;
+    // ---- inj: chains handed over in ascending s
+    for (int ph = 0; ph < 4; ++ph) {
+        if (s == ph) {
+            float ca[4][4], cb[4][4];
+            #pragma unroll
+            for (int t = 0; t < 4; ++t)
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    ca[t][e] = ph ? chain[0][t][e][T] : 0.0f;
+                    cb[t][e] = ph ? chain[1][t][e][T] : 0.0f;
+                }
+            #pragma unroll
+            for (int kp = 0; kp < nk; ++kp) {
+                const int k = 5 * ph + kp;
+                const int cidx = 512 * k + 4 * T;
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    float wf[4];
+                    xq_pf_unpack4(*reinterpret_cast<const uint2*>(winj + (long long)t * N + cidx), wf);
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        if (k & 1) cb[t][e] += wf[e] * hf[kp][e]; else ca[t][e] += wf[e] * hf[kp][e];
+                    }
+                }
+            }
+            if (ph < 3) {
+                #pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) { chain[0][t][e][T] = ca[t][e]; chain[1][t][e][T] = cb[t][e]; }
+            } else {
+                #pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) sm[t][4 * T + e] = ca[t][e] + cb[t][e];   // level 512
+            }
+        }
+        __syncthreads();
+    }
+    if (s == 3) {
+        const int wp = T >> 5, ln = T & 31;
+        const float r = xq_pf_tree512(sm[wp], ln);
+        if (ln == 0) inj[b * hc + wp] = 2.0f * xq_sig(r / (float)hc);
+    }
+}

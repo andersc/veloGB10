@@ -192,6 +192,8 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     "xq_moe_pf2_prof_g1", "xq_moe_pf2_prof_g2", "xq_moe_pf2_prof_g4", "xq_moe_pf2_prof_g8",
     // A5-P2: prefill hc inject+norm / mix twins (128-thread CTAs, bitwise)
     "xq_pf_hc_inj_norm", "xq_pf_hc_mix_2560x4",
+    // HC-UPMIX (experimental): fused hc up GEMM + mix, per-row inj_norm with the inj gates
+    "xq_hc_upmix_2560x4", "xq_pf_hc_inj_norm_rowinj",
     // S-A3-q P3: row-batched bit-exact prefill router
     "xq_gemm_f16_f32_rows",
     // S-A3-u B: 32-row smem-staged bit-exact router twin
@@ -829,6 +831,10 @@ pub fn probe_gemm(dir: &str, widths: &[usize], slab_cols: usize) -> Result<()> {
     if crate::opts::var(crate::opt!("binv-section")).as_deref() == Ok("moe_pf") {
         return probe_moe_pf(&dev);
     }
+    // --binv-section=hc_upmix: HC-UPMIX fused up+mix / rowinj check (synthetic; no pack reads).
+    if crate::opts::var(crate::opt!("binv-section")).as_deref() == Ok("hc_upmix") {
+        return probe_hc_upmix(&dev);
+    }
     // --binv-section=pf_hc: only the A5-P2 prefill hc section (synthetic; no pack reads).
     if crate::opts::var(crate::opt!("binv-section")).as_deref() == Ok("pf_hc") {
         return probe_pf_hc(&dev);
@@ -1151,6 +1157,141 @@ fn probe_gdn_tc2(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
                  ns / nb as f64 / 1e3, (g1 - g0) as f64 / 1e6, ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6],
                  ph[..7].iter().sum::<f64>());
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HC-UPMIX: (1) xq_pf_hc_inj_norm_rowinj == xq_pf_hc_inj_norm (resid, hn) + xq_pf_hc_mix_2560x4's inj, BITWISE;
+// (2) xq_hc_upmix_2560x4's u (debug output) vs an f64 CPU reference of up(dd) (f16 ulp histogram), and its x
+// == xq_pf_hc_mix_2560x4(x, hn, u_dbg) BITWISE; (3) timing upmix vs pf_mix alone at c = 5830.
+fn probe_hc_upmix(dev: &std::sync::Arc<CudaDevice>) -> Result<()> {
+    use cudarc::driver::sys;
+    let (h, hc, lr) = (2560usize, 4usize, 320usize);
+    let n = h * hc;
+    let eps = 1e-6f32;
+    let f = |nm: &str| dev.get_func(MODULE, nm).with_context(|| nm.to_string());
+    let lc = |g: u32, b: u32, sm: u32| LaunchConfig { grid_dim: (g, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: sm };
+    let mut st = 0x1234_5679u32;
+    let mut unif = move || { st = st.wrapping_mul(1664525).wrapping_add(1013904223); ((st >> 8) as f32 + 0.5) / 16777216.0 };
+    let cmax = 5830usize;
+    let resid0: Vec<f32> = (0..cmax * n).map(|i| (unif() * 2.0 - 1.0) * 10f32.powi(((i / n) % 5) as i32 - 2)).collect();
+    let y = wp20_synth(cmax * h, 0xC0A1, 0.5);
+    let injv: Vec<f32> = (0..cmax * hc).map(|_| unif() * 2.0).collect();
+    let w = wp20_synth(n, 0xC0A2, 0.05);
+    let winj = wp20_synth(hc * n, 0xC0A4, 0.01);
+    let dd = wp20_synth(cmax * lr, 0xC0A5, 1.0);
+    let up = wp20_synth(n * lr, 0xC0A6, 0.06);
+    let d_r0 = dev.htod_sync_copy(&resid0)?;
+    let d_y = dev.htod_sync_copy(&y)?;
+    let d_inj0 = dev.htod_sync_copy(&injv)?;
+    let d_w = dev.htod_sync_copy(&w)?;
+    let d_winj = dev.htod_sync_copy(&winj)?;
+    let d_dd = dev.htod_sync_copy(&dd)?;
+    let d_up = dev.htod_sync_copy(&up)?;
+    let mut d_ra = dev.alloc_zeros::<f32>(cmax * n)?;
+    let mut d_rb = dev.alloc_zeros::<f32>(cmax * n)?;
+    let mut d_hna = dev.alloc_zeros::<u16>(cmax * n)?;
+    let mut d_hnb = dev.alloc_zeros::<u16>(cmax * n)?;
+    let mut d_ia = dev.alloc_zeros::<f32>(cmax * hc)?;
+    let mut d_ib = dev.alloc_zeros::<f32>(cmax * hc)?;
+    let mut d_xa = dev.alloc_zeros::<u16>(cmax * h)?;
+    let mut d_xb = dev.alloc_zeros::<u16>(cmax * h)?;
+    let mut d_u = dev.alloc_zeros::<u16>(cmax * n)?;
+    let (f_injn, f_mix, f_row) = (f("xq_pf_hc_inj_norm")?, f("xq_pf_hc_mix_2560x4")?, f("xq_pf_hc_inj_norm_rowinj")?);
+    let smem_up: u32 = 64 * 328 * 2 + 3 * 128 * 72 * 2;
+    let rf_up = crate::exl3_forward::xq_raw_fn("xq_hc_upmix_2560x4").context("raw fn xq_hc_upmix_2560x4 (stale PTX?)")?;
+    {
+        let r = unsafe { sys::cuFuncSetAttribute(rf_up, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_up as i32) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "smem opt-in {r:?}");
+    }
+    let (ddp, upp) = (*d_dd.device_ptr() as u64, *d_up.device_ptr() as u64);
+    let up_launch = |x: u64, hn: u64, u: u64, c: usize| -> Result<()> {
+        let mut a = [x, hn, ddp, upp, u];
+        let mut ci = c as i32;
+        let mut p: [*mut std::ffi::c_void; 6] = [
+            &mut a[0] as *mut u64 as *mut _, &mut a[1] as *mut u64 as *mut _, &mut a[2] as *mut u64 as *mut _,
+            &mut a[3] as *mut u64 as *mut _, &mut a[4] as *mut u64 as *mut _, &mut ci as *mut i32 as *mut _,
+        ];
+        let r = unsafe { sys::cuLaunchKernel(rf_up, c.div_ceil(64) as u32, 1, 1, 256, 1, 1, smem_up, std::ptr::null_mut(),
+                                             p.as_mut_ptr(), std::ptr::null_mut()) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "upmix launch {r:?}");
+        Ok(())
+    };
+    let yp = *d_y.device_ptr() as u64;
+    let winjp = *d_winj.device_ptr() as u64;
+    let h2f = |v: u16| half::f16::from_bits(v).to_f32();
+    for &c in &[5830usize, 1241, 100, 17] {
+        let ci = c as i32;
+        for (doinj, with_w) in [(true, true), (false, true), (true, false)] {
+            let ypp = if doinj { yp } else { 0u64 };
+            let wp = if with_w { winjp } else { 0u64 };
+            dev.dtod_copy(&d_r0, &mut d_ra)?; dev.dtod_copy(&d_r0, &mut d_rb)?;
+            dev.dtod_copy(&d_inj0, &mut d_ia)?; dev.dtod_copy(&d_inj0, &mut d_ib)?;
+            unsafe {
+                f_injn.clone().launch(lc((hc * c) as u32, 128, 0), (&mut d_hna, &mut d_ra, ypp, &d_ia, &d_w, h as i32, hc as i32, ci, eps))?;
+                f_mix.clone().launch(lc(c as u32, 128, 0), (&mut d_xa, &mut d_ia, &d_hna, &d_dd /*u: any*/, wp, ci))?;
+                f_row.clone().launch(lc(c as u32, 512, 0), (&mut d_hnb, &mut d_rb, ypp, &mut d_ib, &d_w, wp, ci, eps))?;
+            }
+            dev.synchronize()?;
+            let (ra, rb) = (dev.dtoh_sync_copy(&d_ra)?, dev.dtoh_sync_copy(&d_rb)?);
+            let bad_r = ra[..c * n].iter().zip(&rb[..c * n]).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let (ha, hb) = (dev.dtoh_sync_copy(&d_hna)?, dev.dtoh_sync_copy(&d_hnb)?);
+            let bad_h = ha[..c * n].iter().zip(&hb[..c * n]).filter(|(a, b)| a != b).count();
+            let (ia, ib) = (dev.dtoh_sync_copy(&d_ia)?, dev.dtoh_sync_copy(&d_ib)?);
+            let bad_i = ia[..c * hc].iter().zip(&ib[..c * hc]).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            println!("HC-UPMIX rowinj c={c} inject={doinj} winj={with_w}: resid differ {bad_r}, hn differ {bad_h}, inj differ {bad_i}");
+            anyhow::ensure!(bad_r == 0 && bad_h == 0 && bad_i == 0, "HC-UPMIX rowinj FAIL");
+        }
+        // ---- upmix: u vs f64 reference, x vs pf_mix(u_dbg)
+        let hn_real = dev.dtoh_sync_copy(&d_hna)?;
+        let d_hn = dev.htod_sync_copy(&hn_real)?;
+        dev.htod_sync_copy_into(&vec![0x7E00u16; cmax * n], &mut d_u)?;
+        dev.htod_sync_copy_into(&vec![0x7E00u16; cmax * h], &mut d_xb)?;
+        up_launch(*d_xb.device_ptr() as u64, *d_hn.device_ptr() as u64, *d_u.device_ptr() as u64, c)?;
+        dev.synchronize()?;
+        let u = dev.dtoh_sync_copy(&d_u)?;
+        let mut hist = [0usize; 4];
+        let rows: Vec<usize> = if c > 64 { (0..c).step_by(c / 37 + 1).chain([c - 1]).collect() } else { (0..c).collect() };
+        for &r in &rows {
+            for col in 0..n {
+                let mut s = 0f64;
+                for k in 0..lr { s += h2f(dd[r * lr + k]) as f64 * h2f(up[col * lr + k]) as f64; }
+                let refh = half::f16::from_f64(s).to_bits() as i32;
+                let got = u[r * n + col] as i32;
+                let d = ((refh - got).abs() as usize).min(3);
+                hist[d] += 1;
+            }
+        }
+        let nan_u = u[..c * n].iter().filter(|&&v| v == 0x7E00).count();
+        dev.htod_sync_copy_into(&vec![0x7E00u16; cmax * h], &mut d_xa)?;
+        dev.dtod_copy(&d_inj0, &mut d_ia)?;
+        unsafe { f_mix.clone().launch(lc(c as u32, 128, 0), (&mut d_xa, &mut d_ia, &d_hn, &d_u, 0u64, ci))?; }
+        dev.synchronize()?;
+        let (xa, xb) = (dev.dtoh_sync_copy(&d_xa)?, dev.dtoh_sync_copy(&d_xb)?);
+        let bad_x = xa[..c * h].iter().zip(&xb[..c * h]).filter(|(a, b)| a != b).count();
+        let tail_x = xb[c * h..].iter().filter(|&&v| v != 0x7E00).count();
+        println!("HC-UPMIX upmix c={c}: u vs f64 ref ulp hist [0, 1, 2, >=3] = {hist:?} over {} rows; u unwritten {nan_u}; \
+                  x vs pf_mix(u_dbg) differ {bad_x}; rows past c written {tail_x}", rows.len());
+        anyhow::ensure!(nan_u == 0 && bad_x == 0 && tail_x == 0 && hist[2] + hist[3] == 0, "HC-UPMIX upmix FAIL");
+    }
+    // ---- timing at c = 5830
+    let c = cmax; let ci = c as i32;
+    let ev = |fun: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+        for _ in 0..3 { fun()?; }
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 { fun()?; }
+        dev.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / 20.0)
+    };
+    let d_hn = dev.htod_sync_copy(&dev.dtoh_sync_copy(&d_hna)?)?;
+    let t_mix = ev(&mut || { unsafe { f_mix.clone().launch(lc(c as u32, 128, 0), (&mut d_xa, &mut d_ia, &d_hn, &d_u, winjp, ci))?; } Ok(()) })?;
+    let (xbp, hnp) = (*d_xb.device_ptr() as u64, *d_hn.device_ptr() as u64);
+    let t_up = ev(&mut || up_launch(xbp, hnp, 0u64, c))?;
+    let t_injn = ev(&mut || { unsafe { f_injn.clone().launch(lc((hc * c) as u32, 128, 0), (&mut d_hna, &mut d_ra, yp, &d_ia, &d_w, h as i32, hc as i32, ci, eps))?; } Ok(()) })?;
+    let t_row = ev(&mut || { unsafe { f_row.clone().launch(lc(c as u32, 512, 0), (&mut d_hnb, &mut d_rb, yp, &mut d_ib, &d_w, winjp, ci, eps))?; } Ok(()) })?;
+    println!("HC-UPMIX timing c={c} (ms/call): pf_mix {t_mix:.3} | upmix (up GEMM + mix) {t_up:.3} | inj_norm {t_injn:.3} -> rowinj {t_row:.3}");
+    println!("HC-UPMIX: PASS");
     Ok(())
 }
 

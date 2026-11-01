@@ -27,7 +27,7 @@ pub const REG: &[Opt] = &[
           help: "WP03 cross-lane tap bit-compare every round (syncs)" },
     Opt { flag: "bench-logits-hash", env: "GB10_BENCH_LOGITS_HASH", ty: Ty::Flag, def: "off", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
           help: "bench: print a logits hash per step" },
-    Opt { flag: "binv-section", env: "GB10_BINV_SECTION", ty: Ty::Choice(&["wp18", "moe_pf", "pf_hc", "gdn_tc"]), def: "all", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
+    Opt { flag: "binv-section", env: "GB10_BINV_SECTION", ty: Ty::Choice(&["wp18", "moe_pf", "pf_hc", "gdn_tc", "hc_upmix"]), def: "all", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
           help: "EXL3 --probe-binv: run only this section" },
     Opt { flag: "bisect-len", env: "GB10_BISECT_LEN", ty: Ty::Int, def: "unset", cat: Cat::Diag, scope: Scope::Spmd, vis: Vis::Adv,
           help: "DSV4 TP bench: pad/truncate the prompt to exactly N tokens" },
