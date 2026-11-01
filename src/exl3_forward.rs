@@ -7167,13 +7167,17 @@ struct Mx8State {
     xq: Option<CudaSlice<u8>>,
     xs: Option<CudaSlice<u8>>,
     bad: std::collections::HashSet<(usize, usize)>,
+    last: Option<(u64, usize, usize)>,   // (x, m, k) currently held in xq/xs
 }
+/// EXP-MX8: the caller promises the next GEMM(s) read the same, unmodified x as the previous one.
+static MX8_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn mx8_reuse(on: bool) { MX8_REUSE.store(on, std::sync::atomic::Ordering::Relaxed); }
 static MX8: std::sync::Mutex<Option<Mx8State>> = std::sync::Mutex::new(None);
 /// Ok(true) = y written by the MXFP8 GEMM; Ok(false) = not taken (caller runs the f16 GEMM).
 fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usize, r: &ReconBufs) -> Result<bool> {
     if k % 32 != 0 || n % 16 != 0 || stream_capturing(l) { return Ok(false); }
     let mut g = MX8.lock().unwrap();
-    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, bad: Default::default() });
+    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, bad: Default::default(), last: None });
     if st.bad.contains(&(k, n)) { return Ok(false); }
     if !st.w.contains_key(&wf) {
         let mut q: CudaSlice<u8> = l.dev.alloc_zeros::<u8>(n * k)?;
@@ -7190,14 +7194,18 @@ fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usiz
     let need_q = m * k;
     let need_s = mx8_sf_bytes(m, k);
     if st.xq.as_ref().map_or(true, |b| b.len() < need_q) {
-        st.xq = Some(l.dev.alloc_zeros::<u8>(need_q.max(16384 * 6144))?);
+        st.last = None; st.xq = Some(l.dev.alloc_zeros::<u8>(need_q.max(16384 * 6144))?);
     }
     if st.xs.as_ref().map_or(true, |b| b.len() < need_s) {
-        st.xs = Some(l.dev.htod_sync_copy(&vec![127u8; need_s.max(mx8_sf_bytes(16384, 6144))])?);
+        st.last = None; st.xs = Some(l.dev.htod_sync_copy(&vec![127u8; need_s.max(mx8_sf_bytes(16384, 6144))])?);
     }
     let (qx, sx) = (*st.xq.as_ref().unwrap().device_ptr() as u64, *st.xs.as_ref().unwrap().device_ptr() as u64);
-    let nt = (m * (k / 8)) as u32;
-    xqlaunch!(l, "xq_mx8_quant", (nt.div_ceil(256), 1, 1), (256, 1, 1), 0, (x, qx, sx, m as i32, k as i32))?;
+    let reuse = MX8_REUSE.load(std::sync::atomic::Ordering::Relaxed) && st.last == Some((x, m, k));
+    if !reuse {
+        let nt = (m * (k / 8)) as u32;
+        xqlaunch!(l, "xq_mx8_quant", (nt.div_ceil(256), 1, 1), (256, 1, 1), 0, (x, qx, sx, m as i32, k as i32))?;
+        st.last = Some((x, m, k));
+    }
     let (wq, ws) = { let e = &st.w[&wf]; (*e.0.device_ptr() as u64, *e.1.device_ptr() as u64) };
     let pm = lt_canon_m();
     let rc = unsafe {
@@ -14947,7 +14955,9 @@ impl FwdModel {
                          rb: &ReconBufs) -> Result<()> {
         let mi = moe.sh_down.k as usize; // EXL27C TP-B: the rank's intermediate slice (full at TP=1)
         exl3_chain_rb_dense(l, &moe.sh_gate, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.sh1, c, &psc.chain_ws, rb)?;
-        exl3_chain_rb_dense(l, &moe.sh_up, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.sh2, c, &psc.chain_ws, rb)?;
+        mx8_reuse(true);   // same psc.x as sh_gate
+        let ru = exl3_chain_rb_dense(l, &moe.sh_up, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.sh2, c, &psc.chain_ws, rb);
+        mx8_reuse(false); ru?;
         let sh1p = *psc.sh1.device_ptr() as u64;
         xqlaunch!(l, "xq_silu_mul", (((c * mi) as u32 + 255) / 256, 1, 1), (256, 1, 1), 0,
                  (&mut psc.sh1, sh1p, &psc.sh2, (c * mi) as i64))?;
@@ -16112,7 +16122,9 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                 Mixer::Gdn(g) => {
                     exl3_chain_rb(&l, &g.in_qkv, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.qkv, c, &psc.chain_ws, &rb)?;
                     self.tr_u16(ld, true, li, &psc.qkv, &format!("g{li}_qkv"), c * conv_dim)?;
-                    exl3_chain_rb(&l, &g.in_z, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.zbuf, c, &psc.chain_ws, &rb)?;
+                    mx8_reuse(true);   // same psc.x as in_qkv: reuse its MXFP8 quantisation
+                    let rz = exl3_chain_rb(&l, &g.in_z, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.zbuf, c, &psc.chain_ws, &rb);
+                    mx8_reuse(false); rz?;
                     self.tr_u16(ld, true, li, &psc.zbuf, &format!("g{li}_z"), c * vd)?;
                     if rmin > 0 && c >= rmin {
                         // S-A3-f-g: the 48-wide a/b projections are the worst
@@ -16267,8 +16279,10 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
                 }
                 Mixer::Attn(a) => {
                     exl3_chain_rb(&l, &a.q_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.qg, c, &psc.chain_ws, &rb)?;
-                    exl3_chain_rb(&l, &a.k_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.kp, c, &psc.chain_ws, &rb)?;
-                    exl3_chain_rb(&l, &a.v_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.vp, c, &psc.chain_ws, &rb)?;
+                    mx8_reuse(true);   // k/v read the same psc.x as q_proj
+                    let rkv = exl3_chain_rb(&l, &a.k_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.kp, c, &psc.chain_ws, &rb)
+                        .and_then(|_| exl3_chain_rb(&l, &a.v_proj, &psc.x, &mut psc.chain_xh, &mut psc.chain_yraw, &mut psc.vp, c, &psc.chain_ws, &rb));
+                    mx8_reuse(false); rkv?;
                     let nh_a = cfg.num_heads;
                     let nkv = cfg.num_kv_heads;
                     let hd = cfg.head_dim;
