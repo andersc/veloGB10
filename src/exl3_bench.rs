@@ -193,7 +193,7 @@ pub(crate) const MODULE_FNS: &[&str] = &[
     // A5-P2: prefill hc inject+norm / mix twins (128-thread CTAs, bitwise)
     "xq_pf_hc_inj_norm", "xq_pf_hc_mix_2560x4",
     // HC-UPMIX (experimental): fused hc up GEMM + mix, per-row inj_norm with the inj gates
-    "xq_hc_upmix_2560x4", "xq_pf_hc_inj_norm_rowinj",
+    "xq_hc_upmix_2560x4", "xq_pf_hc_inj_norm_rowinj", "xq_mx8_quant", "xq_mx8_quant_t",
     // S-A3-q P3: row-batched bit-exact prefill router
     "xq_gemm_f16_f32_rows",
     // S-A3-u B: 32-row smem-staged bit-exact router twin

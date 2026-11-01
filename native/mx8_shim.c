@@ -30,6 +30,10 @@ static Mx8Kn* kn_get(cublasLtHandle_t h, int k, int n, int mc, size_t wsz) {
     int md = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
     cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &md, sizeof(md));
     cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &md, sizeof(md));
+    // the heuristic rejects block-scale modes without scale pointers (status 7): placeholders, replaced per call
+    { const void* ph = (const void*)(size_t)256;
+      cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &ph, sizeof(ph));
+      cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &ph, sizeof(ph)); }
     if (cublasLtMatrixLayoutCreate(&p->la, CUDA_R_8F_E4M3, k, n, k)) return NULL;
     // canonical-m algorithm
     cublasLtMatrixLayout_t lb, lc;
@@ -40,7 +44,7 @@ static Mx8Kn* kn_get(cublasLtHandle_t h, int k, int n, int mc, size_t wsz) {
     cublasLtMatmulHeuristicResult_t res; int nr = 0;
     cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(h, p->op, p->la, lb, lc, lc, pref, 1, &res, &nr);
     cublasLtMatmulPreferenceDestroy(pref); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
-    if (st || nr == 0) { fprintf(stderr, "[exp-mx8] no MXFP8 algorithm for k=%d n=%d (status %d)\n", k, n, (int)st); return NULL; }
+    if (st || nr == 0) { fprintf(stderr, "[exp-mx8] no MXFP8 algorithm for k=%d n=%d (status %d, ws %zu)\n", k, n, (int)st, wsz); return NULL; }
     p->algo = res.algo; p->ok = 1; g_nkn++;
     return p;
 }

@@ -7166,15 +7166,15 @@ struct Mx8State {
     bytes: usize,
     xq: Option<CudaSlice<u8>>,
     xs: Option<CudaSlice<u8>>,
-    off: bool,
+    bad: std::collections::HashSet<(usize, usize)>,
 }
 static MX8: std::sync::Mutex<Option<Mx8State>> = std::sync::Mutex::new(None);
 /// Ok(true) = y written by the MXFP8 GEMM; Ok(false) = not taken (caller runs the f16 GEMM).
 fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usize, r: &ReconBufs) -> Result<bool> {
     if k % 32 != 0 || n % 16 != 0 || stream_capturing(l) { return Ok(false); }
     let mut g = MX8.lock().unwrap();
-    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, off: false });
-    if st.off { return Ok(false); }
+    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, bad: Default::default() });
+    if st.bad.contains(&(k, n)) { return Ok(false); }
     if !st.w.contains_key(&wf) {
         let mut q: CudaSlice<u8> = l.dev.alloc_zeros::<u8>(n * k)?;
         let mut sf: CudaSlice<u8> = l.dev.htod_sync_copy(&vec![127u8; mx8_sf_bytes(n, k)])?;
@@ -7206,8 +7206,8 @@ fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usiz
                  l.stream.stream as *mut core::ffi::c_void)
     };
     if rc < 0 {
-        st.off = true;
-        crate::rprintln!("[exp-mx8] MXFP8 GEMM unavailable (rc {rc}, k={k} n={n} m={m}): f16 from here on");
+        st.bad.insert((k, n));
+        crate::rprintln!("[exp-mx8] MXFP8 GEMM unavailable (rc {rc}, k={k} n={n} m={m}): f16 for this shape");
         return Ok(false);
     }
     Ok(true)
