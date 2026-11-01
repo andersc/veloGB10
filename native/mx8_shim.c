@@ -8,6 +8,7 @@
 #include <cublasLt.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct { int k, n; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la; cublasLtMatmulAlgo_t algo; int ok; } Mx8Kn;
@@ -46,6 +47,25 @@ static Mx8Kn* kn_get(cublasLtHandle_t h, int k, int n, int mc, size_t wsz) {
     cublasLtMatmulPreferenceDestroy(pref); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
     if (st || nr == 0) { fprintf(stderr, "[exp-mx8] no MXFP8 algorithm for k=%d n=%d (status %d, ws %zu)\n", k, n, (int)st, wsz); return NULL; }
     p->algo = res.algo; p->ok = 1; g_nkn++;
+    {   // report the config; MX8_FORCE_SPLITK1=1 forces split-K 1 / no reduction (batch invariance)
+        int id = 0, tile = 0, sk = 0, red = 0, sw = 0, co = 0; size_t w;
+        cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_ID, &id, sizeof(id), &w);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile), &w);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &sk, sizeof(sk), &w);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &red, sizeof(red), &w);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &sw, sizeof(sw), &w);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &co, sizeof(co), &w);
+        // split-K 1 / no reduction by default: the heuristic's "auto" split-K (-2) re-splits K by problem
+        // size, which breaks row invariance in m AND collapses to ~57 TFLOPS at k 2560 n 10240 m 8800
+        // (2.9 ms forced vs 8.1 ms auto). MX8_AUTO_SPLITK=1 keeps the heuristic's choice.
+        const char* f = getenv("MX8_AUTO_SPLITK");
+        if (!(f && f[0] == '1')) {
+            int one = 1, none = 0;
+            cublasLtMatmulAlgoConfigSetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &one, sizeof(one));
+            cublasLtMatmulAlgoConfigSetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &none, sizeof(none));
+        }
+        if (getenv("MX8_VERBOSE")) fprintf(stderr, "[exp-mx8] k=%d n=%d algo id %d tile %d splitK %d red %d swz %d custom %d\n", k, n, id, tile, sk, red, sw, co);
+    }
     return p;
 }
 
