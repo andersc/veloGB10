@@ -3126,6 +3126,11 @@ macro_rules! gblaunch {
 pub(crate) const XQ_HSL_KERNEL: &str = "xq_had_suh_rows_live_u2";
 pub(crate) const XQ_HSL_U: usize = 2;
 pub(crate) const XQ_HSL_BLOCKS: usize = 288;
+/// PACK-PF: persistent grid of the replicated (non-EP) xq_had_suh_rows_live call (PACKPF_HSL_BLOCKS, default 576).
+fn hsl_full_blocks() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PACKPF_HSL_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(576))
+}
 
 macro_rules! xqlaunch {
     ($l:expr, $name:expr, $grid:expr, $block:expr, $smem:expr, ($($arg:expr),* $(,)?)) => {{
@@ -14962,8 +14967,13 @@ would leave the output of this layer's {}-bit routed experts unwritten (HTTP 200
                 xqlaunch!(l, XQ_HSL_KERNEL, (blocks, 1, 1), (256, 1, 1), 0,
                          (&psc.x, &moe.suh_gu, &psc.pf_ident, &psc.row_tok, &psc.row_eidx, &mut psc.xh_e, live_end, r as i32, 2560i32))?;
             } else {
-                xqlaunch!(l, "xq_had_suh_rows", ((r * 20) as u32, 1, 1), (32, 1, 1), 0,
-                         (&psc.x, &moe.suh_gu, &psc.pf_ident, &psc.row_tok, &psc.row_eidx, &mut psc.xh_e, r as i32, 2560i32))?;
+                // PACK-PF: the vectorised persistent twin over ALL R rows (live_end = null) — the same
+                // per-element arithmetic as xq_had_suh_rows (bitwise), 8-byte lanes and 8-warp blocks instead
+                // of 1-warp blocks (ncu: the 1-warp grid reached 19% of DRAM bandwidth).
+                let nitem = (r * 20) as u64;
+                let blocks = nitem.div_ceil(8 * XQ_HSL_U as u64).min(hsl_full_blocks()).max(1) as u32;
+                xqlaunch!(l, XQ_HSL_KERNEL, (blocks, 1, 1), (256, 1, 1), 0,
+                         (&psc.x, &moe.suh_gu, &psc.pf_ident, &psc.row_tok, &psc.row_eidx, &mut psc.xh_e, 0u64, r as i32, 2560i32))?;
             }
             let kn_gu = (2560 | ((mi * 2) << 16)) as i32;
             let kn_d = (mi | (h << 16)) as i32;
@@ -24250,6 +24260,17 @@ pub fn probe_pack_pf(a: &FwdArgs) -> Result<()> {
     };
     // warm-up both (cold PLE pages, autotune)
     run_a(&mut psc)?; run_b(&mut psc)?;
+    // PACKPF_PROF=a|b: profile only that arm (nsys --capture-range=cudaProfilerApi), 2 runs, then stop
+    if let Ok(arm) = std::env::var("PACKPF_PROF") {
+        run_a(&mut psc)?; run_b(&mut psc)?;
+        model.dev.synchronize()?;
+        cudarc::driver::profiler_start()?;
+        for _ in 0..2 { if arm == "a" { run_a(&mut psc)?; } else { run_b(&mut psc)?; } }
+        model.dev.synchronize()?;
+        cudarc::driver::profiler_stop()?;
+        crate::rprintln!("[packpf] profiled arm {arm} x2");
+        return Ok(());
+    }
     run_c(&mut psc)?; let lc = seam(&mut dsc)?;
     let (_, ca) = run_a(&mut psc)?; let sa = snap(ca)?; let la = seam(&mut dsc)?;
     let (_, cb) = run_b(&mut psc)?; let sb = snap(cb)?; let lb = seam(&mut dsc)?;

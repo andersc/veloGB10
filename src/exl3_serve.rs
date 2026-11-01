@@ -1981,6 +1981,17 @@ fn packpf_min() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::opts::var(crate::opt!("prefill-pack-min")).ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
+/// PACK-PF: --prefill-pack-wait on — while lanes decode, also hold a queue shorter than
+/// --prefill-pack-min (more requests arrive as lanes finish), so passes fill up (throughput mode).
+fn packpf_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(crate::opts::var(crate::opt!("prefill-pack-wait")).as_deref(), Ok("on") | Ok("1")))
+}
+/// PACK-PF: --prefill-pack-wait-ms — the longest a request is held for a fuller pack.
+fn packpf_wait_ms() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("prefill-pack-wait-ms")).ok().and_then(|v| v.parse().ok()).unwrap_or(1000))
+}
 /// The prefill scratch rows to ALLOCATE: psc_rows (what the chunk grid may merge up to), grown to the
 /// packed pass budget when packing is on. The grid keeps using psc_rows.
 fn psc_alloc_rows(c: usize, tp: bool) -> usize {
@@ -4198,7 +4209,11 @@ the [gen] line says stop_p=na", stats));
                     let nfree = self.lanes.iter().filter(|l| l.is_none()).count();
                     let running = self.lanes.iter().any(|l| l.is_some());
                     let front_packed = waiting.front().map_or(false, |f| self.pf_done.values().any(|(p, _)| *p == f.prompt));
-                    if !front_packed && running && waiting.len() >= packpf_min() && nfree < packpf_min() {
+                    let short_queue = packpf_wait() && waiting.len() < packpf_min();
+                    // only a packable front is worth holding, and never past --prefill-pack-wait-ms
+                    let front_ok = waiting.front().map_or(false, |f| self.pf_eligible(f)
+                        && f.received_at.elapsed().as_millis() < packpf_wait_ms() as u128);
+                    if !front_packed && running && front_ok && (short_queue || (waiting.len() >= packpf_min() && nfree < packpf_min())) {
                         break; // run a decode round first; more lanes free up for a fuller pack
                     }
                 }
@@ -4566,6 +4581,14 @@ the [gen] line says stop_p=na", stats));
                  segs.len(), segs.iter().map(|s| s.n).collect::<Vec<_>>(), rows as f64 * 1e3 / ms.max(1e-3),
                  segs.iter().map(|s| s.slot).collect::<Vec<_>>());
         Ok(())
+    }
+
+    /// PACK-PF: can this request ride a packed pass (fresh, text-only, one chunk, dense attention)?
+    fn pf_eligible(&self, r: &BatchRequest) -> bool {
+        let c = self.chunk.max(1);
+        let n = r.prompt.len().saturating_sub(1);
+        r.image_spans.is_empty() && n >= 64 && n <= c && !self.model.qsa_live(n)
+            && self.own_snapshot_slot(&r.prompt).is_none()
     }
 
     fn own_snapshot_slot(&self, prompt: &[u32]) -> Option<usize> {
