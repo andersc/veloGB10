@@ -39,6 +39,17 @@ fn main() {
         .compile("net_shim");
     println!("cargo:rustc-link-lib=ibverbs");
 
+    // ---- EXP-MX8 (native/mx8_shim.c): MXFP8 dense GEMM through cuBLASLt block-scale modes ----
+    println!("cargo:rerun-if-changed=native/mx8_shim.c");
+    cc::Build::new()
+        .file("native/mx8_shim.c")
+        .include(format!("{cuda_home}/include"))
+        .flag("-O2")
+        .warnings(false)
+        .compile("mx8_shim");
+    println!("cargo:rustc-link-search=native={cuda_home}/lib64");
+    println!("cargo:rustc-link-lib=cublasLt");
+
     let nvcc = PathBuf::from(&cuda_home).join("bin/nvcc");
     let kernel_dir = PathBuf::from("kernels");
     let out_dir = PathBuf::from("src/ptx");

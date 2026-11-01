@@ -7041,6 +7041,12 @@ fn exl3_chain_impl(l: &Launcher, q: &Quad, x: &CudaSlice<u16>, xh: &mut CudaSlic
             let rmin = recon_min_rows();
             if rmin > 0 && m >= rmin && wide_trellis_supports_bits(q.bits as usize) {
                 if let Some(wf) = recon_folded_get(l, q, r)? {
+                    // EXP-MX8: the same folded matrix as MXFP8 (e4m3 + per-32 e8m0 scales) on FP8 tensor cores.
+                    if dense_mx8_on() && m >= dense_mx8_min_rows()
+                        && mx8_matmul(l, wf, *x.device_ptr() as u64, *y.device_ptr() as u64,
+                                      q.k as usize, q.n as usize, m, r)? {
+                        return Ok(());
+                    }
                     exl3_lt_matmul(l, wf, *x.device_ptr() as u64, *y.device_ptr() as u64,
                                    q.k as usize, q.n as usize, m, false, r.ltws, r.ltws_len)?;
                     return Ok(());
@@ -7134,6 +7140,79 @@ fn recon_folded_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VELO_RECON_RESIDENT").map_or(false, |v| v == "2"))
 }
+// ---------------------------------------------------------------------------------------------
+// EXP-MX8 (experimental, VELO_DENSE_MX8=1): the rc2 folded dense GEMMs as MXFP8 through cuBLASLt's
+// VEC32_UE8M0 block-scale mode (native/mx8_shim.c). Weights: converted once from the folded f16
+// W_full [k][n] to e4m3 [n][k] + swizzled scales (xq_mx8_quant_t). Activations: quantised per call
+// (xq_mx8_quant). One algorithm per (k, n), chosen at the canonical m, so rows stay batch-invariant.
+// Changes rounding (≈3.7% relative RMS per GEMM output on gaussian data) — a gold-set question.
+extern "C" {
+    fn mx8_gemm(handle: *mut core::ffi::c_void, k: i32, n: i32, m: i32, m_canon: i32,
+                qw: u64, sw: u64, qx: u64, sx: u64, y: u64, ws: u64, wsz: usize,
+                stream: *mut core::ffi::c_void) -> i32;
+}
+fn dense_mx8_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| { let on = std::env::var("VELO_DENSE_MX8").map_or(false, |v| v == "1");
+        if on { crate::rprintln!("[exp-mx8] MXFP8 folded dense GEMMs ON (min rows {})", dense_mx8_min_rows()); } on })
+}
+fn dense_mx8_min_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VELO_DENSE_MX8_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(17))
+}
+fn mx8_sf_bytes(rows: usize, k: usize) -> usize { rows.div_ceil(128) * 128 * (k / 32).div_ceil(4) * 4 }
+struct Mx8State {
+    w: std::collections::HashMap<u64, (CudaSlice<u8>, CudaSlice<u8>)>,
+    bytes: usize,
+    xq: Option<CudaSlice<u8>>,
+    xs: Option<CudaSlice<u8>>,
+    off: bool,
+}
+static MX8: std::sync::Mutex<Option<Mx8State>> = std::sync::Mutex::new(None);
+/// Ok(true) = y written by the MXFP8 GEMM; Ok(false) = not taken (caller runs the f16 GEMM).
+fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usize, r: &ReconBufs) -> Result<bool> {
+    if k % 32 != 0 || n % 16 != 0 || stream_capturing(l) { return Ok(false); }
+    let mut g = MX8.lock().unwrap();
+    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, off: false });
+    if st.off { return Ok(false); }
+    if !st.w.contains_key(&wf) {
+        let mut q: CudaSlice<u8> = l.dev.alloc_zeros::<u8>(n * k)?;
+        let mut sf: CudaSlice<u8> = l.dev.htod_sync_copy(&vec![127u8; mx8_sf_bytes(n, k)])?;
+        let nt = (n * (k / 32)) as u32;
+        xqlaunch!(l, "xq_mx8_quant_t", (nt.div_ceil(256), 1, 1), (256, 1, 1), 0,
+                 (wf, &mut q, &mut sf, n as i32, k as i32))?;
+        st.bytes += n * k + mx8_sf_bytes(n, k);
+        if st.w.len() % 32 == 31 || st.w.len() < 2 {
+            crate::rprintln!("[exp-mx8] {} weights converted, {:.2} GiB", st.w.len() + 1, st.bytes as f64 / (1u64 << 30) as f64);
+        }
+        st.w.insert(wf, (q, sf));
+    }
+    let need_q = m * k;
+    let need_s = mx8_sf_bytes(m, k);
+    if st.xq.as_ref().map_or(true, |b| b.len() < need_q) {
+        st.xq = Some(l.dev.alloc_zeros::<u8>(need_q.max(16384 * 6144))?);
+    }
+    if st.xs.as_ref().map_or(true, |b| b.len() < need_s) {
+        st.xs = Some(l.dev.htod_sync_copy(&vec![127u8; need_s.max(mx8_sf_bytes(16384, 6144))])?);
+    }
+    let (qx, sx) = (*st.xq.as_ref().unwrap().device_ptr() as u64, *st.xs.as_ref().unwrap().device_ptr() as u64);
+    let nt = (m * (k / 8)) as u32;
+    xqlaunch!(l, "xq_mx8_quant", (nt.div_ceil(256), 1, 1), (256, 1, 1), 0, (x, qx, sx, m as i32, k as i32))?;
+    let (wq, ws) = { let e = &st.w[&wf]; (*e.0.device_ptr() as u64, *e.1.device_ptr() as u64) };
+    let pm = lt_canon_m();
+    let rc = unsafe {
+        mx8_gemm(lt_handle() as *mut core::ffi::c_void, k as i32, n as i32, m as i32,
+                 if pm > 0 { pm as i32 } else { 4095 }, wq, ws, qx, sx, y, r.ltws, r.ltws_len,
+                 l.stream.stream as *mut core::ffi::c_void)
+    };
+    if rc < 0 {
+        st.off = true;
+        crate::rprintln!("[exp-mx8] MXFP8 GEMM unavailable (rc {rc}, k={k} n={n} m={m}): f16 from here on");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// EXP-RC2: build (first use) and return the folded matrix for q. Computed by pushing identity
 /// rows through the module's own chain: row i of W_full = chain(e_i).
 fn recon_folded_get(l: &Launcher, q: &Quad, r: &ReconBufs) -> Result<Option<u64>> {

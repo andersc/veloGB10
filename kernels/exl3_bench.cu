@@ -19846,3 +19846,73 @@ xq_pf_hc_inj_norm_rowinj(__half* __restrict__ out, float* __restrict__ x, const 
         if (ln == 0) inj[b * hc + wp] = 2.0f * xq_sig(r / (float)hc);
     }
 }
+
+// =============================================================================
+// EXP-MX8 (experimental, VELO_DENSE_MX8=1): MXFP8 operands for the folded dense GEMMs (native/mx8_shim.c).
+// e4m3 values (RN, satfinite) with one ue8m0 scale per 32 consecutive k: E = smallest exponent with
+// amax * 2^-E <= 448. Scales in cuBLAS's VEC32_UE8M0 layout: 128 x 4 tiles of 512 bytes, tiles along k
+// first; inside a tile byte (r % 32) * 16 + ((r % 128) / 32) * 4 + (c % 4).
+// =============================================================================
+__device__ __forceinline__ size_t xq_mx8_sf_off(int r, int c, int kc) {
+    const int nct = (kc + 3) >> 2;
+    return ((size_t)(r >> 7) * nct + (c >> 2)) * 512 + (r & 31) * 16 + ((r & 127) >> 5) * 4 + (c & 3);
+}
+__device__ __forceinline__ int xq_mx8_exp(float am) {
+    int E = 0;
+    if (am > 0.f) E = (int)ceilf(log2f(am * (1.0f / 448.0f)));
+    return max(-127, min(127, E));
+}
+// activations: x [R][K] f16 (K contiguous) -> q [R][K] e4m3, sf swizzled. One thread per 8 values.
+extern "C" __global__ void __launch_bounds__(256)
+xq_mx8_quant(const __half* __restrict__ x, unsigned char* __restrict__ q, unsigned char* __restrict__ sf, int R, int K) {
+    const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int k8 = K >> 3;
+    const bool live = t < (long long)R * k8;
+    const int r = live ? (int)(t / k8) : 0;
+    const int k0 = live ? (int)(t - (long long)r * k8) * 8 : 0;
+    float v[8]; float am = 0.f;
+    if (live) {
+        const uint4 u = *reinterpret_cast<const uint4*>(x + (size_t)r * K + k0);
+        const __half* h = reinterpret_cast<const __half*>(&u);
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) { v[e] = __half2float(h[e]); am = fmaxf(am, fabsf(v[e])); }
+    }
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+    if (!live) return;
+    const int E = xq_mx8_exp(am);
+    const float inv = exp2f((float)-E);
+    uint32_t w0 = 0, w1 = 0;
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const uint32_t b = (uint32_t)__nv_cvt_float_to_fp8(v[e] * inv, __NV_SATFINITE, __NV_E4M3);
+        if (e < 4) w0 |= b << (8 * e); else w1 |= b << (8 * (e - 4));
+    }
+    *reinterpret_cast<uint2*>(q + (size_t)r * K + k0) = make_uint2(w0, w1);
+    if ((k0 & 31) == 0) sf[xq_mx8_sf_off(r, k0 >> 5, K >> 5)] = (unsigned char)(E + 127);
+}
+// weights (load time): src [K][R] f16 (R contiguous, the folded W_full layout) -> q [R][K] e4m3, sf swizzled.
+// One thread per (r, 32-block); r fastest so the strided reads coalesce across the warp.
+extern "C" __global__ void __launch_bounds__(256)
+xq_mx8_quant_t(const __half* __restrict__ src, unsigned char* __restrict__ q, unsigned char* __restrict__ sf, int R, int K) {
+    const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int kc = K >> 5;
+    if (t >= (long long)R * kc) return;
+    const int kb = (int)(t / R), r = (int)(t - (long long)kb * R);
+    float v[32]; float am = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) { v[j] = __half2float(src[(size_t)(kb * 32 + j) * R + r]); am = fmaxf(am, fabsf(v[j])); }
+    const int E = xq_mx8_exp(am);
+    const float inv = exp2f((float)-E);
+    uint32_t w[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        w[i] = 0;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+            w[i] |= (uint32_t)__nv_cvt_float_to_fp8(v[4 * i + e] * inv, __NV_SATFINITE, __NV_E4M3) << (8 * e);
+    }
+    uint4* d = reinterpret_cast<uint4*>(q + (size_t)r * K + kb * 32);
+    d[0] = make_uint4(w[0], w[1], w[2], w[3]); d[1] = make_uint4(w[4], w[5], w[6], w[7]);
+    sf[xq_mx8_sf_off(r, kb, kc)] = (unsigned char)(E + 127);
+}
