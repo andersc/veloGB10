@@ -654,6 +654,8 @@ struct Exl3Scheduler {
     // TP-D: the last admit's resume points (prompt-end reuse, WP16/C1 checkpoint q) — proven
     // identical on every rank by the seam lockstep
     last_resume: (usize, usize),
+    /// PACK-PF: slot -> (prompt, segment) whose rows 0..plen-2 a packed pass already prefilled.
+    pf_done: std::collections::HashMap<usize, (Vec<u32>, usize)>,
     // VIS-2: the text config's interleaved mrope_section (rope_parameters.mrope_section; None = the
     // model declares no interleaved mrope -> image requests are refused)
     mrope_section: Option<[usize; 3]>,
@@ -1962,6 +1964,41 @@ fn interleave_point(interleave: usize, cancellable: bool, end: usize, n: usize) 
 
 /// C1 v2: prefill scratch rows — the merged-chunk cap with tail checkpoints on (2C - 1; under TP
 /// min(2C - 1, 4,095) so `--prefill-chunk 4095` fits the all-reduce partial buffer, TP-4X1), else C.
+/// PACK-PF: --prefill-pack on.
+fn packpf_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(crate::opts::var(crate::opt!("prefill-pack")).as_deref(), Ok("on") | Ok("1")))
+}
+
+/// PACK-PF: --prefill-pack-rows N — the packed pass row budget (0 = the chunk size).
+fn packpf_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("prefill-pack-rows")).ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+/// PACK-PF: --prefill-pack-min K — with K or more requests waiting and fewer than K free lanes while
+/// lanes are decoding, admission waits for lanes (a round) so the next packed pass carries K prompts.
+fn packpf_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("prefill-pack-min")).ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
+/// PACK-PF: --prefill-pack-wait on — while lanes decode, also hold a queue shorter than
+/// --prefill-pack-min (more requests arrive as lanes finish), so passes fill up (throughput mode).
+fn packpf_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(crate::opts::var(crate::opt!("prefill-pack-wait")).as_deref(), Ok("on") | Ok("1")))
+}
+/// PACK-PF: --prefill-pack-wait-ms — the longest a request is held for a fuller pack.
+fn packpf_wait_ms() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::opts::var(crate::opt!("prefill-pack-wait-ms")).ok().and_then(|v| v.parse().ok()).unwrap_or(1000))
+}
+/// The prefill scratch rows to ALLOCATE: psc_rows (what the chunk grid may merge up to), grown to the
+/// packed pass budget when packing is on. The grid keeps using psc_rows.
+fn psc_alloc_rows(c: usize, tp: bool) -> usize {
+    let r = psc_rows(c, tp);
+    if packpf_on() && !tp { r.max(packpf_rows()) } else { r }
+}
+
 fn psc_rows(c: usize, tp: bool) -> usize {
     if crate::exl3_forward::tail_ckpt_on() && !crate::exl3_forward::wp16_off() {
         crate::exl3_forward::merge_cap(c, tp).max(c)
@@ -2013,7 +2050,7 @@ impl Exl3Scheduler {
         let tp = std::time::Instant::now();
         let c = self.chunk.max(1);
         if self.psc.is_none() {
-            self.psc = Some(self.model.prefill_scratch(psc_rows(c, self.tp.is_some()))?);
+            self.psc = Some(self.model.prefill_scratch(psc_alloc_rows(c, self.tp.is_some()))?);
         }
         let mut pos = from;
         let n = to.min(prompt.len().saturating_sub(1)); // the seam token is a decode step
@@ -2216,6 +2253,20 @@ impl Exl3Scheduler {
         let plen = prompt.len();
         let end = plen.saturating_sub(1);
         self.last_resume = (0, 0);
+        if let Some((p, k)) = self.pf_done.remove(&slot) {
+            if p == prompt && key == prompt {
+                // PACK-PF: rows 0..end were prefilled by a packed pass; select this segment's carry
+                let psc = self.psc.as_mut().context("PACK-PF: no prefill scratch")?;
+                self.model.pf_use_carry(psc, k)?;
+                self.kv_pf = Some((slot, end));
+                self.publish_kv();
+                if !self.prefix_on || !self.model.prefix_snapshots() { return Ok(true); }
+                self.model.snapshot_slot(slot, self.psc.as_ref().unwrap())?;
+                self.cache[slot] = Some(key[..end].to_vec());
+                return Ok(true);
+            }
+            // a different prompt took the slot: its state is stale, the normal path resets it
+        }
         if !self.prefix_on || !self.model.prefix_snapshots() {
             // PFX1 (b): the chunked prefill below head-fills rows 0..plen-2 (no head-KV memset)
             self.model.reset_slot_for_prefill(slot)?;
@@ -2248,7 +2299,7 @@ impl Exl3Scheduler {
             }
         }
         if self.psc.is_none() {
-            self.psc = Some(self.model.prefill_scratch(psc_rows(self.chunk.max(1), self.tp.is_some()))?);
+            self.psc = Some(self.model.prefill_scratch(psc_alloc_rows(self.chunk.max(1), self.tp.is_some()))?);
         }
         let c = self.chunk.max(1);
         // WP16: only on a prompt-end miss (a hit is always the deeper, unchanged resume).
@@ -4154,6 +4205,25 @@ the [gen] line says stop_p=na", stats));
                     }
                     continue; // re-plan from the top of this while
                 }
+                if packpf_on() && packpf_min() > 2 {
+                    let nfree = self.lanes.iter().filter(|l| l.is_none()).count();
+                    let running = self.lanes.iter().any(|l| l.is_some());
+                    let front_packed = waiting.front().map_or(false, |f| self.pf_done.values().any(|(p, _)| *p == f.prompt));
+                    let short_queue = packpf_wait() && waiting.len() < packpf_min();
+                    // only a packable front is worth holding, and never past --prefill-pack-wait-ms
+                    let front_ok = waiting.front().map_or(false, |f| self.pf_eligible(f)
+                        && f.received_at.elapsed().as_millis() < packpf_wait_ms() as u128);
+                    if !front_packed && running && front_ok && (short_queue || (waiting.len() >= packpf_min() && nfree < packpf_min())) {
+                        break; // run a decode round first; more lanes free up for a fuller pack
+                    }
+                }
+                if packpf_on() && waiting.len() >= 2 {
+                    if let Err(e) = self.pack_prefill_waiting(&waiting) {
+                        crate::reprintln!("[exl3-serve] PACK-PF: packed prefill failed, admitting one by one: {e:#}");
+                        self.pf_done.clear();
+                        if sticky_cuda_error(&e) { self.fatal = Some(format!("{e:#}")); }
+                    }
+                }
                 let Some(req) = waiting.pop_front() else { break };
                 if req.tx.is_closed() {
                     continue;
@@ -4237,7 +4307,7 @@ the [gen] line says stop_p=na", stats));
         let (_, digest) = crate::tp_serve::image_rows_wire(&rows);
         self.vis_seam = Some((n_img as u32, delta as i32, digest));
         if self.psc.is_none() {
-            self.psc = Some(self.model.prefill_scratch(psc_rows(self.chunk.max(1), self.tp.is_some()))?);
+            self.psc = Some(self.model.prefill_scratch(psc_alloc_rows(self.chunk.max(1), self.tp.is_some()))?);
         }
         let img = self.model.vis_rows_upload(&rows)?;
         let psc = self.psc.as_mut().unwrap();
@@ -4446,6 +4516,81 @@ the [gen] line says stop_p=na", stats));
 
     /// The pick block's prompt-end hit test over FREE lanes (same test, same (len, slot) max):
     /// the "own slot" a waiting request is admitted into first under --lane-reserve.
+    /// PACK-PF: prefill the front run of eligible waiting requests (fresh: no snapshot / WP16 resume
+    /// on any free lane, text-only, one chunk, dense attention) in ONE packed pass over free lanes.
+    /// Each packed slot is marked in `pf_done`; the normal admit then picks that slot and
+    /// prefill_cached skips the prefill. Needs >= 2 eligible requests and free lanes.
+    fn pack_prefill_waiting(&mut self, waiting: &std::collections::VecDeque<BatchRequest>) -> Result<()> {
+        if self.tp.is_some() || self.df2.is_some() || self.spill.is_some() { return Ok(()); }
+        // markers of requests no longer waiting are stale; a packed front request is admitted first
+        self.pf_done.retain(|_, (p, _)| waiting.iter().any(|r| r.prompt == *p));
+        if let Some(f) = waiting.front() {
+            if self.pf_done.values().any(|(p, _)| *p == f.prompt) { return Ok(()); }
+        }
+        // the packed run is a FIFO prefix: with an unpacked front every remaining marker is
+        // unreachable (and its carry index would be overwritten by the new pass)
+        self.pf_done.clear();
+        let c = self.chunk.max(1);
+        if self.psc.is_none() {
+            self.psc = Some(self.model.prefill_scratch(psc_alloc_rows(c, false))?);
+        }
+        let budget = if packpf_rows() > 0 { packpf_rows() } else { c };
+        let cap = budget.min(self.model.pf_rows_cap(self.psc.as_ref().unwrap()));
+        let mut free: Vec<usize> = (0..self.lanes.len())
+            .filter(|&i| self.lanes[i].is_none() && !self.pf_done.contains_key(&i)).collect();
+        // victims: empty lanes first, then the rest (a packed prefill overwrites the lane's snapshot)
+        free.sort_by_key(|&i| self.cache[i].is_some());
+        let mut picks: Vec<(usize, usize)> = Vec::new(); // (waiting index, slot)
+        let mut rows = 0usize;
+        for (wi, r) in waiting.iter().enumerate() {
+            if picks.len() >= free.len() || picks.len() >= crate::exl3_forward::PACK_PF_MAX { break; }
+            if r.tx.is_closed() || self.pf_done.values().any(|(p, _)| *p == r.prompt) { continue; }
+            let plen = r.prompt.len();
+            let n = plen.saturating_sub(1);
+            let ok = r.image_spans.is_empty() && n >= 64 && n <= c && rows + n <= cap
+                && !self.model.qsa_live(n)
+                && self.own_snapshot_slot(&r.prompt).is_none()
+                && self.wp16.as_ref().map_or(true, |st| free.iter().all(|&i| st.resume_point(i, &r.prompt, n, c).0 == 0))
+                && picks.iter().all(|&(pw, _)| waiting[pw].prompt != r.prompt);
+            if !ok { break; } // keep FIFO order: stop at the first request that cannot pack
+            picks.push((wi, free[picks.len()]));
+            rows += n;
+        }
+        if picks.len() < 2 { return Ok(()); }
+        let t0 = std::time::Instant::now();
+        let mut toks: Vec<i32> = Vec::with_capacity(rows);
+        let mut segs: Vec<crate::exl3_forward::PfSeg> = Vec::with_capacity(picks.len());
+        for &(wi, slot) in &picks {
+            let r = &waiting[wi];
+            let n = r.prompt.len() - 1;
+            self.model.clear_slot_vision(slot)?;
+            self.model.reset_slot_for_prefill(slot)?;
+            self.cache[slot] = None;
+            if let Some(st) = self.wp16.as_mut() { st.begin_aligned(slot, 0, c); }
+            segs.push(crate::exl3_forward::PfSeg { r0: toks.len(), n, pos0: 0, slot });
+            toks.extend(r.prompt[..n].iter().map(|&t| t as i32));
+        }
+        let psc = self.psc.as_mut().unwrap();
+        self.model.prefill_segs(psc, &toks, &segs, false, None)?;
+        crate::metrics::sched_touch();
+        for (k, &(wi, slot)) in picks.iter().enumerate() {
+            self.pf_done.insert(slot, (waiting[wi].prompt.clone(), k));
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        crate::drprintln!("[exl3-serve] PACK-PF: {} prompts in one prefill pass, rows {:?} = {rows} in {ms:.1} ms ({:.0} tok/s), slots {:?}",
+                 segs.len(), segs.iter().map(|s| s.n).collect::<Vec<_>>(), rows as f64 * 1e3 / ms.max(1e-3),
+                 segs.iter().map(|s| s.slot).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// PACK-PF: can this request ride a packed pass (fresh, text-only, one chunk, dense attention)?
+    fn pf_eligible(&self, r: &BatchRequest) -> bool {
+        let c = self.chunk.max(1);
+        let n = r.prompt.len().saturating_sub(1);
+        r.image_spans.is_empty() && n >= 64 && n <= c && !self.model.qsa_live(n)
+            && self.own_snapshot_slot(&r.prompt).is_none()
+    }
+
     fn own_snapshot_slot(&self, prompt: &[u32]) -> Option<usize> {
         (0..self.lanes.len()).filter(|&i| self.lanes[i].is_none())
             .filter_map(|i| match &self.cache[i] {
@@ -4504,11 +4649,12 @@ the [gen] line says stop_p=na", stats));
                 Some((allowed, _)) => free.into_iter().filter(|i| allowed.contains(i)).collect(),
                 None => free,
             };
+            let packed = free.iter().copied().find(|i| self.pf_done.get(i).map_or(false, |(p, _)| *p == req.prompt));
             let hit = free.iter().copied().filter_map(|i| match &self.cache[i] {
                 Some(t) if t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..] => Some((t.len(), i)),
                 _ => None,
             }).max();
-            hit.map(|(_, i)| i)
+            packed.or(hit.map(|(_, i)| i))
                 .or_else(|| {
                     // LANERES1: a scoped admit that did not come through the snapshot-hit arm
                     // picks its owner-change victim among the allowed lanes only.
@@ -6446,7 +6592,7 @@ fn build_serve(args: &[String], model_dir: &str, tp: Option<crate::exl3_forward:
     }
     // S-A3-u: build the prefill scratch at startup and warm cuBLASLt (lazy kernel loads + plans
     // ~0.4 s) so request 1 does not pay it. --exl3-no-prefill-warmup skips (diagnostics).
-    let mut psc0 = model.prefill_scratch(psc_rows(chunk.max(1), tp_rank.is_some()))?;
+    let mut psc0 = model.prefill_scratch(psc_alloc_rows(chunk.max(1), tp_rank.is_some()))?;
     if crate::opts::var(crate::opt!("exl3-no-prefill-warmup")).is_err() {
         model.prefill_warmup(&mut psc0, 0, &crate::exl3_forward::FwdModel::prefill_warmup_widths(chunk.max(1)))?;
     }
@@ -6743,7 +6889,7 @@ the free memory that matters is the 'after the boot' figure of the PLE line belo
         wp16, wp16_xcheck,
         loop_cfg, pen_range, spec_ratio, draft_temp, gate: None, tok: tok.clone(),
         tp: tp_rank.map(|r| TpSync::new(r, tp_world as i32)),
-        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), mrope_section, vis_seam: None, kv_pf: None,
+        exit_on_fatal, fatal: None, inject_panic, steps: 0, last_resume: (0, 0), pf_done: Default::default(), mrope_section, vis_seam: None, kv_pf: None,
     };
     if width > 1 && spec_live {
         crate::dprintln!("[exl3-serve] serial lane order (--lane-order): {}{}", lane_order.name(),
@@ -7179,7 +7325,7 @@ pub fn wp24_served_gate(args: &[String], model_dir: &str) -> Result<bool> {
         prefix_on: true, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: None, pen_range: 1024, spec_ratio: false, draft_temp, gate: None, tok: tok.clone(), tp: None,
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None, kv_pf: None,
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), pf_done: Default::default(), mrope_section: None, vis_seam: None, kv_pf: None,
     };
     let quick = args.iter().any(|a| a == "--quick");
     wp24_gate_conditions(&mut sched, &prompt, &text, trials, positions, n_seeds, top_k, draft_conf, draft_temp, quick)
@@ -7642,7 +7788,7 @@ pub fn run_spec(model_dir: &str, ctx: Option<crate::tp::TpContext>, prompts: Opt
         prefix_on: o.prefix, cache: (0..width).map(|_| None).collect(),
         wp16: None, wp16_xcheck: false,
         loop_cfg: Some((300, 3)), pen_range: 1024, spec_ratio: true, draft_temp: None, gate: None, tok: tok.clone(),
-        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), mrope_section: None, vis_seam: None, kv_pf: None,
+        exit_on_fatal: false, fatal: None, inject_panic: None, steps: 0, last_resume: (0, 0), pf_done: Default::default(), mrope_section: None, vis_seam: None, kv_pf: None,
         tp: if tp_on { Some(TpSync::new(rank, world)) } else { None },
     };
     let mut arms = vec![SpecArm::Plain];
