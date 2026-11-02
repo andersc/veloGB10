@@ -4499,29 +4499,41 @@ static LT_REC: std::sync::Mutex<Vec<(usize, usize, usize, bool, usize)>> = std::
 static LT_FAMILIES: std::sync::Mutex<Option<(Vec<(usize, usize, bool, usize, usize)>, usize)>> =
     std::sync::Mutex::new(None);
 
+// PACK-PF: inside a packed prefill pass (prefill_segs with 2+ segments) LT_SEGS holds the segment
+// row counts in row order. A GEMM over all the pass's rows (m == their sum) runs as one cuBLASLt call
+// per segment at that segment's own m (row-offset B and C pointers), so each segment gets the
+// algorithm cuBLASLt picks for m = segment rows: the algorithm a per-prompt prefill of that prompt
+// runs. cuBLASLt picks its algorithm per m, so this is what keeps a packed prompt's bytes equal to
+// its unpacked prefill. Every other launch of the pass is row-independent.
+std::thread_local! {
+    static LT_SEGS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// One wide-M GEMM through cuBLASLt (SM121 nvjet kernels) on a reconstructed f16
 /// weight. Layouts (all f16, fp32 accumulate): A = Wdec row-major [K,N] →
 /// col-major view [N,K], ld=N, opA=N; B = xh row-major [m,K] → col-major [K,m],
 /// ld=K, opB=N (row offset applied by the caller via pointer); C row-major
 /// [m,N] → col-major [N,m], ld=N. Heuristics per (k,n,m), cached process-wide
 /// (the brief's "heuristics first"; the winning algo is pinned by the cache).
-/// PACK-PF: --exl3-lt-canon N — inside a prefill pass (LT_CANON_ACTIVE) every cuBLASLt GEMM at
-/// m >= 17 runs the algo cuBLASLt picks for m = N, pinned on the m-row layouts (the TP-SP pin
-/// mechanism), so a row's bytes do not depend on how many rows share the chunk (chunk grid, packed
-/// prompts). 0 = off (the per-m heuristic).
-fn lt_canon_m() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| crate::opts::var(crate::opt!("exl3-lt-canon")).ok().and_then(|v| v.parse().ok()).unwrap_or(0))
-}
-static LT_CANON_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn exl3_lt_matmul(l: &Launcher, a: u64, b: u64, c: u64,
                   k: usize, n: usize, m: usize, ta: bool, ltws: u64, ltws_len: usize) -> Result<()> {
-    let pm = lt_canon_m();
-    if pm > 0 && m != pm && m >= 17 && LT_CANON_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-        && lt_pin_plan_ensure(k, n, m, pm, ta, ltws_len).is_ok() {
-        return exl3_lt_matmul_pinned(l, a, b, c, k, n, m, pm, ta, ltws, ltws_len);
+    let split: Option<Vec<usize>> = LT_SEGS.with(|v| {
+        let v = v.borrow();
+        (v.len() > 1 && v.iter().sum::<usize>() == m).then(|| v.clone())
+    });
+    if let Some(segs) = split {
+        let mut r0 = 0usize;
+        for mi in segs {
+            exl3_lt_matmul_one(l, a, b + (r0 * k * 2) as u64, c + (r0 * n * 2) as u64, k, n, mi, ta, ltws, ltws_len)?;
+            r0 += mi;
+        }
+        return Ok(());
     }
+    exl3_lt_matmul_one(l, a, b, c, k, n, m, ta, ltws, ltws_len)
+}
+
+fn exl3_lt_matmul_one(l: &Launcher, a: u64, b: u64, c: u64,
+                      k: usize, n: usize, m: usize, ta: bool, ltws: u64, ltws_len: usize) -> Result<()> {
     if LT_REC_ON.load(std::sync::atomic::Ordering::Relaxed) {
         let mut rec = LT_REC.lock().unwrap();
         if !rec.contains(&(k, n, m, ta, ltws_len)) { rec.push((k, n, m, ta, ltws_len)); }
@@ -15653,9 +15665,10 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
     /// A single segment is exactly the old prefill_chunk (all offsets 0).
     pub fn prefill_segs(&self, psc: &mut PrefillScratch, toks: &[i32], segs: &[PfSeg],
                         want_logits: bool, ld: Option<&LadderCtx>) -> Result<()> {
-        LT_CANON_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        if segs.len() < 2 { return self.prefill_segs_inner(psc, toks, segs, want_logits, ld); }
+        LT_SEGS.with(|v| *v.borrow_mut() = segs.iter().map(|sg| sg.n).collect());
         let r = self.prefill_segs_inner(psc, toks, segs, want_logits, ld);
-        LT_CANON_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        LT_SEGS.with(|v| v.borrow_mut().clear());
         r
     }
 
@@ -16249,14 +16262,6 @@ lists (the device-routed path serves 3-, 4- and 5-bit)", moe.bits);
         let po = *psc.normed.device_ptr() as u64 + (r0 * nh_a * hd * 2) as u64;
         let pq = *psc.qg.device_ptr() as u64 + (r0 * nh_a * hd * 2 * 2) as u64;
         let pc = *psc.cos.device_ptr() as u64 + (r0 * 2 * rdim * 4) as u64;
-        let hpk = if nkv > 0 { nh_a / nkv } else { 0 };
-        if causal && attn_tc() && hd == 256 && t >= 64 && hpk > 0 && hpk % 6 == 0 {
-            const TC_SMEM: u32 = 6 * 16 * 264 * 2 + 2 * 32 * 264 * 2;
-            xqlaunch_raw!(l, "xq_attn_prefill_tc256", ((((t as u32) + 15) / 16), (nkv * (hpk / 6)) as u32, 1), (192, 1, 1), TC_SMEM,
-                      (po, pq, kc_p, *a.qnkn.device_ptr() as u64, pc, (nkv as i32) | ((nh_a as i32) << 16),
-                       (hd as i32) | ((rdim as i32) << 16), self.mpf(), slot_pos0, t as i32, cfg.rms_eps))?;
-            return Ok(());
-        }
         let kname = if !v { "xq_attn_prefill_flash256" } else if causal { "xq_attn_prefill_flash256c" } else { "xq_attn_prefill_flash256v" };
         xqlaunch!(l, kname, (((t as u32) + 7) / 8, nh_a as u32, 1), (256, 1, 1), 0,
                   (po, pq, kc_p, &a.qnkn, pc, (nkv as i32) | ((nh_a as i32) << 16),
@@ -24042,16 +24047,20 @@ mod spill_region_tests {
 /// head-fill carries) and times both arms. GB10_PACKPF_K (3), GB10_PACKPF_LEN (1200), GB10_PACKPF_REPS (3).
 pub fn probe_pack_pf(a: &FwdArgs) -> Result<()> {
     let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let k = env("PACKPF_K", 3).clamp(1, PACK_PF_MAX);
+    // PACKPF_LENS=a,b,c sets every prompt's length (K = their count); else K prompts near PACKPF_LEN
+    let lens: Vec<usize> = std::env::var("PACKPF_LENS").ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+    let k = if lens.is_empty() { env("PACKPF_K", 3) } else { lens.len() }.clamp(1, PACK_PF_MAX);
     let len = env("PACKPF_LEN", 1200);
     let reps = env("PACKPF_REPS", 3).max(1);
     let model = FwdModel::load(&a.dir, k, a.max_pos)?;
-    let rows = env("PACKPF_ROWS", (k * len).min(4095));
+    let want: usize = if lens.is_empty() { k * len } else { lens.iter().sum() };
+    let rows = env("PACKPF_ROWS", want.min(4095));
     let mut psc = model.prefill_scratch(rows)?;
     let vocab = model.cfg.vocab_size as u64;
     let mut seed = 0x9E3779B97F4A7C15u64;
     let prompts: Vec<Vec<i32>> = (0..k).map(|j| {
-        let n = len - (j * 37) % 200;
+        let n = if lens.is_empty() { len - (j * 37) % 200 } else { lens[j] };
         (0..n).map(|_| {
             seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
             (1000 + seed % (vocab.min(150000) - 1000)) as i32
