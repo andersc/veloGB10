@@ -7168,7 +7168,11 @@ extern "C" {
     fn mx8_gemm(handle: *mut core::ffi::c_void, k: i32, n: i32, m: i32, m_canon: i32,
                 qw: u64, sw: u64, qx: u64, sx: u64, y: u64, ws: u64, wsz: usize,
                 stream: *mut core::ffi::c_void) -> i32;
+    fn mx8_prepare(handle: *mut core::ffi::c_void, k: i32, n: i32, mmax: i32, m_canon: i32, wsz: usize) -> i32;
+    fn mx8_max_m() -> i32;
 }
+/// EXP-MX8: MXFP8 calls that failed at run time and ran f16 instead (should stay 0; logged each time).
+pub static MX8_RUNTIME_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn dense_mx8_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| { let on = std::env::var("VELO_DENSE_MX8").map_or(false, |v| v == "1");
@@ -7184,7 +7188,9 @@ struct Mx8State {
     bytes: usize,
     xq: Option<CudaSlice<u8>>,
     xs: Option<CudaSlice<u8>>,
-    bad: std::collections::HashSet<(usize, usize)>,
+    // (k, n) -> MXFP8 usable. Decided ONCE, at the shape's first use, by validating every chunk size
+    // 1..=mx8_max_m() (mx8_prepare): a property of the shape, never of the traffic seen so far.
+    shape_ok: std::collections::HashMap<(usize, usize), bool>,
     last: Option<(u64, usize, usize)>,   // (x, m, k) currently held in xq/xs
 }
 /// EXP-MX8: the caller promises the next GEMM(s) read the same, unmodified x as the previous one.
@@ -7195,8 +7201,23 @@ static MX8: std::sync::Mutex<Option<Mx8State>> = std::sync::Mutex::new(None);
 fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usize, r: &ReconBufs) -> Result<bool> {
     if k % 32 != 0 || n % 16 != 0 || stream_capturing(l) { return Ok(false); }
     let mut g = MX8.lock().unwrap();
-    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, bad: Default::default(), last: None });
-    if st.bad.contains(&(k, n)) { return Ok(false); }
+    let st = g.get_or_insert_with(|| Mx8State { w: Default::default(), bytes: 0, xq: None, xs: None, shape_ok: Default::default(), last: None });
+    let pm = lt_canon_m();
+    let mc = if pm > 0 { pm as i32 } else { 4095 };
+    let ok = match st.shape_ok.get(&(k, n)) {
+        Some(&ok) => ok,
+        None => {
+            let t0 = std::time::Instant::now();
+            let mmax = unsafe { mx8_max_m() };
+            let bad = unsafe { mx8_prepare(lt_handle() as *mut core::ffi::c_void, k as i32, n as i32, mmax, mc, r.ltws_len) };
+            let ok = bad == 0;
+            crate::rprintln!("[exp-mx8] shape k={k} n={n}: chunk sizes 1..={mmax} validated in {:.0} ms, {} refused -> {}",
+                             t0.elapsed().as_secs_f64() * 1e3, bad, if ok { "MXFP8" } else { "f16 for this shape (fixed, all traffic)" });
+            st.shape_ok.insert((k, n), ok);
+            ok
+        }
+    };
+    if !ok { return Ok(false); }
     if !st.w.contains_key(&wf) {
         let mut q: CudaSlice<u8> = l.dev.alloc_zeros::<u8>(n * k)?;
         let mut sf: CudaSlice<u8> = l.dev.htod_sync_copy(&vec![127u8; mx8_sf_bytes(n, k)])?;
@@ -7225,16 +7246,24 @@ fn mx8_matmul(l: &Launcher, wf: u64, x: u64, y: u64, k: usize, n: usize, m: usiz
         st.last = Some((x, m, k));
     }
     let (wq, ws) = { let e = &st.w[&wf]; (*e.0.device_ptr() as u64, *e.1.device_ptr() as u64) };
-    let pm = lt_canon_m();
-    let rc = unsafe {
-        mx8_gemm(lt_handle() as *mut core::ffi::c_void, k as i32, n as i32, m as i32,
-                 if pm > 0 { pm as i32 } else { 4095 }, wq, ws, qx, sx, y, r.ltws, r.ltws_len,
-                 l.stream.stream as *mut core::ffi::c_void)
-    };
-    if rc < 0 {
-        st.bad.insert((k, n));
-        crate::rprintln!("[exp-mx8] MXFP8 GEMM unavailable (rc {rc}, k={k} n={n} m={m}): f16 for this shape");
-        return Ok(false);
+    // Rows in chunks of at most mx8_max_m() (a multiple of 128, so each chunk's scales start on a
+    // 128-row tile of the one quantisation above). Every chunk size was validated by mx8_prepare.
+    let cm = unsafe { mx8_max_m() } as usize;
+    let mut c0 = 0usize;
+    while c0 < m {
+        let mm = cm.min(m - c0);
+        let rc = unsafe {
+            mx8_gemm(lt_handle() as *mut core::ffi::c_void, k as i32, n as i32, mm as i32, mc,
+                     wq, ws, qx + (c0 * k) as u64, sx + mx8_sf_bytes(c0, k) as u64, y + (c0 * n * 2) as u64,
+                     r.ltws, r.ltws_len, l.stream.stream as *mut core::ffi::c_void)
+        };
+        if rc < 0 {
+            // No permanent switch: this call alone runs f16 (the f16 GEMM rewrites all m rows of y).
+            let nf = MX8_RUNTIME_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            crate::rprintln!("[exp-mx8] ERROR MXFP8 GEMM failed (rc {rc}, k={k} n={n} m={m} chunk {c0}+{mm}): f16 for THIS call only ({nf} so far)");
+            return Ok(false);
+        }
+        c0 += mm;
     }
     Ok(true)
 }

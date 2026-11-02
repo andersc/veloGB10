@@ -3,22 +3,25 @@
 //   Y[m][n] (f16) = sum_k X[m][k] * W[n][k],  X/W e4m3 K-contiguous, scales in cuBLAS's 128x4 swizzle.
 // Batch invariance: the algorithm is chosen ONCE per (k, n) at a canonical m (the --exl3-lt-canon pin, or
 // 4095) and reused for every m (cublasLtMatmulAlgoCheck); each output row then depends only on its own
-// input row, whatever m is. If the canonical algorithm does not apply at some m, that m falls back to
-// its own heuristic and the shim reports it once (returns 2 instead of 0).
+// input row, whatever m is. If the canonical algorithm does not apply at some m, that m is refused
+// (negative return); mx8_prepare() finds such m before any traffic.
 #include <cublasLt.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int k, n; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la; cublasLtMatmulAlgo_t algo; int ok; } Mx8Kn;
-typedef struct { int k, n, m; cublasLtMatrixLayout_t lb, lc; cublasLtMatmulAlgo_t algo; int fallback; } Mx8Knm;
+// Per-m entries are kept in a per-(k, n) array indexed by m (no global table: the old fixed 4096-entry
+// table filled up after ~512 distinct pass sizes and then every new m failed, which made the caller
+// switch MXFP8 off for good mid-run). The caller splits passes into chunks of at most MX8_MAX_M rows,
+// so the array is bounded; mx8_prepare() validates every m up front.
+typedef struct { int k, n, m; cublasLtMatrixLayout_t lb, lc; cublasLtMatmulAlgo_t algo; int bad; } Mx8Knm;
+typedef struct { int k, n; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la; cublasLtMatmulAlgo_t algo; int ok;
+                 Mx8Knm** bym; int cap; } Mx8Kn;
 #define MX8_KN 128
-#define MX8_KNM 4096
+#define MX8_MAX_M 4096
 static Mx8Kn g_kn[MX8_KN]; static int g_nkn = 0;
-static Mx8Knm g_knm[MX8_KNM]; static int g_nknm = 0;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static int g_warned = 0;
 
 static Mx8Kn* kn_get(cublasLtHandle_t h, int k, int n, int mc, size_t wsz) {
     for (int i = 0; i < g_nkn; ++i) if (g_kn[i].k == k && g_kn[i].n == n) return &g_kn[i];
@@ -70,30 +73,43 @@ static Mx8Kn* kn_get(cublasLtHandle_t h, int k, int n, int mc, size_t wsz) {
 }
 
 static Mx8Knm* knm_get(cublasLtHandle_t h, Mx8Kn* p, int m, size_t wsz) {
-    for (int i = 0; i < g_nknm; ++i) if (g_knm[i].k == p->k && g_knm[i].n == p->n && g_knm[i].m == m) return &g_knm[i];
-    if (g_nknm >= MX8_KNM) return NULL;
-    Mx8Knm* q = &g_knm[g_nknm]; memset(q, 0, sizeof(*q)); q->k = p->k; q->n = p->n; q->m = m;
-    if (cublasLtMatrixLayoutCreate(&q->lb, CUDA_R_8F_E4M3, p->k, m, p->k)) return NULL;
-    if (cublasLtMatrixLayoutCreate(&q->lc, CUDA_R_16F, p->n, m, p->n)) return NULL;
+    if (m < 1 || m > MX8_MAX_M) return NULL;
+    if (!p->bym) { p->bym = (Mx8Knm**)calloc(MX8_MAX_M + 1, sizeof(Mx8Knm*)); if (!p->bym) return NULL; p->cap = MX8_MAX_M + 1; }
+    Mx8Knm* q = p->bym[m];
+    if (q) return q->bad ? NULL : q;
+    q = (Mx8Knm*)calloc(1, sizeof(Mx8Knm)); if (!q) return NULL;
+    q->k = p->k; q->n = p->n; q->m = m; p->bym[m] = q;
+    if (cublasLtMatrixLayoutCreate(&q->lb, CUDA_R_8F_E4M3, p->k, m, p->k) ||
+        cublasLtMatrixLayoutCreate(&q->lc, CUDA_R_16F, p->n, m, p->n)) {
+        q->bad = 1; fprintf(stderr, "[exp-mx8] ERROR layout create failed k=%d n=%d m=%d\n", p->k, p->n, m); return NULL;
+    }
+    // strict: only the canonical algorithm (row invariance in m). No own-heuristic fallback any more.
     cublasLtMatmulHeuristicResult_t chk;
     if (cublasLtMatmulAlgoCheck(h, p->op, p->la, q->lb, q->lc, q->lc, &p->algo, &chk) == CUBLAS_STATUS_SUCCESS
         && chk.workspaceSize <= wsz) {
         q->algo = p->algo;
-    } else {
-        cublasLtMatmulPreference_t pref; cublasLtMatmulPreferenceCreate(&pref);
-        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
-        cublasLtMatmulHeuristicResult_t res; int nr = 0;
-        cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(h, p->op, p->la, q->lb, q->lc, q->lc, pref, 1, &res, &nr);
-        cublasLtMatmulPreferenceDestroy(pref);
-        if (st || nr == 0) return NULL;
-        q->algo = res.algo; q->fallback = 1;
-        if (!g_warned) { g_warned = 1; fprintf(stderr, "[exp-mx8] canonical algorithm not valid at k=%d n=%d m=%d: own heuristic (batch invariance lost there)\n", p->k, p->n, m); }
+        return q;
     }
-    g_nknm++;
-    return q;
+    q->bad = 1;
+    fprintf(stderr, "[exp-mx8] ERROR canonical algorithm not valid at k=%d n=%d m=%d\n", p->k, p->n, m);
+    return NULL;
 }
 
-// 0 = ok, 2 = ok on a fallback algorithm, negative = not run (caller falls back to f16)
+// Validate (and cache) every m in [1, mmax] for (k, n) once, before traffic: returns the number of m that
+// cannot run the canonical algorithm (0 = MXFP8 is safe for this shape at every chunk size).
+int mx8_prepare(void* handle, int k, int n, int mmax, int m_canon, size_t wsz) {
+    cublasLtHandle_t h = (cublasLtHandle_t)handle;
+    if (mmax > MX8_MAX_M) mmax = MX8_MAX_M;
+    pthread_mutex_lock(&g_mu);
+    Mx8Kn* p = kn_get(h, k, n, m_canon > 0 ? m_canon : 4095, wsz);
+    int bad = 0;
+    if (!p) bad = mmax; else for (int m = 1; m <= mmax; ++m) if (!knm_get(h, p, m, wsz)) ++bad;
+    pthread_mutex_unlock(&g_mu);
+    return bad;
+}
+int mx8_max_m(void) { return MX8_MAX_M; }
+
+// 0 = ok, negative = not run (caller falls back to f16 for this call only and logs it)
 int mx8_gemm(void* handle, int k, int n, int m, int m_canon,
              const void* qw, const void* sw, const void* qx, const void* sx, void* y,
              void* ws, size_t wsz, void* stream) {
@@ -107,8 +123,7 @@ int mx8_gemm(void* handle, int k, int n, int m, int m_canon,
     float one = 1.f, zero = 0.f;
     cublasStatus_t st = cublasLtMatmul(h, p->op, &one, qw, p->la, qx, q->lb, &zero, y, q->lc, y, q->lc,
                                        &q->algo, ws, wsz, (cudaStream_t)stream);
-    int fb = q->fallback;
     pthread_mutex_unlock(&g_mu);
-    if (st) { fprintf(stderr, "[exp-mx8] cublasLtMatmul status %d (k=%d n=%d m=%d)\n", (int)st, k, n, m); return -2; }
-    return fb ? 2 : 0;
+    if (st) { fprintf(stderr, "[exp-mx8] ERROR cublasLtMatmul status %d (k=%d n=%d m=%d)\n", (int)st, k, n, m); return -2; }
+    return 0;
 }
