@@ -1,3 +1,50 @@
+## Unreleased — andersc/veloGB10 fork, on top of v0.7.8
+
+Additions for the EXL3 server on one GB10 (TP=1). Every one is opt-in or leaves output
+byte-identical to v0.7.8.
+
+- **Per-token log probabilities.** Chat completions accept `logprobs` + `top_logprobs` (0–20) and
+  return `choices[].logprobs.content`; legacy completions accept `logprobs` (0–20). Values are taken
+  after the penalties and before temperature / top-k / top-p / min-p. A request that asks for them
+  decodes without speculation; requests that don't are unchanged. Refused with HTTP 400: `stream=true`,
+  `top_logprobs` without `logprobs`, values above 20, TP, the NVFP4 scheduler, and
+  `--scrub-tool-secrets`.
+- **JSON-schema constrained decoding** (`--json-schema-enforce on`, default off). `response_format`
+  (`json_schema` / `json_object`) is enforced with a per-token mask, so the answer always parses and
+  matches the schema (subset: type, properties, required, additionalProperties, items,
+  min/maxItems, min/maxLength, minimum/maximum, enum). Replies carry `x-json-schema-enforced: full`;
+  an unsupported schema is served unconstrained with `none`. Schema requests decode without
+  speculation. TP refuses them.
+- **Faster prompt reading, byte-identical output:**
+  - the prefill MoE kernel fetches each trellis word pair with 2 shuffles and loads the A fragment
+    with one `ldmatrix` (ncu: kernel 6.43 → 5.49 ms on a 2,048-row chunk);
+  - the prefill row build prefetches the chunk's n-gram table rows (`posix_fadvise(WILLNEED)`) before
+    reading them, so SSD reads are queued together (no effect when the table is in RAM).
+- **Packed prefill** (`--prefill-pack on`, default off; tuning: `--prefill-pack-rows`,
+  `--prefill-pack-min`, `--prefill-pack-wait`, `--prefill-pack-wait-ms`). Several waiting fresh text
+  prompts of 64 to ~2,051 tokens are read in one prefill pass, so the expert weights are streamed once
+  for all of them. Attention, the GDN state and the conv history run per prompt; the dense matrix
+  multiplies run per prompt at that prompt's own row count, so each prompt gets the cuBLASLt
+  algorithm it gets alone. Output is byte-identical to per-prompt prefill and to v0.7.8.
+
+Receipts (one GB10, Qwen3.8-Flash-Next EXL3 3.05 bpw, `--max-batch 16`, ~1,240-token prompts, n-gram
+rows evicted from the page cache before each phase):
+
+| Prompt tok/s | v0.7.8 | fork, packing off | `--prefill-pack on` | packing tuned |
+|---|---:|---:|---:|---:|
+| 16 in flight | 979 | 1,525 | 1,782 | 1,895 |
+| 8 in flight | 970 | 1,565 | 1,771 | 1,836 |
+| one request | 1,449 | 1,517 | 1,519 | 1,522 |
+| one 12K-token prompt | 1,598 | 1,722 | 1,716 | 1,720 |
+| output tok/s, 8 streams | 131 | 130 | 132 | 131 |
+
+"Packing tuned" = `--prefill-pack-rows 12285 --prefill-pack-min 6 --prefill-pack-wait on
+--prefill-pack-wait-ms 5000`. All plain outputs byte-identical to the v0.7.8 release binary. With
+strict JSON and top-20 logprobs on every request: 1,464 → 1,754 tok/s at 16 in flight, answers and
+logprobs byte-identical to the fork without packing. Packed vs per-prompt prefill compared every
+internal state and logit at 4 (64–200 tokens), 5, 6 (mixed 64–2,000 tokens) and 9 prompts per pass: 0 differing
+bytes. Not exercised under TP=2/TP=4.
+
 ## v0.7.8 — fix: `top_k` client compatibility (PR #29 by @andersc) + the NVFP4 sampler cap made explicit
 
 Fixes the client-compatibility blocker reported in [#29](https://github.com/sf-stav/veloGB10/pull/29):

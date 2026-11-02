@@ -165,6 +165,23 @@ the directory holding `gb10_inference` and `src/ptx/`.
   --max-batch 1
 ```
 
+**Many requests at once (this fork).** For batch work such as many short, independent prompts, serve
+more lanes and read waiting prompts together. Answers stay byte-identical:
+
+```bash
+./gb10_inference --server \
+  --model-dir ~/veloGB10/Qwen3.8-Flash-Next-EXL3-3.05bpw \
+  --port 9000 \
+  --max-seq-len 65536 \
+  --max-batch 16 \
+  --prefill-pack on --prefill-pack-rows 12285 --prefill-pack-min 6 \
+  --prefill-pack-wait on --prefill-pack-wait-ms 5000
+```
+
+Add `--json-schema-enforce on` if clients send `response_format`. Measured: 979 → 1,895 prompt tok/s
+at 16 requests in flight with ~1,240-token prompts (v0.7.8 → this fork); see the
+[README](README.md#this-fork-anderscvelogb10) for the full table.
+
 ### What you should see
 
 On a TP run the head plans and ships each rank's shard — only the missing bytes move, so the second

@@ -46,6 +46,52 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
+## This fork (andersc/veloGB10)
+
+This is a fork of [sf-stav/veloGB10](https://github.com/sf-stav/veloGB10), based on **v0.7.8**. It adds
+the features below for the **EXL3 server on one GB10 (TP=1)**. Each is either opt-in or leaves
+output byte-identical to v0.7.8. The release binaries linked above are upstream's; this fork
+publishes no binaries.
+
+| Addition | How to use it | Output vs v0.7.8 |
+|---|---|---|
+| Per-token log probabilities | `logprobs` / `top_logprobs` (0–20) in the request | Unchanged; a request that asks for them decodes without speculation |
+| JSON-schema constrained decoding | `--json-schema-enforce on` + `response_format` | Unchanged when off; when on, the answer is guaranteed to parse and match the schema |
+| Faster prompt reading: MoE prefill kernel fix + n-gram row prefetch | always on | Byte-identical |
+| Packed prefill: several waiting prompts read in one GPU pass | `--prefill-pack on` (+ the tuning flags in [Server flags](#server-flags---server)) | Byte-identical |
+
+**Measured on one GB10** (Qwen3.8-Flash-Next EXL3 3.05 bpw, `--max-batch 16`, ~1,240-token prompts,
+n-gram table rows not in the page cache, outputs compared byte for byte against the v0.7.8 release
+binary):
+
+| Prompt tok/s | v0.7.8 | This fork, packing off | `--prefill-pack on` | Packing tuned¹ |
+|---|---:|---:|---:|---:|
+| 16 requests in flight | 979 | 1,525 | 1,782 | **1,895** |
+| 8 requests in flight | 970 | 1,565 | 1,771 | 1,836 |
+| One request | 1,449 | 1,517 | 1,519 | 1,522 |
+| One 12K-token prompt | 1,598 | 1,722 | 1,716 | 1,720 |
+| Output tok/s, 8 streams | 131 | 130 | 132 | 131 |
+
+¹ `--prefill-pack on --prefill-pack-rows 12285 --prefill-pack-min 6 --prefill-pack-wait on
+--prefill-pack-wait-ms 5000`. Median latency at 16 in flight: 18.6 s (v0.7.8) → 9.4 s.
+
+With strict JSON (`--json-schema-enforce on`) and top-20 logprobs on every request, packing (tuned)
+raises prompt reading at 16 in flight from 1,464 to 1,754 tok/s, with byte-identical answers and
+logprobs.
+
+What packing does and does not do:
+
+- Only fresh text prompts of 64 up to ~2,051 tokens (the dense-attention window) are packed. Longer
+  prompts, images and prefix-cache resumes are read one at a time as before.
+- The expert weights are streamed once per pass for all its prompts. The dense matrix multiplies run
+  per prompt at that prompt's own row count, so each prompt gets the cuBLASLt algorithm it gets alone:
+  that is what keeps the output byte-identical however requests are grouped.
+- It speeds up prompt reading only; token generation is unchanged.
+- `--prefill-pack-rows` above the chunk size allocates a larger prefill scratch.
+- With `--prefill-pack-wait on`, a request can be held up to `--prefill-pack-wait-ms` while a fuller
+  pass collects. A lone request is not delayed (measured ~0.9 s at one request in flight).
+- Measured at TP=1 only; not exercised under TP=2/TP=4.
+
 ## Update — Qwen3.8-Flash-Next support (veloGB10 v0.7.1)
 
 **New in v0.7.5 — the Naive-N0.5-Flash family is served too:** TP=2/TP=4 on GB10s with
@@ -765,7 +811,9 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   byte-for-byte), seedable sampling, continuous batching, prefix caching, and OpenAI
   `reasoning_effort` levels (`none/low/medium/high/xhigh/max`). `response_format` requests are
   **served** (never rejected); a reply that could not enforce the schema advertises it honestly via
-  the `x-json-schema-enforced: none` response header.
+  the `x-json-schema-enforced: none` response header. On the EXL3 server at TP=1,
+  `--json-schema-enforce on` makes it enforced (`x-json-schema-enforced: full`), and
+  `logprobs` / `top_logprobs` return per-token log probabilities (this fork; see above).
   Also exposes vLLM-compatible `POST /v1/tokenize` and `POST /v1/detokenize` endpoints for
   benchmarking.
 - **Built-in OpenTelemetry** — `--otel-endpoint <URL>` streams OTLP/HTTP-JSON generation telemetry
@@ -911,6 +959,7 @@ large-model + long-context + multi-lane combinations fit.
 |---|---:|---|
 | Qwen3.5 122B | **702** | grouped-MoE GEMM with N=16 weight reuse |
 | Qwen3.6 27B | ~721 | 2.7 s TTFT on a 2048-token prompt |
+| Qwen3.8-Flash-Next EXL3 3.05 bpw (this fork) | **1,895** | 16 requests in flight, ~1,240-token prompts, `--prefill-pack` tuned; v0.7.8: 979 |
 
 ### Quality ([tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench/), agentic scenario suite)
 
@@ -976,6 +1025,12 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--max-tokens <N>` | EXL3: unlimited; NVFP4: 8192 | Output length for a **chat** request that omits `max_tokens`. A default, not a cap: a request may ask for more, up to the room left in the context. `/v1/completions` requests that omit it get 16 and ignore this flag |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family); since v0.7.4 the EXL3 server clamps too and prints the limit (before, a larger value booted and could corrupt device memory). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
 | `--prefill-interleave <N>` | 0 | EXL3, one machine: after each prefill chunk (except the last) of a prompt that joins while other requests are generating, run up to N decode steps for those requests. Measured with a 20K-token joining prompt: longest stall 14.1 s → 5.4 s at the default `--prefill-chunk 4095`, 15.1 s → 2.7 s at 2048, 16.6–17.0 s → 1.35–1.47 s at 1024, for +3 % to +9 % time to first token of the joining request. The joining request's output is unchanged. Ignored under TP (a boot line says so) |
+| `--json-schema-enforce <on\|off>` | off | EXL3, TP=1 (this fork): enforce `response_format` (`json_schema` / `json_object`) with a per-token mask, so the answer always parses and matches the schema (supported: type, properties, required, additionalProperties, items, min/maxItems, min/maxLength, minimum/maximum, enum). Replies carry `x-json-schema-enforced: full`; an unsupported schema is served unconstrained with `none`. Schema requests decode without speculation; when the prompt opens a think block, the constraint starts after it |
+| `--prefill-pack <on\|off>` | off | EXL3, TP=1 (this fork): read several waiting fresh prompts (64 to ~2,051 tokens, text only) in one prefill pass, so the expert weights are streamed once for all of them. Output byte-identical to per-prompt prefill. Measured +17–24% prompt tok/s at 8–16 in flight |
+| `--prefill-pack-rows <N>` | 0 | Rows one packed pass may carry (0 = the prefill chunk size). Larger allocates a larger prefill scratch; 12285 measured best |
+| `--prefill-pack-min <K>` | 2 | With K or more requests waiting and fewer than K free lanes while lanes decode, wait for a round so the next pass carries K prompts |
+| `--prefill-pack-wait <on\|off>` | off | Throughput mode: while lanes decode, also hold a queue shorter than `--prefill-pack-min` so passes fill up |
+| `--prefill-pack-wait-ms <MS>` | 1000 | The longest a request is held for a fuller pass |
 | `--vision-cpu` | off | NVFP4 server: force the CPU vision tower (reference path) instead of the GPU tower; a diagnostic escape. The EXL3 server always builds the GPU tower and says so if this is given; since v0.7.4 a GPU-tower error there falls back to the CPU tower for that one request by itself |
 | `--vision-cpu-threads <N>` | 1 | Threads of the CPU tower (1 to 64; used when the GPU tower failed, or with `--vision-cpu`). The embeddings are bit-identical for every N; 448 x 448 on one machine: 172.9 s at 1, 44.8 s at 4, 31.0 s at 8 |
 | `--reasoning-effort <e>` | template default | Reasoning level in the chat template (`no_think`/`low`/`medium`/`high`/`xhigh`); per-request `reasoning_effort` overrides |
