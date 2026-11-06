@@ -50,8 +50,9 @@ compiling anything.
 
 This is a fork of [sf-stav/veloGB10](https://github.com/sf-stav/veloGB10), based on **v0.7.8**. It adds
 the features below for the **EXL3 server on one GB10 (TP=1)**. Each is either opt-in or leaves
-output byte-identical to v0.7.8. The release binaries linked above are upstream's; this fork
-publishes no binaries.
+output byte-identical to v0.7.8. The release binaries linked above are upstream's; this fork's
+releases (tag plus a prebuilt GB10 binary, from `v0.7.8-fork.2`) are on its
+[Releases page](https://github.com/andersc/veloGB10/releases).
 
 | Addition | How to use it | Output vs v0.7.8 |
 |---|---|---|

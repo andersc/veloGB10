@@ -1,4 +1,4 @@
-## Unreleased — andersc/veloGB10 fork, on top of v0.7.8
+## v0.7.8-fork.2 — 2026-11-05 — andersc/veloGB10 fork, on top of v0.7.8
 
 Additions for the EXL3 server on one GB10 (TP=1). Every one is opt-in or leaves output
 byte-identical to v0.7.8.
