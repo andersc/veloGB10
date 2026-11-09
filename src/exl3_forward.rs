@@ -2668,6 +2668,11 @@ pub struct Scratch {
     vmask: CudaSlice<u32>,
     vmask_flags: CudaSlice<i32>,
     vmask_live: bool,
+    // SCHEMA-SPEC: a schema lane's FSM for the NEXT speculative verify (`set_vspec`): the
+    // lane's JSON-schema machine, its state after the round's input token b, and whether the
+    // constraint is armed. ONE-SHOT: `mtp_verify` takes it, builds one allowed-token mask per
+    // verify row by walking the drafts through the machine, and stages them with set_vmask.
+    vspec: Option<(Arc<crate::json_schema::SchemaMask>, u32, bool)>,
     pen_hist: CudaSlice<i32>,
     pen_draft_i: Option<usize>,
     // API-parity DDS: per-draft-pass confidence (the draft head's max logit) [MTP_MAX_K + 1]
@@ -3033,6 +3038,7 @@ impl Scratch {
             vmask: dev.htod_sync_copy(&vec![0u32; w.max(1) * vmask_words(cfg.vocab_size)])?,
             vmask_flags: dev.htod_sync_copy(&vec![0i32; w.max(1)])?,
             vmask_live: false,
+            vspec: None,
             pen_hist: dev.htod_sync_copy(&vec![0i32; w.max(1) * PEN_RING])?,
             pen_draft_i: None,
             dconf: dev.htod_sync_copy(&[0f32; MTP_MAX_K + 1])?,
@@ -13444,6 +13450,14 @@ impl FwdModel {
         Ok(())
     }
 
+    /// SCHEMA-SPEC: stage a schema lane's FSM for the next `mtp_verify` (None = clear). The
+    /// verify masks each of its rows with the allowed set of the state that row continues, so an
+    /// accepted draft is always a token the machine accepts and every emitted token is the masked
+    /// argmax a plain step would have chosen.
+    pub fn set_vspec(&self, sc: &mut Scratch, spec: Option<(Arc<crate::json_schema::SchemaMask>, u32, bool)>) {
+        sc.vspec = spec;
+    }
+
     /// WP15: seed `slot`'s penalty ring with the committed prompt positions 0..toks.len() (the
     /// chunk-prefilled prompt[..plen-1]; the seam step commits the last prompt token itself).
     /// Only the tail the largest window can reach is written.
@@ -18585,6 +18599,39 @@ fn sk(sc: &Scratch) -> usize {
 fn vmask_key(sc: &Scratch) -> usize {
     (sc.vmask_live as usize) << 47
 }
+/// SCHEMA-SPEC: the verify's per-row masks for a schema lane. Row 0 continues b (the machine
+/// is at `state` / `armed` after b); row i+1 continues draft d_i. A row gets the allowed set of
+/// the state it continues while the constraint is armed; unarmed rows (inside the think block)
+/// stay unmasked, exactly as the plain step leaves them. The walk stops at the first draft the
+/// machine refuses, completes on, or dead-ends after: the masked argmax of that row cannot equal
+/// such a draft (or the turn ends on it), so no later row is ever emitted and stays unmasked.
+pub fn schema_verify_masks(sm: &crate::json_schema::SchemaMask, mut state: u32, mut armed: bool,
+                           drafts: &[i32], m: usize) -> Vec<Option<Arc<Vec<u32>>>> {
+    let mut rows: Vec<Option<Arc<Vec<u32>>>> = vec![None; m];
+    if m == 0 { return rows; }
+    if armed { rows[0] = Some(sm.allowed(state)); }
+    for (i, &d) in drafts.iter().enumerate().take(m.saturating_sub(1)) {
+        let tok = d.max(0) as u32;
+        if !armed {
+            if sm.defer_until() == Some(tok) { armed = true; }
+        } else {
+            match sm.step(state, tok) {
+                None => break,
+                Some(ns) => {
+                    if sm.is_complete(ns) { break; }
+                    state = ns;
+                }
+            }
+        }
+        if armed {
+            let a = sm.allowed(state);
+            if a.iter().all(|&w| w == 0) { break; }
+            rows[i + 1] = Some(a);
+        }
+    }
+    rows
+}
+
 /// W2-EXL3: u32 words of one row's allowed-token bitset (= json_schema::vocab_words).
 pub fn vmask_words(vocab: usize) -> usize {
     vocab.div_ceil(32)
@@ -19674,7 +19721,7 @@ impl FwdModel {
         // MTP_DIAG: final-mixer pre-RMS input (col 0) — the head out_proj plane.
         if let Some(d) = bmtd.as_ref() { dump_f(&d, &sc.resid, "finalmix", 0)?; }
         let v = cfg.vocab_size;
-        if self.vp_greedy(sc, m) {
+        if self.vp_greedy(sc, m) && !sc.vmask_live {
             // TP-H #4: vocab-parallel greedy tail (shard GEMM + argmax keys + one key exchange) —
             // sc.argmax[0..m] = the replicated argmax bit for bit; no sampler (samp_live is false,
             // so xq_sample_rows would return at once on every row).
@@ -19690,6 +19737,9 @@ impl FwdModel {
         // WP15: row i is penalized over the committed history + b, d_0..d_{i-1} (exactly the
         // plain decode's past at that position), before the argmax and the sampler.
         self.pen_rows(l, sc, m)?;
+        // SCHEMA-SPEC: row i keeps only the tokens the schema allows after b, d_0..d_{i-1}
+        // (the plain masked step's row at that position); no launch unless a mask is staged.
+        self.vmask_rows(l, sc, m)?;
         // WP09: one m x nb-block launch replaces the m single-block launches (bitwise ids).
         self.argmax_rows(l, sc, m, v)?;
         if sc.rq_live {
@@ -23460,6 +23510,15 @@ step (no draft fits before the sparse switch)"));
         // as ONE CUDA graph per (m, regime, slot) — first round eager, then captured
         // (the forward_step pattern). Kills the eager path's launch gaps (~6 ms/round
         // at m=6, S-A3-m budget).
+        // SCHEMA-SPEC: a schema lane's per-row masks (row i continues toks_v[..=i]).
+        match sc.vspec.take() {
+            Some((sm, st, armed)) => {
+                let rows = schema_verify_masks(&sm, st, armed, &drafts, m);
+                let refs: Vec<Option<&[u32]>> = rows.iter().map(|r| r.as_deref().map(|v| &v[..])).collect();
+                self.set_vmask(sc, &refs)?;
+            }
+            None => sc.vmask_live = false,
+        }
         let tp3 = std::time::Instant::now();
         let qsa = self.qsa_live(p + k);
         let (qg, qb) = self.qsa_grid_bucket_key(p + k);
@@ -23467,7 +23526,8 @@ step (no draft fits before the sparse switch)"));
         let vkey = vkey_of(slot, m, qsa, qb) | sk(sc) // TP-C: + the scratch id
             | ((sc.pen_live as usize) << 40) // WP15: penalized verify = its own graph
             | rq_verify_key(sc) // WP24: the real-q verify sampler = its own graph
-            | self.vp_key(sc, m); // TP-H #4: the vocab-parallel greedy tail = its own graph
+            | self.vp_key(sc, m) // TP-H #4: the vocab-parallel greedy tail = its own graph
+            | vmask_key(sc); // SCHEMA-SPEC: a masked verify = its own graph (bit 47)
         let want_graph = crate::opts::var(crate::opt!("exl3-no-graph")).is_err()
             && crate::opts::var(crate::opt!("mtp-dump")).map_or(true, |s| s.is_empty())
             && gdn_ring_mode() != 2
@@ -23502,6 +23562,8 @@ step (no draft fits before the sparse switch)"));
             if rp_live { self.dev.synchronize()?; } // REPRIME: capture with the re-prime drained
             self.capture_verify_graph(&l, sc, slot, m, k, qsa, vkey);
         }
+        // SCHEMA-SPEC: one-shot, cleared only AFTER the capture (the bit-47 graph holds its mask node).
+        sc.vmask_live = false;
         let a = out[k + 2] as usize;
         anyhow::ensure!(a <= k, "mtp_round: accept out of range");
         let emitted: Vec<i32> = out[..=a].to_vec();

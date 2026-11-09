@@ -370,9 +370,10 @@ struct Lane {
     logprobs: Option<u8>,
     // W2-EXL3: the request's compiled JSON-schema FSM (None = unconstrained), its current
     // state, and whether the constraint is live yet (false while the lane is still inside the
-    // think block its prompt opened: the mask arms on the think-close token). A schema lane
-    // never speculates (mtp = None for its whole life), so every token it emits comes from a
-    // masked plain step.
+    // think block its prompt opened: the mask arms on the think-close token). SCHEMA-SPEC: a
+    // greedy schema lane may speculate; its plain/control steps stage the row mask and its
+    // verify rows are masked per draft position (mtp_verify), and round_emit feeds every
+    // emitted token through the machine, so a round ends at the document's end.
     schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
     schema_state: u32,
     schema_armed: bool,
@@ -438,6 +439,13 @@ enum SchemaStep {
 /// token the state refuses): an error, so the client never reads the partial document as a
 /// completed one.
 const SCHEMA_DEAD_END: &str = "error: json-schema constrained decoding reached a state with no valid continuation";
+
+/// SCHEMA-SPEC: greedy schema lanes speculate with masked verify rows (default on;
+/// VELO_SCHEMA_MTP=0 = every schema lane decodes plain, the pre-SCHEMA-SPEC behaviour).
+fn schema_mtp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELO_SCHEMA_MTP").map_or(true, |v| v != "0"))
+}
 
 /// W2-EXL3: advance a schema lane's FSM by one emitted token (pure; unit-tested).
 fn schema_feed(sm: &crate::json_schema::SchemaMask, state: &mut u32, armed: &mut bool, tok: u32) -> SchemaStep {
@@ -2791,7 +2799,9 @@ impl Exl3Scheduler {
                 // (PACK5) a topology whose packed sampled tail is not gated (TP=2)
                 sampled_lone: crate::wp24::dump_on() || !self.pack_sampled,
                 penalized: l.pen.is_some(),
-                image: l.img,
+                // SCHEMA-SPEC: a schema lane's verify is masked per row on the lone path only;
+                // it never packs (reported under the image skip reason)
+                image: l.img || l.schema.is_some(),
                 depth: 0, // set by lane_view from kd_reg (capped at PACK_DEPTH_MAX: PACK4-REVIEW A4)
             };
             // The verify's regime is its LAST row's (p + w for the w <= kd drafts the DDS keeps).
@@ -3289,6 +3299,16 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
         self.model.set_spec_sampling(&mut self.sc, if plain_step { &rows[..1] } else { &rows }, rq)?;
         // WP15: the same penalty params on every row of the round (and the draft mirror's row 0).
         self.model.set_penalties(&mut self.sc, &vec![pen; if plain_step { 1 } else { k + 1 }])?;
+        // SCHEMA-SPEC: a schema lane's FSM for this round's verify (one-shot; mtp_verify takes it).
+        let (schema_spec, schema_row) = {
+            let lane = self.lanes[s].as_ref().unwrap();
+            match lane.schema.as_ref() {
+                Some(sm) => (Some((sm.clone(), lane.schema_state, lane.schema_armed)),
+                             if lane.schema_armed { Some(sm.allowed(lane.schema_state)) } else { None }),
+                None => (None, None),
+            }
+        };
+        self.model.set_vspec(&mut self.sc, if plain_step { None } else { schema_spec });
         let t0 = std::time::Instant::now();
         let g0 = self.model.graph_count(); // WP23: a round that captures a graph is not cost-fit
         let mut df2_served = false;
@@ -3328,6 +3348,8 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             } else {
                 t0
             };
+            // SCHEMA-SPEC: the plain/control step of a schema lane is the masked plain step.
+            self.model.set_vmask(&mut self.sc, &[schema_row.as_deref().map(|v| &v[..])])?;
             let ids = self.model.forward_step(&mut self.sc, &[b], &[p], &[s], None)?;
             let ms = tc.elapsed().as_secs_f64() * 1e3;
             if ctrl_new {
@@ -3733,11 +3755,29 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
                     || (self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new);
                 let rsn = if lane.generated >= lane.max_new { "length" }
                     else if fin { "stop" } else { "" };
-                // WP08: a loop ends the round mid-list like a stop token (rest dropped).
-                if !fin && lane.loop_feed(t) {
+                if fin {
+                    (fin, rsn.to_string(), lane.generated)
+                } else if let Some(sm) = lane.schema.clone().filter(|_| lane.schema_armed) {
+                    // SCHEMA-SPEC: step_plain's rule — the document's end ends the turn mid-round
+                    // (the rest of the list is dropped); no loop detector on an armed lane.
+                    match schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t) {
+                        SchemaStep::Continue => (false, String::new(), lane.generated),
+                        SchemaStep::Complete => (true, "stop".to_string(), lane.generated),
+                        SchemaStep::Invalid => {
+                            crate::reprintln!("[schema] slot {s}: token {t} leaves no valid continuation \
+                                               — ending the turn with an error");
+                            (true, SCHEMA_DEAD_END.to_string(), lane.generated)
+                        }
+                    }
+                } else if lane.loop_feed(t) {
+                    // WP08: a loop ends the round mid-list like a stop token (rest dropped).
                     (true, "loop_detected".to_string(), lane.generated)
                 } else {
-                    (fin, rsn.to_string(), lane.generated)
+                    if let Some(sm) = lane.schema.clone() {
+                        // not armed yet (reasoning): this token may be the one that arms it
+                        schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t);
+                    }
+                    (false, String::new(), lane.generated)
                 }
             };
             if let Some(lane) = self.lanes[s].as_mut() {
@@ -4901,10 +4941,16 @@ the [gen] line says stop_p=na", stats));
         // seam decode step's sc.resid — exact, same composition as the bench-mtp
         // prime and every round's re-prime), then feed the head the last prompt
         // token with that tap (round 1's draft-extend reuses tap_row 0).
-        // A lane that reports log probabilities, or a schema lane (its verify rows are not masked),
-        // never speculates: every token comes from a plain step's logits row.
+        // A lane that reports log probabilities never speculates: every token comes from a plain
+        // step's logits row. SCHEMA-SPEC: a GREEDY schema lane speculates (TP=1; schema lanes are
+        // refused under TP): each verify row is masked with the allowed set of the state it
+        // continues (mtp_verify / schema_verify_masks), so the emitted tokens are the masked
+        // plain decode's. A sampled schema lane stays plain (the draft's q' is unmasked), and
+        // VELO_SCHEMA_MTP=0 keeps every schema lane plain.
+        let schema_spec_ok = req.schema.is_none() || (schema_mtp_on() && self.tp.is_none()
+            && crate::exl3_forward::SampParams::sampled(req.temperature, req.top_p, req.top_k, req.min_p, req.seed.unwrap_or(0), 0).is_none());
         let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt()
-            && req.logprobs.is_none() && req.schema.is_none() {
+            && req.logprobs.is_none() && schema_spec_ok {
             match self.mtp_prime(free, *req.prompt.last().unwrap(), plen) {
                 Ok(()) => {
                     if crate::exl3_forward::a_xcheck_on() {
