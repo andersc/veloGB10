@@ -1,3 +1,28 @@
+## v0.7.8-fork.3 — 2026-11-10 — andersc/veloGB10 fork, on top of v0.7.8-fork.2
+
+One addition for the EXL3 server on one GB10 (TP=1). Output is byte-identical to v0.7.8-fork.2.
+
+- **Speculation for strict-JSON requests.** Greedy (temperature 0) requests with a `json_schema` /
+  `json_object` constraint now use the MTP draft heads. The verify pass applies the schema mask at
+  every draft position, so a draft is accepted only if it is the token masked one-at-a-time decoding
+  would have picked; if the document ends inside a draft run, the rest is dropped. On by default
+  when `--json-schema-enforce on`; `VELO_SCHEMA_MTP=0` restores fork.2 behaviour. Still decoded
+  without speculation: schema requests that also ask for `logprobs`, sampled requests (temperature
+  > 0), and TP (which refuses schema requests).
+
+Receipts (one GB10, Qwen3.8-Flash-Next EXL3 3.05 bpw, `--max-batch 16`, earnings-call extraction
+and a 20-post social-media batch schema, greedy, no logprobs; same binary with
+`VELO_SCHEMA_MTP=0` vs on, run twice):
+
+| Requests at once | off, output tok/s total | on (two runs) | change |
+|---:|---:|---:|---:|
+| 1 | 34.9 | 73.8 / 75.4 | ×2.1 |
+| 8 | 77.1 | 82.2 / 84.4 | +7–9% |
+| 16 | 94.5 | 92.7 / 93.0 | none (within noise) |
+
+All 81 responses byte-identical between off, on and the repeat; the fork.2 binary matched "off"
+(9/9). The gain is for one or a few concurrent strict-JSON streams; a busy 16-lane server sees none.
+
 ## v0.7.8-fork.2 — 2026-11-06 — andersc/veloGB10 fork, on top of v0.7.8
 
 Additions for the EXL3 server on one GB10 (TP=1). Every one is opt-in or leaves output
@@ -14,7 +39,7 @@ byte-identical to v0.7.8.
   matches the schema (subset: type, properties, required, additionalProperties, items,
   min/maxItems, min/maxLength, minimum/maximum, enum). Replies carry `x-json-schema-enforced: full`;
   an unsupported schema is served unconstrained with `none`. Schema requests decode without
-  speculation. TP refuses them.
+  speculation (from fork.3 only those that also ask for logprobs or sample). TP refuses them.
 - **Faster prompt reading, byte-identical output:**
   - the prefill MoE kernel fetches each trellis word pair with 2 shuffles and loads the A fragment
     with one `ldmatrix` (ncu: kernel 6.43 → 5.49 ms on a 2,048-row chunk);

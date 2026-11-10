@@ -51,7 +51,7 @@ compiling anything.
 This is a fork of [sf-stav/veloGB10](https://github.com/sf-stav/veloGB10), based on **v0.7.8**. It adds
 the features below for the **EXL3 server on one GB10 (TP=1)**. Each is either opt-in or leaves
 output byte-identical to v0.7.8. The release binaries linked above are upstream's; this fork's
-releases (tag plus a prebuilt GB10 binary, from `v0.7.8-fork.2`) are on its
+releases (tag plus a prebuilt GB10 binary, from `v0.7.8-fork.2`; latest `v0.7.8-fork.3`) are on its
 [Releases page](https://github.com/andersc/veloGB10/releases).
 
 | Addition | How to use it | Output vs v0.7.8 |
@@ -60,6 +60,7 @@ releases (tag plus a prebuilt GB10 binary, from `v0.7.8-fork.2`) are on its
 | JSON-schema constrained decoding | `--json-schema-enforce on` + `response_format` | Unchanged when off; when on, the answer is guaranteed to parse and match the schema |
 | Faster prompt reading: MoE prefill kernel fix + n-gram row prefetch | always on | Byte-identical |
 | Packed prefill: several waiting prompts read in one GPU pass | `--prefill-pack on` (+ the tuning flags in [Server flags](#server-flags---server)) | Byte-identical |
+| Speculation for strict-JSON requests (v0.7.8-fork.3): greedy `json_schema` requests use the MTP draft heads, each draft checked against the schema mask | on by default with `--json-schema-enforce on`; `VELO_SCHEMA_MTP=0` turns it off | Byte-identical to decoding one token at a time. One strict-JSON stream ~2.1× faster (34.9 → ~74 tok/s); +7–9% at 8 in flight; no gain at 16 |
 
 **Measured on one GB10** (Qwen3.8-Flash-Next EXL3 3.05 bpw, `--max-batch 16`, ~1,240-token prompts,
 n-gram table rows not in the page cache, outputs compared byte for byte against the v0.7.8 release
@@ -1026,7 +1027,7 @@ construction. Both are pure tokenizer calls (no forward, no KV, no GPU work).
 | `--max-tokens <N>` | EXL3: unlimited; NVFP4: 8192 | Output length for a **chat** request that omits `max_tokens`. A default, not a cap: a request may ask for more, up to the room left in the context. `/v1/completions` requests that omit it get 16 and ignore this flag |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family); since v0.7.4 the EXL3 server clamps too and prints the limit (before, a larger value booted and could corrupt device memory). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
 | `--prefill-interleave <N>` | 0 | EXL3, one machine: after each prefill chunk (except the last) of a prompt that joins while other requests are generating, run up to N decode steps for those requests. Measured with a 20K-token joining prompt: longest stall 14.1 s → 5.4 s at the default `--prefill-chunk 4095`, 15.1 s → 2.7 s at 2048, 16.6–17.0 s → 1.35–1.47 s at 1024, for +3 % to +9 % time to first token of the joining request. The joining request's output is unchanged. Ignored under TP (a boot line says so) |
-| `--json-schema-enforce <on\|off>` | off | EXL3, TP=1 (this fork): enforce `response_format` (`json_schema` / `json_object`) with a per-token mask, so the answer always parses and matches the schema (supported: type, properties, required, additionalProperties, items, min/maxItems, min/maxLength, minimum/maximum, enum). Replies carry `x-json-schema-enforced: full`; an unsupported schema is served unconstrained with `none`. Schema requests decode without speculation; when the prompt opens a think block, the constraint starts after it |
+| `--json-schema-enforce <on\|off>` | off | EXL3, TP=1 (this fork): enforce `response_format` (`json_schema` / `json_object`) with a per-token mask, so the answer always parses and matches the schema (supported: type, properties, required, additionalProperties, items, min/maxItems, min/maxLength, minimum/maximum, enum). Replies carry `x-json-schema-enforced: full`; an unsupported schema is served unconstrained with `none`. Greedy schema requests speculate with the MTP heads, each draft checked against the schema mask, byte-identical to plain decoding (fork.3; `VELO_SCHEMA_MTP=0` turns it off); schema requests that also ask for logprobs, or sample, decode without speculation; when the prompt opens a think block, the constraint starts after it |
 | `--prefill-pack <on\|off>` | off | EXL3, TP=1 (this fork): read several waiting fresh prompts (64 to ~2,051 tokens, text only) in one prefill pass, so the expert weights are streamed once for all of them. Output byte-identical to per-prompt prefill. Measured +17–24% prompt tok/s at 8–16 in flight |
 | `--prefill-pack-rows <N>` | 0 | Rows one packed pass may carry (0 = the prefill chunk size). Larger allocates a larger prefill scratch; 12285 measured best |
 | `--prefill-pack-min <K>` | 2 | With K or more requests waiting and fewer than K free lanes while lanes decode, wait for a round so the next pass carries K prompts |
