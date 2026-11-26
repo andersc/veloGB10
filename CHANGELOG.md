@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.8.1-fork.1 — 2026-11-26 — andersc/veloGB10 fork, on top of upstream v0.8.1
+
+Rebased cleanly onto upstream `sf-stav/veloGB10` `v0.8.1` (`05530eb`), which already merges
+4 of our 5 previous `v0.7.8-fork.3` additions (`exl3-logprobs`, `exl3-json-schema`,
+`perf-prefill`, and `perf-prefill-pack`). Only one fork patch remains on top of upstream:
+
+- **Speculation for strict-JSON requests (`--json-schema-mtp <on|off>`, default `on`).**
+  Greedy (temperature 0) requests with a `json_schema` / `json_object` constraint at TP=1
+  use the MTP draft heads (including requests with `logprobs`, via upstream's
+  `round_logprobs`). The verify pass applies the schema mask at every draft position, so a
+  draft is accepted only if one-token-at-a-time masked decoding would have picked it; if
+  the document ends inside a draft run, the tail is dropped. Schema lanes stay off
+  `lane_pack`, `lane_wide`, and `copy-span` (`copy_round` / `cpv`) so every schema verify
+  runs on the masked lone path. `--json-schema-mtp off` restores stock `v0.8.1` behaviour
+  (replaces the old `VELO_SCHEMA_MTP=0` env var to keep the CLI-1 option registry clean).
+
+Receipts (one GB10, Qwen3.8-Flash-Next EXL3 3.05 bpw, `--max-seq-len 65536 --max-batch 16`
+with production `k8s-qwen` flags and `--thermal-guard off`, vs `v0.7.8-fork.3` and stock
+`v0.8.1` (`--json-schema-mtp off`)):
+
+| Workload | `v0.7.8-fork.3` | `v0.8.1-fork.1` | `v0.8.1` (`--json-schema-mtp off`) | Parity |
+|---|---:|---:|---:|---|
+| `schema_spec` c=1 (9 req, 6,562 tok) | 79.1 tok/s | **74.8 tok/s** | 36.3 tok/s | 9/9 byte-identical (all 3) |
+| `schema_spec` c=8 (16 req, 10,124 tok) | 81.1 tok/s | **87.1 tok/s** (+7.4%) | — | 16/16 byte-identical |
+| `bench_ple` strict JSON + top-20 logprobs (all phases) | 1724.1 pt/s (short c=8) | **1729.9 pt/s** (short c=8) | 1740.1 pt/s (quick) | 185/185 byte-identical (incl. logprobs) |
+| `bench_ple` decode1 / decode8 | 91.65 / 135.55 tok/s | **92.99 / 137.28 tok/s** | — | 10/10 byte-identical |
+
+All 1,735 unit/integration tests pass (`cargo test --release --locked --lib` + `--tests`).
+
 ## v0.8.1 — `--gpu-wait` fixes, `--proxy-owed-wait`, KV-spill pre-D2H budgeting, Inkling-2 1M context
 
 A focused patch release on top of v0.8.0: adds exact pre-D2H KV-spill snapshot
