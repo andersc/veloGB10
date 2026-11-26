@@ -630,7 +630,7 @@ impl FwdModel {
     /// W2-EXL3: `xq_vmask_rows` over the m logits rows: a row whose flag is set keeps only the
     /// tokens whose bit is set in its allowed bitset (every other logit becomes -inf). No launch
     /// unless a mask is staged for this step.
-    fn vmask_rows(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
+    pub(super) fn vmask_rows(&self, l: &Launcher, sc: &mut Scratch, m: usize) -> Result<()> {
         if !sc.vmask_live {
             return Ok(());
         }

@@ -421,7 +421,7 @@ impl FwdModel {
         // MTP_DIAG: final-mixer pre-RMS input (col 0) — the head out_proj plane.
         if let Some(d) = bmtd.as_ref() { dump_f(&d, &sc.resid, "finalmix", 0)?; }
         let v = cfg.vocab_size;
-        if self.vp_greedy(sc, m) {
+        if self.vp_greedy(sc, m) && !sc.vmask_live {
             // TP-H #4: vocab-parallel greedy tail (shard GEMM + argmax keys + one key exchange) —
             // sc.argmax[0..m] = the replicated argmax bit for bit; no sampler (samp_live is false,
             // so xq_sample_rows would return at once on every row).
@@ -437,6 +437,9 @@ impl FwdModel {
         // WP15: row i is penalized over the committed history + b, d_0..d_{i-1} (exactly the
         // plain decode's past at that position), before the argmax and the sampler.
         self.pen_rows(l, sc, m)?;
+        // SCHEMA-SPEC: row i keeps only the tokens the schema allows after b, d_0..d_{i-1}
+        // (the plain masked step's row at that position); no launch unless a mask is staged.
+        self.vmask_rows(l, sc, m)?;
         // WP09: one m x nb-block launch replaces the m single-block launches (bitwise ids).
         self.argmax_rows(l, sc, m, v)?;
         if sc.rq_live {

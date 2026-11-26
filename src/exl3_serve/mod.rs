@@ -261,9 +261,10 @@ struct Lane {
     logprobs: Option<u8>,
     // W2-EXL3: the request's compiled JSON-schema FSM (None = unconstrained), its current
     // state, and whether the constraint is live yet (false while the lane is still inside the
-    // think block its prompt opened: the mask arms on the think-close token). A schema lane
-    // never speculates (mtp = None for its whole life), so every token it emits comes from a
-    // masked plain step.
+    // think block its prompt opened: the mask arms on the think-close token). SCHEMA-SPEC: a
+    // greedy schema lane may speculate; its plain/control steps stage the row mask and its
+    // verify rows are masked per draft position (mtp_verify), and round_emit feeds every
+    // emitted token through the machine, so a round ends at the document's end.
     schema: Option<std::sync::Arc<crate::json_schema::SchemaMask>>,
     schema_state: u32,
     schema_armed: bool,

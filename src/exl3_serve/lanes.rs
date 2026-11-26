@@ -63,6 +63,12 @@ pub(super) enum SchemaStep {
 /// completed one.
 pub(super) const SCHEMA_DEAD_END: &str = "error: json-schema constrained decoding reached a state with no valid continuation";
 
+/// SCHEMA-SPEC: greedy schema lanes speculate with masked verify rows (default on;
+/// `--json-schema-mtp off` = every schema lane decodes plain, the pre-SCHEMA-SPEC behaviour).
+pub(super) fn schema_mtp_on() -> bool {
+    !matches!(crate::opts::var(crate::opt!("json-schema-mtp")).as_deref(), Ok("0"))
+}
+
 /// W2-EXL3: advance a schema lane's FSM by one emitted token (pure; unit-tested).
 pub(super) fn schema_feed(sm: &crate::json_schema::SchemaMask, state: &mut u32, armed: &mut bool, tok: u32) -> SchemaStep {
     if !*armed {

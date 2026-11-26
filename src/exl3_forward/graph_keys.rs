@@ -63,6 +63,38 @@ pub(super) fn sk(sc: &Scratch) -> usize {
 pub(super) fn vmask_key(sc: &Scratch) -> usize {
     (sc.vmask_live as usize) << 47
 }
+/// SCHEMA-SPEC: the verify's per-row masks for a schema lane. Row 0 continues b (the machine
+/// is at `state` / `armed` after b); row i+1 continues draft d_i. A row gets the allowed set of
+/// the state it continues while the constraint is armed; unarmed rows (inside the think block)
+/// stay unmasked, exactly as the plain step leaves them. The walk stops at the first draft the
+/// machine refuses, completes on, or dead-ends after: the masked argmax of that row cannot equal
+/// such a draft (or the turn ends on it), so no later row is ever emitted and stays unmasked.
+pub fn schema_verify_masks(sm: &crate::json_schema::SchemaMask, mut state: u32, mut armed: bool,
+                           drafts: &[i32], m: usize) -> Vec<Option<Arc<Vec<u32>>>> {
+    let mut rows: Vec<Option<Arc<Vec<u32>>>> = vec![None; m];
+    if m == 0 { return rows; }
+    if armed { rows[0] = Some(sm.allowed(state)); }
+    for (i, &d) in drafts.iter().enumerate().take(m.saturating_sub(1)) {
+        let tok = d.max(0) as u32;
+        if !armed {
+            if sm.defer_until() == Some(tok) { armed = true; }
+        } else {
+            match sm.step(state, tok) {
+                None => break,
+                Some(ns) => {
+                    if sm.is_complete(ns) { break; }
+                    state = ns;
+                }
+            }
+        }
+        if armed {
+            let a = sm.allowed(state);
+            if a.iter().all(|&w| w == 0) { break; }
+            rows[i + 1] = Some(a);
+        }
+    }
+    rows
+}
 /// W2-EXL3: u32 words of one row's allowed-token bitset (= json_schema::vocab_words).
 pub fn vmask_words(vocab: usize) -> usize {
     vocab.div_ceil(32)

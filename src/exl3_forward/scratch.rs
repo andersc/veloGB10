@@ -223,6 +223,7 @@ impl Scratch {
             vmask: dev.htod_sync_copy(&vec![0u32; w.max(1) * vmask_words(cfg.vocab_size)])?,
             vmask_flags: dev.htod_sync_copy(&vec![0i32; w.max(1)])?,
             vmask_live: false,
+            vspec: None,
             lp_live: false,
             pen_hist: dev.htod_sync_copy(&vec![0i32; w.max(1) * PEN_RING])?,
             pen_draft_i: None,

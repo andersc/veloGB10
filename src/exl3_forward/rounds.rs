@@ -204,6 +204,15 @@ step (no draft fits before the sparse switch)"));
         // as ONE CUDA graph per (m, regime, slot) — first round eager, then captured
         // (the forward_step pattern). Kills the eager path's launch gaps (~6 ms/round
         // at m=6, S-A3-m budget).
+        // SCHEMA-SPEC: a schema lane's per-row masks (row i continues toks_v[..=i]).
+        match sc.vspec.take() {
+            Some((sm, st, armed)) => {
+                let rows = schema_verify_masks(&sm, st, armed, &drafts, m);
+                let refs: Vec<Option<&[u32]>> = rows.iter().map(|r| r.as_deref().map(|v| &v[..])).collect();
+                self.set_vmask(sc, &refs)?;
+            }
+            None => sc.vmask_live = false,
+        }
         let tp3 = std::time::Instant::now();
         let qsa = self.qsa_live(p + k);
         let (qg, qb) = self.qsa_grid_bucket_key(p + k);
@@ -211,7 +220,8 @@ step (no draft fits before the sparse switch)"));
         let vkey = vkey_of(slot, m, qsa, qb) | sk(sc) // TP-C: + the scratch id
             | ((sc.pen_live as usize) << 40) // WP15: penalized verify = its own graph
             | rq_verify_key(sc) // WP24: the real-q verify sampler = its own graph
-            | self.vp_key(sc, m); // TP-H #4: the vocab-parallel greedy tail = its own graph
+            | self.vp_key(sc, m) // TP-H #4: the vocab-parallel greedy tail = its own graph
+            | vmask_key(sc); // SCHEMA-SPEC: a masked verify = its own graph (bit 47)
         let want_graph = crate::opts::var(crate::opt!("exl3-no-graph")).is_err()
             && crate::opts::var(crate::opt!("mtp-dump")).map_or(true, |s| s.is_empty())
             && gdn_ring_mode() != 2
@@ -246,6 +256,8 @@ step (no draft fits before the sparse switch)"));
             if rp_live { self.dsync()?; } // REPRIME: capture with the re-prime drained
             self.capture_verify_graph(&l, sc, slot, m, k, qsa, vkey);
         }
+        // SCHEMA-SPEC: one-shot, cleared only AFTER the capture (the bit-47 graph holds its mask node).
+        sc.vmask_live = false;
         let a = out[k + 2] as usize;
         anyhow::ensure!(a <= k, "mtp_round: accept out of range");
         let emitted: Vec<i32> = out[..=a].to_vec();

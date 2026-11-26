@@ -660,7 +660,7 @@ impl Exl3Scheduler {
         }
         let f = cp::Facts {
             on: self.cpv_on, solo, plain_step, cursor_live, in_prefill: self.in_prefill,
-            penalized: lane.pen.is_some(), logprobs: lane.logprobs.is_some(), image: lane.img,
+            penalized: lane.pen.is_some(), logprobs: lane.logprobs.is_some(), image: lane.img || lane.schema.is_some(),
             tap_ok: lane.mtp.map_or(false, |t| t != usize::MAX), scratch_ok: self.psc.is_some(), n,
             run, min_run: cp::min_run(), pays,
         };

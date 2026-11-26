@@ -445,15 +445,20 @@ this line prints once per boot)"));
         // seam decode step's sc.resid — exact, same composition as the bench-mtp
         // prime and every round's re-prime), then feed the head the last prompt
         // token with that tap (round 1's draft-extend reuses tap_row 0).
-        // A JSON-schema lane decodes plain steps (its mask does not cover the verify rows yet); a lane that reports log
-        // probabilities speculates like any other (round_emit reads the round's verify rows).
-        if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() && req.schema.is_some() {
+        // SCHEMA-SPEC: a GREEDY schema lane speculates (TP=1; schema lanes are refused under TP):
+        // each verify row is masked with the allowed set of the state it continues (mtp_verify /
+        // schema_verify_masks), so the emitted tokens (and logprobs) are the masked plain decode's.
+        // A sampled schema lane stays plain (the draft's q' is unmasked), and `--json-schema-mtp off`
+        // keeps every schema lane plain.
+        let schema_spec_ok = req.schema.is_none() || (schema_mtp_on() && self.tp.is_none()
+            && crate::exl3_forward::SampParams::sampled(req.temperature, req.top_p, req.top_k, req.min_p, req.seed.unwrap_or(0), 0).is_none());
+        if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() && !schema_spec_ok {
             // the speed such a request pays, visible to scripts/owner_check.py (velogb10_spec_off_lanes_total)
             crate::metrics::spec_off_lane(true);
         }
-        // log probabilities keep speculation (round_emit reads the round's verify rows); a schema lane decodes
-        // plain steps until its mask covers the verify rows
-        let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() && req.schema.is_none() {
+        // log probabilities keep speculation (round_emit reads the round's verify rows); greedy
+        // schema lanes speculate too when schema_spec_ok holds.
+        let mtp = if self.model.mtp.is_some() && !crate::exl3_forward::mtp_disabled_by_opt() && schema_spec_ok {
             match self.mtp_prime(free, *req.prompt.last().unwrap(), plen) {
                 Ok(()) => {
                     if crate::exl3_forward::a_xcheck_on() {
@@ -493,8 +498,10 @@ this line prints once per boot)"));
             }
             _ => (None, Vec::new()),
         };
-        let copy = match (self.copy_arm, mtp.is_some()) {
-            (Some(arm), true) => {
+        // SCHEMA-SPEC: copy-span rounds (copy_round / cpv) stay off schema lanes so every
+        // schema verify goes through the masked neural mtp_verify path.
+        let copy = match (self.copy_arm, mtp.is_some(), req.schema.is_none()) {
+            (Some(arm), true, true) => {
                 let th = std::time::Instant::now();
                 let mut ctx = Vec::with_capacity(req.prompt.len() + 1);
                 ctx.extend_from_slice(&req.prompt);

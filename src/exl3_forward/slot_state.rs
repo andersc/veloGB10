@@ -120,6 +120,14 @@ impl FwdModel {
         Ok(())
     }
 
+    /// SCHEMA-SPEC: stage a schema lane's FSM for the next `mtp_verify` (None = clear). The
+    /// verify masks each of its rows with the allowed set of the state that row continues, so an
+    /// accepted draft is always a token the machine accepts and every emitted token is the masked
+    /// argmax a plain step would have chosen.
+    pub fn set_vspec(&self, sc: &mut Scratch, spec: Option<(Arc<crate::json_schema::SchemaMask>, u32, bool)>) {
+        sc.vspec = spec;
+    }
+
     /// WP15: seed `slot`'s penalty ring with the committed prompt positions 0..toks.len() (the
     /// chunk-prefilled prompt[..plen-1]; the seam step commits the last prompt token itself).
     /// Only the tail the largest window can reach is written.

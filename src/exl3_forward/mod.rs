@@ -925,6 +925,11 @@ pub struct Scratch {
     vmask: CudaSlice<u32>,
     vmask_flags: CudaSlice<i32>,
     vmask_live: bool,
+    // SCHEMA-SPEC: a schema lane's FSM for the NEXT speculative verify (`set_vspec`): the
+    // lane's JSON-schema machine, its state after the round's input token b, and whether the
+    // constraint is armed. ONE-SHOT: `mtp_verify` takes it, builds one allowed-token mask per
+    // verify row by walking the drafts through the machine, and stages them with set_vmask.
+    vspec: Option<(Arc<crate::json_schema::SchemaMask>, u32, bool)>,
     /// Logprobs at TP (owner 2026-11-02): a lane of this step reports log probabilities, so the LM-head tail must
     /// leave FULL logits rows (the TP row gather / the replicated head, as for a sampled row) instead of the
     /// vocabulary-parallel greedy key exchange. Set per step by the scheduler from its lanes (identical on every

@@ -162,6 +162,16 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
         // WP15: the same penalty params on every row of the round (and the draft mirror's row 0).
         self.model.set_penalties(&mut self.sc, &vec![pen; if plain_step { 1 } else { k + 1 }])?;
         }
+        // SCHEMA-SPEC: a schema lane's FSM for this round's verify (one-shot; mtp_verify takes it).
+        let (schema_spec, schema_row) = {
+            let lane = self.lanes[s].as_ref().unwrap();
+            match lane.schema.as_ref() {
+                Some(sm) => (Some((sm.clone(), lane.schema_state, lane.schema_armed)),
+                             if lane.schema_armed { Some(sm.allowed(lane.schema_state)) } else { None }),
+                None => (None, None),
+            }
+        };
+        self.model.set_vspec(&mut self.sc, if plain_step { None } else { schema_spec });
         let t0 = std::time::Instant::now();
         let g0 = self.model.graph_count(); // WP23: a round that captures a graph is not cost-fit
         let mut df2_served = false;
@@ -201,6 +211,8 @@ sparse switch (depth {k_eff} -> {kd}; --qsa-row-regime 0 = rounds may straddle i
             } else {
                 t0
             };
+            // SCHEMA-SPEC: the plain/control step of a schema lane is the masked plain step.
+            self.model.set_vmask(&mut self.sc, &[schema_row.as_deref().map(|v| &v[..])])?;
             let ids = self.model.forward_step(&mut self.sc, &[b], &[p], &[s], None)?;
             let ms = tc.elapsed().as_secs_f64() * 1e3;
             if ctrl_new {
@@ -712,11 +724,29 @@ ms/tok vs plain {:.2}; backoff reset to {}", cfg.probe_window, cost, plain_ref, 
                     || (self.eos.contains(&t) && !lane.ignore_eos && lane.generated >= lane.min_new);
                 let rsn = if lane.generated >= lane.max_new { "length" }
                     else if fin { "stop" } else { "" };
-                // WP08: a loop ends the round mid-list like a stop token (rest dropped).
-                if !fin && lane.loop_feed(t) {
+                if fin {
+                    (fin, rsn.to_string(), lane.generated)
+                } else if let Some(sm) = lane.schema.clone().filter(|_| lane.schema_armed) {
+                    // SCHEMA-SPEC: step_plain's rule — the document's end ends the turn mid-round
+                    // (the rest of the list is dropped); no loop detector on an armed lane.
+                    match schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t) {
+                        SchemaStep::Continue => (false, String::new(), lane.generated),
+                        SchemaStep::Complete => (true, "stop".to_string(), lane.generated),
+                        SchemaStep::Invalid => {
+                            crate::reprintln!("[schema] slot {s}: token {t} leaves no valid continuation \
+                                               — ending the turn with an error");
+                            (true, SCHEMA_DEAD_END.to_string(), lane.generated)
+                        }
+                    }
+                } else if lane.loop_feed(t) {
+                    // WP08: a loop ends the round mid-list like a stop token (rest dropped).
                     (true, "loop_detected".to_string(), lane.generated)
                 } else {
-                    (fin, rsn.to_string(), lane.generated)
+                    if let Some(sm) = lane.schema.clone() {
+                        // not armed yet (reasoning): this token may be the one that arms it
+                        schema_feed(&sm, &mut lane.schema_state, &mut lane.schema_armed, t);
+                    }
+                    (false, String::new(), lane.generated)
                 }
             };
             if let Some(lane) = self.lanes[s].as_mut() {

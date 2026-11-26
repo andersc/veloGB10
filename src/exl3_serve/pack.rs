@@ -51,7 +51,9 @@ impl Exl3Scheduler {
                 // (PACK5) a topology whose packed sampled tail is not gated (TP=2)
                 sampled_lone: crate::wp24::dump_on() || !self.pack_sampled,
                 penalized: l.pen.is_some(),
-                image: l.img,
+                // SCHEMA-SPEC: a schema lane's verify is masked per row on the lone path only;
+                // it never packs (reported under the image skip reason)
+                image: l.img || l.schema.is_some(),
                 logprobs_tp: l.logprobs.is_some() && self.tp.is_some(),
                 depth: 0, // set by lane_view from kd_reg (capped at PACK_DEPTH_MAX: PACK4-REVIEW A4)
             };
@@ -267,7 +269,8 @@ velogb10_lane_pack_skip_total{{reason=\"{}\"}})", why.text(), self.pack_logs, wh
                 control: l.force_control || owes || l.reprobe.phase == crate::mtp_reprobe::Phase::Probing,
                 penalized: l.pen.is_some(),
                 logprobs: l.logprobs.is_some(),
-                image: l.img,
+                // SCHEMA-SPEC: schema lanes stay on the lone masked-verify path, never wide-verify
+                image: l.img || l.schema.is_some(),
                 sparse: self.model.qsa_live(l.pos + kd.max(1)),
                 depth: kd,
                 in_prefill: self.in_prefill,
